@@ -55,16 +55,95 @@ export function isAssistantTextMatch(candidate: string, target: string): boolean
   return false;
 }
 
+export type ProviderRowTextReconciliation = {
+  winner: 'server' | 'realtime' | 'distinct';
+  serverMessageId?: string;
+};
+
+const MIN_PROVIDER_ROW_PREFIX_LENGTH = 100;
+
+/** Removes presentation-only Markdown characters before provider-row comparison. */
+function normalizeProviderRowText(content: string): string {
+  return (content || '')
+    .trim()
+    .normalize('NFKC')
+    .split('\n')
+    .map((line) => line.replace(/^\s*(?:#{1,6}\s+|>\s?|[-+*]\s+|\d+[.)]\s+)/, ''))
+    .join('')
+    .replace(/[\\`*_~\[\](){}]/g, '')
+    .replace(/\s+/g, '');
+}
+
 /**
- * Stable provider identity permits whitespace normalization, but never the
- * progressive-prefix tolerance used by legacy stream matching. A history row
- * can be observed while it is only partially written; treating that prefix as
- * final would delete the complete live row and lose user-visible text.
+ * Checks for contiguous containment after presentation normalization. This is
+ * linear and, unlike a similarity score or a loose subsequence, cannot hide a
+ * changed word such as a negation, amount, or version number.
  */
-function isProviderRowTextEquivalent(candidate: string, target: string): boolean {
-  const compactCandidate = (candidate || '').trim().replace(/\s+/g, '');
-  const compactTarget = (target || '').trim().replace(/\s+/g, '');
-  return compactCandidate.length > 0 && compactCandidate === compactTarget;
+function isContainedProviderRowText(candidate: string, container: string): boolean {
+  return candidate.length > 0 && container.includes(candidate);
+}
+
+/**
+ * Chooses which transport owns a uniquely keyed provider row. Exact history
+ * wins; a strictly longer live row wins when history is its prefix; and a
+ * a presentation-preserving containing superset handles providers that rewrite
+ * Markdown when completing.
+ * Ambiguous keys and materially different text always remain visible.
+ */
+export function reconcileProviderRowText(
+  realtimeMessage: NormalizedMessage,
+  serverMessages: NormalizedMessage[],
+): ProviderRowTextReconciliation {
+  if (!realtimeMessage.providerRowKey) {
+    return { winner: 'distinct' };
+  }
+
+  const keyedServerRows = serverMessages.filter((serverMessage) =>
+    serverMessage.provider === realtimeMessage.provider
+    && serverMessage.kind === 'text'
+    && serverMessage.role === 'assistant'
+    && Boolean(serverMessage.providerRowKey),
+  );
+  if (keyedServerRows.length === 0) {
+    return { winner: 'distinct' };
+  }
+
+  const matchingRows = keyedServerRows.filter(
+    (serverMessage) => serverMessage.providerRowKey === realtimeMessage.providerRowKey,
+  );
+  if (matchingRows.length !== 1) {
+    return { winner: 'distinct' };
+  }
+
+  const serverMessage = matchingRows[0];
+  const serverText = normalizeProviderRowText(serverMessage.content || '');
+  const realtimeText = normalizeProviderRowText(realtimeMessage.content || '');
+  if (!serverText || !realtimeText) {
+    return { winner: 'distinct' };
+  }
+
+  const result = (winner: 'server' | 'realtime'): ProviderRowTextReconciliation => ({
+    winner,
+    serverMessageId: serverMessage.id,
+  });
+  if (serverText === realtimeText) {
+    return result('server');
+  }
+
+  const shorterLength = Math.min(serverText.length, realtimeText.length);
+  const hasSafePrefix = shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH;
+  if (hasSafePrefix && realtimeText.startsWith(serverText)) {
+    return result('realtime');
+  }
+  if (hasSafePrefix && serverText.startsWith(realtimeText)) {
+    return result('server');
+  }
+
+  if (shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH && isContainedProviderRowText(serverText, realtimeText)) {
+    return result(serverText.length >= realtimeText.length ? 'server' : 'realtime');
+  }
+
+  return { winner: 'distinct' };
 }
 
 /**
@@ -165,18 +244,14 @@ export function isAssistantTextEchoedInSameTurnOnServer(
   // different rows. Require one matching server row and compatible content so
   // a provider collision or partially written transcript cannot drop live text.
   if (message.providerRowKey) {
-    const keyedServerRows = serverMessages.filter((serverMessage) =>
+    const hasKeyedServerRow = serverMessages.some((serverMessage) =>
       serverMessage.provider === message.provider
       && serverMessage.kind === 'text'
       && serverMessage.role === 'assistant'
       && Boolean(serverMessage.providerRowKey),
     );
-    if (keyedServerRows.length > 0) {
-      const matchingRows = keyedServerRows.filter(
-        (serverMessage) => serverMessage.providerRowKey === message.providerRowKey,
-      );
-      return matchingRows.length === 1
-        && isProviderRowTextEquivalent(matchingRows[0].content || '', assistantText);
+    if (hasKeyedServerRow) {
+      return reconcileProviderRowText(message, serverMessages).winner === 'server';
     }
   }
 

@@ -58,6 +58,7 @@ import {
   isAssistantTextEchoedInSameTurnOnServer,
   isAssistantTextMatch,
   readMessageTime,
+  reconcileProviderRowText,
 } from '@/modules/chat/utils/sessionMessageTurnDedupe';
 
 // ─── Per-session slot ────────────────────────────────────────────────────────
@@ -349,6 +350,30 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
 
   const serverIds = new Set(server.map((message) => message.id));
   const reconciledRealtime = removeOptimisticUserEchoes(server, realtime);
+  const providerRowReconciliations = new Map<string, ReturnType<typeof reconcileProviderRowText>>();
+  const reconcileRealtimeProviderRow = (message: NormalizedMessage) => {
+    const cached = providerRowReconciliations.get(message.id);
+    if (cached) {
+      return cached;
+    }
+    const reconciliation = reconcileProviderRowText(message, server);
+    providerRowReconciliations.set(message.id, reconciliation);
+    return reconciliation;
+  };
+  const serverRowsSupersededByRealtime = new Set(
+    reconciledRealtime.flatMap((message) => {
+      if (
+        !message.providerRowKey
+        || !((message.kind === 'text' && message.role === 'assistant') || message.kind === 'stream_delta')
+      ) {
+        return [];
+      }
+      const reconciliation = reconcileRealtimeProviderRow(message);
+      return reconciliation.winner === 'realtime' && reconciliation.serverMessageId
+        ? [reconciliation.serverMessageId]
+        : [];
+    }),
+  );
   const extra = reconciledRealtime.filter((message) => {
     if (serverIds.has(message.id)) {
       return false;
@@ -361,7 +386,10 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
       || message.kind === 'stream_delta'
       || message.id === `__streaming_${message.sessionId}`
     ) {
-      if (isAssistantTextEchoedInSameTurnOnServer(message, server, realtime)) {
+      if (
+        reconcileRealtimeProviderRow(message).winner === 'server'
+        || isAssistantTextEchoedInSameTurnOnServer(message, server, realtime)
+      ) {
         return false;
       }
     }
@@ -369,13 +397,16 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
   });
 
   if (extra.length === 0) {
-    return dedupeAdjacentAssistantEchoes(server);
+    return dedupeAdjacentAssistantEchoes(
+      server.filter((message) => !serverRowsSupersededByRealtime.has(message.id)),
+    );
   }
 
   // Interleave by timestamp so live rows stay with their turn instead of
   // piling up at the bottom after every refresh.
   return dedupeAdjacentAssistantEchoes(
-    [...server, ...extra].sort(compareMessagesChronologically),
+    [...server.filter((message) => !serverRowsSupersededByRealtime.has(message.id)), ...extra]
+      .sort(compareMessagesChronologically),
   );
 }
 

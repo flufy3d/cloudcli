@@ -59,7 +59,7 @@ flowchart LR
 
 模块内还有四条次级排序契约（都曾是真实 bug），见 `sessionTimelineStore.ts` 头注释：内容帧先 flush 流式缓冲再落表（路由表的 flush 门）；服务端覆盖剪枝必须先于内容级短路；旧页拉取期间的偏移漂移要先做一次有界最新页校准；流式行时间戳锚定在分段开始且不刷新。
 
-assistant 文本的 live/history 对账优先使用 provider 给出的 `providerRowKey`。流式缓冲从 delta 到 `__streaming_`、再到定稿 `text_` 全程保留该 key；key 变化以及有 key/无 key 的切换都会先闭合旧段，避免相邻 provider 行或普通 stdout 被拼成一条。历史刷新只在 provider、会话、key 唯一对应且正文去除空白后严格相同时剪掉实时行；不同 key、同 key 多候选、正文前缀或正文冲突都保留，防止误删与丢失尚未落盘的答案尾部。任一侧没有 key 时才使用正文、时间与回合位置的兼容算法。Antigravity 的纯 assistant 正文使用原生 `step_index` 派生 key，`complete` 仍只是终态信号，正文由随后的历史刷新接管。
+assistant 文本的 live/history 对账优先使用 provider 给出的 `providerRowKey`。流式缓冲从 delta 到 `__streaming_`、再到定稿 `text_` 全程保留该 key；key 变化以及有 key/无 key 的切换都会先闭合旧段，避免相邻 provider 行或普通 stdout 被拼成一条。历史刷新只在 provider、会话、key 唯一对应时裁决：正文去除空白和 Markdown 表现字符后相同，由历史接管；历史正文是实时正文的足够长前缀，或两者之一完整、连续地包含另一方时，保留更完整的一侧。这个包含判断是线性的，且不会把改动过的否定词、金额或版本号当作同一正文。不同 key、同 key 多候选、短文本或不完整包含的正文都保留，避免误删真实冲突。任一侧没有 key 时才使用正文、时间与回合位置的兼容算法。Antigravity 的纯 assistant 正文使用原生 `step_index` 派生 key，`complete` 仍只是终态信号，正文由随后的历史刷新接管。
 
 工具卡的跨路去重按 `toolIdentity.ts` 匹配：精确 toolId，或"工具名 + 完整参数指纹"（claimed 一对一，按 realtime 顺序配对）——两路对同一调用各自发 id（live 引擎 payload 兜底 vs 转录 part id），精确 id 不是身份的全部；`__finalized_` 合成结算行随其卡片退役。逐引擎定论（2026-09 可行域调查）：claude（共用归一化器）与 zcode（引擎持久化 `callID = toolCallId`，28k 真实行 0 缺失）两路 id 天然同源，有 parity 测试钉住；codex（live `item_<n>` 本地合成、rollout `call_id` 不在 wire 格式）、antigravity（live 锚执行步/历史锚 planner 步+下标）、opencode（无真实 live 样本）**结构性无法对齐，指纹层是其永久机制**，勿再立项对齐。
 

@@ -363,10 +363,10 @@ test('matching provider row keys do not discard a stream whose content differs f
   );
 });
 
-test('a keyed history prefix does not discard the complete Antigravity stream', async () => {
+test('a keyed history prefix yields to the complete Antigravity stream', async () => {
   const providerRowKey = 'assistant-step:7';
-  const completeReply = `${'A detailed implementation step with concrete safeguards. '.repeat(4)}Final verification.`;
-  const persistedPrefix = completeReply.slice(0, Math.floor(completeReply.length * 0.8));
+  const completeReply = `${'A detailed implementation step with concrete safeguards. '.repeat(8)}Final verification.`;
+  const persistedPrefix = completeReply.slice(0, Math.floor(completeReply.length * 0.3));
   const initialUser = msg(1, { provider: 'antigravity', content: 'write the complete plan' });
   const fetchPage = scriptedFetcher([
     {
@@ -404,7 +404,99 @@ test('a keyed history prefix does not discard the complete Antigravity stream', 
     store.getMessages(SESSION_ID)
       .filter((row) => row.role === 'assistant')
       .map((row) => row.content),
-    [persistedPrefix, completeReply],
+    [completeReply],
+  );
+});
+
+test('a near-identical keyed Antigravity history row yields to richer markdown-formatted stream text', async () => {
+  const providerRowKey = 'assistant-step:7b';
+  const shared = '游戏世界与界面分工协作是现代 Web 游戏的常见架构。'.repeat(18);
+  const persistedReply = `${shared}原版客户端在同一绘制表面中逐层绘制。`;
+  const streamedReply = `## 结论\n\n${shared}\n\n**原版客户端**在同一绘制表面中逐层绘制。\n\n- Canvas 负责动态世界\n- DOM 负责复杂交互`;
+  const initialUser = msg(1, { provider: 'antigravity', content: '解释 Canvas 和 DOM 的分工' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [initialUser, msg(2, {
+          id: 'msg_session_7b',
+          provider: 'antigravity',
+          content: persistedReply,
+          providerRowKey,
+        })],
+        total: 2,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: streamedReply,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content),
+    [streamedReply],
+  );
+});
+
+test('a keyed Antigravity row with a changed word remains visible as a real conflict', async () => {
+  const providerRowKey = 'assistant-step:7c';
+  const shared = '这一段用于保证回答足够长，同时验证不能因为大部分文字相同就吞掉修改过的事实。'.repeat(5);
+  const persistedReply = `该方案支持离线模式。${shared}`;
+  const streamedReply = `该方案不支持离线模式。${shared}`;
+  const initialUser = msg(1, { provider: 'antigravity', content: '确认离线模式是否可用' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [initialUser, msg(2, {
+          id: 'msg_session_7c',
+          provider: 'antigravity',
+          content: persistedReply,
+          providerRowKey,
+        })],
+        total: 2,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: streamedReply,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content),
+    [persistedReply, streamedReply],
   );
 });
 
