@@ -198,6 +198,12 @@ function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedM
     }
 
     if (m.kind === 'stream_delta') {
+      // Keyed rows reconcile only through the cross-transport identity path.
+      // Content-only collapse must not hide a key collision.
+      if (m.providerRowKey) {
+        out.push(m);
+        continue;
+      }
       const prev = out[out.length - 1];
       if (prev && prev.kind === 'text' && prev.role === 'assistant') {
         const ps = (prev.content || '').trim();
@@ -209,6 +215,14 @@ function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedM
     }
 
     if (m.kind === 'text' && m.role === 'assistant') {
+      // A providerRowKey makes this row ineligible for the legacy text map.
+      // The merge/prune phase already removed a unique, content-compatible
+      // live echo; anything left here is a distinct row or a collision that
+      // must remain visible rather than being silently discarded.
+      if (m.providerRowKey) {
+        out.push(m);
+        continue;
+      }
       const text = (m.content || '').trim();
       const compactKey = text.replace(/\s+/g, '');
       if (compactKey.length > 0) {
@@ -516,7 +530,12 @@ export class SessionTimelineStore {
   // Per-session stream-segment buffers with their 100ms throttle timers, and
   // the per-session reconnect resume seq. Timeline state, store-owned.
   private readonly streamTimers = new Map<string, number>();
-  private readonly accumulatedStreams = new Map<string, string>();
+  /** Retains the open text segment's body and cross-transport identity until it is finalized. */
+  private readonly accumulatedStreams = new Map<string, {
+    content: string;
+    provider: LLMProvider;
+    providerRowKey?: string;
+  }>();
   private readonly resumeSeqs = new Map<string, number>();
 
   constructor(options: SessionTimelineStoreOptions = {}) {
@@ -574,7 +593,7 @@ export class SessionTimelineStore {
       // whatever comes after it. zcode's engine never emits text-boundary
       // events, so without this flush a whole turn's text landed in one
       // streaming bubble.
-      this.flushStream(sid, provider);
+      this.flushStream(sid);
     }
 
     switch (route.action) {
@@ -627,7 +646,7 @@ export class SessionTimelineStore {
       case 'streamDelta': {
         const text = (msg.content as string) || '';
         if (!text || !sid) return null;
-        this.appendStreamDelta(sid, text, provider);
+        this.appendStreamDelta(sid, msg as NormalizedMessage, provider);
         return null;
       }
 
@@ -636,7 +655,7 @@ export class SessionTimelineStore {
         // Flushes the buffered text (finalizing its row when any existed),
         // then closes the synthetic streaming row even when nothing was
         // buffered — finalizeStreaming is a no-op when none exists.
-        this.flushStream(sid, provider);
+        this.flushStream(sid);
         this.finalizeStreaming(sid);
         return null;
       }
@@ -1074,7 +1093,10 @@ export class SessionTimelineStore {
    * tool calls the model makes after writing it, not drift to the last
    * update and get pushed below them.
    */
-  private updateStreaming(sessionId: string, accumulatedText: string, msgProvider: LLMProvider): void {
+  private updateStreaming(
+    sessionId: string,
+    accumulatedStream: { content: string; provider: LLMProvider; providerRowKey?: string },
+  ): void {
     const slot = this.getSlot(sessionId);
     const streamId = `__streaming_${sessionId}`;
     const existing = slot.realtimeMessages.find((m) => m.id === streamId);
@@ -1082,9 +1104,10 @@ export class SessionTimelineStore {
       id: streamId,
       sessionId,
       timestamp: existing?.timestamp ?? new Date().toISOString(),
-      provider: msgProvider,
+      provider: accumulatedStream.provider,
       kind: 'stream_delta',
-      content: accumulatedText,
+      content: accumulatedStream.content,
+      providerRowKey: accumulatedStream.providerRowKey,
     };
     const idx = slot.realtimeMessages.findIndex(m => m.id === streamId);
     if (idx >= 0) {
@@ -1176,12 +1199,38 @@ export class SessionTimelineStore {
    * throttle that pushes the accumulated text into its `__streaming_` row.
    * Consumer: `applyServerEvent`'s stream_delta route.
    */
-  private appendStreamDelta(sessionId: string, text: string, msgProvider: LLMProvider): void {
-    this.accumulatedStreams.set(sessionId, (this.accumulatedStreams.get(sessionId) ?? '') + text);
+  private appendStreamDelta(
+    sessionId: string,
+    message: NormalizedMessage,
+    fallbackProvider: LLMProvider,
+  ): void {
+    const text = message.content || '';
+    const existing = this.accumulatedStreams.get(sessionId);
+    if (
+      existing
+      && existing.providerRowKey !== message.providerRowKey
+      && Boolean(existing.providerRowKey || message.providerRowKey)
+    ) {
+      // A stable identity must cover the whole buffered segment. Close the
+      // current segment when the provider changes keys or crosses between a
+      // keyed row and an unkeyed stdout/notice frame; otherwise unrelated text
+      // inherits a key and prevents the persisted answer from reconciling.
+      this.flushStream(sessionId);
+    }
+
+    const current = this.accumulatedStreams.get(sessionId);
+    this.accumulatedStreams.set(sessionId, {
+      content: (current?.content ?? '') + text,
+      provider: message.provider ?? current?.provider ?? fallbackProvider,
+      providerRowKey: message.providerRowKey ?? current?.providerRowKey,
+    });
     if (!this.streamTimers.has(sessionId)) {
       const timer = window.setTimeout(() => {
         this.streamTimers.delete(sessionId);
-        this.updateStreaming(sessionId, this.accumulatedStreams.get(sessionId) ?? '', msgProvider);
+        const accumulatedStream = this.accumulatedStreams.get(sessionId);
+        if (accumulatedStream) {
+          this.updateStreaming(sessionId, accumulatedStream);
+        }
       }, 100);
       this.streamTimers.set(sessionId, timer);
     }
@@ -1221,16 +1270,16 @@ export class SessionTimelineStore {
    * nothing was buffered (the timer, if armed, is still cancelled). Consumer:
    * `applyServerEvent`'s flush gate, stream_end and complete routes.
    */
-  private flushStream(sessionId: string, msgProvider: LLMProvider): void {
+  private flushStream(sessionId: string): void {
     const timer = this.streamTimers.get(sessionId);
     if (timer !== undefined) {
       clearTimeout(timer);
       this.streamTimers.delete(sessionId);
     }
-    const buffer = this.accumulatedStreams.get(sessionId);
-    if (buffer) {
+    const accumulatedStream = this.accumulatedStreams.get(sessionId);
+    if (accumulatedStream?.content) {
       this.accumulatedStreams.delete(sessionId);
-      this.updateStreaming(sessionId, buffer, msgProvider);
+      this.updateStreaming(sessionId, accumulatedStream);
       this.finalizeStreaming(sessionId);
     }
   }

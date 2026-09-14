@@ -48,6 +48,15 @@ import {
 const PROVIDER = 'antigravity';
 
 /**
+ * Builds the identity shared by Antigravity's live assistant delta and its
+ * eventual PLANNER_RESPONSE transcript row. Missing native step indexes stay
+ * unidentified so clients can fall back to their legacy reconciliation rules.
+ */
+function buildAntigravityAssistantRowKey(stepIndex: number | undefined): string | undefined {
+  return stepIndex === undefined ? undefined : `assistant-step:${stepIndex}`;
+}
+
+/**
  * Finds the transcript.jsonl file for a session across possible brain directories.
  */
 function findTranscriptPath(sessionId: string): string | null {
@@ -318,6 +327,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
           sessionId,
           provider: PROVIDER,
           sequence: stepIndex,
+          providerRowKey: buildAntigravityAssistantRowKey(stepIndex),
         }));
       }
 
@@ -418,7 +428,8 @@ export class AntigravitySessionsProvider implements IProviderSessions {
           const source = readOptionalString(entry.source);
           const rawContent = readOptionalString(entry.content) ?? '';
           const createdAt = readOptionalString(entry.created_at) ?? new Date().toISOString();
-          const stepIndex = typeof entry.step_index === 'number' ? entry.step_index : i;
+          const nativeStepIndex = typeof entry.step_index === 'number' ? entry.step_index : undefined;
+          const stepIndex = nativeStepIndex ?? i;
           const baseId = `msg_${sessionId}_${stepIndex}`;
 
           // User prompt
@@ -488,6 +499,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                   role: 'assistant',
                   content: cleanedContent,
                   sequence: stepIndex,
+                  providerRowKey: buildAntigravityAssistantRowKey(nativeStepIndex),
                 }));
               }
             }

@@ -392,6 +392,15 @@ export type NormalizedMessage = {
    * has to survive a reload — never a value this app synthesized.
    */
   transcriptAnchorId?: string;
+  /**
+   * Provider-defined identity for matching one live-rendered row with the same
+   * row later loaded from history. It is scoped to a provider session, must be
+   * reproducible on both transport paths, and is used only for timeline
+   * reconciliation — never for transcript editing, websocket replay ordering,
+   * or display order. Providers must omit it when no stable native identity is
+   * available rather than substituting a line number or app-generated id.
+   */
+  providerRowKey?: string;
   sessionId: string;
   timestamp: string;
   provider: LLMProvider;

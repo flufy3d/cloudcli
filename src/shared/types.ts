@@ -400,6 +400,13 @@ export type QuestionOption = {
 /** A provider-agnostic transcript event as normalized by the backend adapters, with all kind-specific fields kept flat; it is the shape the session store holds and that chat converts into ChatMessage for rendering, so treat it as the wire contract rather than a view model. */
 export type NormalizedMessage = {
   id: string;
+  /**
+   * Provider-native identity of one final renderable row, shared by live and
+   * history normalization when the provider can prove both paths describe the
+   * same row. It is scoped by provider and session, and is distinct from the
+   * websocket replay `seq`, provider ordering `sequence`, and edit anchor.
+   */
+  providerRowKey?: string;
   sessionId: string;
   timestamp: string;
   provider: LLMProvider;

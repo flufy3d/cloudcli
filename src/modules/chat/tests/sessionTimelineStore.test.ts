@@ -43,6 +43,11 @@ function emit(store: SessionTimelineStore, frame: Record<string, unknown>): void
   store.applyServerEvent(frame as ServerEvent, { provider: 'claude' });
 }
 
+/** Drives one Antigravity frame so its provider-native row identity is exercised. */
+function emitAntigravity(store: SessionTimelineStore, frame: Record<string, unknown>): void {
+  store.applyServerEvent(frame as ServerEvent, { provider: 'antigravity' });
+}
+
 /**
  * A scripted transport: each call must match the next entry's limit/offset
  * (pinning offset bookkeeping), and unexpected calls fail the test.
@@ -224,6 +229,332 @@ test('a streaming row anchors its timestamp at segment start and finalizes in pl
   const nextSegment = store.getMessages(SESSION_ID).find((row) => row.id === `__streaming_${SESSION_ID}`);
   assert.ok(nextSegment);
   assert.equal(nextSegment!.content, 'Next');
+});
+
+test('a persisted Antigravity row replaces its keyed stream even after a newer user turn exists', async () => {
+  const streamedContent = 'A concrete implementation plan with enough text to identify the persisted row.';
+  const providerRowKey = 'assistant-step:2';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'please propose a plan' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_2',
+    provider: 'antigravity',
+    content: streamedContent,
+    providerRowKey,
+  });
+  const newerUser = msg(3, { provider: 'antigravity', content: 'continue with the implementation' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser, persistedReply, newerUser], total: 3, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: streamedContent,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent).map((row) => row.id),
+    ['msg_session_2'],
+  );
+  assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 0);
+});
+
+test('a keyed Antigravity stream survives an empty first refresh and is pruned when the second refresh lands it', async () => {
+  const streamedContent = 'The transcript is deliberately one refresh behind this completed stream.';
+  const providerRowKey = 'assistant-step:4';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'draft the migration steps' });
+  const newerUser = msg(3, { provider: 'antigravity', content: 'go ahead' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_4',
+    provider: 'antigravity',
+    content: streamedContent,
+    providerRowKey,
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser, newerUser], total: 2, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser, persistedReply, newerUser], total: 3, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: streamedContent,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+  let matchingRows = store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent);
+  assert.equal(matchingRows.length, 1);
+  assert.match(matchingRows[0].id, /^text_/);
+  assert.equal(matchingRows[0].providerRowKey, providerRowKey);
+
+  await store.refreshLatestFromServer(SESSION_ID);
+  matchingRows = store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent);
+  assert.deepEqual(matchingRows.map((row) => row.id), ['msg_session_4']);
+  assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 0);
+});
+
+test('matching provider row keys do not discard a stream whose content differs from history', async () => {
+  const providerRowKey = 'assistant-step:6';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'prepare the final answer' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_6',
+    provider: 'antigravity',
+    content: 'Persisted partial answer.',
+    providerRowKey,
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: 'Live complete answer with content that has not landed in history.',
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content),
+    [
+      'Persisted partial answer.',
+      'Live complete answer with content that has not landed in history.',
+    ],
+  );
+});
+
+test('a keyed history prefix does not discard the complete Antigravity stream', async () => {
+  const providerRowKey = 'assistant-step:7';
+  const completeReply = `${'A detailed implementation step with concrete safeguards. '.repeat(4)}Final verification.`;
+  const persistedPrefix = completeReply.slice(0, Math.floor(completeReply.length * 0.8));
+  const initialUser = msg(1, { provider: 'antigravity', content: 'write the complete plan' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [initialUser, msg(2, {
+          id: 'msg_session_7',
+          provider: 'antigravity',
+          content: persistedPrefix,
+          providerRowKey,
+        })],
+        total: 2,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: completeReply,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content),
+    [persistedPrefix, completeReply],
+  );
+});
+
+test('different provider row keys preserve identical Antigravity text as distinct rows', async () => {
+  const repeatedContent = 'This answer is intentionally repeated in two distinct provider steps.';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'answer twice' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_8',
+    provider: 'antigravity',
+    content: repeatedContent,
+    providerRowKey: 'assistant-step:8',
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: repeatedContent,
+    providerRowKey: 'assistant-step:9',
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.equal(
+    store.getMessages(SESSION_ID).filter((row) => row.content === repeatedContent).length,
+    2,
+  );
+});
+
+test('a duplicated persisted provider row key does not discard any candidate by content', async () => {
+  const repeatedContent = 'A provider key collision must stay visible instead of deleting user-visible text.';
+  const providerRowKey = 'assistant-step:9';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'show the plan' });
+  const firstPersistedReply = msg(2, {
+    id: 'msg_session_9_a',
+    provider: 'antigravity',
+    content: repeatedContent,
+    providerRowKey,
+  });
+  const secondPersistedReply = msg(4, {
+    id: 'msg_session_9_b',
+    provider: 'antigravity',
+    content: repeatedContent,
+    providerRowKey,
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [initialUser, firstPersistedReply, secondPersistedReply],
+        total: 3,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: repeatedContent,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.equal(
+    store.getMessages(SESSION_ID).filter((row) => row.content === repeatedContent).length,
+    3,
+  );
+  assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 1);
+});
+
+test('a new provider row key splits Antigravity deltas even when no stream_end arrives', () => {
+  const store = new SessionTimelineStore();
+
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: 'First provider step.',
+    providerRowKey: 'assistant-step:10',
+  });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: 'Second provider step.',
+    providerRowKey: 'assistant-step:11',
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.kind === 'text' && row.role === 'assistant')
+      .map((row) => ({ content: row.content, providerRowKey: row.providerRowKey })),
+    [
+      { content: 'First provider step.', providerRowKey: 'assistant-step:10' },
+      { content: 'Second provider step.', providerRowKey: 'assistant-step:11' },
+    ],
+  );
+});
+
+test('crossing between unkeyed stdout and keyed Antigravity text closes each stream segment', () => {
+  const store = new SessionTimelineStore();
+
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: 'Unkeyed notice before the answer.',
+  });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: 'Persistable provider answer.',
+    providerRowKey: 'assistant-step:12',
+  });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: 'Unkeyed notice after the answer.',
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.kind === 'text' && row.role === 'assistant')
+      .map((row) => ({ content: row.content, providerRowKey: row.providerRowKey })),
+    [
+      { content: 'Unkeyed notice before the answer.', providerRowKey: undefined },
+      { content: 'Persistable provider answer.', providerRowKey: 'assistant-step:12' },
+      { content: 'Unkeyed notice after the answer.', providerRowKey: undefined },
+    ],
+  );
 });
 
 // ─── Merged view: the three realtime-echo absorptions ────────────────────────

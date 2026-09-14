@@ -1,5 +1,6 @@
 # Provider 架构与接入指南
 
+> 基准：2.3.0 / 2026-09-14
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -70,6 +71,8 @@
 6. **前端外观**：`src/shared/ui/LLMProviderLogo.tsx` 加 Logo、`src/shared/providerDisplay.ts` 加显示名。composer 无需改动——它按能力矩阵渲染。
 
 改完跑：`npm run typecheck && npm run lint && npm test`（provider 相关测试在 `server/modules/providers/tests/`）。
+
+**跨路文本身份要求**：`NormalizedMessage.providerRowKey` 是 provider 在同一会话内为一条最终可渲染行生成的稳定身份，只在 live 与历史两路都能从原生数据复建时设置；它不承担消息展示 id、WebSocket `seq`、provider 排序 `sequence` 或编辑锚点的职责。前端先按 `(provider, sessionId, providerRowKey)` 对账，再校验正文且一对一认领；缺 key 才走回合/正文兜底，同 key 多候选或正文不一致必须保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
 
 **会话层级要求**：会话列表只索引顶层、可由用户继续对话的 provider 会话。Antigravity 使用其摘要库的 `parent_conversation_id` 与 `nesting_depth` 识别子 agent；子 agent 不写入活动列表，已被旧版本索引的行会软归档，原始 transcript 与本地元数据保留。缺少这两个字段的旧版 Antigravity 摘要库按顶层兼容读取。
 

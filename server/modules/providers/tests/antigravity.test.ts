@@ -420,6 +420,28 @@ test('AntigravitySessionsProvider normalizes stream-json events', () => {
   assert.equal(deltaMsg.length, 1);
   assert.equal(deltaMsg[0]?.kind, 'stream_delta');
   assert.equal(deltaMsg[0]?.content, 'Hello World');
+  assert.equal(deltaMsg[0]?.providerRowKey, 'assistant-step:2');
+
+  const nextDeltaMsg = sessions.normalizeMessage({
+    event: 'step_update',
+    step_update: {
+      step_index: 8,
+      state: 'ACTIVE',
+      step_type: 'agent_response',
+      text_delta: 'Next answer',
+    },
+  }, 'test-conv-123');
+  assert.equal(nextDeltaMsg[0]?.providerRowKey, 'assistant-step:8');
+
+  const deltaWithoutStepIndex = sessions.normalizeMessage({
+    event: 'step_update',
+    step_update: {
+      state: 'ACTIVE',
+      step_type: 'agent_response',
+      text_delta: 'Unidentified answer',
+    },
+  }, 'test-conv-123');
+  assert.equal(deltaWithoutStepIndex[0]?.providerRowKey, undefined);
 
   // Test tool call
   const toolUseMsg = sessions.normalizeMessage({
@@ -553,6 +575,8 @@ test('AntigravitySessionsProvider fetchHistory renders replies and tool results 
     { step_index: 6, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-08-18T03:55:24Z', tool_calls: [{ name: 'grep_search', args: { Query: 'foo' } }, { name: 'view_file', args: { AbsolutePath: '/tmp/x' } }] },
     { step_index: 7, source: 'MODEL', type: 'GREP_SEARCH', status: 'ERROR', created_at: '2026-08-18T03:55:25Z', content: 'not found' },
     { step_index: 8, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', exit_code: 0, created_at: '2026-08-18T03:55:26Z', content: 'file body' },
+    { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-08-18T03:55:27Z', content: 'Reply without native step.' },
+    { step_index: 9, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-08-18T03:55:28Z', content: 'Another reply.' },
   ];
   await fs.writeFile(
     path.join(transcriptDir, 'transcript.jsonl'),
@@ -564,9 +588,17 @@ test('AntigravitySessionsProvider fetchHistory renders replies and tool results 
     const sessions = new AntigravitySessionsProvider();
     const result = await sessions.fetchHistory(sessionId, {});
 
-    assert.equal(result.total, 5);
+    assert.equal(result.total, 7);
 
-    const [userMsg, toolMsg, assistantMsg, failedToolMsg, okToolMsg] = result.messages;
+    const [
+      userMsg,
+      toolMsg,
+      assistantMsg,
+      failedToolMsg,
+      okToolMsg,
+      assistantWithoutStep,
+      nextAssistantMsg,
+    ] = result.messages;
     assert.equal(userMsg?.kind, 'text');
     assert.equal(userMsg?.role, 'user');
     assert.equal(userMsg?.content, 'list files');
@@ -579,6 +611,17 @@ test('AntigravitySessionsProvider fetchHistory renders replies and tool results 
     assert.equal(assistantMsg?.kind, 'text');
     assert.equal(assistantMsg?.role, 'assistant');
     assert.equal(assistantMsg?.content, 'Done listing.');
+    assert.equal(assistantMsg?.providerRowKey, 'assistant-step:4');
+    const matchingLiveReply = sessions.normalizeMessage({
+      event: 'step_update',
+      step_update: {
+        step_index: 4,
+        state: 'ACTIVE',
+        step_type: 'agent_response',
+        text_delta: 'Done listing.',
+      },
+    }, sessionId)[0];
+    assert.equal(matchingLiveReply?.providerRowKey, assistantMsg?.providerRowKey);
 
     // Result entries pair with pending tool_uses in call order.
     assert.equal(failedToolMsg?.toolName, 'grep_search');
@@ -587,6 +630,10 @@ test('AntigravitySessionsProvider fetchHistory renders replies and tool results 
     assert.equal(okToolMsg?.toolName, 'view_file');
     assert.equal(okToolMsg?.toolResult?.content, 'file body');
     assert.equal(okToolMsg?.toolResult?.isError, false);
+    assert.equal(assistantWithoutStep?.content, 'Reply without native step.');
+    assert.equal(assistantWithoutStep?.providerRowKey, undefined);
+    assert.equal(nextAssistantMsg?.providerRowKey, 'assistant-step:9');
+    assert.notEqual(nextAssistantMsg?.providerRowKey, assistantMsg?.providerRowKey);
   } finally {
     restoreDataDir();
     await fs.rm(tempRoot, { recursive: true, force: true });

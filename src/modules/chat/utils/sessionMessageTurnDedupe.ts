@@ -56,6 +56,18 @@ export function isAssistantTextMatch(candidate: string, target: string): boolean
 }
 
 /**
+ * Stable provider identity permits whitespace normalization, but never the
+ * progressive-prefix tolerance used by legacy stream matching. A history row
+ * can be observed while it is only partially written; treating that prefix as
+ * final would delete the complete live row and lose user-visible text.
+ */
+function isProviderRowTextEquivalent(candidate: string, target: string): boolean {
+  const compactCandidate = (candidate || '').trim().replace(/\s+/g, '');
+  const compactTarget = (target || '').trim().replace(/\s+/g, '');
+  return compactCandidate.length > 0 && compactCandidate === compactTarget;
+}
+
+/**
  * Count how many user turns precede `message` in a chronologically merged view
  * of server + realtime rows. Used to match a realtime row to the correct turn
  * on disk when several turns share identical assistant text.
@@ -147,6 +159,27 @@ export function isAssistantTextEchoedInSameTurnOnServer(
     return false;
   }
 
+  // A provider row key is the only cross-transport identity that does not
+  // depend on clocks or inferred turn position. Once both paths expose keyed
+  // assistant rows, a different key is authoritative evidence that they are
+  // different rows. Require one matching server row and compatible content so
+  // a provider collision or partially written transcript cannot drop live text.
+  if (message.providerRowKey) {
+    const keyedServerRows = serverMessages.filter((serverMessage) =>
+      serverMessage.provider === message.provider
+      && serverMessage.kind === 'text'
+      && serverMessage.role === 'assistant'
+      && Boolean(serverMessage.providerRowKey),
+    );
+    if (keyedServerRows.length > 0) {
+      const matchingRows = keyedServerRows.filter(
+        (serverMessage) => serverMessage.providerRowKey === message.providerRowKey,
+      );
+      return matchingRows.length === 1
+        && isProviderRowTextEquivalent(matchingRows[0].content || '', assistantText);
+    }
+  }
+
   // 0. Precise turn anchor match when transcriptAnchorId is available
   if (message.transcriptAnchorId) {
     const anchorIndex = serverMessages.findIndex(
@@ -219,8 +252,10 @@ export function isAssistantTextEchoedInSameTurnOnServer(
         if (isAssistantTextMatch(joinedText, assistantText)) {
           return true;
         }
-        // The server user turn exists, but this assistant text has not landed yet.
-        return false;
+        // The inferred turn does not own this row. Continue through the
+        // ordinal and timestamp-guarded fallbacks: client/server clock skew can
+        // otherwise attach an older live row to a newer persisted user turn.
+        break;
       }
     }
   }
