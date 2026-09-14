@@ -1,4 +1,4 @@
-import React, { memo, useMemo, useState } from 'react';
+import React, { memo, useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
@@ -10,8 +10,10 @@ import { useTranslation } from 'react-i18next';
 import { SyntaxHighlighter, isRegisteredLanguage } from '@/modules/chat/composer/codeHighlightLanguages';
 import { MermaidDiagram } from '@/modules/code-editor';
 import { normalizeInlineCodeFences } from '@/modules/chat/utils/chatFormatting';
-import { filePathFromFileUrl, markdownUrlTransform } from '@/modules/chat/utils/fileLink';
+import { filePathFromFileUrl, isFileUrl, markdownUrlTransform } from '@/modules/chat/utils/fileLink';
+import { readExternalFileContent } from '@/shared/api';
 import { copyTextToClipboard } from '@/shared/utils';
+import { UnifiedImageViewer } from '@/shared/ui';
 import { usePaletteOps } from '@/modules/command-palette';
 import { useTheme } from '@/shared/context/ThemeContext';
 
@@ -178,6 +180,113 @@ const CodeBlock = memo(function CodeBlock({ node: _node, className, children, fo
   );
 });
 
+// Images referenced by absolute filesystem path — bare `/Users/...` (how
+// Antigravity embeds its verification snapshots) or a `file://` URL. A bare
+// `/...` src is read by the browser as a same-origin relative URL (404 on the
+// SPA fallback) and `file://` subresources are blocked outright, so both are
+// routed through the allowlisted read-only endpoint instead. Site-relative
+// URLs (e.g. `/icons/x.png`) share the shape; resolving them once through the
+// endpoint and falling back to the raw src on refusal keeps them working.
+const LOCAL_IMAGE_PATH_RE = /^\/.+\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i;
+
+const localPathFromImageSrc = (src?: string): string | undefined => {
+  if (!src) {
+    return undefined;
+  }
+  if (isFileUrl(src)) {
+    return filePathFromFileUrl(src);
+  }
+  return LOCAL_IMAGE_PATH_RE.test(src.split('?')[0]) ? src : undefined;
+};
+
+type MarkdownImageProps = { node?: unknown } & React.ImgHTMLAttributes<HTMLImageElement>;
+
+// Renders markdown <img> inside chat messages — both the live stream and
+// restored history go through here. Remote and data images render as-is;
+// local filesystem images resolve into a blob URL (a bare <img> cannot carry
+// the auth header) and expand into the unified image viewer on click.
+function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) {
+  const { t } = useTranslation('chat');
+  const localPath = localPathFromImageSrc(src);
+  // Blob URL handed to <img> once the bytes arrive; null while loading.
+  const [blobSrc, setBlobSrc] = useState<string | null>(null);
+  // Set when the endpoint refuses the path (not allowlisted / deleted): fall
+  // back to the raw src, i.e. exactly the pre-fix rendering.
+  const [resolveFailed, setResolveFailed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!localPath) {
+      return;
+    }
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+    const load = async () => {
+      try {
+        const response = await readExternalFileContent(localPath, { signal: controller.signal });
+        if (!response.ok) {
+          throw new Error(`Image request failed with status ${response.status}`);
+        }
+        const blob = await response.blob();
+        objectUrl = URL.createObjectURL(blob);
+        // The effect may have been cleaned up during the await; the cleanup
+        // saw objectUrl still null, so revoke this one here.
+        if (controller.signal.aborted) {
+          URL.revokeObjectURL(objectUrl);
+          return;
+        }
+        setBlobSrc(objectUrl);
+      } catch {
+        if (!controller.signal.aborted) {
+          setResolveFailed(true);
+        }
+      }
+    };
+    void load();
+    return () => {
+      controller.abort();
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [localPath]);
+
+  if (!localPath || resolveFailed) {
+    return (
+      // Lazy decoding keeps late image loads from shifting scroll position
+      // while the user reads (native anchoring absorbs what remains).
+      <img src={src} alt={alt} loading="lazy" decoding="async" className="rounded-lg" {...props} />
+    );
+  }
+
+  if (!blobSrc) {
+    // Placeholder holds the layout while the bytes load.
+    return <div className="my-1 h-28 max-w-sm animate-pulse rounded-lg bg-muted" />;
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setExpanded(true)}
+        aria-label={t('misc.expandImage', { name: alt ?? '' })}
+        className="block max-w-full cursor-zoom-in"
+      >
+        <img src={blobSrc} alt={alt} loading="lazy" decoding="async" className="rounded-lg" {...props} />
+      </button>
+      {expanded && (
+        <UnifiedImageViewer
+          src={blobSrc}
+          alt={alt ?? ''}
+          title={alt ?? ''}
+          filePath={localPath}
+          onClose={() => setExpanded(false)}
+        />
+      )}
+    </>
+  );
+}
+
 const markdownComponents = {
   code: CodeBlock,
   // Fenced/indented code arrives as <pre><code>. Re-render the child CodeBlock
@@ -211,11 +320,7 @@ const markdownComponents = {
       <table className="my-0 min-w-full border-collapse text-sm">{children}</table>
     </div>
   ),
-  img: ({ src, alt, node: _node, ...props }: { node?: unknown } & React.ImgHTMLAttributes<HTMLImageElement>) => (
-    // Lazy decoding keeps late image loads from shifting scroll position
-    // while the user reads (native anchoring absorbs what remains).
-    <img src={src} alt={alt} loading="lazy" decoding="async" className="rounded-lg" {...props} />
-  ),
+  img: MarkdownImage,
   thead: ({ children }: { children?: React.ReactNode }) => <thead className="bg-muted/60">{children}</thead>,
   tr: ({ children }: { children?: React.ReactNode }) => (
     <tr className="[&:last-child>td]:border-b-0">{children}</tr>
