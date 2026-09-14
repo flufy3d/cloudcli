@@ -740,7 +740,7 @@ test('AntigravitySessionsProvider fetchHistory returns empty for unknown session
   }
 });
 
-test('AntigravitySessionSynchronizer reads the summaries db from the overridden data root', async () => {
+test('AntigravitySessionSynchronizer indexes only top-level summaries and archives indexed child agents', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-sync-'));
   // A mocked, empty home proves the synchronizer resolves the db through the
   // shared data root instead of the historical ~/.gemini hardcode.
@@ -756,19 +756,49 @@ test('AntigravitySessionSynchronizer reads the summaries db from the overridden 
       title TEXT,
       workspace_uris TEXT,
       last_modified_time TEXT,
-      status TEXT
+      status TEXT,
+      parent_conversation_id TEXT,
+      nesting_depth INTEGER
     );
   `);
   summariesDb.prepare(`
     INSERT INTO conversation_summaries
-      (conversation_id, title, workspace_uris, last_modified_time, status)
-    VALUES (?, ?, ?, ?, ?)
+      (conversation_id, title, workspace_uris, last_modified_time, status, parent_conversation_id, nesting_depth)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     'fixture-conv-1',
     'Fixture Conversation',
     JSON.stringify([`file://${tempRoot}/workspace`]),
     new Date().toISOString(),
     'ACTIVE',
+    '',
+    0,
+  );
+  summariesDb.prepare(`
+    INSERT INTO conversation_summaries
+      (conversation_id, title, workspace_uris, last_modified_time, status, parent_conversation_id, nesting_depth)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'fixture-child-agent-1',
+    'Child Agent Conversation',
+    JSON.stringify([`file://${tempRoot}/workspace`]),
+    new Date().toISOString(),
+    'ACTIVE',
+    'fixture-conv-1',
+    1,
+  );
+  summariesDb.prepare(`
+    INSERT INTO conversation_summaries
+      (conversation_id, title, workspace_uris, last_modified_time, status, parent_conversation_id, nesting_depth)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'fixture-child-agent-negative-depth',
+    'Malformed Child Agent Conversation',
+    JSON.stringify([`file://${tempRoot}/workspace`]),
+    new Date().toISOString(),
+    'ACTIVE',
+    '',
+    -1,
   );
 
   const transcriptDir = path.join(tempRoot, 'brain', 'fixture-conv-1', '.system_generated', 'logs');
@@ -781,6 +811,25 @@ test('AntigravitySessionSynchronizer reads the summaries db from the overridden 
   await initializeDatabase();
 
   try {
+    sessionsDb.createAppSession(
+      'fixture-other-provider-session',
+      'zcode',
+      path.join(tempRoot, 'workspace'),
+      'Unrelated Provider Session',
+    );
+    sessionsDb.assignProviderSessionId('fixture-other-provider-session', 'fixture-child-agent-1');
+    sessionsDb.createSession(
+      'fixture-child-agent-1',
+      'antigravity',
+      path.join(tempRoot, 'workspace'),
+      'Previously Indexed Child Agent',
+    );
+    sessionsDb.createSession(
+      'fixture-child-agent-negative-depth',
+      'antigravity',
+      path.join(tempRoot, 'workspace'),
+      'Malformed Previously Indexed Child Agent',
+    );
     const synchronizer = new AntigravitySessionSynchronizer();
     const processed = await synchronizer.synchronize();
 
@@ -788,6 +837,24 @@ test('AntigravitySessionSynchronizer reads the summaries db from the overridden 
     const synced = sessionsDb.getSessionByProviderSessionId('fixture-conv-1');
     assert.ok(synced, 'fixture conversation must be indexed into the sessions db');
     assert.equal(synced?.jsonl_path, transcriptPath, 'jsonl_path should record the transcript location');
+    assert.equal(
+      sessionsDb.getArchivedSessions().some((session) => (
+        session.provider === 'antigravity'
+        && session.provider_session_id === 'fixture-child-agent-1'
+      )),
+      true,
+      'previously indexed child agents must leave the active session list',
+    );
+    assert.equal(
+      sessionsDb.getSessionByProviderSessionId('fixture-child-agent-negative-depth')?.isArchived,
+      1,
+      'non-zero nesting depth must also archive a previously indexed child agent',
+    );
+    assert.equal(
+      sessionsDb.getSessionById('fixture-other-provider-session')?.isArchived,
+      0,
+      'an unrelated provider session with the same provider-native id must stay active',
+    );
   } finally {
     summariesDb.close();
     closeConnection();

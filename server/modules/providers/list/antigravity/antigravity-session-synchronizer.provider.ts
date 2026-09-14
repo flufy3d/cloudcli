@@ -1,7 +1,8 @@
 import fsSync from 'node:fs';
 
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 
+import { sessionsDb } from '@/modules/database/index.js';
 import {
   parseAntigravityWorkspacePath,
   readOptionalString,
@@ -20,16 +21,36 @@ type AntigravitySummaryRow = {
   title: string | null;
   workspace_uris: string | null;
   last_modified_time: string | null;
+  parent_conversation_id: string | null;
+  nesting_depth: number | null;
 };
+
+type ConversationSummaryHierarchy = {
+  hasParentConversationId: boolean;
+  hasNestingDepth: boolean;
+};
+
+function readConversationSummaryHierarchy(db: Database.Database): ConversationSummaryHierarchy {
+  const columns = db.prepare('PRAGMA table_info(conversation_summaries)').all() as Array<{ name: string }>;
+  const columnNames = new Set(columns.map((column) => column.name));
+  return {
+    hasParentConversationId: columnNames.has('parent_conversation_id'),
+    hasNestingDepth: columnNames.has('nesting_depth'),
+  };
+}
+
+function isTopLevelConversation(row: AntigravitySummaryRow): boolean {
+  return !readOptionalString(row.parent_conversation_id) && (row.nesting_depth ?? 0) === 0;
+}
 
 /**
  * Session synchronizer for Antigravity's conversation_summaries.db.
  *
  * Contributes Antigravity's row mapping to the shared SQLite synchronizer
- * skeleton: the workspace is decoded from `workspace_uris` (falling back to
- * the process cwd), `last_modified_time` is an ISO string, and each session
- * row carries the path of its per-session brain transcript via
- * `resolveJsonlPath`.
+ * skeleton: only top-level conversations are indexed, the workspace is decoded
+ * from `workspace_uris` (falling back to the process cwd),
+ * `last_modified_time` is an ISO string, and each session row carries the path
+ * of its per-session brain transcript via `resolveJsonlPath`.
  */
 export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<AntigravitySummaryRow> {
   protected readonly fallbackTitle = 'Untitled Antigravity Session';
@@ -47,6 +68,16 @@ export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<An
     return getAntigravitySummariesDbPath();
   }
 
+  async synchronize(since?: Date): Promise<number> {
+    this.archiveIndexedSubagentSessions();
+    return super.synchronize(since);
+  }
+
+  async synchronizeFile(filePath: string): Promise<string | null> {
+    this.archiveIndexedSubagentSessions();
+    return super.synchronizeFile(filePath);
+  }
+
   protected selectSessionRows(
     db: Database.Database,
     _sinceMillis: number | null,
@@ -54,14 +85,26 @@ export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<An
   ): AntigravitySummaryRow[] {
     // The summaries table has no filterable timestamp column in SQL; the
     // shared skeleton applies the since filter per row after parsing the
-    // ISO `last_modified_time`.
+    // ISO `last_modified_time`. Newer schemas expose hierarchy columns, while
+    // old schemas remain readable without them.
+    const hierarchy = readConversationSummaryHierarchy(db);
+    const parentColumn = hierarchy.hasParentConversationId
+      ? 'COALESCE(parent_conversation_id, \'\')'
+      : "''";
+    const nestingColumn = hierarchy.hasNestingDepth
+      ? 'COALESCE(nesting_depth, 0)'
+      : '0';
     const query = `
       SELECT
         conversation_id AS id,
         title,
         workspace_uris,
-        last_modified_time
+        last_modified_time,
+        ${parentColumn} AS parent_conversation_id,
+        ${nestingColumn} AS nesting_depth
       FROM conversation_summaries
+      WHERE ${parentColumn} = ''
+        AND ${nestingColumn} = 0
       ORDER BY last_modified_time DESC
       ${limit === null ? '' : 'LIMIT ?'}
     `;
@@ -83,6 +126,11 @@ export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<An
 
   protected getProjectPath(row: AntigravitySummaryRow): string | null {
     return parseAntigravityWorkspacePath(row.workspace_uris) ?? process.cwd();
+  }
+
+  /** Defends against a future query change accidentally reintroducing child rows. */
+  protected getSessionId(row: AntigravitySummaryRow): string | null {
+    return isTopLevelConversation(row) ? super.getSessionId(row) : null;
   }
 
   protected deriveSessionName(_db: Database.Database, row: AntigravitySummaryRow): string | null {
@@ -112,5 +160,56 @@ export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<An
     }
 
     return null;
+  }
+
+  /**
+   * Hides previously indexed child-agent sessions without deleting their local
+   * metadata or transcript. The source database owns hierarchy, so this runs
+   * before every scan instead of persisting a parallel hierarchy model.
+   */
+  private archiveIndexedSubagentSessions(): void {
+    const dbPath = this.getDatabasePath();
+    if (!fsSync.existsSync(dbPath)) {
+      return;
+    }
+
+    let db: Database.Database | null = null;
+    try {
+      db = new Database(dbPath, { readonly: true, fileMustExist: true });
+      const hierarchy = readConversationSummaryHierarchy(db);
+      if (!hierarchy.hasParentConversationId && !hierarchy.hasNestingDepth) {
+        return;
+      }
+
+      const parentColumn = hierarchy.hasParentConversationId
+        ? 'COALESCE(parent_conversation_id, \'\')'
+        : "''";
+      const nestingColumn = hierarchy.hasNestingDepth
+        ? 'COALESCE(nesting_depth, 0)'
+        : '0';
+      const childRows = db.prepare(`
+        SELECT conversation_id AS id
+        FROM conversation_summaries
+        WHERE ${parentColumn} <> '' OR ${nestingColumn} <> 0
+      `).all() as Array<{ id: string }>;
+
+      const activeAntigravitySessionIds = new Map(
+        sessionsDb.getAllSessions()
+          .filter((session) => session.provider === 'antigravity' && Boolean(session.provider_session_id))
+          .map((session) => [session.provider_session_id as string, session.session_id] as const),
+      );
+
+      for (const childRow of childRows) {
+        const childSessionId = activeAntigravitySessionIds.get(childRow.id);
+        if (childSessionId) {
+          sessionsDb.updateSessionIsArchived(childSessionId, true);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`${this.logTag} Failed to archive child-agent sessions:`, message);
+    } finally {
+      db?.close();
+    }
   }
 }
