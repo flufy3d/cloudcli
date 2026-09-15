@@ -30,6 +30,8 @@
  * - The streaming row's timestamp anchors at segment start and never
  *   refreshes, so the finalized text sorts ahead of the turn's later tool
  *   calls.
+ * - Server history and realtime rows are stable-merged: each source keeps its
+ *   own order because their wall clocks are not a shared causal clock.
  *
  * Consumer: `useSessionStore` (the React adapter) is the only production
  * consumer; `sessionTimelineStore.test.ts` and the hook-level
@@ -340,6 +342,42 @@ function pruneRealtimeSupersededByServer(
   });
 }
 
+/**
+ * Interleaves two already ordered sources without reordering either source.
+ * History timestamps and live timestamps can come from different machines;
+ * they locate the next row approximately, while source order preserves the
+ * causal user → reply sequence and server transcript order.
+ */
+function stableMergeMessageSources(
+  serverMessages: NormalizedMessage[],
+  realtimeMessages: NormalizedMessage[],
+): NormalizedMessage[] {
+  const merged: NormalizedMessage[] = [];
+  let serverIndex = 0;
+  let realtimeIndex = 0;
+
+  while (serverIndex < serverMessages.length && realtimeIndex < realtimeMessages.length) {
+    if (
+      compareMessagesChronologically(
+        serverMessages[serverIndex],
+        realtimeMessages[realtimeIndex],
+      ) <= 0
+    ) {
+      merged.push(serverMessages[serverIndex]);
+      serverIndex++;
+    } else {
+      merged.push(realtimeMessages[realtimeIndex]);
+      realtimeIndex++;
+    }
+  }
+
+  merged.push(
+    ...serverMessages.slice(serverIndex),
+    ...realtimeMessages.slice(realtimeIndex),
+  );
+  return merged;
+}
+
 function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[]): NormalizedMessage[] {
   if (realtime.length === 0) {
     return dedupeAdjacentAssistantEchoes(server);
@@ -402,11 +440,13 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
     );
   }
 
-  // Interleave by timestamp so live rows stay with their turn instead of
-  // piling up at the bottom after every refresh.
+  // Interleave the two sources by timestamp without reordering either one.
+  // Their clocks can disagree, but arrival order within realtime is causal.
   return dedupeAdjacentAssistantEchoes(
-    [...server.filter((message) => !serverRowsSupersededByRealtime.has(message.id)), ...extra]
-      .sort(compareMessagesChronologically),
+    stableMergeMessageSources(
+      server.filter((message) => !serverRowsSupersededByRealtime.has(message.id)),
+      extra,
+    ),
   );
 }
 

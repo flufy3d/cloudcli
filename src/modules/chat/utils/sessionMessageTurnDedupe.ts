@@ -62,16 +62,12 @@ export type ProviderRowTextReconciliation = {
 
 const MIN_PROVIDER_ROW_PREFIX_LENGTH = 100;
 
-/** Removes presentation-only Markdown characters before provider-row comparison. */
+/** Removes presentation-only Markdown formatting, symbols, and whitespace before provider-row comparison. */
 function normalizeProviderRowText(content: string): string {
   return (content || '')
-    .trim()
     .normalize('NFKC')
-    .split('\n')
-    .map((line) => line.replace(/^\s*(?:#{1,6}\s+|>\s?|[-+*]\s+|\d+[.)]\s+)/, ''))
-    .join('')
-    .replace(/[\\`*_~\[\](){}]/g, '')
-    .replace(/\s+/g, '');
+    .replace(/[^\p{L}\p{N}]/gu, '')
+    .toLowerCase();
 }
 
 /**
@@ -86,8 +82,8 @@ function isContainedProviderRowText(candidate: string, container: string): boole
 /**
  * Chooses which transport owns a uniquely keyed provider row. Exact history
  * wins; a strictly longer live row wins when history is its prefix; and a
- * a presentation-preserving containing superset handles providers that rewrite
- * Markdown when completing.
+ * presentation-preserving containing superset handles providers that rewrite
+ * Markdown when completing or resume a partial stream.
  * Ambiguous keys and materially different text always remain visible.
  */
 export function reconcileProviderRowText(
@@ -116,16 +112,23 @@ export function reconcileProviderRowText(
   }
 
   const serverMessage = matchingRows[0];
+  const result = (winner: 'server' | 'realtime'): ProviderRowTextReconciliation => ({
+    winner,
+    serverMessageId: serverMessage.id,
+  });
+
+  const rawServer = (serverMessage.content || '').trim();
+  const rawRealtime = (realtimeMessage.content || '').trim();
+  if (rawServer && rawServer === rawRealtime) {
+    return result('server');
+  }
+
   const serverText = normalizeProviderRowText(serverMessage.content || '');
   const realtimeText = normalizeProviderRowText(realtimeMessage.content || '');
   if (!serverText || !realtimeText) {
     return { winner: 'distinct' };
   }
 
-  const result = (winner: 'server' | 'realtime'): ProviderRowTextReconciliation => ({
-    winner,
-    serverMessageId: serverMessage.id,
-  });
   if (serverText === realtimeText) {
     return result('server');
   }
@@ -139,7 +142,10 @@ export function reconcileProviderRowText(
     return result('server');
   }
 
-  if (shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH && isContainedProviderRowText(serverText, realtimeText)) {
+  if (
+    shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH
+    && (isContainedProviderRowText(realtimeText, serverText) || isContainedProviderRowText(serverText, realtimeText))
+  ) {
     return result(serverText.length >= realtimeText.length ? 'server' : 'realtime');
   }
 

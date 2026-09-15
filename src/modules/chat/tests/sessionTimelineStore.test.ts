@@ -500,6 +500,122 @@ test('a keyed Antigravity row with a changed word remains visible as a real conf
   );
 });
 
+test('a partial Antigravity stream suffix yields to the complete persisted history row', async () => {
+  const providerRowKey = 'assistant-step:7d';
+  const prefix = '在系统设计中，界面的对话消息有两条流向：第一条路是 REST 历史记录；第二条路是 WebSocket 实时流。'.repeat(4);
+  const suffix = '去重机制如果失效，就会在时间线上留下两个分身并被折叠显示。'.repeat(5);
+  const completePersistedReply = `${prefix}${suffix}`;
+  const partialStreamedSuffix = suffix;
+  const initialUser = msg(1, { provider: 'antigravity', content: '解释去重机制' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [initialUser, msg(2, {
+          id: 'msg_session_7d',
+          provider: 'antigravity',
+          content: completePersistedReply,
+          providerRowKey,
+        })],
+        total: 2,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: partialStreamedSuffix,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content),
+    [completePersistedReply],
+  );
+});
+
+test('a keyed Antigravity stream suffix with pangu spacing and missing markdown newlines yields to complete formatted history', async () => {
+  const providerRowKey = 'assistant-step:7e';
+  const prefix = '从你的截图来看，每一个显示 x2 的工具调用，点开后里面其实都是同一个操作的两个分身：后端历史记录与 WebSocket 实时流。'.repeat(3);
+  const formattedSuffix = [
+    '### 为什么会出现两个分身？（根本原因）',
+    '',
+    '在 CloudCLI 的设计中，界面的对话消息有**两条流向**：',
+    '- **第一条路（REST 历史记录）**：当你打开页面、切换会话时，前端拉取最新的历史记录。',
+    '- **第二条路（WebSocket 实时流）**：正在运行的 Codex 任务，会把实时事件一条条推送给前端。',
+    '',
+    '#### 1. 两边的“身份证（ID）”天然对不上',
+    'Codex SDK 实时推过来的事件使用的是 SDK 内部临时生成的 ID，而写入日志历史文件的则是底层的 ID。',
+    '',
+    '#### 2. “指纹比对”因为 diff 数据缺失导致不一致',
+    '比对算法发现两者的参数内容完全不同，判定它们是两次不同的工具调用。',
+    '',
+    '2. 在后端实时流处理时补齐对应的 tool_result 完成帧。',
+  ].join('\n');
+
+  const rawStreamSuffix = [
+    '的对话消息有**两条流向**：',
+    '- **第一条路（REST历史记录）**：当你打开页面、切换会话时，前端拉取最新的历史记录。- **第二条路（WebSocket 实时流）**：正在运行的 Codex任务，会把实时事件一条条推送给前端。',
+    '#### 1.两边的“身份证（ID）”天然对不上Codex SDK实时推过来的事件使用的是SDK内部临时生成的 ID，而写入日志历史文件的则是底层的 ID。',
+    '#### 2. “指纹比对”因为diff数据缺失导致不一致比对算法发现两者的参数内容完全不同，判定它们是两次不同的工具调用。',
+    '2.在后端实时流处理时补齐对应的 tool_result完成帧。',
+  ].join('\n');
+
+  const completePersistedReply = `${prefix}\n\n${formattedSuffix}`;
+  const initialUser = msg(1, { provider: 'antigravity', content: '分析原因' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [initialUser, msg(2, {
+          id: 'msg_session_7e',
+          provider: 'antigravity',
+          content: completePersistedReply,
+          providerRowKey,
+        })],
+        total: 2,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  emitAntigravity(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: rawStreamSuffix,
+    providerRowKey,
+  });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content),
+    [completePersistedReply],
+  );
+});
+
 test('different provider row keys preserve identical Antigravity text as distinct rows', async () => {
   const repeatedContent = 'This answer is intentionally repeated in two distinct provider steps.';
   const initialUser = msg(1, { provider: 'antigravity', content: 'answer twice' });
@@ -694,6 +810,40 @@ test('optimistic user, thinking, and same-turn assistant echoes are absorbed int
   assert.deepEqual(
     store.getMessages(SESSION_ID).map((row) => row.id),
     ['m1', 'm2', 'm4'],
+  );
+});
+
+test('a live assistant reply cannot overtake the optimistic user row when clocks disagree', async () => {
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [msg(2, { content: 'answer from an earlier turn' })],
+        total: 1,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  // The browser clock is ahead of the server clock, but append order still
+  // captures causality: the question was sent before its reply arrived.
+  store.appendRealtime(SESSION_ID, msg(3, {
+    id: 'local_current_question',
+    content: 'current question',
+    timestamp: '2026-01-01T00:00:08.900Z',
+  }));
+  store.appendRealtime(SESSION_ID, msg(4, {
+    id: 'live_assistant_reply',
+    content: 'reply to current question',
+    timestamp: '2026-01-01T00:00:08.388Z',
+  }));
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).map((row) => row.id),
+    ['m2', 'local_current_question', 'live_assistant_reply'],
   );
 });
 
