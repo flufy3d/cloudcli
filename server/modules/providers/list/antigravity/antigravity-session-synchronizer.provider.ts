@@ -190,7 +190,7 @@ export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<An
       const childRows = db.prepare(`
         SELECT conversation_id AS id
         FROM conversation_summaries
-        WHERE ${parentColumn} <> '' OR ${nestingColumn} <> 0
+        WHERE TRIM(${parentColumn}) <> '' OR ${nestingColumn} <> 0
       `).all() as Array<{ id: string }>;
 
       const activeAntigravitySessionIds = new Map(

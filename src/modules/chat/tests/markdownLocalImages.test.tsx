@@ -80,4 +80,12 @@ describe('Markdown local image resolution', () => {
     expect(imageBySrc('https://example.com/hero.png')).toBeDefined();
     expect(readExternalFileContent).not.toHaveBeenCalled();
   });
+
+  it('leaves web-relative static paths untouched without querying external files', () => {
+    render(<Markdown>{'![logo](/logo.png) ![assets](/assets/banner.png)'}</Markdown>);
+
+    expect(imageBySrc('/logo.png')).toBeDefined();
+    expect(imageBySrc('/assets/banner.png')).toBeDefined();
+    expect(readExternalFileContent).not.toHaveBeenCalled();
+  });
 });

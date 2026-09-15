@@ -62,7 +62,7 @@ export type ProviderRowTextReconciliation = {
 
 const MIN_PROVIDER_ROW_PREFIX_LENGTH = 100;
 
-/** Removes presentation-only Markdown formatting, symbols, and whitespace before provider-row comparison. */
+/** Removes presentation-only Markdown formatting, structural markers, and whitespace before provider-row comparison. */
 function normalizeProviderRowText(content: string): string {
   return (content || '')
     .normalize('NFKC')
@@ -134,7 +134,13 @@ export function reconcileProviderRowText(
   }
 
   const shorterLength = Math.min(serverText.length, realtimeText.length);
-  const hasSafePrefix = shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH;
+  const longerLength = Math.max(serverText.length, realtimeText.length);
+  // Adaptive prefix matching: large texts use MIN_PROVIDER_ROW_PREFIX_LENGTH,
+  // while short responses (e.g. 10-30 chars) are eligible when the prefix accounts
+  // for most of the content (>= 60% ratio) or reaches >= 8 characters.
+  const hasSafePrefix = shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH
+    || (shorterLength >= 8 && shorterLength / longerLength >= 0.6);
+
   if (hasSafePrefix && realtimeText.startsWith(serverText)) {
     return result('realtime');
   }
@@ -143,7 +149,7 @@ export function reconcileProviderRowText(
   }
 
   if (
-    shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH
+    hasSafePrefix
     && (isContainedProviderRowText(realtimeText, serverText) || isContainedProviderRowText(serverText, realtimeText))
   ) {
     return result(serverText.length >= realtimeText.length ? 'server' : 'realtime');

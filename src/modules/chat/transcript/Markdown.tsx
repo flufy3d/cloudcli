@@ -180,14 +180,22 @@ const CodeBlock = memo(function CodeBlock({ node: _node, className, children, fo
   );
 });
 
-// Images referenced by absolute filesystem path — bare `/Users/...` (how
-// Antigravity embeds its verification snapshots) or a `file://` URL. A bare
-// `/...` src is read by the browser as a same-origin relative URL (404 on the
-// SPA fallback) and `file://` subresources are blocked outright, so both are
-// routed through the allowlisted read-only endpoint instead. Site-relative
-// URLs (e.g. `/icons/x.png`) share the shape; resolving them once through the
-// endpoint and falling back to the raw src on refusal keeps them working.
-const LOCAL_IMAGE_PATH_RE = /^\/.+\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i;
+const LOCAL_IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i;
+const SYSTEM_ABSOLUTE_PREFIX_RE = /^\/(Users|home|var|tmp|private|Volumes|opt|mnt|root)\//i;
+const WINDOWS_ABSOLUTE_PATH_RE = /^[a-zA-Z]:[/\\]/;
+const COMMON_STATIC_WEB_PREFIX_RE = /^\/(assets|static|public|icons|images|favicon|logo)[/.?#]/i;
+
+const isLikelyLocalFilesystemPath = (rawPath: string): boolean => {
+  if (COMMON_STATIC_WEB_PREFIX_RE.test(rawPath)) {
+    return false;
+  }
+  if (SYSTEM_ABSOLUTE_PREFIX_RE.test(rawPath) || WINDOWS_ABSOLUTE_PATH_RE.test(rawPath)) {
+    return true;
+  }
+  const clean = rawPath.split('?')[0].split('#')[0];
+  const segments = clean.split('/').filter(Boolean);
+  return segments.length >= 3;
+};
 
 const localPathFromImageSrc = (src?: string): string | undefined => {
   if (!src) {
@@ -196,7 +204,14 @@ const localPathFromImageSrc = (src?: string): string | undefined => {
   if (isFileUrl(src)) {
     return filePathFromFileUrl(src);
   }
-  return LOCAL_IMAGE_PATH_RE.test(src.split('?')[0]) ? src : undefined;
+  if (!src.startsWith('/')) {
+    return undefined;
+  }
+  const clean = src.split('?')[0].split('#')[0];
+  if (!LOCAL_IMAGE_EXTENSION_RE.test(clean)) {
+    return undefined;
+  }
+  return isLikelyLocalFilesystemPath(clean) ? clean : undefined;
 };
 
 type MarkdownImageProps = { node?: unknown } & React.ImgHTMLAttributes<HTMLImageElement>;
@@ -217,8 +232,13 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
 
   useEffect(() => {
     if (!localPath) {
+      setBlobSrc(null);
+      setResolveFailed(false);
       return;
     }
+
+    setBlobSrc(null);
+    setResolveFailed(false);
     const controller = new AbortController();
     let objectUrl: string | null = null;
     const load = async () => {
@@ -229,8 +249,6 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
         }
         const blob = await response.blob();
         objectUrl = URL.createObjectURL(blob);
-        // The effect may have been cleaned up during the await; the cleanup
-        // saw objectUrl still null, so revoke this one here.
         if (controller.signal.aborted) {
           URL.revokeObjectURL(objectUrl);
           return;
@@ -245,9 +263,6 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
     void load();
     return () => {
       controller.abort();
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
     };
   }, [localPath]);
 

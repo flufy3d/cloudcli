@@ -463,11 +463,40 @@ export class AntigravitySessionsProvider implements IProviderSessions {
             continue;
           }
 
-          // Planner entries carry either tool invocations or the assistant's
-          // reply text. Real transcripts emit replies as PLANNER_RESPONSE
-          // content without tool_calls (GENERIC only appears for background
-          // task status), so both shapes must be handled here.
+          // Planner entries carry tool invocations, reasoning, and/or the assistant's
+          // reply text. Real transcripts emit replies as PLANNER_RESPONSE.
           if (type === 'PLANNER_RESPONSE') {
+            const rawThinking = readOptionalString(entry.thinking);
+            if (rawThinking) {
+              normalizedMessages.push(createNormalizedMessage({
+                id: `${baseId}_thinking`,
+                sessionId,
+                timestamp: createdAt,
+                provider: PROVIDER,
+                role: 'assistant',
+                kind: 'thinking',
+                content: rawThinking,
+                sequence: stepIndex,
+              }));
+            }
+
+            if (rawContent) {
+              const cleanedContent = cleanAntigravityMessageContent(rawContent, 'assistant');
+              if (cleanedContent) {
+                normalizedMessages.push(createNormalizedMessage({
+                  id: baseId,
+                  sessionId,
+                  timestamp: createdAt,
+                  provider: PROVIDER,
+                  kind: 'text',
+                  role: 'assistant',
+                  content: cleanedContent,
+                  sequence: stepIndex,
+                  providerRowKey: buildAntigravityAssistantRowKey(nativeStepIndex),
+                }));
+              }
+            }
+
             if (Array.isArray(entry.tool_calls) && entry.tool_calls.length > 0) {
               for (let t = 0; t < entry.tool_calls.length; t++) {
                 const tc = entry.tool_calls[t] as AnyRecord;
@@ -485,21 +514,6 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                   toolInput: args,
                   toolId,
                   sequence: stepIndex,
-                }));
-              }
-            } else if (rawContent) {
-              const cleanedContent = cleanAntigravityMessageContent(rawContent, 'assistant');
-              if (cleanedContent) {
-                normalizedMessages.push(createNormalizedMessage({
-                  id: baseId,
-                  sessionId,
-                  timestamp: createdAt,
-                  provider: PROVIDER,
-                  kind: 'text',
-                  role: 'assistant',
-                  content: cleanedContent,
-                  sequence: stepIndex,
-                  providerRowKey: buildAntigravityAssistantRowKey(nativeStepIndex),
                 }));
               }
             }

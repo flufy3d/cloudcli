@@ -787,6 +787,61 @@ test('AntigravitySessionsProvider fetchHistory returns empty for unknown session
   }
 });
 
+test('AntigravitySessionsProvider fetchHistory parses companion text and thinking alongside tool calls in PLANNER_RESPONSE', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-data-planner-'));
+  const sessionId = 'session-planner-combo';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(transcriptDir, { recursive: true });
+
+  const entries = [
+    {
+      step_index: 0,
+      source: 'USER_EXPLICIT',
+      type: 'USER_INPUT',
+      status: 'DONE',
+      created_at: '2026-09-15T12:00:00Z',
+      content: 'Run a check and explain first',
+    },
+    {
+      step_index: 1,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-09-15T12:00:01Z',
+      thinking: 'I need to check the directory status first.',
+      content: 'I will list the directory contents to see the structure.',
+      tool_calls: [
+        {
+          name: 'run_command',
+          args: { CommandLine: 'ls -la' },
+        },
+      ],
+    },
+  ];
+  await fs.writeFile(
+    path.join(transcriptDir, 'transcript.jsonl'),
+    entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+  );
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const sessions = new AntigravitySessionsProvider();
+    const result = await sessions.fetchHistory(sessionId, {});
+    assert.equal(result.total, 4); // user prompt + thinking + text message + tool_use
+    assert.equal(result.messages[0]?.role, 'user');
+    assert.equal(result.messages[1]?.kind, 'thinking');
+    assert.equal(result.messages[1]?.content, 'I need to check the directory status first.');
+    assert.equal(result.messages[2]?.kind, 'text');
+    assert.equal(result.messages[2]?.role, 'assistant');
+    assert.equal(result.messages[2]?.content, 'I will list the directory contents to see the structure.');
+    assert.equal(result.messages[3]?.kind, 'tool_use');
+    assert.equal(result.messages[3]?.toolName, 'run_command');
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('AntigravitySessionSynchronizer indexes only top-level summaries and archives indexed child agents', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-sync-'));
   // A mocked, empty home proves the synchronizer resolves the db through the
