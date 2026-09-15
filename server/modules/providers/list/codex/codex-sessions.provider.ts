@@ -2261,17 +2261,34 @@ export class CodexSessionsProvider implements IProviderSessions {
         case 'file_change': {
           // One row per file so each change gets the same diff view as an Edit.
           const changes = Array.isArray(raw.changes) ? raw.changes : [];
-          return changes.map((change: AnyRecord, index: number) => createNormalizedMessage({
-            id: `${itemId}_${index}`,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_use',
-            toolName: change?.kind === 'add' ? 'Write' : 'Edit',
-            toolInput: { file_path: change?.path, old_string: '', new_string: '' },
-            toolId: `${itemId}_${index}`,
-            status: raw.status,
-          }));
+          const rows: NormalizedMessage[] = [];
+          for (const [index, change] of changes.entries()) {
+            const toolCallId = `${itemId}_${index}`;
+            rows.push(createNormalizedMessage({
+              id: toolCallId,
+              sessionId,
+              timestamp: ts,
+              provider: PROVIDER,
+              kind: 'tool_use',
+              toolName: change?.kind === 'add' ? 'Write' : 'Edit',
+              toolInput: { file_path: change?.path, old_string: '', new_string: '' },
+              toolId: toolCallId,
+              status: raw.status,
+            }));
+            if (raw.status !== 'in_progress') {
+              rows.push(createNormalizedMessage({
+                id: `${toolCallId}_result`,
+                sessionId,
+                timestamp: ts,
+                provider: PROVIDER,
+                kind: 'tool_result',
+                toolId: toolCallId,
+                content: raw.status === 'failed' ? 'Failed to apply file changes' : 'File changes applied',
+                isError: raw.status === 'failed',
+              }));
+            }
+          }
+          return rows;
         }
         case 'mcp_tool_call': {
           const toolName = raw.server ? `mcp__${String(raw.server)}__${String(raw.tool ?? 'tool')}` : String(raw.tool || 'MCP');

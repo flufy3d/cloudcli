@@ -801,3 +801,89 @@ test('an interrupted subagent closes its Task row instead of running forever', a
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+test('normalizeMessage on completed file_change emits tool_use and tool_result pairs', () => {
+  const provider = new CodexSessionsProvider();
+  const event = {
+    type: 'item',
+    itemType: 'file_change',
+    itemId: 'item_file_change_1',
+    status: 'completed',
+    changes: [
+      { path: '/repo/docs/AGENTS.md', kind: 'update' },
+      { path: '/repo/README.md', kind: 'add' },
+    ],
+  };
+  const messages = provider.normalizeMessage(event, 'session-1');
+
+  assert.equal(messages.length, 4);
+
+  // First file: Edit
+  assert.equal(messages[0].kind, 'tool_use');
+  assert.equal(messages[0].toolName, 'Edit');
+  assert.equal(messages[0].toolId, 'item_file_change_1_0');
+  assert.deepEqual(messages[0].toolInput, { file_path: '/repo/docs/AGENTS.md', old_string: '', new_string: '' });
+
+  assert.equal(messages[1].kind, 'tool_result');
+  assert.equal(messages[1].toolId, 'item_file_change_1_0');
+  assert.equal(messages[1].isError, false);
+
+  // Second file: Write
+  assert.equal(messages[2].kind, 'tool_use');
+  assert.equal(messages[2].toolName, 'Write');
+  assert.equal(messages[2].toolId, 'item_file_change_1_1');
+  assert.deepEqual(messages[2].toolInput, { file_path: '/repo/README.md', old_string: '', new_string: '' });
+
+  assert.equal(messages[3].kind, 'tool_result');
+  assert.equal(messages[3].toolId, 'item_file_change_1_1');
+  assert.equal(messages[3].isError, false);
+});
+
+test('normalizeMessage on in_progress file_change emits only tool_use', () => {
+  const provider = new CodexSessionsProvider();
+  const event = {
+    type: 'item',
+    itemType: 'file_change',
+    itemId: 'item_file_change_2',
+    status: 'in_progress',
+    changes: [{ path: '/repo/docs/AGENTS.md', kind: 'update' }],
+  };
+  const messages = provider.normalizeMessage(event, 'session-1');
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].kind, 'tool_use');
+  assert.equal(messages[0].status, 'in_progress');
+});
+
+test('normalizeMessage on failed file_change marks result as error', () => {
+  const provider = new CodexSessionsProvider();
+  const event = {
+    type: 'item',
+    itemType: 'file_change',
+    itemId: 'item_file_change_failed',
+    status: 'failed',
+    changes: [{ path: '/repo/docs/AGENTS.md', kind: 'update' }],
+  };
+  const messages = provider.normalizeMessage(event, 'session-1');
+
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].kind, 'tool_use');
+  assert.equal(messages[0].status, 'failed');
+  assert.equal(messages[1].kind, 'tool_result');
+  assert.equal(messages[1].isError, true);
+  assert.equal(messages[1].content, 'Failed to apply file changes');
+});
+
+test('normalizeMessage on file_change with empty or non-array changes returns empty array', () => {
+  const provider = new CodexSessionsProvider();
+  assert.deepEqual(
+    provider.normalizeMessage({ type: 'item', itemType: 'file_change', itemId: 'empty_1', status: 'completed', changes: [] }, 'session-1'),
+    [],
+  );
+  assert.deepEqual(
+    provider.normalizeMessage({ type: 'item', itemType: 'file_change', itemId: 'empty_2', status: 'completed', changes: null }, 'session-1'),
+    [],
+  );
+});
+
+

@@ -1,3 +1,4 @@
+import { canonicalToolName, isEditTool } from '@/modules/chat/tools/toolTaxonomy';
 import type { NormalizedMessage } from '@/shared/types';
 
 /**
@@ -45,6 +46,15 @@ function stableInput(value: unknown): unknown {
   return value;
 }
 
+function extractFilePath(input: unknown): string | null {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const record = input as Record<string, unknown>;
+  const val = record.file_path ?? record.TargetFile ?? record.path ?? record.filePath ?? record.AbsolutePath;
+  return typeof val === 'string' && val.trim().length > 0 ? val.trim().replace(/\\/g, '/') : null;
+}
+
 /**
  * Full-call fingerprint: tool + complete input (the owning session already
  * implies the provider). Two rows with the same fingerprint are treated as
@@ -52,14 +62,29 @@ function stableInput(value: unknown): unknown {
  * pairs 1:1 through the claim set, and unsafe inputs (a path, a URL) are
  * exactly what makes the fingerprint discriminative for the shadow-card
  * engines (Write/Edit/Bash payloads).
+ *
+ * For file mutation tools (Edit, Write), the fingerprint is keyed by canonical
+ * tool name and target file path. This ensures that live events (which carry
+ * file paths but empty diffs before rollout records land) pair cleanly with
+ * persisted rows that contain full diff text, avoiding duplicate shadow cards.
  */
 function toolCallFingerprint(message: NormalizedMessage): string | null {
   if (message.kind !== 'tool_use' || !message.toolName) {
     return null;
   }
-  const input = typeof message.toolInput === 'string'
-    ? stableInput(safeParse(message.toolInput) ?? message.toolInput)
-    : stableInput(message.toolInput);
+  const parsedInput = typeof message.toolInput === 'string'
+    ? (safeParse(message.toolInput) ?? message.toolInput)
+    : message.toolInput;
+
+  const toolName = canonicalToolName(message.toolName);
+  if (isEditTool(toolName)) {
+    const filePath = extractFilePath(parsedInput);
+    if (filePath) {
+      return JSON.stringify([toolName, { file_path: filePath }]);
+    }
+  }
+
+  const input = stableInput(parsedInput);
   return JSON.stringify([message.toolName, input]);
 }
 
