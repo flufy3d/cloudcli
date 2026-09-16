@@ -122,6 +122,34 @@ function opaqueCredential(): AntigravityTokenInfo {
 }
 
 /**
+ * Detects the OAuth credentials agy keeps in the Windows Credential Manager
+ * (target `gemini:antigravity`, the same entry agy writes on login). The
+ * `antigravity-oauth-token` file this provider otherwise checks does not
+ * exist on Windows installs — agy persists credentials to the Credential
+ * Manager instead — so without this probe every logged-in Windows user is
+ * misreported as logged out. `cmdkey /list:<target>` exits 0 whether or not
+ * the target exists, so the output is matched for a `Target:` line rather
+ * than trusting the exit code. Read-only: listing neither modifies the entry
+ * nor reveals the stored secret. Shares the
+ * `CLOUDCLI_ANTIGRAVITY_SKIP_KEYCHAIN=1` test escape hatch with the macOS
+ * keychain probe below.
+ */
+function hasWindowsCredentials(): boolean {
+  if (process.platform !== 'win32' || process.env.CLOUDCLI_ANTIGRAVITY_SKIP_KEYCHAIN === '1') {
+    return false;
+  }
+  try {
+    const output = execFileSync('cmdkey', ['/list:gemini:antigravity'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    return /^\s*Target:/m.test(output);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Detects the OAuth credentials agy keeps in the macOS login keychain
  * (service `gemini`, account `antigravity`). agy writes the token file on a
  * completed login, but later refreshes update only the keychain — and a
@@ -153,7 +181,9 @@ function hasKeychainCredentials(): boolean {
  *
  * The token file written by a completed `agy` login counts as authenticated;
  * so does a macOS keychain credential when the file is gone, because agy
- * silently refreshes from the keychain on its next run. `installation_id` and
+ * silently refreshes from the keychain on its next run. On Windows the token
+ * file never exists, so the Windows Credential Manager entry
+ * (`gemini:antigravity`) counts instead. `installation_id` and
  * `settings.json` are created on first launch regardless of login state, so
  * they must never mark the provider as authenticated.
  */
@@ -172,6 +202,10 @@ function readAntigravityCredential(): AntigravityTokenInfo | null {
     // Keychain-only credentials are live but opaque: expiry and email stay
     // inside the item agy owns, and `isCredentialValid` treats an unknown
     // expiry as valid so an existing user is never locked out.
+    return opaqueCredential();
+  }
+
+  if (hasWindowsCredentials()) {
     return opaqueCredential();
   }
 

@@ -118,6 +118,46 @@ test('AntigravityProviderAuth only reports authenticated with an OAuth token fil
   }
 });
 
+test('AntigravityProviderAuth recognizes the Windows Credential Manager entry', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('Windows Credential Manager probe is win32-only');
+    return;
+  }
+  // This test asserts live machine state, so it bows out on machines where
+  // agy was never logged in instead of failing there.
+  const { execFileSync } = await import('node:child_process');
+  let machineHasEntry = false;
+  try {
+    const output = execFileSync('cmdkey', ['/list:gemini:antigravity'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    machineHasEntry = /^\s*Target:/m.test(String(output));
+  } catch {
+    machineHasEntry = false;
+  }
+  if (!machineHasEntry) {
+    t.skip('no gemini:antigravity credential stored on this machine');
+    return;
+  }
+
+  // An empty data-root fixture holds no token file, so only the Windows
+  // Credential Manager probe can report authenticated here. The skip-keychain
+  // escape hatch stays unset so the real probe runs.
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-auth-wincred-'));
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const auth = new AntigravityProviderAuth();
+    const status = await auth.getStatus();
+    assert.equal(status.installed, true);
+    assert.equal(status.authenticated, true);
+    assert.equal(status.error, undefined);
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('AntigravityProviderModels returns builtin models fallback', async () => {
   const models = new AntigravityProviderModels();
   const definition = await models.getSupportedModels();
@@ -906,8 +946,7 @@ test('AntigravityProviderModels reads the default model from the overridden data
   }
 });
 
-test('AntigravityProviderAuth validates token expiry and extracts the account email', async () => {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-auth-expiry-'));
+test('AntigravityProviderAuth validates token expiry and extracts the account email', async () => {  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-auth-expiry-'));
   const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
   const restoreAgyPath = withEnvValue('CLOUDCLI_AGY_PATH', path.join(tempRoot, 'agy'));
   // Isolate from the real keychain so the file fixture alone decides the verdict.
