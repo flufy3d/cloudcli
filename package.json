@@ -1,5 +1,5 @@
 {
-  "name": "@cloudcli-ai/cloudcli",
+  "name": "cloudcli",
   "version": "2.3.0",
   "productName": "CloudCLI",
   "description": "A web-based UI for Claude Code CLI",
@@ -55,6 +55,7 @@
     "lint:client": "oxlint src/",
     "lint:fix": "oxlint src/ server/ --fix",
     "start": "npm run build && npm run server",
+    "deploy": "node scripts/deploy.mjs",
     "release": "./release.sh",
     "prepublishOnly": "npm run build",
     "postinstall": "node scripts/fix-node-pty.js",

@@ -24,17 +24,20 @@ For every task that creates, modifies, refactors, or reviews backend code under 
 
 ## Service Operations & Process Management
 
-This project is managed and monitored via **PM2**:
-- Application name: `cloudcli-ui`
-- Restart command: `pm2 restart cloudcli-ui`
-- Logs command: `pm2 logs cloudcli-ui`
+The **production instance** runs from a global pnpm install (`~/Library/pnpm/global/5/node_modules/cloudcli`) as a static copy fully detached from this repo — editing repo code or running dev here never affects it. PM2 persists its config in `~/.pm2/ecosystem.config.cjs` (process env vars must live there; PM2-managed processes never read `.zshrc`).
+
+- Application name: `cloudcli`
+- Publish a new build: `pnpm run deploy` (build → pack → global install → PM2 cutover → `pm2 save`). Run it in a terminal **outside** any cloudcli-hosted session — the cutover drops the session's own server.
+- Service port: `3030` (`http://localhost:3030`)
+- Restart command: `pm2 restart cloudcli`
+- Logs command: `pm2 logs cloudcli`
 - Status command: `pm2 status`
-- Default service port: `3001` (`http://localhost:3001`)
+- Local dev keeps the defaults (`3001` server + `5173` vite), so dev and production coexist; after config changes run `pm2 save` so `pm2 resurrect` doesn't restore a stale snapshot.
 
 Always use PM2 commands when restarting or inspecting the server process, rather than running ad-hoc background node processes.
 
 **Important Note on Server Restarts**:
-Restarting the PM2 service will abruptly drop the live websocket/HTTP connection with the user interface. Before triggering `pm2 restart cloudcli-ui`, always send a message to the user informing them in advance that the service is about to restart and connection will temporarily drop. After the restart, wait for the user to send a prompt to resume and continue the work.
+Restarting the PM2 service will abruptly drop the live websocket/HTTP connection with the user interface. Before triggering `pm2 restart cloudcli`, always send a message to the user informing them in advance that the service is about to restart and connection will temporarily drop. After the restart, wait for the user to send a prompt to resume and continue the work.
 
 ## Frontend code
 
