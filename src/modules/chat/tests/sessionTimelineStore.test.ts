@@ -320,7 +320,7 @@ test('a keyed Antigravity stream survives an empty first refresh and is pruned w
   assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 0);
 });
 
-test('matching provider row keys do not discard a stream whose content differs from history', async () => {
+test('a complete keyed history row owns its realtime counterpart regardless of body differences', async () => {
   const providerRowKey = 'assistant-step:6';
   const initialUser = msg(1, { provider: 'antigravity', content: 'prepare the final answer' });
   const persistedReply = msg(2, {
@@ -356,10 +356,7 @@ test('matching provider row keys do not discard a stream whose content differs f
     store.getMessages(SESSION_ID)
       .filter((row) => row.role === 'assistant')
       .map((row) => row.content),
-    [
-      'Persisted partial answer.',
-      'Live complete answer with content that has not landed in history.',
-    ],
+    ['Persisted partial answer.'],
   );
 });
 
@@ -381,6 +378,7 @@ test('a keyed history prefix yields to the complete Antigravity stream', async (
           provider: 'antigravity',
           content: persistedPrefix,
           providerRowKey,
+          contentCompleteness: 'truncated',
         })],
         total: 2,
         hasMore: false,
@@ -427,6 +425,7 @@ test('a near-identical keyed Antigravity history row yields to richer markdown-f
           provider: 'antigravity',
           content: persistedReply,
           providerRowKey,
+          contentCompleteness: 'truncated',
         })],
         total: 2,
         hasMore: false,
@@ -454,7 +453,7 @@ test('a near-identical keyed Antigravity history row yields to richer markdown-f
   );
 });
 
-test('a keyed Antigravity row with a changed word remains visible as a real conflict', async () => {
+test('a unique provider row key treats changed wording as the same persisted row', async () => {
   const providerRowKey = 'assistant-step:7c';
   const shared = '这一段用于保证回答足够长，同时验证不能因为大部分文字相同就吞掉修改过的事实。'.repeat(5);
   const persistedReply = `该方案支持离线模式。${shared}`;
@@ -496,7 +495,7 @@ test('a keyed Antigravity row with a changed word remains visible as a real conf
     store.getMessages(SESSION_ID)
       .filter((row) => row.role === 'assistant')
       .map((row) => row.content),
-    [persistedReply, streamedReply],
+    [persistedReply],
   );
 });
 
@@ -916,7 +915,7 @@ test('a live card whose call is not persisted yet survives the refresh', async (
   assert.ok(merged.some((message) => message.id === 'rt-live_zcode_1'));
 });
 
-test('two identical persisted calls keep both live cards pruned one-to-one', async () => {
+test('tool cards without a provable user turn remain visible rather than cross-turn claiming', async () => {
   const fetchPage = scriptedFetcher([
     {
       params: { limit: 20, offset: 0 },
@@ -934,9 +933,52 @@ test('two identical persisted calls keep both live cards pruned one-to-one', asy
   await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
 
   const toolCards = store.getMessages(SESSION_ID).filter((message) => message.kind === 'tool_use');
-  assert.equal(toolCards.length, 2, 'identical repeat calls stay distinct');
+  assert.equal(toolCards.length, 4, 'unanchored calls stay visible');
   assert.deepEqual(
     toolCards.map((message) => message.toolId).sort(),
-    ['msg_1_part_2', 'msg_3_part_4'],
+    ['live_zcode_1', 'live_zcode_2', 'msg_1_part_2', 'msg_3_part_4'],
   );
+});
+
+test('a repeated local user prompt cannot prove a stale server turn for tool reconciliation', async () => {
+  const staleServerUser = msg(1, { id: 'server-old-user', content: '继续', role: 'user' });
+  const staleServerTool = persistedWriteCard('server-old-tool');
+  const fetchPage = scriptedFetcher([{
+    params: { limit: 20, offset: 0 },
+    page: { messages: [staleServerUser, staleServerTool], total: 2, hasMore: false },
+  }]);
+  const store = new SessionTimelineStore({ fetchPage });
+  const currentLocalUser = msg(2, { id: 'local-current-user', content: '继续', role: 'user' });
+
+  store.appendRealtime(SESSION_ID, currentLocalUser);
+  store.appendRealtime(SESSION_ID, liveWriteCard('live-current-tool'));
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  const toolCards = store.getMessages(SESSION_ID).filter((message) => message.kind === 'tool_use');
+  assert.deepEqual(
+    toolCards.map((message) => message.toolId).sort(),
+    ['live-current-tool', 'server-old-tool'],
+  );
+});
+
+test('an Edit for the same path in a later user turn cannot claim an earlier persisted Edit', async () => {
+  const firstUser = msg(1, { id: 'server-user-one', content: 'first edit' });
+  const secondUser = msg(3, { id: 'server-user-two', content: 'second edit' });
+  const firstEdit = persistedWriteCard('server-edit-one');
+  const secondEdit = persistedWriteCard('server-edit-two');
+  firstEdit.toolInput = { file_path: '/a.ts', content: 'first change' };
+  secondEdit.toolInput = { file_path: '/a.ts', content: 'second change' };
+  const fetchPage = scriptedFetcher([{
+    params: { limit: 20, offset: 0 },
+    page: { messages: [firstUser, firstEdit, secondUser, secondEdit], total: 4, hasMore: false },
+  }]);
+  const store = new SessionTimelineStore({ fetchPage });
+  emit(store, firstUser);
+  emit(store, firstEdit);
+  emit(store, secondUser);
+  emit(store, liveWriteCard('live-second-edit'));
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  assert.ok(store.getMessages(SESSION_ID).some((message) => message.id === 'rt-live-second-edit'));
 });

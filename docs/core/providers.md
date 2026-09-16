@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.3.0 / 2026-09-14
+> 基准：2.3.0 / 2026-09-16
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -72,11 +72,13 @@
 
 改完跑：`npm run typecheck && npm run lint && npm test`（provider 相关测试在 `server/modules/providers/tests/`）。
 
-**跨路文本身份要求**：`NormalizedMessage.providerRowKey` 是 provider 在同一会话内为一条最终可渲染行生成的稳定身份，只在 live 与历史两路都能从原生数据复建时设置；它不承担消息展示 id、WebSocket `seq`、provider 排序 `sequence` 或编辑锚点的职责。前端先按 `(provider, sessionId, providerRowKey)` 对账，再校验正文且一对一认领；缺 key 才走回合/正文兜底，同 key 多候选或正文不一致必须保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
-
-**会话层级要求**：会话列表只索引顶层、可由用户继续对话的 provider 会话。Antigravity 使用其摘要库的 `parent_conversation_id` 与 `nesting_depth` 识别子 agent；子 agent 不写入活动列表，已被旧版本索引的行会软归档，原始 transcript 与本地元数据保留。缺少这两个字段的旧版 Antigravity 摘要库按顶层兼容读取。
+**跨路文本身份要求**：`NormalizedMessage.providerRowKey` 是 provider 在同一会话内为一条最终可渲染行生成的稳定身份，只在 live 与历史两路都能从原生数据复建时设置；它不承担消息展示 id、WebSocket `seq`、provider 排序 `sequence` 或编辑锚点的职责。前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选或缺 key 且无法证明同一用户回合时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
 
 **工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（codex/antigravity 现状——三命名空间无桥、锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。
+
+**Antigravity 转录读取**：`antigravity-transcript.provider.ts` 是 compact `transcript.jsonl` 与 `transcript_full.jsonl` 的唯一读取入口。它按原生 `step_index` 以 full 覆盖同一步、保留 compact 尚未被 full 追上的尾部，并跳过损坏 JSONL 尾行；历史正文同时带明确的完整度事实。历史专属 thinking 不进入可见时间线，因为它没有可与实时流对应的稳定身份。
+
+**会话层级要求**：会话列表只索引顶层、可由用户继续对话的 provider 会话。Antigravity 使用其摘要库的 `parent_conversation_id` 与 `nesting_depth` 识别子 agent；子 agent 不写入活动列表，已被旧版本索引的行会软归档，原始 transcript 与本地元数据保留。缺少这两个字段的旧版 Antigravity 摘要库按顶层兼容读取。
 
 ### ⚠ 已知坑
 

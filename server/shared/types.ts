@@ -165,6 +165,22 @@ export type ProviderSessionWatchTarget = {
 };
 
 /**
+ * Lifecycle facts produced while synchronizing one provider artifact file.
+ *
+ * `updatedSessionId` is the CloudCLI app session id upserted from the watched
+ * file; it is null when that file has no indexable top-level session.
+ * `removedSessionIds` contains CloudCLI app session ids that transitioned to
+ * archived during the same operation. Consumers must treat both collections as
+ * idempotent deltas: a watcher can receive duplicate filesystem events, and
+ * only the synchronizer can authoritatively determine an active-to-archived
+ * transition.
+ */
+export type ProviderSessionFileSynchronizationDelta = {
+  updatedSessionId: string | null;
+  removedSessionIds: string[];
+};
+
+/**
  * One selectable model row in a provider model catalog.
  */
 export type ProviderModelOption = {
@@ -401,6 +417,13 @@ export type NormalizedMessage = {
    * available rather than substituting a line number or app-generated id.
    */
   providerRowKey?: string;
+  /**
+   * Whether a provider transcript explicitly marked this row's visible body as
+   * complete. Timeline reconciliation may replace a truncated history body
+   * with the corresponding complete realtime body, but never infers this from
+   * text similarity.
+   */
+  contentCompleteness?: 'complete' | 'truncated';
   sessionId: string;
   timestamp: string;
   provider: LLMProvider;

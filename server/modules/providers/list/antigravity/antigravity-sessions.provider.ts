@@ -44,6 +44,7 @@ import {
   getAntigravitySummariesDbPath,
   getAntigravityTranscriptCandidates,
 } from './antigravity-data-root.js';
+import { readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
 
 const PROVIDER = 'antigravity';
 
@@ -414,16 +415,12 @@ export class AntigravitySessionsProvider implements IProviderSessions {
     }
 
     try {
-      const content = await readFile(transcriptPath, 'utf8');
-      const lines = content.split(/\r?\n/);
+      const canonicalRows = await readCanonicalAntigravityTranscript(providerSessionId);
       const normalizedMessages: NormalizedMessage[] = [];
 
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i]?.trim();
-        if (!line) continue;
-
+      for (let i = 0; i < canonicalRows.length; i++) {
         try {
-          const entry = JSON.parse(line) as AnyRecord;
+          const { entry, contentCompleteness } = canonicalRows[i];
           const type = readOptionalString(entry.type);
           const source = readOptionalString(entry.source);
           const rawContent = readOptionalString(entry.content) ?? '';
@@ -466,19 +463,8 @@ export class AntigravitySessionsProvider implements IProviderSessions {
           // Planner entries carry tool invocations, reasoning, and/or the assistant's
           // reply text. Real transcripts emit replies as PLANNER_RESPONSE.
           if (type === 'PLANNER_RESPONSE') {
-            const rawThinking = readOptionalString(entry.thinking);
-            if (rawThinking) {
-              normalizedMessages.push(createNormalizedMessage({
-                id: `${baseId}_thinking`,
-                sessionId,
-                timestamp: createdAt,
-                provider: PROVIDER,
-                role: 'assistant',
-                kind: 'thinking',
-                content: rawThinking,
-                sequence: stepIndex,
-              }));
-            }
+            // Historical thinking lacks a matching live identity, so exposing
+            // it makes refresh introduce rows that were absent while streaming.
 
             if (rawContent) {
               const cleanedContent = cleanAntigravityMessageContent(rawContent, 'assistant');
@@ -493,6 +479,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                   content: cleanedContent,
                   sequence: stepIndex,
                   providerRowKey: buildAntigravityAssistantRowKey(nativeStepIndex),
+                  contentCompleteness,
                 }));
               }
             }

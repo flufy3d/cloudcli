@@ -137,7 +137,7 @@ test('a finalized row is recognised as echo even when older user turns are pagin
   assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[3], server, realtime), true);
 });
 
-test('a finalized row is recognised as echo when all user turns are paginated away by tool calls', () => {
+test('a finalized row is retained when all user turns are paginated away by tool calls', () => {
   // Server only carries tool calls and the assistant reply (user message was 40 tool calls ago)
   const server = [
     msg('tool_use', undefined, '', '2026-01-01T00:00:20Z'),
@@ -149,7 +149,7 @@ test('a finalized row is recognised as echo when all user turns are paginated aw
     msg('text', 'assistant', 'long detailed summary of accomplished work', '2026-01-01T00:00:24Z'),
   ];
 
-  assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[2], server, realtime), true);
+  assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[2], server, realtime), false);
 });
 
 test('a finalized row is recognised as echo when streaming loses whitespace at token boundaries', () => {
@@ -179,7 +179,7 @@ test('identical assistant replies across different user turns are not treated as
   assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[0], server, realtime), false);
 });
 
-test('a server clock ahead of the client still recognises the echo via the text scan', () => {
+test('a server clock ahead of the client retains an unanchored echo', () => {
   // The finalized row anchors to the client clock while the transcript stamps
   // with the engine clock; when the engine runs ahead, both the preceding-user
   // scan and the turn-ordinal count break out empty and the ordinal lands on
@@ -195,7 +195,7 @@ test('a server clock ahead of the client still recognises the echo via the text 
     msg('text', 'assistant', 'the actual reply', '2026-01-01T00:20:05Z'),
   ];
 
-  assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[0], server, realtime), true);
+  assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[0], server, realtime), false);
 });
 
 test('anchored turns match accurately using transcriptAnchorId', () => {
@@ -215,4 +215,3 @@ test('anchored turns match accurately using transcriptAnchorId', () => {
 
   assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[0], server, realtime), true);
 });
-

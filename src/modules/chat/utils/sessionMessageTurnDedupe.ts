@@ -55,36 +55,16 @@ export function isAssistantTextMatch(candidate: string, target: string): boolean
   return false;
 }
 
-export type ProviderRowTextReconciliation = {
+type ProviderRowTextReconciliation = {
   winner: 'server' | 'realtime' | 'distinct';
   serverMessageId?: string;
 };
 
-const MIN_PROVIDER_ROW_PREFIX_LENGTH = 100;
-
-/** Removes presentation-only Markdown formatting, structural markers, and whitespace before provider-row comparison. */
-function normalizeProviderRowText(content: string): string {
-  return (content || '')
-    .normalize('NFKC')
-    .replace(/[^\p{L}\p{N}]/gu, '')
-    .toLowerCase();
-}
-
 /**
- * Checks for contiguous containment after presentation normalization. This is
- * linear and, unlike a similarity score or a loose subsequence, cannot hide a
- * changed word such as a negation, amount, or version number.
- */
-function isContainedProviderRowText(candidate: string, container: string): boolean {
-  return candidate.length > 0 && container.includes(candidate);
-}
-
-/**
- * Chooses which transport owns a uniquely keyed provider row. Exact history
- * wins; a strictly longer live row wins when history is its prefix; and a
- * presentation-preserving containing superset handles providers that rewrite
- * Markdown when completing or resume a partial stream.
- * Ambiguous keys and materially different text always remain visible.
+ * Chooses which transport owns a uniquely keyed provider row. The provider
+ * identity is the proof; body text is never normalized or compared. A complete
+ * history row wins, while a complete realtime body may replace an explicitly
+ * truncated history body. Ambiguous keys remain visible.
  */
 export function reconcileProviderRowText(
   realtimeMessage: NormalizedMessage,
@@ -117,45 +97,17 @@ export function reconcileProviderRowText(
     serverMessageId: serverMessage.id,
   });
 
-  const rawServer = (serverMessage.content || '').trim();
-  const rawRealtime = (realtimeMessage.content || '').trim();
-  if (rawServer && rawServer === rawRealtime) {
+  const serverCompleteness = serverMessage.contentCompleteness ?? 'complete';
+  const realtimeCompleteness = realtimeMessage.contentCompleteness ?? 'complete';
+  if (serverCompleteness === 'complete') {
     return result('server');
   }
-
-  const serverText = normalizeProviderRowText(serverMessage.content || '');
-  const realtimeText = normalizeProviderRowText(realtimeMessage.content || '');
-  if (!serverText || !realtimeText) {
-    return { winner: 'distinct' };
-  }
-
-  if (serverText === realtimeText) {
-    return result('server');
-  }
-
-  const shorterLength = Math.min(serverText.length, realtimeText.length);
-  const longerLength = Math.max(serverText.length, realtimeText.length);
-  // Adaptive prefix matching: large texts use MIN_PROVIDER_ROW_PREFIX_LENGTH,
-  // while short responses (e.g. 10-30 chars) are eligible when the prefix accounts
-  // for most of the content (>= 60% ratio) or reaches >= 8 characters.
-  const hasSafePrefix = shorterLength >= MIN_PROVIDER_ROW_PREFIX_LENGTH
-    || (shorterLength >= 8 && shorterLength / longerLength >= 0.6);
-
-  if (hasSafePrefix && realtimeText.startsWith(serverText)) {
+  if (realtimeCompleteness === 'complete') {
     return result('realtime');
   }
-  if (hasSafePrefix && serverText.startsWith(realtimeText)) {
-    return result('server');
-  }
-
-  if (
-    hasSafePrefix
-    && (isContainedProviderRowText(realtimeText, serverText) || isContainedProviderRowText(serverText, realtimeText))
-  ) {
-    return result(serverText.length >= realtimeText.length ? 'server' : 'realtime');
-  }
-
-  return { winner: 'distinct' };
+  return (serverMessage.content || '').length >= (realtimeMessage.content || '').length
+    ? result('server')
+    : result('realtime');
 }
 
 /**
@@ -373,23 +325,5 @@ export function isAssistantTextEchoedInSameTurnOnServer(
     }
   }
 
-  if (!turnRange || !ordinalTurnMatched) {
-    // 3. Robust fallback: the ordinal count breaks out empty under engine-vs-
-    // client clock skew or a paginated-away / never-fetched user row, which
-    // lands the range on an older turn. A found-but-unmatched range used to
-    // return false here, so the echo survived every prune and rendered next to
-    // its transcript copy. Scan the text instead — the `precedingUserTime`
-    // guard still keeps echoes from a turn older than the row's own.
-    for (const sm of serverMessages) {
-      if (sm.kind === 'text' && sm.role === 'assistant' && isAssistantTextMatch(sm.content || '', assistantText)) {
-        const smTime = readMessageTime(sm);
-        if (precedingUserTime === null || smTime === null || smTime >= precedingUserTime) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  return true;
+  return Boolean(turnRange && ordinalTurnMatched);
 }

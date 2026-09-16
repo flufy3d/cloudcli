@@ -33,7 +33,7 @@ function toolUse(overrides: Partial<NormalizedMessage> = {}): NormalizedMessage 
   };
 }
 
-test('an exact toolId match claims regardless of differing input', () => {
+test('an exact toolId match claims without any user-turn anchor regardless of differing input', () => {
   const server = toolUse({ toolId: 'msg_1_part_2', toolInput: { file_path: '/a.ts', content: 'changed' } });
   const index = collectServerToolCalls([server]);
   const claimed = new Set<string>();
@@ -116,7 +116,7 @@ test('a card without a tool name only matches by exact id', () => {
   assert.equal(claimMatchingServerToolCall(toolUse({ toolName: undefined, toolId: 'live_9' }), index, claimed), false);
 });
 
-test('an Edit or Write tool matches by file_path even when live row has empty diff strings', () => {
+test('a same-turn scoped Edit index matches an empty live diff by canonical path', () => {
   // Persisted row reconstructed from patch rollout: carries real diff content
   const serverEdit = toolUse({
     toolName: 'Edit',
@@ -141,6 +141,40 @@ test('an Edit or Write tool matches by file_path even when live row has empty di
   assert.deepEqual([...claimed], [serverEdit.id]);
 });
 
+test('a same-turn insertion with an empty old string still requires its complete diff fingerprint', () => {
+  const serverEdit = toolUse({
+    toolName: 'Edit',
+    toolId: 'call_insert_1',
+    toolInput: { file_path: '/repo/src/config.ts', old_string: '', new_string: 'enabled: true' },
+  });
+  const index = collectServerToolCalls([serverEdit]);
+
+  const liveDifferentInsertion = toolUse({
+    toolName: 'Edit',
+    toolId: 'live_insert_1',
+    toolInput: { file_path: '/repo/src/config.ts', old_string: '', new_string: 'enabled: false' },
+  });
+
+  assert.equal(claimMatchingServerToolCall(liveDifferentInsertion, index, new Set()), false);
+});
+
+test('a same-turn deletion with an empty new string still requires its complete diff fingerprint', () => {
+  const serverEdit = toolUse({
+    toolName: 'Edit',
+    toolId: 'call_delete_1',
+    toolInput: { file_path: '/repo/src/config.ts', old_string: 'enabled: true', new_string: '' },
+  });
+  const index = collectServerToolCalls([serverEdit]);
+
+  const liveDifferentDeletion = toolUse({
+    toolName: 'Edit',
+    toolId: 'live_delete_1',
+    toolInput: { file_path: '/repo/src/config.ts', old_string: 'enabled: false', new_string: '' },
+  });
+
+  assert.equal(claimMatchingServerToolCall(liveDifferentDeletion, index, new Set()), false);
+});
+
 test('different target files on Edit do not match', () => {
   const serverEdit = toolUse({
     toolName: 'Edit',
@@ -162,7 +196,7 @@ test('different target files on Edit do not match', () => {
   assert.equal(claimMatchingServerToolCall(liveOther, index, new Set()), false);
 });
 
-test('path aliases (TargetFile) and slash normalization match correctly', () => {
+test('path aliases alone cannot match an Edit without its change payload', () => {
   const serverEdit = toolUse({
     toolName: 'Edit',
     toolId: 'call_1',
@@ -177,8 +211,8 @@ test('path aliases (TargetFile) and slash normalization match correctly', () => 
     toolInput: { file_path: 'C:/project/src/index.ts', old_string: '', new_string: '' },
   });
 
-  assert.equal(claimMatchingServerToolCall(liveEdit, index, claimed), true);
-  assert.deepEqual([...claimed], [serverEdit.id]);
+  assert.equal(claimMatchingServerToolCall(liveEdit, index, claimed), false);
+  assert.deepEqual([...claimed], []);
 });
 
 test('Edit and Write for the same path do not cross-claim', () => {
@@ -197,5 +231,3 @@ test('Edit and Write for the same path do not cross-claim', () => {
 
   assert.equal(claimMatchingServerToolCall(liveEdit, index, new Set()), false);
 });
-
-

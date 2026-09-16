@@ -407,6 +407,8 @@ export type NormalizedMessage = {
    * websocket replay `seq`, provider ordering `sequence`, and edit anchor.
    */
   providerRowKey?: string;
+  /** Whether the provider marked this row's visible body as complete or truncated. */
+  contentCompleteness?: 'complete' | 'truncated';
   sessionId: string;
   timestamp: string;
   provider: LLMProvider;

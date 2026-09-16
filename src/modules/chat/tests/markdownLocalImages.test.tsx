@@ -88,4 +88,21 @@ describe('Markdown local image resolution', () => {
     expect(imageBySrc('/assets/banner.png')).toBeDefined();
     expect(readExternalFileContent).not.toHaveBeenCalled();
   });
+
+  it('releases each resolved blob URL when its image unmounts', async () => {
+    const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:released-image');
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL');
+    readExternalFileContent.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['jpeg-bytes'], { type: 'image/jpeg' }),
+    });
+
+    const rendered = render(<Markdown>{`![snap](${BRAIN_SNAPSHOT})`}</Markdown>);
+    await waitFor(() => expect(imageBySrc('blob:released-image')).toBeDefined());
+    rendered.unmount();
+
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:released-image');
+    expect(revokeObjectURL).toHaveBeenCalledTimes(1);
+  });
 });

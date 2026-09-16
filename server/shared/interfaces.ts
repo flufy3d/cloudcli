@@ -12,6 +12,7 @@ import type {
   ProviderModelsDefinition,
   ProviderMcpServer,
   ProviderQuotaData,
+  ProviderSessionFileSynchronizationDelta,
   ProviderSessionUsageInput,
   ProviderSessionWatchTarget,
   ProviderSkillCreateInput,
@@ -278,4 +279,11 @@ export interface IProviderSessionSynchronizer {
    * Parses and upserts one provider artifact file without running a full scan.
    */
   synchronizeFile(filePath: string): Promise<string | null>;
+
+  /**
+   * Optionally returns every lifecycle fact from one file-level synchronization.
+   * Providers that only upsert sessions omit this; the orchestration layer then
+   * derives the equivalent single updated id from `synchronizeFile`.
+   */
+  synchronizeFileWithLifecycle?(filePath: string): Promise<ProviderSessionFileSynchronizationDelta>;
 }

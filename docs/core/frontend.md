@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.3.0 / 2026-09-14
+> 基准：2.3.0 / 2026-09-16
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -24,7 +24,7 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`），�
 
 聊天消息**不走 Context**：走 `SessionTimelineStore`（框架无关）+ `useSessionStore` 适配器，见 [chat.md](./chat.md) 的四层结构。
 
-前后端共用的 `NormalizedMessage` 是聊天时间线的 wire contract；provider 给出的跨路行身份必须由 WebSocket 与历史接口原样传入 `SessionTimelineStore`，不能在视图模型层重新生成。身份的分段与对账规则见 [chat.md](./chat.md)。
+前后端共用的 `NormalizedMessage` 是聊天时间线的 wire contract；provider 给出的跨路行身份和历史正文完整度必须由 WebSocket 与历史接口原样传入 `SessionTimelineStore`，不能在视图模型层重新生成。身份的分段与对账规则见 [chat.md](./chat.md)。本地 Markdown 图片经授权端点转换为 Blob URL 后，组件换图或卸载必须中止请求并恰好释放一次 URL。
 
 ## Provider 相关前端（零分支原则）
 

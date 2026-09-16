@@ -228,6 +228,8 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
   // Set when the endpoint refuses the path (not allowlisted / deleted): fall
   // back to the raw src, i.e. exactly the pre-fix rendering.
   const [resolveFailed, setResolveFailed] = useState(false);
+  // Controls the viewer only after a resolved image is clicked; it is not
+  // derivable from the URL because closing the viewer must preserve the image.
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
@@ -241,6 +243,13 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
     setResolveFailed(false);
     const controller = new AbortController();
     let objectUrl: string | null = null;
+    let revoked = false;
+    const revokeObjectUrl = () => {
+      if (objectUrl && !revoked) {
+        revoked = true;
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
     const load = async () => {
       try {
         const response = await readExternalFileContent(localPath, { signal: controller.signal });
@@ -250,7 +259,7 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
         const blob = await response.blob();
         objectUrl = URL.createObjectURL(blob);
         if (controller.signal.aborted) {
-          URL.revokeObjectURL(objectUrl);
+          revokeObjectUrl();
           return;
         }
         setBlobSrc(objectUrl);
@@ -263,6 +272,7 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
     void load();
     return () => {
       controller.abort();
+      revokeObjectUrl();
     };
   }, [localPath]);
 

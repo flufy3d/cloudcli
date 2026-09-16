@@ -43,7 +43,11 @@ import { authenticatedFetch } from '@/shared/api';
 import type { LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
 import { removeOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
 import { isThinkingRowEchoOnServer, upsertThinkingRow } from '@/modules/chat/utils/sessionThinkingRows';
-import { claimMatchingServerToolCall, collectServerToolCalls } from '@/modules/chat/utils/toolIdentity';
+import {
+  claimExactServerToolCall,
+  claimMatchingServerToolCall,
+  collectServerToolCalls,
+} from '@/modules/chat/utils/toolIdentity';
 import {
   buildSessionMessagesUrl,
   hasReachedCachedTailTimeBoundary,
@@ -189,13 +193,11 @@ function enqueueHistoryMutation<T>(
  */
 function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedMessage[] {
   const out: NormalizedMessage[] = [];
-  const seenAssistantTexts = new Map<string, number>();
   let currentTurnAssistantTexts = new Set<string>();
 
   for (const m of merged) {
     if (m.kind === 'text' && m.role === 'user') {
       currentTurnAssistantTexts = new Set<string>();
-      seenAssistantTexts.clear();
       out.push(m);
       continue;
     }
@@ -236,19 +238,22 @@ function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedM
           if (isAssistantTextMatch(deltaText, text)) {
             out[lastIdx] = m;
             currentTurnAssistantTexts.add(compactKey);
-            seenAssistantTexts.set(compactKey, lastIdx);
             continue;
           }
         }
 
-        // Check if duplicate in current turn or duplicate reply across the list
+        // Content-only reconciliation is restricted to the current user turn.
         const isDuplicateInTurn = currentTurnAssistantTexts.has(compactKey);
-        const previousIndex = seenAssistantTexts.get(compactKey);
 
-        if (isDuplicateInTurn || previousIndex !== undefined) {
-          const targetIndex = previousIndex ?? out.findIndex(
-            (item) => item.kind === 'text' && item.role === 'assistant' && isAssistantTextMatch(item.content || '', text),
-          );
+        if (isDuplicateInTurn) {
+          let targetIndex = -1;
+          for (let index = out.length - 1; index >= 0; index -= 1) {
+            const item = out[index];
+            if (item.kind === 'text' && item.role === 'assistant' && isAssistantTextMatch(item.content || '', text)) {
+              targetIndex = index;
+              break;
+            }
+          }
           if (targetIndex >= 0) {
             // Prefer persisted message over synthetic realtime message
             if (out[targetIndex].id.startsWith('text_') && !m.id.startsWith('text_')) {
@@ -259,7 +264,6 @@ function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedM
         }
 
         currentTurnAssistantTexts.add(compactKey);
-        seenAssistantTexts.set(compactKey, out.length);
       }
     }
 
@@ -284,8 +288,35 @@ function pruneRealtimeSupersededByServer(
 
   const serverIds = new Set(serverMessages.map((message) => message.id));
   const reconciledRealtimeMessages = removeOptimisticUserEchoes(serverMessages, realtimeMessages);
-  const serverTools = collectServerToolCalls(serverMessages);
   const claimedServerRowIds = new Set<string>();
+  const allServerTools = collectServerToolCalls(serverMessages);
+
+  const serverTurnForRealtimeMessage = (message: NormalizedMessage): NormalizedMessage[] => {
+    const realtimeIndex = realtimeMessages.findIndex((candidate) => candidate.id === message.id);
+    if (realtimeIndex < 0) return [];
+    let userMessage: NormalizedMessage | undefined;
+    for (let index = realtimeIndex - 1; index >= 0; index -= 1) {
+      const candidate = realtimeMessages[index];
+      if (candidate.kind === 'text' && candidate.role === 'user') {
+        userMessage = candidate;
+        break;
+      }
+    }
+    if (!userMessage) return [];
+    const matchingUserIndexes = serverMessages.flatMap((candidate, index) => {
+      if (candidate.kind !== 'text' || candidate.role !== 'user') return [];
+      const sharedMessageId = Boolean(candidate.id) && candidate.id === userMessage!.id;
+      const sharedTranscriptAnchor = Boolean(candidate.transcriptAnchorId)
+        && candidate.transcriptAnchorId === userMessage!.transcriptAnchorId;
+      return sharedMessageId || sharedTranscriptAnchor ? [index] : [];
+    });
+    if (matchingUserIndexes.length !== 1) return [];
+    const start = matchingUserIndexes[0];
+    const end = serverMessages.findIndex(
+      (candidate, index) => index > start && candidate.kind === 'text' && candidate.role === 'user',
+    );
+    return serverMessages.slice(start, end < 0 ? undefined : end);
+  };
 
   const retained = reconciledRealtimeMessages.filter((message) => {
     if (serverIds.has(message.id)) {
@@ -315,9 +346,14 @@ function pruneRealtimeSupersededByServer(
     }
 
     if (message.kind === 'tool_use' && message.toolId) {
-      // The two paths mint different ids for the same call (engine payload
-      // fallbacks vs transcript part ids), so exact toolId alone is not the
-      // identity — the claim set also pairs on the full call fingerprint.
+      // A divergent id may use the parameter fingerprint only after the
+      // preceding user turn identifies one unique persisted turn. When history
+      // is paged or clocks disagree we retain the card instead of letting an
+      // Edit/Write from another turn claim it by target path.
+      if (claimExactServerToolCall(message, allServerTools, claimedServerRowIds)) {
+        return false;
+      }
+      const serverTools = collectServerToolCalls(serverTurnForRealtimeMessage(message));
       if (claimMatchingServerToolCall(message, serverTools, claimedServerRowIds)) {
         return false;
       }
