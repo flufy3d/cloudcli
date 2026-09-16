@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { Markdown } from '@/modules/chat/transcript/Markdown';
 import type * as sharedApi from '@/shared/api';
@@ -64,6 +64,23 @@ describe('Markdown local image resolution', () => {
     expect(readExternalFileContent).toHaveBeenCalledWith('/Users/azrael/brain/snap.png', expect.anything());
   });
 
+  it('resolves Windows absolute paths with drive letters', async () => {
+    readExternalFileContent.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['png-bytes'], { type: 'image/png' }),
+    });
+
+    render(<Markdown>{'![win](C:\\Users\\azrael\\AppData\\brain\\snap.png)'}</Markdown>);
+
+    await waitFor(() => {
+      expect(imageBySrc('blob:mock-image')).toBeDefined();
+    });
+    expect(readExternalFileContent).toHaveBeenCalledWith(
+      'C:\\Users\\azrael\\AppData\\brain\\snap.png',
+      expect.anything(),
+    );
+  });
+
   it('falls back to the raw src when the endpoint refuses the path', async () => {
     readExternalFileContent.mockResolvedValue({ ok: false, status: 403 });
 
@@ -104,5 +121,25 @@ describe('Markdown local image resolution', () => {
     expect(createObjectURL).toHaveBeenCalledTimes(1);
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:released-image');
     expect(revokeObjectURL).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops click event propagation so parent link is not triggered', async () => {
+    readExternalFileContent.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['jpeg-bytes'], { type: 'image/jpeg' }),
+    });
+    const linkClickHandler = vi.fn((e) => e.preventDefault());
+
+    render(
+      <a href="https://example.com" onClick={linkClickHandler}>
+        <Markdown>{`![snap](${BRAIN_SNAPSHOT})`}</Markdown>
+      </a>,
+    );
+
+    await waitFor(() => expect(imageBySrc('blob:mock-image')).toBeDefined());
+    const img = imageBySrc('blob:mock-image')!;
+    fireEvent.click(img);
+
+    expect(linkClickHandler).not.toHaveBeenCalled();
   });
 });

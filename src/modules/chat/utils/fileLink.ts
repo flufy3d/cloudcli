@@ -6,10 +6,13 @@ import { defaultUrlTransform } from 'react-markdown';
 // are kept verbatim and converted back to a filesystem path when clicked.
 export const isFileUrl = (url?: string): boolean => /^file:\/\//i.test(url ?? '');
 
-// react-markdown `urlTransform` hook: keep `file://` URLs intact and delegate
-// every other URL to the library's default sanitization.
+export const isWindowsAbsolutePath = (url?: string): boolean =>
+  /^[a-zA-Z]:([/\\]|%5[cC])/i.test(url ?? '');
+
+// react-markdown `urlTransform` hook: keep `file://` URLs and Windows absolute paths
+// intact and delegate every other URL to the library's default sanitization.
 export const markdownUrlTransform = (url: string): string =>
-  isFileUrl(url) ? url : defaultUrlTransform(url);
+  isFileUrl(url) || isWindowsAbsolutePath(url) ? url : defaultUrlTransform(url);
 
 // Converts a `file://` URL back into an absolute filesystem path, decoding
 // percent-escapes so paths with spaces or non-ASCII characters survive.

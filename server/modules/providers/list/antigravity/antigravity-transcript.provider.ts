@@ -36,9 +36,10 @@ async function readJsonl(pathname: string): Promise<CanonicalAntigravityTranscri
 
 /**
  * Reads Antigravity's compact and full transcript artifacts as one canonical
- * ordered stream. Consumers get native step identity and content completeness,
- * while this module owns partial writes, corrupt JSONL tails, and the case
- * where the full file has not caught up with compact yet.
+ * ordered stream. Consumed by AntigravitySessionsProvider to normalize historical
+ * turns with exact step identity and content completeness, while this module owns
+ * partial writes, corrupt JSONL tails, and the case where the full file has not
+ * caught up with compact yet.
  */
 export async function readCanonicalAntigravityTranscript(
   sessionId: string,
@@ -70,7 +71,7 @@ export async function readCanonicalAntigravityTranscript(
   }
   for (const row of fullRows) {
     const step = row.entry.step_index;
-    if (typeof step !== 'number' || !compactSteps.has(step)) merged.push(row);
+    if (typeof step === 'number' && !compactSteps.has(step)) merged.push(row);
   }
   // Compact order is the newest writer's causal order. Do not sort it: rows
   // without a native step index still have a meaningful transcript position.

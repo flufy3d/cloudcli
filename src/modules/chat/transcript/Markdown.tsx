@@ -182,7 +182,7 @@ const CodeBlock = memo(function CodeBlock({ node: _node, className, children, fo
 
 const LOCAL_IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i;
 const SYSTEM_ABSOLUTE_PREFIX_RE = /^\/(Users|home|var|tmp|private|Volumes|opt|mnt|root)\//i;
-const WINDOWS_ABSOLUTE_PATH_RE = /^[a-zA-Z]:[/\\]/;
+const WINDOWS_ABSOLUTE_PATH_RE = /^[a-zA-Z]:([/\\]|%5[cC])/i;
 const COMMON_STATIC_WEB_PREFIX_RE = /^\/(assets|static|public|icons|images|favicon|logo)[/.?#]/i;
 
 const isLikelyLocalFilesystemPath = (rawPath: string): boolean => {
@@ -193,7 +193,7 @@ const isLikelyLocalFilesystemPath = (rawPath: string): boolean => {
     return true;
   }
   const clean = rawPath.split('?')[0].split('#')[0];
-  const segments = clean.split('/').filter(Boolean);
+  const segments = clean.replace(/\\/g, '/').split('/').filter(Boolean);
   return segments.length >= 3;
 };
 
@@ -204,10 +204,16 @@ const localPathFromImageSrc = (src?: string): string | undefined => {
   if (isFileUrl(src)) {
     return filePathFromFileUrl(src);
   }
-  if (!src.startsWith('/')) {
+  let decoded = src;
+  try {
+    decoded = decodeURIComponent(src);
+  } catch {
+    // Keep raw src if decode fails
+  }
+  if (!decoded.startsWith('/') && !WINDOWS_ABSOLUTE_PATH_RE.test(decoded)) {
     return undefined;
   }
-  const clean = src.split('?')[0].split('#')[0];
+  const clean = decoded.split('?')[0].split('#')[0];
   if (!LOCAL_IMAGE_EXTENSION_RE.test(clean)) {
     return undefined;
   }
@@ -286,14 +292,23 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
 
   if (!blobSrc) {
     // Placeholder holds the layout while the bytes load.
-    return <div className="my-1 h-28 max-w-sm animate-pulse rounded-lg bg-muted" />;
+    return (
+      <div
+        role="img"
+        aria-label={alt || 'Image loading'}
+        className="my-1 h-28 max-w-sm animate-pulse rounded-lg bg-muted"
+      />
+    );
   }
 
   return (
     <>
       <button
         type="button"
-        onClick={() => setExpanded(true)}
+        onClick={(event) => {
+          event.stopPropagation();
+          setExpanded(true);
+        }}
         aria-label={t('misc.expandImage', { name: alt ?? '' })}
         className="block max-w-full cursor-zoom-in"
       >

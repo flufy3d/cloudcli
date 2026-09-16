@@ -585,6 +585,35 @@ test('canonical Antigravity transcript reader merges full rows with compact-only
   }
 });
 
+test('canonical Antigravity transcript reader does not duplicate unindexed rows present in both files', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-canonical-unindexed-'));
+  const sessionId = 'canonical-unindexed-session';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(transcriptDir, { recursive: true });
+  await fs.writeFile(path.join(transcriptDir, 'transcript.jsonl'), [
+    JSON.stringify({ type: 'CHECKPOINT', content: 'checkpoint-0' }),
+    JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', content: 'compact reply' }),
+  ].join('\n'));
+  await fs.writeFile(path.join(transcriptDir, 'transcript_full.jsonl'), [
+    JSON.stringify({ type: 'CHECKPOINT', content: 'checkpoint-0' }),
+    JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', content: 'full reply' }),
+    JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', content: 'full extra' }),
+  ].join('\n'));
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const rows = await readCanonicalAntigravityTranscript(sessionId);
+    assert.deepEqual(rows.map((row) => [row.entry.step_index, row.entry.content]), [
+      [undefined, 'checkpoint-0'],
+      [1, 'full reply'],
+      [2, 'full extra'],
+    ]);
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('AntigravitySessionsProvider fetchHistory renders replies and tool results from transcript fixtures', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-data-'));
   const sessionId = 'hist-sess-1';

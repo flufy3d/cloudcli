@@ -6,7 +6,7 @@
  * sessionMessagePagination.ts / sessionMessageReconciliation.ts.
  */
 
-import type { NormalizedMessage } from '@/modules/chat/hooks/useSessionStore';
+import type { NormalizedMessage } from '@/shared/types';
 
 export function readMessageTime(m: NormalizedMessage): number | null {
   const time = Date.parse(m.timestamp);
