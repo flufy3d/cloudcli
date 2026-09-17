@@ -192,6 +192,41 @@ function dispatchEventChunk(state: ServerState, chunk: string): void {
   }
 }
 
+/**
+ * Force-terminates the shared server and every process underneath it.
+ *
+ * On Windows `cross-spawn` launches `opencode` through a `cmd.exe` wrapper, so
+ * the child handle points at `cmd.exe` and a plain `kill` would orphan the real
+ * `opencode.exe` and its MCP children. `taskkill /T` walks that tree; POSIX
+ * needs only the direct child.
+ *
+ * Consumers: `startOpenCodeServer` (failed startup), `releaseOpenCodeServer`
+ * (idle shutdown), and `shutdownOpenCodeServer` (server shutdown/tests).
+ */
+function killOpenCodeServerProcess(child: ChildProcess): void {
+  if (child.pid === undefined || child.exitCode !== null) {
+    return;
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      crossSpawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      return;
+    } catch {
+      // Fall through to the direct kill below.
+    }
+  }
+
+  try {
+    child.kill();
+  } catch {
+    // Already gone.
+  }
+}
+
 async function startOpenCodeServer(): Promise<ServerState> {
   const port = await reserveLoopbackPort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -200,6 +235,9 @@ async function startOpenCodeServer(): Promise<ServerState> {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
+    // Windows routes `opencode` through a `cmd.exe` wrapper (it is a `.cmd`
+    // shim); without this every launch pops an interactive console window.
+    windowsHide: true,
   });
 
   // Drain both pipes: an unread stream back-pressures the child and stalls it.
@@ -212,11 +250,7 @@ async function startOpenCodeServer(): Promise<ServerState> {
   try {
     await waitForServer(baseUrl, headers, child);
   } catch (error) {
-    try {
-      child.kill();
-    } catch {
-      // Already gone.
-    }
+    killOpenCodeServerProcess(child);
     const detail = stderrTail.trim() ? `: ${stderrTail.trim().split('\n').slice(-3).join(' | ')}` : '';
     throw new Error(`${error instanceof Error ? error.message : String(error)}${detail}`);
   }
@@ -291,11 +325,7 @@ export function releaseOpenCodeServer(): void {
     }
     serverState = null;
     state.streamAbort.abort();
-    try {
-      state.process.kill();
-    } catch {
-      // Already gone.
-    }
+    killOpenCodeServerProcess(state.process);
   }, SERVER_IDLE_SHUTDOWN_MS);
   state.idleTimer.unref?.();
 }
@@ -547,7 +577,13 @@ export async function rejectOpenCodeQuestion(
   }
 }
 
-/** Test hook: tears the shared server down immediately. */
+/**
+ * Tears the shared server down immediately, cancelling its idle timer.
+ *
+ * Consumers: the server entrypoint (server/index.ts) during shutdown, so a
+ * restart does not leave `opencode serve` (and its taskkill-invisible children)
+ * running, plus tests that need a clean slate.
+ */
 export function shutdownOpenCodeServer(): void {
   const state = serverState;
   serverState = null;
@@ -559,9 +595,5 @@ export function shutdownOpenCodeServer(): void {
     clearTimeout(state.idleTimer);
   }
   state.streamAbort.abort();
-  try {
-    state.process.kill();
-  } catch {
-    // Already gone.
-  }
+  killOpenCodeServerProcess(state.process);
 }

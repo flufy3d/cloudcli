@@ -16,6 +16,7 @@ import {
     initializeSessionsWatcher,
     providerRuntimeService,
     sessionsAutoArchiveService,
+    shutdownOpenCodeServer,
     shutdownZCodeRuntime,
 } from '@/modules/providers/index.js';
 import { createWebSocketServer } from '@/modules/websocket/index.js';
@@ -424,6 +425,11 @@ async function startServer() {
                 await shutdownZCodeRuntime();
             } catch (err) {
                 console.error('[ZCode] Error during protocol client shutdown:', getErrorMessage(err));
+            }
+            try {
+                shutdownOpenCodeServer();
+            } catch (err) {
+                console.error('[OpenCode] Error stopping shared server during shutdown:', getErrorMessage(err));
             }
             process.exit(0);
         };
