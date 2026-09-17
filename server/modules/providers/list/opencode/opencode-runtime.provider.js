@@ -1,5 +1,6 @@
 import fsSync from 'node:fs';
 import net from 'node:net';
+import { spawnSync } from 'node:child_process';
 
 import crossSpawn from 'cross-spawn';
 import Database from 'better-sqlite3';
@@ -53,6 +54,36 @@ export function resolveOpenCodePermissionOptions(permissionMode) {
       return { args: [], env: { OPENCODE_PERMISSION: JSON.stringify({ edit: 'allow' }) } };
     default:
       return { args: [], env: {} };
+  }
+}
+
+/**
+ * Kills a spawned CLI process and everything it started.
+ *
+ * `cross-spawn` resolves `opencode` through the Windows `.cmd` shim, so the
+ * handle it hands back is cmd.exe: killing that leaves the real opencode.exe
+ * (and any server it hosts) running, holding the port and the project
+ * instance. `taskkill /T` walks the whole tree; POSIX children take the
+ * signal directly.
+ */
+function killProcessTree(child) {
+  if (!child) {
+    return;
+  }
+
+  if (process.platform === 'win32' && child.pid) {
+    try {
+      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      return;
+    } catch {
+      // Fall through to the plain kill.
+    }
+  }
+
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // Already gone.
   }
 }
 
@@ -368,7 +399,7 @@ function abortOpenCodeSession(sessionId) {
   // The abort handler sends the terminal complete (aborted: true); flag the
   // process so its close handler does not emit a second one.
   process.aborted = true;
-  process.kill('SIGTERM');
+  killProcessTree(process);
   activeOpenCodeProcesses.delete(sessionId);
   return true;
 }
@@ -540,7 +571,7 @@ async function compactOpenCodeSession(options = {}, ws, context) {
     }
     throw error;
   } finally {
-    serverProcess.kill('SIGTERM');
+    killProcessTree(serverProcess);
   }
 }
 

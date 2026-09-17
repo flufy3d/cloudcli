@@ -29,7 +29,8 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`），�
 - **回退镜像**：`src/shared/providerCatalogFallback.ts` 只用于首屏与请求失败兜底，由 parity 测试钉住与后端一致；**其 key 顺序是全应用引擎规范顺序**（一处改动不要在别处另排顺序）。
 - 本地选择持久化为 `<provider>-model` / `<provider>-effort`（`useChatProviderState` 直接读写 localStorage，设备本地，不经 preference store）。
 - 引擎外观：`src/shared/providerDisplay.ts`（显示名）、`src/shared/ui/LLMProviderLogo.tsx`（Logo）。
-- 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染（slash 菜单同理：`/compact` 仅在 `supportsCompaction` 为真时出现）。
+- 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染（slash 菜单同理：`/compact` 仅在 `supportsCompaction` 为真时出现，能力为真时前端发 `chat.compact` 帧并**不**落乐观用户气泡）。
+- **上下文占用展示**：`tokenBudget`（WS `token_budget` 指令 / 历史页 `tokenUsage`）同时喂 composer 徽章与 `/cost` 弹窗。字段语义与来源全在后端 `ProviderTokenUsageResult`（见 [providers.md](./providers.md)），前端不按引擎分支：`total` 存在时徽章在 `used` 后显示 `xx%`（引擎自报 `percentage` 优先，否则 `used/total`），`cumulative` 只在 `/cost` 里单列。
 
 ## 性能守则（硬约束，都是踩过坑的）
 

@@ -123,9 +123,10 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsEffort: true,
     supportsMessageEditing: false,
     supportsSessionForking: false,
-    // `agy` expands slash commands in print mode (the behavior its
-    // --disable-slash-commands flag suppresses), so /compact runs as a turn.
-    supportsCompaction: true,
+    // Verified against agy 1.1.x: print mode passes `/compact` through to the
+    // model ("not a built-in slash command"), and the CLI has no compaction
+    // subcommand or flag. Slash expansion only covers skills/custom commands.
+    supportsCompaction: false,
   },
 };
 

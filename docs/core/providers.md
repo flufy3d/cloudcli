@@ -51,7 +51,7 @@
 | zcode | 消息级累计 | 无 | 无窗口，不显示百分比 |
 | cursor | 无 `getTokenUsage` 切面 | — | `supportsTokenUsage: false` |
 
-**`/compact` 的引擎实现**（能力开关是 runtime 可选切面 `compact`）：claude 把 `/compact` 当输入流的一条用户消息（CLI 按 local slash command 执行）；opencode 临时拉起 `opencode serve`（回环随机端口），调用 CLI 自己的压缩原语 `POST /session/:id/summarize`（TUI `/compact` 用的同一条路；`run --command` 只认用户配置命令，实测内置 `/compact` 会 500），payload 取 opencode.db 里会话行 `model` 列的 providerID/modelID；codex 走 app-server JSON-RPC `thread/resume` + `thread/compact/start`（`list/codex/codex-app-server.client.ts`）；antigravity 在 print 模式发 `/compact`（agy 的 `--disable-slash-commands` 反向证明 print 模式会展开 slash）。zcode / cursor 不实现，菜单按能力矩阵隐藏。
+**`/compact` 的引擎实现**（能力开关是 runtime 可选切面 `compact`）：claude 把 `/compact` 当输入流的一条用户消息（SDK 按 local slash command 执行，实测可通过 `Query.getContextUsage()` 复核）；opencode 临时拉起 `opencode serve`（回环随机端口），调用 CLI 自己的压缩原语 `POST /session/:id/summarize`（TUI `/compact` 用的同一条路；`run --command` 只认用户配置命令，实测内置 `/compact` 会 500），payload 取 opencode.db 里会话行 `model` 列的 providerID/modelID；codex 走 app-server JSON-RPC `thread/resume`（必须带出 turns，摘要器要读被替换的对话）+ `thread/compact/start`，并且**要等压缩回合完成通知**（`item/completed` 的 `contextCompaction` 或 `turn/completed`）才能杀掉子进程，否则摘要只存在于内存里（`list/codex/codex-app-server.client.ts`）。antigravity 实测**不支持**：agy print 模式把 `/compact` 当普通 prompt 透传（"not a built-in slash command"），且 CLI 无压缩子命令。zcode / cursor 同样不实现，菜单按能力矩阵隐藏。
 
 ## 共享基础设施（写新引擎前先看）
 
