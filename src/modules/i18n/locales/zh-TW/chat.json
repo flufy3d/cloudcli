@@ -268,7 +268,12 @@
     }
   },
   "misc": {
-    "needsInput": "需要你的輸入"
+    "needsInput": "需要你的輸入",
+    "selectAllThatApply": "可多選",
+    "other": "其他…",
+    "back": "上一步",
+    "next": "下一步",
+    "submit": "提交"
   },
   "export": {
     "trigger": "匯出對話",

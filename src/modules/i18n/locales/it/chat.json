@@ -224,6 +224,14 @@
       "cancel": "Annulla"
     }
   },
+  "misc": {
+    "needsInput": "L'assistente attende una risposta",
+    "selectAllThatApply": "Seleziona tutte le opzioni applicabili",
+    "other": "Altro...",
+    "back": "Indietro",
+    "next": "Avanti",
+    "submit": "Invia"
+  },
   "export": {
     "trigger": "Esporta conversazione",
     "heading": "Esporta come",

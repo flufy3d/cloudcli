@@ -224,6 +224,14 @@
       "cancel": "İptal"
     }
   },
+  "misc": {
+    "needsInput": "Asistan yanıtınızı bekliyor",
+    "selectAllThatApply": "Geçerli olanların tümünü seçin",
+    "other": "Diğer...",
+    "back": "Geri",
+    "next": "İleri",
+    "submit": "Gönder"
+  },
   "export": {
     "trigger": "Sohbeti dışa aktar",
     "heading": "Şu biçimde dışa aktar",

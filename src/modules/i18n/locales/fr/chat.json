@@ -226,6 +226,14 @@
       "cancel": "Annuler"
     }
   },
+  "misc": {
+    "needsInput": "L'assistant attend votre réponse",
+    "selectAllThatApply": "Sélectionnez tout ce qui s'applique",
+    "other": "Autre...",
+    "back": "Retour",
+    "next": "Suivant",
+    "submit": "Envoyer"
+  },
   "export": {
     "trigger": "Exporter la conversation",
     "heading": "Exporter en",

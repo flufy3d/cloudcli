@@ -224,6 +224,14 @@
       "cancel": "Abbrechen"
     }
   },
+  "misc": {
+    "needsInput": "Der Assistent benötigt deine Eingabe",
+    "selectAllThatApply": "Mehrere auswählbar",
+    "other": "Sonstiges...",
+    "back": "Zurück",
+    "next": "Weiter",
+    "submit": "Senden"
+  },
   "export": {
     "trigger": "Unterhaltung exportieren",
     "heading": "Exportieren als",
