@@ -631,6 +631,89 @@ test('token usage reports the newest assistant message context plus the model wi
   }
 });
 
+test('token usage reports a compaction reset instead of the pre-compaction context', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-compacted-usage-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await createOpenCodeDatabase(tempRoot, workspacePath);
+    await seedCurrentOpenCodeUsage(tempRoot, { contextLimit: 1_000_000 });
+
+    const databasePath = path.join(tempRoot, '.local', 'share', 'opencode', 'opencode.db');
+    const insertAssistantMessage = (id: string, timeCreated: number, info: Record<string, unknown>) => {
+      const db = new Database(databasePath);
+      try {
+        db.prepare(
+          'INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)',
+        ).run(id, 'open-session-1', timeCreated, timeCreated, JSON.stringify(info));
+      } finally {
+        db.close();
+      }
+    };
+
+    // A compaction summary carries the whole pre-compaction conversation as its
+    // request usage; reporting it as current occupancy is exactly backwards.
+    insertAssistantMessage('message-summary', 1_700_000_010_000, {
+      role: 'assistant',
+      summary: true,
+      modelID: 'deepseek-v4.1-flash',
+      providerID: 'opencode-go',
+      tokens: {
+        total: 319_336,
+        input: 312_690,
+        output: 6_646,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+    });
+
+    const provider = new OpenCodeSessionsProvider();
+    const usageInput = {
+      appSessionId: 'app-1',
+      nativeSessionId: 'open-session-1',
+      jsonlPath: null,
+      projectPath: null,
+    };
+
+    assert.deepEqual(await provider.getTokenUsage(usageInput), {
+      used: 0,
+      total: 1_000_000,
+      inputTokens: 0,
+      outputTokens: 0,
+      breakdown: { input: 0, output: 0 },
+      compacted: true,
+      cumulative: { used: 42, inputTokens: 13, outputTokens: 20 },
+    });
+
+    // The next real turn is the first record that knows the compacted context,
+    // so it becomes the reported occupancy and clears the reset flag.
+    insertAssistantMessage('message-after-compaction', 1_700_000_020_000, {
+      role: 'assistant',
+      modelID: 'deepseek-v4.1-flash',
+      providerID: 'opencode-go',
+      tokens: {
+        total: 900,
+        input: 600,
+        output: 100,
+        reasoning: 0,
+        cache: { read: 200, write: 0 },
+      },
+    });
+
+    const afterCompaction = await provider.getTokenUsage(usageInput);
+    assert.equal(afterCompaction?.used, 900);
+    assert.equal(afterCompaction?.total, 1_000_000);
+    assert.equal(afterCompaction?.compacted, undefined);
+    assert.equal(afterCompaction?.inputTokens, 800);
+    assert.equal(afterCompaction?.outputTokens, 100);
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('token usage falls back to the cumulative columns when the model cache has no window', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-context-window-missing-'));
   const workspacePath = path.join(tempRoot, 'workspace');
