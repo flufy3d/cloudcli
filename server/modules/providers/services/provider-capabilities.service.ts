@@ -36,6 +36,13 @@ export type ProviderCapabilities = {
    * summary.
    */
   supportsCompaction: boolean;
+  /**
+   * Whether replacing an already-sent message also reverts the files the
+   * agent changed, so the composer warns about it. Static per provider: a
+   * transcript either has file side effects to undo (OpenCode's revert) or
+   * does not (Claude's resume, Codex's fork).
+   */
+  editRevertsFiles: boolean;
 };
 
 /**
@@ -72,6 +79,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     supportsMessageEditing: typeof provider.sessions?.resolveEditAnchor === 'function',
     supportsSessionForking: provider.fork !== undefined,
     supportsCompaction: typeof provider.runtime?.compact === 'function',
+    editRevertsFiles: catalog.editRevertsFiles,
   };
 }
 

@@ -220,6 +220,7 @@
     "editing": {
       "title": "Önceki bir mesaj değiştiriliyor",
       "filesNotReverted": "zaten değiştirilen dosyalar geri alınmaz",
+      "filesReverted": "zaten değiştirilen dosyalar da geri alınır",
       "cancel": "İptal"
     }
   },

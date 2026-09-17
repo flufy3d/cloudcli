@@ -70,6 +70,7 @@ function ChatInterface({
     setProviderModel,
     supportsMessageEditing,
     supportsSessionForking,
+    editRevertsFiles,
     currentProviderEffort,
     currentProviderEffortOptions,
     currentProviderModel,
@@ -529,6 +530,7 @@ function ChatInterface({
           onTextareaInput={handleTextareaInput}
           isInputFocused={isInputFocused}
           isEditingSentMessage={Boolean(editingAnchorId)}
+          editRevertsFiles={editRevertsFiles}
           onCancelEditMessage={cancelEditMessage}
           scheduledMessages={scheduledMessages}
           onScheduleMessage={handleScheduleMessage}

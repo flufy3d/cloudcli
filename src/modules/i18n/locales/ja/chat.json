@@ -207,6 +207,7 @@
     "editing": {
       "title": "以前のメッセージを置き換えています",
       "filesNotReverted": "変更済みのファイルは元に戻りません",
+      "filesReverted": "変更済みのファイルも元に戻ります",
       "cancel": "キャンセル"
     }
   },

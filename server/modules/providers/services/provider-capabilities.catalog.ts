@@ -46,6 +46,13 @@ export type ProviderCatalogEntry = {
   supportsAbort: boolean;
   /** Whether the provider runtime can accept model-level reasoning effort. */
   supportsEffort: boolean;
+  /**
+   * Whether replacing an already-sent message also reverts the files the
+   * agent changed. Claude resumes a transcript partway and Codex forks one,
+   * so neither touches files; OpenCode's `rewindSession` marks a server-side
+   * revert that restores the snapshot files along with the conversation.
+   */
+  editRevertsFiles: boolean;
 };
 
 export const PROVIDER_CATALOG = {
@@ -57,6 +64,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    editRevertsFiles: false,
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -66,6 +74,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: false,
+    editRevertsFiles: false,
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -75,6 +84,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    editRevertsFiles: false,
   },
   opencode: {
     // Mapped by the runtime onto OpenCode's controls: the `plan` agent for plan,
@@ -88,6 +98,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    editRevertsFiles: true,
   },
   zcode: {
     // Mapped by the runtime onto ZCode's session/setMode modes: build
@@ -104,6 +115,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    editRevertsFiles: false,
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -113,5 +125,6 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    editRevertsFiles: false,
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;

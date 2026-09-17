@@ -92,6 +92,8 @@ type ChatComposerProps = {
   onEditQueuedDraft: () => void;
   /** True while the composer is editing an already-sent message (edit & resend). */
   isEditingSentMessage: boolean;
+  /** Whether editing also reverts the files the agent changed, so the banner can say which. */
+  editRevertsFiles: boolean;
   onCancelEditMessage: () => void;
   scheduledMessages: ScheduledMessage[];
   onScheduleMessage: (scheduledFor: Date) => void;
@@ -163,6 +165,7 @@ function ChatComposer({
   queuedDraft,
   onEditQueuedDraft,
   isEditingSentMessage,
+  editRevertsFiles,
   onCancelEditMessage,
   scheduledMessages,
   onScheduleMessage,
@@ -312,7 +315,9 @@ function ChatComposer({
           <span className="min-w-0 flex-1">
             {t('composer.editing.title')}
             {' — '}
-            <span className="text-muted-foreground">{t('composer.editing.filesNotReverted')}</span>
+            <span className="text-muted-foreground">
+              {t(editRevertsFiles ? 'composer.editing.filesReverted' : 'composer.editing.filesNotReverted')}
+            </span>
           </span>
           <button
             type="button"

@@ -155,6 +155,7 @@
     "editing": {
       "title": "Replacing an earlier message",
       "filesNotReverted": "files the agent already changed are not reverted",
+      "filesReverted": "files the agent changed are also reverted",
       "cancel": "Cancel"
     }
   },
@@ -349,6 +350,7 @@
     "copyCommand": "Copy command",
     "runningTask": "Running task",
     "userAskedRevise": "User asked to revise the plan",
+    "needsInput": "The assistant needs your input",
     "typeAnswer": "Type your answer...",
     "skipOne": "Skip",
     "skipAll": "Skip all",

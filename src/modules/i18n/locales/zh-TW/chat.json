@@ -263,8 +263,12 @@
     "editing": {
       "title": "正在取代先前的訊息",
       "filesNotReverted": "已修改的檔案不會還原",
+      "filesReverted": "已修改的檔案也會一併還原",
       "cancel": "取消"
     }
+  },
+  "misc": {
+    "needsInput": "需要你的輸入"
   },
   "export": {
     "trigger": "匯出對話",

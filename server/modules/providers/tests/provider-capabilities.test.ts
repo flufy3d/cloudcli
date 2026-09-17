@@ -46,6 +46,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // The Agent SDK processes `/compact` from the held input stream, which is
     // exactly what the runtime's compact primitive feeds it.
     supportsCompaction: true,
+    editRevertsFiles: false,
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -59,6 +60,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsMessageEditing: false,
     supportsSessionForking: false,
     supportsCompaction: false,
+    editRevertsFiles: false,
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -77,6 +79,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsSessionForking: true,
     // `thread/compact/start` on the same app-server transport the fork rides.
     supportsCompaction: true,
+    editRevertsFiles: false,
   },
   opencode: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -97,6 +100,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsSessionForking: true,
     // `opencode run --command compact` runs the CLI's own compaction command.
     supportsCompaction: true,
+    editRevertsFiles: true,
   },
   zcode: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -117,6 +121,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsMessageEditing: false,
     supportsSessionForking: false,
     supportsCompaction: false,
+    editRevertsFiles: false,
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -133,6 +138,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // model ("not a built-in slash command"), and the CLI has no compaction
     // subcommand or flag. Slash expansion only covers skills/custom commands.
     supportsCompaction: false,
+    editRevertsFiles: false,
   },
 };
 

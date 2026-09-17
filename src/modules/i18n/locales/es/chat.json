@@ -141,6 +141,7 @@
     "editing": {
       "title": "Reemplazando un mensaje anterior",
       "filesNotReverted": "los archivos ya modificados no se revierten",
+      "filesReverted": "los archivos ya modificados también se revierten",
       "cancel": "Cancelar"
     }
   },

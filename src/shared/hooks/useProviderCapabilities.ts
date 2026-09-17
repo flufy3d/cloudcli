@@ -27,6 +27,8 @@ export type ProviderCapabilities = {
   supportsEffort?: boolean;
   supportsMessageEditing?: boolean;
   supportsSessionForking?: boolean;
+  /** Whether replacing an already-sent message also reverts the files the agent changed. */
+  editRevertsFiles?: boolean;
   /** Whether the provider runtime can compact a session's context on demand (`/compact`). */
   supportsCompaction?: boolean;
 };

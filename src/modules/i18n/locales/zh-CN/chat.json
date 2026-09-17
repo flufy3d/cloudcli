@@ -248,8 +248,12 @@
     "editing": {
       "title": "正在替换先前的消息",
       "filesNotReverted": "已修改的文件不会被还原",
+      "filesReverted": "已修改的文件也会一并还原",
       "cancel": "取消"
     }
+  },
+  "misc": {
+    "needsInput": "需要你的输入"
   },
   "export": {
     "trigger": "导出对话",

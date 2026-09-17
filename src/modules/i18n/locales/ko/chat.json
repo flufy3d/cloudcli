@@ -241,6 +241,7 @@
     "editing": {
       "title": "이전 메시지를 교체하는 중",
       "filesNotReverted": "이미 변경된 파일은 되돌리지 않습니다",
+      "filesReverted": "이미 변경된 파일도 함께 되돌립니다",
       "cancel": "취소"
     }
   },
