@@ -49,12 +49,14 @@
 | --- | --- | --- | --- |
 | claude | 最新一条主线程 assistant 的 `input + cache_read + cache_creation + output`；每回合结束再用 SDK `Query.getContextUsage({detail:'summary'})` 覆盖（带 `percentage`） | 同一次 SDK 调用的真实 autocompact 窗口；历史页按模型 id 含 `[1m]` 定 1M，否则 200k（`services/claude-usage.ts`） | SDK 会执行输入流里的 `/compact`，无需额外协议 |
 | codex | rollout `token_count.info.last_token_usage`（live 用 `turn.completed.usage`） | `model_context_window` | 旧的 `total_token_usage` 只作 `cumulative` |
-| opencode | 最新 assistant 消息的 `tokens.total` | `~/.cache/opencode/models.json` 的 `limit.context`（`list/opencode/opencode-context-usage.ts`，按 path+mtime+size 记忆化） | 会话列（`tokens_*`）是累计值，只作 `cumulative` |
+| opencode | 最新 assistant 消息的 `tokens.total` | `~/.cache/opencode/models.json` 的 `limit.context`（`list/opencode/opencode-context-usage.ts`，按 path+mtime+size 记忆化） | 会话列（`tokens_*`）是累计值，只作 `cumulative`；压缩摘要消息（`summary: true`）跳过 |
 | antigravity | live usageRecord 的 total | 1M（硬编码） | 同值持久化到 brain `token_usage.json` |
 | zcode | 消息级累计 | 无 | 无窗口，不显示百分比 |
 | cursor | 无 `getTokenUsage` 切面 | — | `supportsTokenUsage: false` |
 
 **`/compact` 的引擎实现**（能力开关是 runtime 可选切面 `compact`）：claude 把 `/compact` 当输入流的一条用户消息（SDK 按 local slash command 执行，实测可通过 `Query.getContextUsage()` 复核）；opencode 临时拉起 `opencode serve`（回环随机端口），调用 CLI 自己的压缩原语 `POST /session/:id/summarize`（TUI `/compact` 用的同一条路；`run --command` 只认用户配置命令，实测内置 `/compact` 会 500），payload 取 opencode.db 里会话行 `model` 列的 providerID/modelID；codex 走 app-server JSON-RPC `thread/resume`（必须带出 turns，摘要器要读被替换的对话）+ `thread/compact/start`，并且**要等压缩回合完成通知**（`item/completed` 的 `contextCompaction` 或 `turn/completed`）才能杀掉子进程，否则摘要只存在于内存里（`list/codex/codex-app-server.client.ts`）。antigravity 实测**不支持**：agy print 模式把 `/compact` 当普通 prompt 透传（"not a built-in slash command"），且 CLI 无压缩子命令。zcode / cursor 同样不实现，菜单按能力矩阵隐藏。
+
+压缩**刚结束的那一刻占用不可知**（opencode 的摘要消息带的是刚被压缩掉的旧对话用量，实测 319k；真实占用要等下一个回合），所以 `ProviderTokenUsageResult` 用 `compacted: true` + `used: 0` 表达"已重置、数字未知"，前端据此把徽章清空而不是继续挂着旧数字（`readTokenBudgetFromUsage`），下一个回合拿到真实值再显示。
 
 ## 共享基础设施（写新引擎前先看）
 

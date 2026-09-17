@@ -143,6 +143,14 @@ export type ProviderTokenUsageResult = {
    * of computing `used / total`.
    */
   percentage?: number;
+  /**
+   * The session was compacted and the engine has not reported the resulting
+   * occupancy yet (OpenCode only learns it when the next turn runs, so its
+   * newest record still describes the PRE-compaction conversation). `used` is
+   * zero and carries no meaning; consumers show "unknown until the next turn"
+   * instead of the stale number.
+   */
+  compacted?: boolean;
   unsupported?: boolean;
   message?: string;
 };

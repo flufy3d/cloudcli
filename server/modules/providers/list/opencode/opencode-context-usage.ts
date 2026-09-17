@@ -161,6 +161,13 @@ const aggregateOpenCodeSessionTokenUsage = (
  * matters — summing them (the session's cumulative columns) counts the same
  * prefix once per turn and inflates the number by orders of magnitude.
  *
+ * Compaction summaries (`summary: true` on an assistant message) are skipped:
+ * their `tokens` describe the summarization request, i.e. the whole
+ * PRE-compaction conversation, so reporting them as current occupancy is
+ * exactly wrong. When such a summary is the newest record, `compacted` is set:
+ * OpenCode only learns the post-compaction occupancy once the next turn runs,
+ * so there is no number to report yet.
+ *
  * Returns null for message shapes that predate `tokens.total`, so callers can
  * fall back to the cumulative columns.
  */
@@ -168,6 +175,7 @@ const readLatestOpenCodeMessageUsage = (
   db: Database.Database,
   sessionId: string,
 ): {
+  compacted: boolean;
   providerId: string | null;
   modelId: string | null;
   inputTokens: number;
@@ -178,9 +186,29 @@ const readLatestOpenCodeMessageUsage = (
 } | null => {
   const rows = db.prepare('SELECT data FROM message WHERE session_id = ? ORDER BY time_created DESC').all(sessionId) as { data: string }[];
 
+  // Rows are newest-first, so any summary seen before the first usable
+  // assistant record is newer than it: compaction is the session's tip.
+  let sawNewerCompaction = false;
+  let latest = null as {
+    providerId: string | null;
+    modelId: string | null;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    used: number;
+  } | null;
+
   for (const row of rows) {
     const info = readJsonRecord(row.data);
-    if (readOptionalString(info?.role) !== 'assistant') {
+    const role = readOptionalString(info?.role);
+    const isCompactionSummary = role === 'assistant' && info?.summary === true;
+    if (isCompactionSummary) {
+      sawNewerCompaction = true;
+      continue;
+    }
+
+    if (role !== 'assistant') {
       continue;
     }
 
@@ -204,7 +232,7 @@ const readLatestOpenCodeMessageUsage = (
       modelId = modelParts.join('/');
     }
 
-    return {
+    latest = {
       providerId,
       modelId,
       inputTokens: readUsageNumber(tokens.input) + cacheReadTokens + cacheWriteTokens,
@@ -213,9 +241,25 @@ const readLatestOpenCodeMessageUsage = (
       cacheWriteTokens,
       used,
     };
+    break;
   }
 
-  return null;
+  if (!latest) {
+    return sawNewerCompaction
+      ? {
+          compacted: true,
+          providerId: null,
+          modelId: null,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          used: 0,
+        }
+      : null;
+  }
+
+  return { compacted: sawNewerCompaction, ...latest };
 };
 
 /**
@@ -274,6 +318,12 @@ const readOpenCodeContextWindow = (providerId: string, modelId: string): number 
  * Falls back to the cumulative columns unchanged for sessions whose messages
  * predate `tokens.total`.
  *
+ * Right after a compaction the window carries `compacted: true` and no
+ * occupancy: the newest record is the summary of the conversation that was
+ * just replaced, so any number taken from it (or from the turns before it)
+ * describes the context the user just got rid of. The next turn reports the
+ * real occupancy.
+ *
  * Consumers: the sessions provider (`fetchHistory` / `getTokenUsage`) and the
  * runtime's end-of-turn token-budget frame.
  */
@@ -291,20 +341,34 @@ export function readOpenCodeContextUsage(
     ? readOpenCodeContextWindow(latest.providerId, latest.modelId)
     : undefined;
 
+  const cumulativePayload = cumulative
+    ? {
+        cumulative: {
+          used: readUsageNumber(cumulative.used),
+          inputTokens: readUsageNumber(cumulative.inputTokens),
+          outputTokens: readUsageNumber(cumulative.outputTokens),
+        },
+      }
+    : {};
+
+  if (latest.compacted) {
+    return {
+      used: 0,
+      ...(contextWindow ? { total: contextWindow } : {}),
+      inputTokens: 0,
+      outputTokens: 0,
+      breakdown: { input: 0, output: 0 },
+      compacted: true,
+      ...cumulativePayload,
+    };
+  }
+
   return {
     used: latest.used,
     ...(contextWindow ? { total: contextWindow } : {}),
     inputTokens: latest.inputTokens,
     outputTokens: latest.outputTokens,
     breakdown: { input: latest.inputTokens, output: latest.outputTokens },
-    ...(cumulative
-      ? {
-          cumulative: {
-            used: readUsageNumber(cumulative.used),
-            inputTokens: readUsageNumber(cumulative.inputTokens),
-            outputTokens: readUsageNumber(cumulative.outputTokens),
-          },
-        }
-      : {}),
+    ...cumulativePayload,
   };
 }
