@@ -313,6 +313,7 @@
     "contextUsage": "Context usage",
     "usedPercent": "{{percent}}% used",
     "cumulativeTokens": "Cumulative tokens",
+    "compactedSummary": "Compaction summary",
     "quotaTitle": "Account Quota & Rate Limits",
     "updatedAt": "Updated at {{time}}",
     "refresh": "Refresh",
@@ -366,6 +367,7 @@
     "userDeniedTool": "User denied tool use",
     "showTokenUsage": "Show token usage",
     "contextUsedPercent": "{{percent}}% of the context window used",
+    "compactedSummarySize": "Compaction summary · {{size}}",
     "compactNoSession": "Start a conversation before compacting its context.",
     "commandDescriptions": {
       "compact": "Summarize the conversation to free up context."

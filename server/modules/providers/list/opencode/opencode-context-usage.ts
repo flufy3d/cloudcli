@@ -176,6 +176,8 @@ const readLatestOpenCodeMessageUsage = (
   sessionId: string,
 ): {
   compacted: boolean;
+  /** Id of the newest compaction summary, whose text is the post-compaction context. */
+  summaryMessageId: string | null;
   providerId: string | null;
   modelId: string | null;
   inputTokens: number;
@@ -184,11 +186,12 @@ const readLatestOpenCodeMessageUsage = (
   cacheWriteTokens: number;
   used: number;
 } | null => {
-  const rows = db.prepare('SELECT data FROM message WHERE session_id = ? ORDER BY time_created DESC').all(sessionId) as { data: string }[];
+  const rows = db.prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created DESC').all(sessionId) as { id: string; data: string }[];
 
   // Rows are newest-first, so any summary seen before the first usable
   // assistant record is newer than it: compaction is the session's tip.
   let sawNewerCompaction = false;
+  let summaryMessageId: string | null = null;
   let latest = null as {
     providerId: string | null;
     modelId: string | null;
@@ -205,6 +208,7 @@ const readLatestOpenCodeMessageUsage = (
     const isCompactionSummary = role === 'assistant' && info?.summary === true;
     if (isCompactionSummary) {
       sawNewerCompaction = true;
+      summaryMessageId = summaryMessageId ?? row.id;
       continue;
     }
 
@@ -248,6 +252,7 @@ const readLatestOpenCodeMessageUsage = (
     return sawNewerCompaction
       ? {
           compacted: true,
+          summaryMessageId,
           providerId: null,
           modelId: null,
           inputTokens: 0,
@@ -259,7 +264,40 @@ const readLatestOpenCodeMessageUsage = (
       : null;
   }
 
-  return { compacted: sawNewerCompaction, ...latest };
+  return { compacted: sawNewerCompaction, summaryMessageId, ...latest };
+};
+
+/**
+ * UTF-8 size of one message's text parts.
+ *
+ * After a compaction the summary's text *is* the conversation handed to the
+ * next turn, so its size is the only honest "how big is the context now"
+ * reading available before that turn reports real occupancy. The summary's own
+ * `tokens` describe the summarization request (the context that was just
+ * discarded), so they cannot be used. A database whose `part` table is missing
+ * or unreadable simply yields 0.
+ */
+const readOpenCodeMessageTextBytes = (db: Database.Database, messageId: string): number => {
+  let rows: { data: string }[];
+  try {
+    rows = db.prepare('SELECT data FROM part WHERE message_id = ?').all(messageId) as { data: string }[];
+  } catch {
+    return 0;
+  }
+
+  let bytes = 0;
+  for (const row of rows) {
+    const part = readJsonRecord(row.data);
+    if (readOptionalString(part?.type) !== 'text') {
+      continue;
+    }
+    const text = part?.text;
+    if (typeof text === 'string') {
+      bytes += Buffer.byteLength(text, 'utf8');
+    }
+  }
+
+  return bytes;
 };
 
 /**
@@ -321,8 +359,9 @@ const readOpenCodeContextWindow = (providerId: string, modelId: string): number 
  * Right after a compaction the window carries `compacted: true` and no
  * occupancy: the newest record is the summary of the conversation that was
  * just replaced, so any number taken from it (or from the turns before it)
- * describes the context the user just got rid of. The next turn reports the
- * real occupancy.
+ * describes the context the user just got rid of. What CAN be measured is the
+ * summary text itself, which is what the next turn feeds back in, so the
+ * payload carries its byte size as `summaryBytes` until a real turn lands.
  *
  * Consumers: the sessions provider (`fetchHistory` / `getTokenUsage`) and the
  * runtime's end-of-turn token-budget frame.
@@ -352,6 +391,10 @@ export function readOpenCodeContextUsage(
     : {};
 
   if (latest.compacted) {
+    const summaryBytes = latest.summaryMessageId
+      ? readOpenCodeMessageTextBytes(db, latest.summaryMessageId)
+      : 0;
+
     return {
       used: 0,
       ...(contextWindow ? { total: contextWindow } : {}),
@@ -359,6 +402,7 @@ export function readOpenCodeContextUsage(
       outputTokens: 0,
       breakdown: { input: 0, output: 0 },
       compacted: true,
+      ...(summaryBytes > 0 ? { summaryBytes } : {}),
       ...cumulativePayload,
     };
   }
