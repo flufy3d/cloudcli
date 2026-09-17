@@ -379,6 +379,37 @@ test('OpenCode sessions provider normalizes quoted live text and skips user echo
   assert.deepEqual(userEcho, []);
 });
 
+test('OpenCode sessions provider surfaces the nested live error message', () => {
+  const provider = new OpenCodeSessionsProvider();
+  // `opencode run --format json` serializes failures as
+  // `{ type: 'error', error: { name, data: { message } } }`.
+  const normalized = provider.normalizeMessage({
+    type: 'error',
+    sessionID: 'open-session-live',
+    error: {
+      name: 'UnknownError',
+      data: { message: 'Model not found: deepseek-v4.1-flash/.', ref: 'err_1234' },
+    },
+  }, null);
+
+  assert.equal(normalized.length, 1);
+  assert.equal(normalized[0]?.kind, 'error');
+  assert.equal(normalized[0]?.content, 'Model not found: deepseek-v4.1-flash/.');
+
+  const flat = provider.normalizeMessage({
+    type: 'error',
+    sessionID: 'open-session-live',
+    error: 'plain failure',
+  }, null);
+  assert.equal(flat[0]?.content, 'plain failure');
+
+  const opaque = provider.normalizeMessage({
+    type: 'error',
+    sessionID: 'open-session-live',
+  }, null);
+  assert.equal(opaque[0]?.content, 'Unknown OpenCode error');
+});
+
 test('OpenCode sessions provider reads sqlite history and token usage', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-history-'));
   const workspacePath = path.join(tempRoot, 'workspace');
