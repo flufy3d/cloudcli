@@ -45,23 +45,58 @@ function capture(cmd, args) {
   }
 }
 
+// ── 0. 更新版本号（自增第三位 patch 版本） ──────────────────
+const pkgJsonPath = path.join(REPO_ROOT, 'package.json');
+const pkgData = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+const semverParts = (pkgData.version || '1.0.0').split('.');
+if (semverParts.length >= 3) {
+  semverParts[2] = String(parseInt(semverParts[2], 10) + 1);
+  pkgData.version = semverParts.join('.');
+} else {
+  pkgData.version = `${pkgData.version || '1.0'}.1`;
+}
+fs.writeFileSync(pkgJsonPath, JSON.stringify(pkgData, null, 2) + '\n');
+console.log(`\n[deploy] 版本号自增至：v${pkgData.version}`);
+
 // ── 1. 编译 ────────────────────────────────────────────────
 run('pnpm', ['build']);
 
-// ── 2. 打包（用 pnpm pack 实际输出的路径，不手拼文件名） ───
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudcli-deploy-'));
-const packOut = capture('pnpm', ['pack', '--pack-destination', tmpDir]);
+// ── 2. 打包（存放于稳定的 ~/.cloudcli/deploy 目录，避免随机临时目录被删导致后续 pnpm ENOENT） ───
+const deployDir = path.join(os.homedir(), '.cloudcli', 'deploy');
+fs.mkdirSync(deployDir, { recursive: true });
+
+// 清理全局 package.json 中可能残留的已失效的本地 file: 路径，防止 pnpm 校验旧依赖时抛 ENOENT
+try {
+  const globalDir = path.dirname(capture('pnpm', ['root', '-g']) || '');
+  const globalPkgJson = path.join(globalDir, 'package.json');
+  if (fs.existsSync(globalPkgJson)) {
+    const pkg = JSON.parse(fs.readFileSync(globalPkgJson, 'utf8'));
+    let modified = false;
+    if (pkg.dependencies?.[APP_NAME]?.startsWith('file:')) {
+      const oldPath = pkg.dependencies[APP_NAME].slice(5);
+      if (!fs.existsSync(oldPath)) {
+        delete pkg.dependencies[APP_NAME];
+        modified = true;
+      }
+    }
+    if (modified) {
+      fs.writeFileSync(globalPkgJson, JSON.stringify(pkg, null, 2) + '\n');
+    }
+  }
+} catch {
+  // 忽略全局配置清理异常
+}
+
+const packOut = capture('pnpm', ['pack', '--pack-destination', deployDir]);
 const packLine = packOut?.split('\n').map((l) => l.trim()).filter(Boolean).pop();
 if (!packLine) {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
   fail('pnpm pack 未输出 tarball 路径');
 }
-const tarball = path.isAbsolute(packLine) ? packLine : path.join(tmpDir, path.basename(packLine));
+const tarball = path.isAbsolute(packLine) ? packLine : path.join(deployDir, path.basename(packLine));
 if (!fs.existsSync(tarball)) fail(`tarball 不存在：${tarball}`);
 
 // ── 3. 全局安装（独立静态副本，首次会编译原生依赖，较慢） ──
 run('pnpm', ['add', '-g', tarball]);
-fs.rmSync(tmpDir, { recursive: true, force: true });
 
 const globalRoot = capture('pnpm', ['root', '-g']);
 const pkgDir = path.join(globalRoot, APP_NAME);
