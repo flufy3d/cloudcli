@@ -655,6 +655,23 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
     }
     return false;
   }
+
+  /**
+   * Compacts the conversation behind one session.
+   *
+   * `agy` expands slash commands in print mode (that is what its
+   * `--disable-slash-commands` flag suppresses), so the compaction request is
+   * just the normal run path with `/compact` as the turn's text: the CLI
+   * answers with its own status events and the summary lands in the
+   * transcript the next refresh reads.
+   */
+  async compact(
+    options: AnyRecord = {},
+    writer: ProviderRuntimeWriter,
+    context: ProviderRuntimeContext,
+  ): Promise<unknown> {
+    return this.run('/compact', options, writer, context);
+  }
 }
 
 export const antigravityRuntime = new AntigravityRuntimeProvider();

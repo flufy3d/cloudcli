@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -541,6 +541,117 @@ test('getTokenUsage reads the token columns for the provider-native session', as
       }),
       { used: 42, inputTokens: 13, outputTokens: 20, breakdown: { input: 13, output: 20 } },
     );
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Rewrites the seeded assistant message into the current OpenCode shape
+ * (`tokens.total`, provider/model ids) and seeds OpenCode's model cache with a
+ * context limit for it.
+ */
+const seedCurrentOpenCodeUsage = async (
+  homeDir: string,
+  options: { messageTokens?: Record<string, unknown>; contextLimit?: number } = {},
+): Promise<void> => {
+  const db = new Database(path.join(homeDir, '.local', 'share', 'opencode', 'opencode.db'));
+  try {
+    const row = db.prepare('SELECT data FROM message WHERE id = ?').get('message-assistant') as { data: string };
+    const info = JSON.parse(row.data);
+    info.providerID = 'opencode-go';
+    info.modelID = 'deepseek-v4.1-flash';
+    info.tokens = options.messageTokens ?? {
+      total: 52_027,
+      input: 13_510,
+      output: 366,
+      reasoning: 0,
+      cache: { read: 38_151, write: 0 },
+    };
+    db.prepare('UPDATE message SET data = ? WHERE id = ?').run(JSON.stringify(info), 'message-assistant');
+  } finally {
+    db.close();
+  }
+
+  if (options.contextLimit !== undefined) {
+    const cacheDir = path.join(homeDir, '.cache', 'opencode');
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(
+      path.join(cacheDir, 'models.json'),
+      JSON.stringify({
+        'opencode-go': {
+          models: {
+            'deepseek-v4.1-flash': { limit: { context: options.contextLimit, output: 384_000 } },
+          },
+        },
+      }),
+    );
+  }
+};
+
+test('token usage reports the newest assistant message context plus the model window', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-context-usage-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await createOpenCodeDatabase(tempRoot, workspacePath);
+    await seedCurrentOpenCodeUsage(tempRoot, { contextLimit: 1_000_000 });
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('open-session-1');
+
+    assert.deepEqual(history.tokenUsage, {
+      // Newest message: total 52027 = input 13510 + output 366 + cache read
+      // 38151; inputTokens is that whole prompt (input + cache), the same
+      // convention Claude's reader uses. The seeded session columns (used 42)
+      // stay as cumulative.
+      used: 52_027,
+      total: 1_000_000,
+      inputTokens: 51_661,
+      outputTokens: 366,
+      breakdown: { input: 51_661, output: 366 },
+      cumulative: { used: 42, inputTokens: 13, outputTokens: 20 },
+    });
+
+    assert.deepEqual(
+      await provider.getTokenUsage({
+        appSessionId: 'app-1',
+        nativeSessionId: 'open-session-1',
+        jsonlPath: null,
+        projectPath: null,
+      }),
+      history.tokenUsage,
+    );
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('token usage falls back to the cumulative columns when the model cache has no window', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-context-window-missing-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await createOpenCodeDatabase(tempRoot, workspacePath);
+    await seedCurrentOpenCodeUsage(tempRoot);
+
+    const provider = new OpenCodeSessionsProvider();
+    const usage = await provider.getTokenUsage({
+      appSessionId: 'app-1',
+      nativeSessionId: 'open-session-1',
+      jsonlPath: null,
+      projectPath: null,
+    });
+
+    assert.equal(usage?.used, 52_027);
+    assert.equal(usage?.total, undefined);
+    assert.deepEqual(usage?.cumulative, { used: 42, inputTokens: 13, outputTokens: 20 });
   } finally {
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });

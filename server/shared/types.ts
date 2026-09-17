@@ -126,6 +126,23 @@ export type ProviderTokenUsageResult = {
     input: number;
     output: number;
   };
+  /**
+   * Session-lifetime token totals. `used` above reports the CURRENT context
+   * occupancy for providers whose engines can tell the two apart (codex,
+   * opencode); this field preserves the cumulative spend those endpoints used
+   * to report, for the `/cost` breakdown.
+   */
+  cumulative?: {
+    used: number;
+    inputTokens: number;
+    outputTokens: number;
+  };
+  /**
+   * Context-window usage percent as reported by the engine itself (Claude's
+   * SDK context-usage twin). When present, consumers use it directly instead
+   * of computing `used / total`.
+   */
+  percentage?: number;
   unsupported?: boolean;
   message?: string;
 };

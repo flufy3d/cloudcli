@@ -376,6 +376,19 @@ Custom commands can be created in:
     const hasTokenBreakdown = computedUsed > 0;
     const used = Math.max(reportedUsed, computedUsed);
 
+    // Providers that report the current context occupancy (codex, opencode)
+    // also ship the session's cumulative spend and the engine's own context
+    // percentage; forward both so the modal can render them.
+    const cumulativeSource = tokenUsage.cumulative;
+    const cumulative = cumulativeSource && typeof cumulativeSource === "object"
+      ? {
+          used: Number(cumulativeSource.used ?? 0) || 0,
+          inputTokens: Number(cumulativeSource.inputTokens ?? 0) || 0,
+          outputTokens: Number(cumulativeSource.outputTokens ?? 0) || 0,
+        }
+      : undefined;
+    const percentage = Number(tokenUsage.percentage ?? 0) || 0;
+
     return {
       type: "builtin",
       action: "cost",
@@ -392,6 +405,8 @@ Custom commands can be created in:
               },
             }
           : {}),
+        ...(percentage > 0 ? { percentage } : {}),
+        ...(cumulative ? { cumulative } : {}),
         provider,
         model,
       },

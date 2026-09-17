@@ -240,4 +240,20 @@ export const codexAppServer = {
       return { threadId, path };
     });
   },
+
+  /**
+   * Compacts a thread's carried conversation into a summary the next turn
+   * builds on, in place.
+   *
+   * `thread/compact/start` needs the thread loaded in the app-server, and this
+   * client spawns a fresh server per operation, so the thread is resumed
+   * first. `excludeTurns` keeps that hydration to metadata — the summary is
+   * what the next turn needs, not the turns being replaced.
+   */
+  async compactThread(input: { threadId: string }): Promise<void> {
+    return withAppServer(async (call) => {
+      await call('thread/resume', { threadId: input.threadId, excludeTurns: true });
+      await call('thread/compact/start', { threadId: input.threadId });
+    });
+  },
 };
