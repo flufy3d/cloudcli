@@ -42,7 +42,7 @@ import path from 'node:path';
 import { SESSION_LOST_METHOD } from './zcode-codec.js';
 import { protocolClient } from './zcode-protocol.client.js';
 import { ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from './zcode-live-event-normalizer.js';
-import { buildZCodeRuntimeModel, readZCodeSessionModelInfoFromDb, resolveZCodeModelRef } from './zcode-models.provider.js';
+import { buildZCodeRuntimeModel, ingestZCodeModelCatalog, readZCodeSessionModelInfoFromDb, resolveZCodeModelDefaultReasoningLevel, resolveZCodeModelRef } from './zcode-models.provider.js';
 import { EngineSilenceTimeoutError, ZCodeRunLifecycle, resolveSilenceTimeoutMs } from './zcode-run-lifecycle.js';
 import type { RunHandle, RunSettle } from './zcode-run-lifecycle.js';
 
@@ -502,6 +502,11 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
         }
       );
 
+      // `session/create` also carries the engine's resolved model catalog; feed
+      // it to the models provider so `session/setModel` can supply the
+      // reasoning level the engine requires without a second catalog request.
+      ingestZCodeModelCatalog(result);
+
       const newSessionId = readOptionalString(result?.sessionId)
         ?? readOptionalString((result?.session as AnyRecord)?.id)
         ?? readOptionalString((result?.session as AnyRecord)?.sessionId);
@@ -546,10 +551,13 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     runtimeModel?: Record<string, unknown>,
   ): Promise<boolean> {
     try {
-      await protocolClient.sendRequest('session/resume', {
+      const result = await protocolClient.sendRequest<AnyRecord>('session/resume', {
         sessionId,
         ...(runtimeModel ? { runtimeModel } : {}),
       });
+      // A resumed session carries the same settings payload as create; capture
+      // the catalog for the reasoning level required by session/setModel.
+      ingestZCodeModelCatalog(result);
       return true;
     } catch (error) {
       const code = (error as AnyRecord | undefined)?.code;
@@ -636,7 +644,25 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       return; // Session already runs the requested model and effort variant
     }
 
-    const modelObj = resolveZCodeModelRef(requestedModel, normalizedVariant);
+    const resolvedRef = resolveZCodeModelRef(requestedModel, normalizedVariant);
+
+    // The engine's setModel schema is strict: the reasoning level lives under
+    // `model.options.reasoningLevel` (a bare `variant` key is rejected), and a
+    // model with reasoning levels is refused when none is supplied. The user's
+    // explicit effort wins; otherwise use the default captured from the
+    // session/create (or session/resume) response. A resumed session created
+    // outside the app may carry no defaults yet, so fall back to the provider
+    // catalog (which resolves the engine catalog on demand).
+    let reasoningLevel = resolvedRef.variant ?? resolveZCodeModelDefaultReasoningLevel(requestedModel);
+    if (!reasoningLevel) {
+      await context.getProviderModels().catch(() => null);
+      reasoningLevel = resolveZCodeModelDefaultReasoningLevel(requestedModel);
+    }
+    const modelObj: AnyRecord = {
+      providerId: resolvedRef.providerId,
+      modelId: resolvedRef.modelId,
+      ...(reasoningLevel ? { options: { reasoningLevel } } : {}),
+    };
 
     try {
       await protocolClient.sendRequest('session/setModel', {

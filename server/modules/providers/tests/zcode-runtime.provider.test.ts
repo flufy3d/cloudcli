@@ -449,9 +449,11 @@ test('runtime configures model and reasoning effort variant', async () => {
 
   const setModelEntry = readStubLog().find((entry) => entry.name === 'setModel');
   assert.ok(setModelEntry, 'session/setModel must be called when model and effort are specified');
-  const setModelPayload = setModelEntry.value as { model: { modelId: string; variant?: string } };
+  const setModelPayload = setModelEntry.value as { model: { modelId: string; options?: { reasoningLevel?: string } } };
   assert.equal(setModelPayload.model.modelId, 'GLM-5.3');
-  assert.equal(setModelPayload.model.variant, 'high');
+  // The engine schema takes the level under `options.reasoningLevel`; a bare
+  // `variant` key is rejected.
+  assert.equal(setModelPayload.model.options?.reasoningLevel, 'high');
 });
 
 test('runtime bridges interaction/requestPermission to the chat stream and answers the engine', async () => {

@@ -8,7 +8,9 @@ import Database from 'better-sqlite3';
 
 import {
   ZCodeProviderModels,
+  ingestZCodeModelCatalog,
   readZCodeSessionModelFromDb,
+  resolveZCodeModelDefaultReasoningLevel,
   resolveZCodeModelRef,
 } from '@/modules/providers/list/zcode/zcode-models.provider.js';
 
@@ -32,7 +34,7 @@ const withZCodeStorage = async (runTest: (storageDir: string) => Promise<void>):
 
 test('getSupportedModels falls back to the builtin catalog without a config', async () => {
   await withZCodeStorage(async () => {
-    const models = new ZCodeProviderModels();
+    const models = new ZCodeProviderModels(async () => null);
     const definition = await models.getSupportedModels();
 
     assert.equal(definition.DEFAULT, 'GLM-5.3');
@@ -66,7 +68,7 @@ test('getSupportedModels parses the v2 config provider catalog', async () => {
       'utf8'
     );
 
-    const models = new ZCodeProviderModels();
+    const models = new ZCodeProviderModels(async () => null);
     const definition = await models.getSupportedModels();
 
     assert.equal(definition.OPTIONS.length, 1);
@@ -118,7 +120,7 @@ test('getSupportedModels ignores disabled providers and deduplicates model optio
       'utf8'
     );
 
-    const models = new ZCodeProviderModels();
+    const models = new ZCodeProviderModels(async () => null);
     const definition = await models.getSupportedModels();
 
     // DISABLED-ONLY should not be present; GLM-5.3 must appear exactly once
@@ -244,5 +246,67 @@ test('readZCodeSessionModelInfoFromDb returns model and variant from latest mess
       variant: 'high',
     });
   });
+});
+
+test('resolveZCodeModelRef maps a bare model through provider_config.json modelOrder', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(
+      path.join(v2Dir, 'provider_config.json'),
+      JSON.stringify({
+        config: {
+          providerConfigRules: {
+            providerRules: [
+              {
+                providerId: 'opencode-go-chat',
+                config: { modelOrder: ['deepseek-v4.1-flash'], personalModelIds: ['longcat-2.0'] },
+              },
+            ],
+          },
+        },
+      }),
+      'utf8'
+    );
+
+    assert.deepEqual(resolveZCodeModelRef('deepseek-v4.1-flash', 'high'), {
+      providerId: 'opencode-go-chat',
+      modelId: 'deepseek-v4.1-flash',
+      variant: 'high',
+    });
+    assert.deepEqual(resolveZCodeModelRef('longcat-2.0'), {
+      providerId: 'opencode-go-chat',
+      modelId: 'longcat-2.0',
+    });
+  });
+});
+
+test('ingestZCodeModelCatalog captures the engine-default reasoning level', () => {
+  ingestZCodeModelCatalog({
+    settings: {
+      model: {
+        available: [
+          {
+            ref: { providerId: 'opencode-go-chat', modelId: 'glm-5.3' },
+            label: 'glm-5.3',
+            reasoning: {
+              levels: [{ value: 'low', label: 'low' }, { value: 'max', label: 'max' }],
+              defaultLevel: 'max',
+            },
+          },
+          {
+            ref: { providerId: 'opencode-zen-chat', modelId: 'kimi-k3' },
+            label: 'kimi-k3',
+            reasoning: { levels: [{ value: 'max', label: 'max' }] },
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(resolveZCodeModelDefaultReasoningLevel('opencode-go-chat/glm-5.3'), 'max');
+  // The last level is the fallback when the engine omits a default.
+  assert.equal(resolveZCodeModelDefaultReasoningLevel('kimi-k3'), 'max');
+  assert.equal(resolveZCodeModelDefaultReasoningLevel('unknown-model'), undefined);
 });
 

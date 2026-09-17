@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { sessionsDb } from '@/modules/database/index.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
+  AnyRecord,
   ProviderCurrentActiveModel,
   ProviderModelOption,
   ProviderModelsDefinition,
@@ -17,6 +18,8 @@ import {
   readOptionalString,
 } from '@/shared/utils.js';
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
+import { tryResolveEnginePath } from './zcode-engine-path.js';
+import { protocolClient } from './zcode-protocol.client.js';
 
 /**
  * ZCode builtin models definition as fallback when config read fails.
@@ -148,6 +151,193 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
     return ZCODE_BUILTIN_MODELS;
   }
 };
+
+/**
+ * Default reasoning level per `providerId/modelId`, captured from the engine's
+ * resolved catalog. `session/setModel` rejects a model that declares reasoning
+ * levels unless one is supplied, so the runtime reads it from here when the
+ * user did not pick an explicit effort.
+ */
+let engineReasoningDefaults = new Map<string, string>();
+
+/** In-flight/settled engine catalog load, shared across providers and runs. */
+let engineCatalogPromise: Promise<ProviderModelsDefinition | null> | null = null;
+
+/**
+ * Maps an engine `session/create` (or `session/resume`) response into CloudCLI's
+ * model catalog.
+ *
+ * The engine resolves every provider from its own builtin + personal config,
+ * including user-added providers that never appear in `v2/config.json`, and
+ * returns them on the session settings as `settings.model.available`. Values
+ * are emitted as `providerId/modelId` so a bare model id shared by multiple
+ * providers stays unambiguous.
+ *
+ * Consumers: `loadEngineModelCatalog`, `PrimeZCodeModelCatalog`, and
+ * `ingestZCodeModelCatalog` (the runtime seeds it from responses it already
+ * has, avoiding a redundant create).
+ */
+function mapEngineModelCatalog(result: AnyRecord | undefined | null): ProviderModelsDefinition | null {
+  const settings = readObjectRecord(result?.settings);
+  const modelSection = readObjectRecord(settings?.model);
+  const available = modelSection?.available;
+  if (!Array.isArray(available) || available.length === 0) {
+    return null;
+  }
+
+  const options: ProviderModelOption[] = [];
+  const reasoningDefaults = new Map<string, string>();
+  const seenValues = new Set<string>();
+
+  for (const entry of available) {
+    const entryRecord = readObjectRecord(entry);
+    const ref = readObjectRecord(entryRecord?.ref);
+    const providerId = readOptionalString(ref?.providerId);
+    const modelId = readOptionalString(ref?.modelId);
+    if (!providerId || !modelId) continue;
+
+    const value = `${providerId}/${modelId}`;
+    if (seenValues.has(value)) continue;
+    seenValues.add(value);
+
+    const reasoning = readObjectRecord(entryRecord?.reasoning);
+    const effortValues: { value: string; description: string }[] = [];
+    if (Array.isArray(reasoning?.levels)) {
+      for (const level of reasoning.levels) {
+        const levelRecord = readObjectRecord(level);
+        const levelValue = readOptionalString(levelRecord?.value);
+        if (!levelValue) continue;
+        effortValues.push({
+          value: levelValue,
+          description: readOptionalString(levelRecord?.label) ?? levelValue,
+        });
+      }
+    }
+
+    const defaultLevel = readOptionalString(reasoning?.defaultLevel)
+      ?? effortValues[effortValues.length - 1]?.value;
+    if (defaultLevel) {
+      reasoningDefaults.set(value, defaultLevel);
+    }
+
+    const contextWindow = typeof entryRecord?.contextWindow === 'number' ? entryRecord.contextWindow : undefined;
+    const maxOutputTokens = typeof entryRecord?.maxOutputTokens === 'number' ? entryRecord.maxOutputTokens : undefined;
+    const providerLabel = readOptionalString(entryRecord?.providerLabel);
+
+    const descriptionParts: string[] = [];
+    if (providerLabel) descriptionParts.push(providerLabel);
+    if (contextWindow) descriptionParts.push(`${(contextWindow / 1000).toFixed(0)}K context`);
+    if (maxOutputTokens) descriptionParts.push(`${(maxOutputTokens / 1000).toFixed(0)}K output`);
+
+    options.push({
+      value,
+      label: readOptionalString(entryRecord?.label) ?? modelId,
+      ...(descriptionParts.length > 0 ? { description: descriptionParts.join(' · ') } : {}),
+      ...(effortValues.length > 0
+        ? { effort: { default: defaultLevel, values: effortValues } }
+        : {}),
+    });
+  }
+
+  if (options.length === 0) {
+    return null;
+  }
+
+  engineReasoningDefaults = reasoningDefaults;
+  return { OPTIONS: options, DEFAULT: options[0].value };
+}
+
+/**
+ * Seeds the shared reasoning-default map from a session response the runtime
+ * already received.
+ *
+ * Consumer: `server/modules/providers/list/zcode/zcode-runtime.provider.ts`
+ * (after `session/create` and `session/resume`), so `session/setModel` can
+ * supply the required reasoning level without a second catalog request.
+ */
+export function ingestZCodeModelCatalog(result: AnyRecord | undefined | null): void {
+  // Always re-map: the shared loader may have resolved to null before the
+  // engine was reachable, and this response is a fresh, authoritative catalog.
+  mapEngineModelCatalog(result);
+}
+
+/**
+ * Loads the resolved model catalog from the engine.
+ *
+ * `session/create` is the only request that returns the workspace model
+ * catalog (`settings.model.available`); the throwaway session is closed again
+ * and never persists without a message. Returns null when the engine is not
+ * installed or the response carries no catalog, so callers can fall back to
+ * the on-disk config reader.
+ *
+ * Consumers: the `ZCodeProviderModels` default loader and
+ * `primeZCodeModelCatalog`.
+ */
+async function loadEngineModelCatalog(): Promise<ProviderModelsDefinition | null> {
+  if (!tryResolveEnginePath()) {
+    return null;
+  }
+
+  try {
+    const workspacePath = getZCodeStorageDir();
+    const result = await protocolClient.sendRequest<AnyRecord>('session/create', {
+      workspace: { workspacePath, workspaceKey: workspacePath },
+    }, 15000);
+
+    const sessionId = readOptionalString(readObjectRecord(result?.session)?.sessionId);
+    if (sessionId) {
+      try {
+        await protocolClient.sendRequest('session/close', { sessionId }, 5000);
+      } catch {
+        // The throwaway session was never persisted; closing is best-effort.
+      }
+    }
+
+    return mapEngineModelCatalog(result);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns the shared engine catalog, loading it once per process.
+ *
+ * Consumers: `ZCodeProviderModels.getSupportedModels` (default loader) and
+ * `resolveZCodeModelDefaultReasoningLevel` (runtime `session/setModel`).
+ */
+export function primeZCodeModelCatalog(): Promise<ProviderModelsDefinition | null> {
+  if (!engineCatalogPromise) {
+    engineCatalogPromise = loadEngineModelCatalog();
+  }
+  return engineCatalogPromise;
+}
+
+/**
+ * Returns the engine default reasoning level for a model reference.
+ *
+ * Accepts the catalog value (`providerId/modelId`) or a bare model id; a bare
+ * id only resolves when exactly one provider exposes it, mirroring
+ * `canonicalizeProviderModel`. Consumers: the zcode runtime provider, which
+ * must include a level on `session/setModel`.
+ */
+export function resolveZCodeModelDefaultReasoningLevel(modelKey: string): string | undefined {
+  const normalized = modelKey.trim();
+  if (!normalized) return undefined;
+
+  const direct = engineReasoningDefaults.get(normalized);
+  if (direct) return direct;
+
+  const suffix = normalized.split('/').pop();
+  if (!suffix) return undefined;
+
+  let match: string | undefined;
+  for (const [key, level] of engineReasoningDefaults) {
+    if (key.split('/').pop() !== suffix) continue;
+    if (match) return undefined; // Ambiguous across providers.
+    match = level;
+  }
+  return match;
+}
 
 /**
  * Reads the model a ZCode session last ran with from ZCode's own SQLite
@@ -387,6 +577,39 @@ export function resolveZCodeModelRef(
     }
   }
 
+  // Newer ZCode stores user-added providers in provider_config.json rather than
+  // v2/config.json. Each provider rule lists every selectable model in
+  // `modelOrder` (and the user's own additions in `personalModelIds`), which is
+  // the only place a bare id like `deepseek-v4.1-flash` maps back to a provider.
+  try {
+    const personalPath = path.join(getZCodeStorageDir(), 'v2', 'provider_config.json');
+    const personalConfig = readObjectRecord(JSON.parse(fsSync.readFileSync(personalPath, 'utf8')));
+    const providerRules = readObjectRecord(personalConfig?.config)?.providerConfigRules;
+    const rules = readObjectRecord(providerRules)?.providerRules;
+    if (Array.isArray(rules)) {
+      for (const rule of rules) {
+        const ruleRecord = readObjectRecord(rule);
+        const providerId = readOptionalString(ruleRecord?.providerId);
+        const ruleConfig = readObjectRecord(ruleRecord?.config);
+        if (!providerId || !ruleConfig) continue;
+
+        const candidates = [
+          ...(Array.isArray(ruleConfig.modelOrder) ? ruleConfig.modelOrder : []),
+          ...(Array.isArray(ruleConfig.personalModelIds) ? ruleConfig.personalModelIds : []),
+        ];
+        if (candidates.some((candidate) => readOptionalString(candidate) === trimmed)) {
+          return {
+            providerId,
+            modelId: trimmed,
+            ...(trimmedVariant ? { variant: trimmedVariant } : {}),
+          };
+        }
+      }
+    }
+  } catch {
+    // Personal provider config missing or unreadable; fall through.
+  }
+
   return {
     providerId: 'builtin:bigmodel-coding-plan',
     modelId: trimmed,
@@ -401,11 +624,22 @@ export class ZCodeProviderModels implements IProviderModels {
   private cachedModels: ProviderModelsDefinition | null = null;
 
   /**
-   * Returns supported models from ZCode config or builtin fallback.
+   * @param loadEngineCatalog - Catalog loader override. Production reads the
+   *   engine's resolved catalog (see `primeZCodeModelCatalog`); tests inject a
+   *   stub to stay hermetic and exercise the on-disk fallback.
+   */
+  constructor(
+    private readonly loadEngineCatalog: () => Promise<ProviderModelsDefinition | null> = primeZCodeModelCatalog,
+  ) {}
+
+  /**
+   * Returns the engine-resolved catalog, falling back to the on-disk ZCode
+   * config and finally the static builtin definition.
    */
   async getSupportedModels(): Promise<ProviderModelsDefinition> {
     if (!this.cachedModels) {
-      this.cachedModels = await readZCodeModelConfig();
+      const engineCatalog = await this.loadEngineCatalog();
+      this.cachedModels = engineCatalog ?? await readZCodeModelConfig();
     }
     return this.cachedModels;
   }

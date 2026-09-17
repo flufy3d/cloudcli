@@ -27,6 +27,7 @@ import { setTimeout as setTimeoutFn, clearTimeout as clearTimeoutFn } from 'node
 
 import { getZCodeStorageDir } from './zcode-data-root.js';
 import { tryResolveEnginePath } from './zcode-engine-path.js';
+import { resolveZCodeProviderConfigEnv } from './zcode-provider-config.js';
 
 /** How much of the engine's stderr to keep for crash explanations. */
 const STDERR_TAIL_LIMIT = 4000;
@@ -104,6 +105,10 @@ export class EngineSupervisor {
           // Ensure ZCode uses the expected storage directory (shared data-root
           // helper, so ZCODE_STORAGE_DIR isolation applies uniformly).
           ZCODE_STORAGE_DIR: getZCodeStorageDir(),
+          // The desktop app normally injects these, pointing the engine at its
+          // builtin + personal provider catalog. Without them a bare spawn
+          // cannot resolve any provider and `session/create` hangs.
+          ...resolveZCodeProviderConfigEnv(enginePath),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
