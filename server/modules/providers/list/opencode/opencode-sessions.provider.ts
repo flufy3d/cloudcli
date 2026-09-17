@@ -111,7 +111,12 @@ const isUserTextEcho = (raw: AnyRecord): boolean => {
 
 export class OpenCodeSessionsProvider implements IProviderSessions {
   /**
-   * Normalizes live `opencode run --format json` events into frontend messages.
+   * Normalizes live OpenCode events into frontend messages.
+   *
+   * The runtime now drives the server's event stream instead of
+   * `opencode run --format json`, but it translates each server event back onto
+   * these same envelopes (`text` / `reasoning` / `tool_use` / `step_finish` /
+   * `error`) so history and live output keep sharing one normalizer.
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
     const raw = readObjectRecord(rawMessage);
