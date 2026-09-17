@@ -93,7 +93,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // The sessions provider resolves an edit anchor and rewinds through the
     // server's `revert` primitive, so editing an already-sent message works.
     supportsMessageEditing: true,
-    supportsSessionForking: false,
+    // The fork facet branches a conversation through the server's `fork`.
+    supportsSessionForking: true,
     // `opencode run --command compact` runs the CLI's own compaction command.
     supportsCompaction: true,
   },
