@@ -33,6 +33,7 @@ import type {
 } from '@/shared/types';
 import type { Project, ProjectSession, LLMProvider, ProviderModelOption } from '@/shared/types';
 import { escapeRegExp } from '@/modules/chat/utils/chatFormatting';
+import { toTokenBudget } from '@/modules/chat/utils/contextUsage';
 
 import { useFileMentions } from '@/modules/chat/hooks/useFileMentions';
 import type { SlashCommand } from '@/shared/types';
@@ -135,6 +136,10 @@ export type CostCommandData = {
   };
   /** Engine-reported context-window percentage (Claude); otherwise derived from used/total. */
   percentage?: number;
+  /** The session was just compacted, so current occupancy is unknown until the next turn. */
+  compacted?: boolean;
+  /** UTF-8 size of the compaction summary, the only size available while `compacted`. */
+  summaryBytes?: number;
   /** Session-lifetime totals for providers whose `tokenUsage.used` is the current context occupancy (codex, opencode). */
   cumulative?: {
     used?: number;
@@ -383,7 +388,11 @@ export function useChatComposerState({
             kind: 'cost',
             data: costData,
           });
-          if (costData.tokenUsage && setTokenBudget) {
+          if (costData.compacted) {
+            // Occupancy is unknown until the next turn, but the summary that
+            // replaced the conversation still has a measurable size.
+            setTokenBudget?.(toTokenBudget({ compacted: true, summaryBytes: costData.summaryBytes }));
+          } else if (costData.tokenUsage && setTokenBudget) {
             setTokenBudget({
               used: costData.tokenUsage.used,
               total: costData.tokenUsage.total,

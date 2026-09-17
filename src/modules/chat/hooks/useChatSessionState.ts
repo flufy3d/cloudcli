@@ -15,26 +15,11 @@ import { normalizedToChatMessages } from '@/modules/chat/hooks/useChatMessages';
 import { useChatScrollController } from '@/modules/chat/hooks/useChatScrollController';
 import { expandVisibleCount, sliceVisibleMessages } from '@/modules/chat/utils/chatScrollMath';
 import { findSearchTargetIndex, resolveSearchWindowSize } from '@/modules/chat/utils/searchTargetLocator';
+import { toTokenBudget } from '@/modules/chat/utils/contextUsage';
 
 const INITIAL_VISIBLE_MESSAGES = 100;
 /** Rows rendered below a search-jump hit; the hit opens the tail slice. */
 const SEARCH_JUMP_TRAILING_CONTEXT = 30;
-
-/**
- * Maps one provider token-usage payload onto composer badge state.
- *
- * `compacted` means the session was just compacted and the engine cannot
- * report the resulting occupancy until the next turn runs (OpenCode only
- * knows it then). The payload's numbers describe the context the user just
- * discarded, so the badge is cleared instead of showing a stale value that
- * would only drop on the next message.
- */
-function readTokenBudgetFromUsage(
-  usage: Record<string, unknown> | object,
-): Record<string, unknown> | null {
-  const record = usage as Record<string, unknown>;
-  return record.compacted === true ? null : record;
-}
 
 type UseChatSessionStateArgs = {
   isActive: boolean;
@@ -259,7 +244,7 @@ export function useChatSessionState({
     setHasMoreMessages(slot.hasMore);
     setTotalMessages(slot.total);
     if (slot.tokenUsage && typeof slot.tokenUsage === 'object') {
-      setTokenBudget(readTokenBudgetFromUsage(slot.tokenUsage));
+      setTokenBudget(toTokenBudget(slot.tokenUsage));
     }
   }, []);
 
@@ -730,8 +715,10 @@ export function useChatSessionState({
         const payload = await response.json();
         if (payload.data && typeof payload.data === 'object' && activeSessionIdRef.current === sid) {
           const nextData = payload.data as Record<string, unknown>;
+          const nextBudget = toTokenBudget(nextData);
           if (nextData.compacted === true) {
-            setTokenBudget(null);
+            // No occupancy until the next turn; only the summary size is known.
+            setTokenBudget(nextBudget);
             return;
           }
           const nextUsed = Number(nextData.used ?? 0)
@@ -741,7 +728,7 @@ export function useChatSessionState({
             if (nextUsed === 0 && currentUsed > 0) {
               return prev;
             }
-            return nextData;
+            return nextBudget;
           });
         }
       }

@@ -26,3 +26,22 @@ test('omits the percentage when the provider reports no context window', () => {
   const { queryByText } = renderBadge({ used: 42, inputTokens: 13, outputTokens: 20 });
   assert.equal(queryByText(/%$/), null);
 });
+
+test('shows the summary size instead of 0 right after a compaction', () => {
+  // Occupancy is unknown until the next turn, but the summary text that now
+  // stands in for the conversation does have a size.
+  const { getByText } = renderBadge({ used: 0, total: 1_000_000, compacted: true, summaryBytes: 9_651 });
+  assert.ok(getByText('9.4KB'), 'the compaction summary size must render');
+});
+
+test('renders nothing for a just-compacted session, whose payload is cleared to null', () => {
+  // A compacted session has no occupancy until the next turn; without this the
+  // badge would pin a meaningless "0" on the toolbar.
+  const { queryByText } = renderBadge(null);
+  assert.equal(queryByText(/0/), null);
+});
+
+test('renders nothing for an all-zero snapshot', () => {
+  const { queryByText } = renderBadge({ used: 0, total: 1_000_000, inputTokens: 0, outputTokens: 0 });
+  assert.equal(queryByText(/0/), null);
+});

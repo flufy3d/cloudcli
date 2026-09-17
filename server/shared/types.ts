@@ -151,6 +151,13 @@ export type ProviderTokenUsageResult = {
    * instead of the stale number.
    */
   compacted?: boolean;
+  /**
+   * UTF-8 size of the compaction summary text that now stands in for the
+   * conversation. Only present alongside `compacted` and only when the summary
+   * could be read; it is the one concrete "how big is the context now" reading
+   * available before the next turn reports real occupancy.
+   */
+  summaryBytes?: number;
   unsupported?: boolean;
   message?: string;
 };

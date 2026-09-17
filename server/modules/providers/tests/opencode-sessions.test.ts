@@ -379,6 +379,37 @@ test('OpenCode sessions provider normalizes quoted live text and skips user echo
   assert.deepEqual(userEcho, []);
 });
 
+test('OpenCode sessions provider surfaces the nested live error message', () => {
+  const provider = new OpenCodeSessionsProvider();
+  // `opencode run --format json` serializes failures as
+  // `{ type: 'error', error: { name, data: { message } } }`.
+  const normalized = provider.normalizeMessage({
+    type: 'error',
+    sessionID: 'open-session-live',
+    error: {
+      name: 'UnknownError',
+      data: { message: 'Model not found: deepseek-v4.1-flash/.', ref: 'err_1234' },
+    },
+  }, null);
+
+  assert.equal(normalized.length, 1);
+  assert.equal(normalized[0]?.kind, 'error');
+  assert.equal(normalized[0]?.content, 'Model not found: deepseek-v4.1-flash/.');
+
+  const flat = provider.normalizeMessage({
+    type: 'error',
+    sessionID: 'open-session-live',
+    error: 'plain failure',
+  }, null);
+  assert.equal(flat[0]?.content, 'plain failure');
+
+  const opaque = provider.normalizeMessage({
+    type: 'error',
+    sessionID: 'open-session-live',
+  }, null);
+  assert.equal(opaque[0]?.content, 'Unknown OpenCode error');
+});
+
 test('OpenCode sessions provider reads sqlite history and token usage', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-history-'));
   const workspacePath = path.join(tempRoot, 'workspace');
@@ -652,6 +683,16 @@ test('token usage reports a compaction reset instead of the pre-compaction conte
         db.close();
       }
     };
+    const insertSummaryPart = (id: string, messageId: string, info: Record<string, unknown>) => {
+      const db = new Database(databasePath);
+      try {
+        db.prepare(
+          'INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)',
+        ).run(id, messageId, 'open-session-1', 1_700_000_010_000, 1_700_000_010_000, JSON.stringify(info));
+      } finally {
+        db.close();
+      }
+    };
 
     // A compaction summary carries the whole pre-compaction conversation as its
     // request usage; reporting it as current occupancy is exactly backwards.
@@ -669,6 +710,12 @@ test('token usage reports a compaction reset instead of the pre-compaction conte
       },
     });
 
+    // The summary text is the conversation the next turn will be given, so its
+    // size is the one occupancy reading available while `compacted`; reasoning
+    // parts are not context and must not count toward it.
+    insertSummaryPart('part-summary-text', 'message-summary', { type: 'text', text: 'compacted' });
+    insertSummaryPart('part-summary-reasoning', 'message-summary', { type: 'reasoning', text: 'x'.repeat(500) });
+
     const provider = new OpenCodeSessionsProvider();
     const usageInput = {
       appSessionId: 'app-1',
@@ -684,6 +731,7 @@ test('token usage reports a compaction reset instead of the pre-compaction conte
       outputTokens: 0,
       breakdown: { input: 0, output: 0 },
       compacted: true,
+      summaryBytes: 9,
       cumulative: { used: 42, inputTokens: 13, outputTokens: 20 },
     });
 

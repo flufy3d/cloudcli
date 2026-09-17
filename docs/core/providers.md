@@ -29,7 +29,7 @@
 
 **可选成员就是能力开关**，这是整个框架的核心设计。
 
-**模型目录特例（opencode）**：`models` 切面一般是 source-controlled 预置表；opencode 在上面叠加引擎自己的 live 目录——`list/opencode/opencode-models.provider.ts` 的 `OPENCODE_PREDEFINED_MODELS` 只作离线兜底与精选标签来源，`getSupportedModels()` 还会读 opencode 的模型缓存 `~/.cache/opencode/models.json`（按 path+mtime+size 记忆化）：对 `opencode` / `opencode-go` 两个网关以 live 为准（active 新模型自动补进并带 live 名称与 effort、deprecated/已移除的剔除、DEFAULT 失效时顺延），其余 provider 段落以及缓存缺失/损坏时保持 curated；两条路径最后都按本机已连接 provider 过滤。
+**模型目录特例（opencode）**：`models` 切面一般是 source-controlled 预置表；opencode 在上面叠加引擎自己的 live 目录——`list/opencode/opencode-models.provider.ts` 的 `OPENCODE_PREDEFINED_MODELS` 只作离线兜底与精选标签来源，`getSupportedModels()` 还会读 opencode 的模型缓存 `~/.cache/opencode/models.json`（按 path+mtime+size 记忆化）：对 `opencode` / `opencode-go` 两个网关以 live 为准（active 新模型自动补进并带 live 名称与 effort、deprecated/已移除的剔除、DEFAULT 失效时顺延），其余 provider 段落以及缓存缺失/损坏时保持 curated；两条路径最后都按本机已连接 provider 过滤。会话模型值统一是目录里的 `<providerID>/<modelID>`：`getCurrentActiveModel()` 读 opencode 自己的 `session.model`（`{id, providerID}`）时补回前缀，`providerModelsService` 的 `resolveSessionModel` / `resolveResumeModel` 再把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原——否则它会以 `--model <modelID>` 传给 CLI，被当成 providerID 而报 `Model not found: <id>/.`。
 
 ## 能力矩阵：推导而非手写
 
@@ -56,7 +56,7 @@
 
 **`/compact` 的引擎实现**（能力开关是 runtime 可选切面 `compact`）：claude 把 `/compact` 当输入流的一条用户消息（SDK 按 local slash command 执行，实测可通过 `Query.getContextUsage()` 复核）；opencode 临时拉起 `opencode serve`（回环随机端口），调用 CLI 自己的压缩原语 `POST /session/:id/summarize`（TUI `/compact` 用的同一条路；`run --command` 只认用户配置命令，实测内置 `/compact` 会 500），payload 取 opencode.db 里会话行 `model` 列的 providerID/modelID；codex 走 app-server JSON-RPC `thread/resume`（必须带出 turns，摘要器要读被替换的对话）+ `thread/compact/start`，并且**要等压缩回合完成通知**（`item/completed` 的 `contextCompaction` 或 `turn/completed`）才能杀掉子进程，否则摘要只存在于内存里（`list/codex/codex-app-server.client.ts`）。antigravity 实测**不支持**：agy print 模式把 `/compact` 当普通 prompt 透传（"not a built-in slash command"），且 CLI 无压缩子命令。zcode / cursor 同样不实现，菜单按能力矩阵隐藏。
 
-压缩**刚结束的那一刻占用不可知**（opencode 的摘要消息带的是刚被压缩掉的旧对话用量，实测 319k；真实占用要等下一个回合），所以 `ProviderTokenUsageResult` 用 `compacted: true` + `used: 0` 表达"已重置、数字未知"，前端据此把徽章清空而不是继续挂着旧数字（`readTokenBudgetFromUsage`），下一个回合拿到真实值再显示。
+压缩**刚结束的那一刻占用不可知**（opencode 的摘要消息带的是刚被压缩掉的旧对话用量，实测 319k；真实占用要等下一个回合），所以 `ProviderTokenUsageResult` 用 `compacted: true` + `used: 0` 表达"已重置、token 数未知"（前端 `readTokenBudgetFromUsage` 与实时 `token_budget` 帧都判这个标记，不会继续挂着旧数字）。唯一当下可测的量是**摘要本身的大小**：摘要的正文存在 `part` 表（`message.data` 里没有 `content`），`readOpenCodeMessageTextBytes` 累计其 `text` 分片的 UTF-8 字节数，作为 `summaryBytes` 随 `compacted` 一起给出（摘要消息自己的 `tokens` 是这次总结调用读进去的旧对话，不能用）。前端用它显示"压缩摘要 · 9.4KB"直到下一个回合拿到真实占用；`/cost` 经 `commands.routes.ts` 透传同样的标记与字节数，把误导性的 0 行换成摘要大小行。
 
 ## 共享基础设施（写新引擎前先看）
 

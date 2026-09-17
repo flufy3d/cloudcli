@@ -83,6 +83,26 @@ const hasUserRole = (value: unknown): boolean => {
   return readOptionalString(record?.role) === 'user';
 };
 
+/**
+ * Reads the human-readable text out of one live OpenCode error event.
+ *
+ * `opencode run --format json` serializes provider failures as
+ * `{ type: 'error', error: { name, data: { message, ref } } }`, so the message
+ * is nested two levels down; the older flat `{ error: '...' }` /
+ * `{ message: '...' }` shapes still occur. Without the nested lookup every
+ * failure degraded to the generic fallback, hiding causes like "Model not
+ * found".
+ */
+const extractErrorMessage = (raw: AnyRecord): string => {
+  const errorRecord = readObjectRecord(raw.error);
+  return readOptionalString(errorRecord?.message)
+    ?? readOptionalString(readObjectRecord(errorRecord?.data)?.message)
+    ?? readOptionalString(errorRecord?.name)
+    ?? readOptionalString(raw.error)
+    ?? readOptionalString(raw.message)
+    ?? 'Unknown OpenCode error';
+};
+
 const isUserTextEcho = (raw: AnyRecord): boolean => {
   return readOptionalString(raw.role) === 'user'
     || hasUserRole(raw.message)
@@ -175,7 +195,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         timestamp,
         provider: PROVIDER,
         kind: 'error',
-        content: readOptionalString(raw.error) ?? readOptionalString(raw.message) ?? 'Unknown OpenCode error',
+        content: extractErrorMessage(raw),
       })];
     }
 

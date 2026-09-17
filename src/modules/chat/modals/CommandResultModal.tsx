@@ -52,6 +52,7 @@ import {
 import { getProviderDisplayName, PROVIDER_DISPLAY_NAMES } from '@/shared/providerDisplay';
 
 import ModelLibraryPanel from '@/modules/chat/modals/ModelLibraryPanel';
+import { formatByteSize } from '@/modules/chat/utils/contextUsage';
 
 type CommandResultModalProps = {
   payload: CommandModalPayload | null;
@@ -666,7 +667,12 @@ function QuotaGroupCard({
 
 function CostContent({ data }: { data: CostCommandData }) {
   const { t } = useTranslation('chat');
-  const used = Number(data.tokenUsage?.used ?? 0);
+  // A just-compacted session reports no occupancy: the numbers that exist
+  // describe the context the user just discarded, so they are suppressed in
+  // favor of an explicit "updates after the next turn" note.
+  const compacted = data.compacted === true;
+  const summaryBytes = Number(data.summaryBytes ?? 0) || 0;
+  const used = compacted ? 0 : Number(data.tokenUsage?.used ?? 0);
   const total = Number(data.tokenUsage?.total ?? 0);
   const model = data.model || 'Unknown';
   const provider = getProviderLabel(data.provider, data.provider || 'Unknown');
@@ -740,7 +746,15 @@ function CostContent({ data }: { data: CostCommandData }) {
       ? Math.min(100, Math.round((used / total) * 100))
       : null;
   const usageRows = [
-    { label: t('cost.totalTokensUsed', { defaultValue: 'Total tokens used' }), value: formatNumber(used), icon: Activity },
+    ...(compacted
+      ? summaryBytes > 0
+        ? [{
+            label: t('cost.compactedSummary', { defaultValue: 'Compaction summary' }),
+            value: formatByteSize(summaryBytes),
+            icon: Gauge,
+          }]
+        : []
+      : [{ label: t('cost.totalTokensUsed', { defaultValue: 'Total tokens used' }), value: formatNumber(used), icon: Activity }]),
     ...(hasBreakdown
       ? [
           {
