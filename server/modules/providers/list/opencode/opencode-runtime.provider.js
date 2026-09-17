@@ -308,7 +308,7 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       const time = readObjectRecord(part.time) ?? {};
       const completed = time.end !== undefined && time.end !== null;
       if (completed && !run.deltaPartIds.has(partId) && typeof part.text === 'string' && part.text.trim()) {
-        emitNormalized({ type: partType, id: partId, sessionID: run.providerSessionId, text: part.text });
+        emitNormalized({ type: partType, id: partId, sessionID: run.providerSessionId, text: part.text, messageID: messageId });
       }
     }
   };
@@ -332,7 +332,7 @@ async function spawnOpenCode(command, options = {}, ws, context) {
 
     run.deltaPartIds.add(partId);
     const kind = run.partTypes.get(partId) === 'reasoning' ? 'reasoning' : 'text';
-    emitNormalized({ type: kind, id: partId, sessionID: run.providerSessionId, text: delta });
+    emitNormalized({ type: kind, id: partId, sessionID: run.providerSessionId, text: delta, messageID: messageId });
   };
 
   const handleMessageUpdated = (event) => {
