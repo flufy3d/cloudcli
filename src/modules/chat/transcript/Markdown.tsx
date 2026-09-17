@@ -10,7 +10,12 @@ import { useTranslation } from 'react-i18next';
 import { SyntaxHighlighter, isRegisteredLanguage } from '@/modules/chat/composer/codeHighlightLanguages';
 import { MermaidDiagram } from '@/modules/code-editor';
 import { normalizeInlineCodeFences } from '@/modules/chat/utils/chatFormatting';
-import { filePathFromFileUrl, isFileUrl, markdownUrlTransform } from '@/modules/chat/utils/fileLink';
+import {
+  filePathFromFileUrl,
+  fileReferenceFromMarkdownHref,
+  isFileUrl,
+  markdownUrlTransform,
+} from '@/modules/chat/utils/fileLink';
 import { readExternalFileContent } from '@/shared/api';
 import { copyTextToClipboard } from '@/shared/utils';
 import { UnifiedImageViewer } from '@/shared/ui';
@@ -404,10 +409,10 @@ export const MarkdownBody = memo(function MarkdownBody({ children, breaks = fals
       a: ({ href, children: linkChildren }: { href?: string; children?: React.ReactNode }) => {
         // Prefer the href when it is a real path; otherwise fall back to the
         // link text, since models often emit `[src/foo.ts]()` with an empty href.
-        // `file://` URLs are decoded to their absolute path first so external
-        // documents (e.g. Antigravity plan files) open read-only in the editor.
+        // Normalize Markdown's percent-escaped local paths and `file://` URLs
+        // before handing them to the editor.
         const linkText = childrenToText(linkChildren);
-        const pathHref = filePathFromFileUrl(href) ?? href;
+        const pathHref = fileReferenceFromMarkdownHref(href);
         const fileRef = looksLikeFilePath(pathHref) ? pathHref : looksLikeFilePath(linkText) ? linkText : undefined;
 
         if (fileRef && !isExternalHref(pathHref)) {

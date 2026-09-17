@@ -32,3 +32,27 @@ export const filePathFromFileUrl = (href?: string): string | undefined => {
     return undefined;
   }
 };
+
+// react-markdown percent-escapes non-ASCII characters and spaces before it
+// hands an href to custom renderers. Decode filesystem references back to the
+// path the editor can read, while leaving web and other non-file schemes alone.
+export const fileReferenceFromMarkdownHref = (href?: string): string | undefined => {
+  if (!href) {
+    return undefined;
+  }
+
+  if (isFileUrl(href)) {
+    return filePathFromFileUrl(href) ?? href;
+  }
+
+  if (!isWindowsAbsolutePath(href) && /^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    return href;
+  }
+
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    // A literal or incomplete percent escape may be part of a valid filename.
+    return href;
+  }
+};
