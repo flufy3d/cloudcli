@@ -447,6 +447,27 @@ export async function abortOpenCodeSession(
   }
 }
 
+/**
+ * Marks a session reverted at `messageId`: that message and everything after it
+ * is dropped the next time a prompt is sent. Used by the edit flow, where the
+ * replacement turn must not be appended to the conversation it replaces.
+ */
+export async function revertOpenCodeSession(
+  handle: OpenCodeServerHandle,
+  directory: string,
+  sessionId: string,
+  messageId: string,
+): Promise<void> {
+  await requestJson(
+    handle,
+    'POST',
+    `/session/${encodeURIComponent(sessionId)}/revert`,
+    directory,
+    { messageID: messageId },
+    30_000,
+  );
+}
+
 /** Answers one pending permission request. Returns false if it was already gone. */
 export async function replyOpenCodePermission(
   handle: OpenCodeServerHandle,

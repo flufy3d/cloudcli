@@ -44,6 +44,8 @@
 
 审批桥 `list/opencode/opencode-permissions.provider.ts` 就是 runtime 的 `permissions` 切面（`supportsPermissionRequests` 因此为 `true`）：`permission.asked` → `permission_request` 卡片 → `POST /permission/:id/reply`（`once/always/reject`）；`question.asked` → `AskUserQuestion` 卡片（`multiple → multiSelect`、`options` 原样映射）→ `POST /question/:id/reply`（跳过/拒绝走 `/reject`）。权限模式映射：`plan` → `plan` agent、`bypassPermissions` → 静默回 `once`（等价 `--auto`）、`acceptEdits` → edit/write/patch 静默放行、`default` → 由用户 opencode 配置决定（`ask` 才出卡片）。
 
+**编辑历史消息**：归一化消息把 provider 的 `msg_…` 暴露为 `transcriptAnchorId`；`sessions.resolveEditAnchor` 返回被编辑消息的前一条，`sessions.rewindSession` 对 server 调 `POST /session/:id/revert`（命名要丢弃的首条消息，即被编辑消息），所以 `supportsMessageEditing` 为 `true`。opencode 的 revert 是「丢弃该消息及其之后、下一条 prompt 时生效」，因此编辑是替换而非保留旧分支。
+
 ## 共享基础设施（写新引擎前先看）
 
 都在 `server/modules/providers/shared/`：
