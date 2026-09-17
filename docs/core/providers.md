@@ -58,7 +58,7 @@
 
 ## 交互式权限与提问（opencode）
 
-`opencode run` 非交互模式对任何 `ask` 规则**直接拒绝**，没有把审批交给用户的通道。因此 opencode runtime 不再解析 `run --format json`，而是驱动一个**共享的 `opencode serve`**（`list/opencode/opencode-server.client.ts`）：单进程 + `/global/event` 事件流（按 `properties.sessionID` 路由到各 run）+ `POST /session[/:id/message]`，请求都带 `?directory=` 定位工程。live 事件翻译回既有 `sessions.normalizeMessage` 认识的信封（`text/reasoning/tool_use/step_finish/error`），历史与实时仍共用同一归一化器。
+`opencode run` 非交互模式对任何 `ask` 规则**直接拒绝**，没有把审批交给用户的通道。因此 opencode runtime 不再解析 `run --format json`，而是驱动一个**共享的 `opencode serve`**（`list/opencode/opencode-server.client.ts`）：单进程 + `/global/event` 事件流（按 `properties.sessionID` 路由到各 run）+ `POST /session[/:id/message]`，请求都带 `?directory=` 定位工程。live 事件翻译回既有 `sessions.normalizeMessage` 认识的信封（`text/reasoning/tool_use/step_finish/error`），历史与实时仍共用同一归一化器。共享 server 按引用计数常驻、空闲 60s 回收；**复用前先探 `/global/health`，探测失败且无 run 持有时重启**（Windows 下 `cmd.exe` shim 可能比真正的 `opencode.exe` 活得久，child 的 `exit` 不再触发）。请求失败时把 undici 的 `fetch failed` 还原成带 `cause`（如 `UND_ERR_SOCKET`/`ECONNREFUSED`）的可读错误，并保留 server stderr 尾部供崩溃诊断。
 
 审批桥 `list/opencode/opencode-permissions.provider.ts` 就是 runtime 的 `permissions` 切面（`supportsPermissionRequests` 因此为 `true`）：`permission.asked` → `permission_request` 卡片 → `POST /permission/:id/reply`（`once/always/reject`）；`question.asked` → `AskUserQuestion` 卡片（`multiple → multiSelect`、`options` 原样映射）→ `POST /question/:id/reply`（跳过/拒绝走 `/reject`）。权限模式映射：`plan` → `plan` agent、`bypassPermissions` → 静默回 `once`（等价 `--auto`）、`default` → 由用户 opencode 配置决定（`ask` 才出卡片）。`/compact` 仍走独立的短生命周期 server（`POST /session/:id/summarize`）。
 

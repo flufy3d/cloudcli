@@ -38,6 +38,7 @@ export type OpenCodeServerEvent = {
 
 const SERVER_READY_TIMEOUT_MS = 30_000;
 const SERVER_IDLE_SHUTDOWN_MS = 60_000;
+const SERVER_HEALTH_TIMEOUT_MS = 3_000;
 const RESPONSE_TIMEOUT_MS = 10 * 60_000;
 
 type ServerState = {
@@ -48,6 +49,10 @@ type ServerState = {
   refCount: number;
   idleTimer: NodeJS.Timeout | null;
   streamAbort: AbortController;
+  /** Rolling tail of the child's stderr, logged when the process dies unexpectedly. */
+  stderr: { tail: string };
+  /** Set while we stop the server on purpose, so its exit is not reported as a crash. */
+  stopping: boolean;
 };
 
 let serverState: ServerState | null = null;
@@ -227,6 +232,99 @@ function killOpenCodeServerProcess(child: ChildProcess): void {
   }
 }
 
+/**
+ * Reads the underlying reason out of undici's opaque `fetch failed` error.
+ *
+ * Node's global `fetch` reports every transport-level failure with the same
+ * `TypeError: fetch failed` message and stores the real condition on
+ * `error.cause` — a `DOMException` for aborts, or a system error carrying a
+ * `code` such as `ECONNREFUSED` or `UND_ERR_SOCKET`. Without digging the cause
+ * out, a dead server, a dropped socket and a failed lookup all read as the same
+ * unhelpful string in the logs and in the chat UI.
+ */
+function readFetchFailureCause(error: Error): string | null {
+  const cause = error.cause;
+  if (!cause) {
+    return null;
+  }
+  if (cause instanceof Error) {
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === 'string' && code) {
+      return code;
+    }
+    return cause.name && cause.name !== 'Error' ? cause.name : cause.message || null;
+  }
+  return typeof cause === 'string' ? cause : null;
+}
+
+/**
+ * Rewrites any exception from a request against the shared server into an error
+ * whose message explains the failure, keeping the original as its cause.
+ *
+ * The runtime and the chat gateway render `error.message` verbatim, so the bare
+ * `fetch failed` undici emits left users and logs with no way to tell a dead
+ * server from a dropped connection.
+ *
+ * Consumers: `requestJson` (every session/message/permission call).
+ */
+function describeRequestFailure(method: string, path: string, error: unknown): Error {
+  const context = `OpenCode server ${method} ${path}`;
+  if (!(error instanceof Error)) {
+    return new Error(`${context} failed: ${String(error)}`);
+  }
+
+  if (error.message === 'fetch failed') {
+    const cause = readFetchFailureCause(error);
+    const detail = cause ? ` (${cause})` : '';
+    return new Error(`${context} could not reach the local OpenCode server${detail}.`, { cause: error });
+  }
+
+  if (error.name === 'TimeoutError') {
+    return new Error(`${context} timed out before the turn finished.`, { cause: error });
+  }
+
+  return new Error(`${context} failed: ${error.message}`, { cause: error });
+}
+
+/**
+ * Probes the shared server's health endpoint.
+ *
+ * Consumers: `acquireOpenCodeServer`. Reusing a handle that points at a process
+ * which died without its child `exit` event firing (on Windows the `cmd.exe`
+ * shim can outlive the real `opencode.exe`) would fail the next request with
+ * `fetch failed`; probing first lets the caller restart instead.
+ */
+async function isOpenCodeServerResponsive(handle: OpenCodeServerHandle): Promise<boolean> {
+  try {
+    const response = await fetch(`${handle.baseUrl}/global/health`, {
+      headers: handle.headers,
+      signal: AbortSignal.timeout(SERVER_HEALTH_TIMEOUT_MS),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Forgets and force-kills the shared server.
+ *
+ * Consumers: `acquireOpenCodeServer` (stale health probe), `releaseOpenCodeServer`
+ * (idle shutdown) and `shutdownOpenCodeServer` (process shutdown).
+ */
+function discardOpenCodeServerState(state: ServerState): void {
+  state.stopping = true;
+  if (state.idleTimer) {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+  }
+  if (serverState === state) {
+    serverState = null;
+  }
+  state.streamAbort.abort();
+  killOpenCodeServerProcess(state.process);
+}
+
 async function startOpenCodeServer(): Promise<ServerState> {
   const port = await reserveLoopbackPort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -242,16 +340,16 @@ async function startOpenCodeServer(): Promise<ServerState> {
 
   // Drain both pipes: an unread stream back-pressures the child and stalls it.
   child.stdout?.on('data', () => {});
-  let stderrTail = '';
+  const stderr = { tail: '' };
   child.stderr?.on('data', (chunk: Buffer) => {
-    stderrTail = (stderrTail + chunk.toString()).slice(-2000);
+    stderr.tail = (stderr.tail + chunk.toString()).slice(-2000);
   });
 
   try {
     await waitForServer(baseUrl, headers, child);
   } catch (error) {
     killOpenCodeServerProcess(child);
-    const detail = stderrTail.trim() ? `: ${stderrTail.trim().split('\n').slice(-3).join(' | ')}` : '';
+    const detail = stderr.tail.trim() ? `: ${stderr.tail.trim().split('\n').slice(-3).join(' | ')}` : '';
     throw new Error(`${error instanceof Error ? error.message : String(error)}${detail}`);
   }
 
@@ -263,15 +361,25 @@ async function startOpenCodeServer(): Promise<ServerState> {
     refCount: 0,
     idleTimer: null,
     streamAbort: new AbortController(),
+    stderr,
+    stopping: false,
   };
 
   void readOpenCodeServerEventStream(state);
 
-  child.once('exit', () => {
+  child.once('exit', (code, signal) => {
     if (serverState === state) {
       serverState = null;
     }
     state.streamAbort.abort();
+    if (state.stopping) {
+      return;
+    }
+    const detail = stderr.tail.trim();
+    const suffix = detail ? ` stderr: ${detail.split('\n').slice(-3).join(' | ')}` : '';
+    console.warn(
+      `[OpenCode] Shared server exited unexpectedly (code ${code ?? 'null'}${signal ? `, signal ${signal}` : ''}).${suffix}`,
+    );
   });
 
   return state;
@@ -280,15 +388,33 @@ async function startOpenCodeServer(): Promise<ServerState> {
 /**
  * Starts the shared server if needed and pins it against idle shutdown for the
  * duration of one run. Always pair with `releaseOpenCodeServer`.
+ *
+ * An existing server is health-probed before reuse so a child that died without
+ * emitting `exit` is replaced rather than handed out for a doomed request.
  */
 export async function acquireOpenCodeServer(): Promise<OpenCodeServerHandle> {
-  if (serverState) {
-    if (serverState.idleTimer) {
-      clearTimeout(serverState.idleTimer);
-      serverState.idleTimer = null;
+  const existing = serverState;
+  if (existing) {
+    const responsive = await isOpenCodeServerResponsive(existing);
+    // A failed probe only proves the server is gone when nothing is using it:
+    // an in-flight run pins `refCount`, and a busy server can still miss a short
+    // health timeout without being dead. Killing it there would abort a healthy
+    // turn, so reuse it and let the run's own request report any real failure.
+    if (responsive || existing.refCount > 0) {
+      if (!responsive) {
+        console.warn('[OpenCode] Shared server missed a health probe while a run is active; keeping it.');
+      }
+      if (existing.idleTimer) {
+        clearTimeout(existing.idleTimer);
+        existing.idleTimer = null;
+      }
+      existing.refCount += 1;
+      return { baseUrl: existing.baseUrl, headers: existing.headers };
     }
-    serverState.refCount += 1;
-    return { baseUrl: serverState.baseUrl, headers: serverState.headers };
+    // Idle handle that no longer answers: the process died without its child
+    // `exit` event firing (on Windows the `cmd.exe` shim can outlive the real
+    // `opencode.exe`). Drop it so the request below starts a fresh server.
+    discardOpenCodeServerState(existing);
   }
 
   if (!serverStarting) {
@@ -323,9 +449,7 @@ export function releaseOpenCodeServer(): void {
     if (serverState !== state || state.refCount > 0) {
       return;
     }
-    serverState = null;
-    state.streamAbort.abort();
-    killOpenCodeServerProcess(state.process);
+    discardOpenCodeServerState(state);
   }, SERVER_IDLE_SHUTDOWN_MS);
   state.idleTimer.unref?.();
 }
@@ -351,12 +475,17 @@ async function requestJson(
   timeoutMs = RESPONSE_TIMEOUT_MS,
 ): Promise<unknown> {
   const url = buildUrl(handle.baseUrl, path, directory);
-  const response = await fetch(url, {
-    method,
-    headers: handle.headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: handle.headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    throw describeRequestFailure(method, path, error);
+  }
 
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
@@ -591,9 +720,5 @@ export function shutdownOpenCodeServer(): void {
   if (!state) {
     return;
   }
-  if (state.idleTimer) {
-    clearTimeout(state.idleTimer);
-  }
-  state.streamAbort.abort();
-  killOpenCodeServerProcess(state.process);
+  discardOpenCodeServerState(state);
 }
