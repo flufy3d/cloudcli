@@ -1,0 +1,310 @@
+/**
+ * OpenCode Context Usage
+ *
+ * Reads "how full is the context window right now" for one OpenCode session
+ * out of the shared `opencode.db` plus OpenCode's own model cache.
+ *
+ * Both the history reader (`opencode-sessions.provider.ts`) and the runtime's
+ * end-of-turn badge refresh (`opencode-runtime.provider.js`) consume this, so
+ * the live counter and a reloaded transcript can never disagree.
+ *
+ * @module opencode-context-usage
+ */
+
+import fsSync from 'node:fs';
+
+import Database from 'better-sqlite3';
+
+import type { AnyRecord, ProviderTokenUsageResult } from '@/shared/types.js';
+import {
+  readJsonRecord,
+  readObjectRecord,
+  readOptionalString,
+  readUsageNumber,
+} from '@/shared/utils.js';
+
+import { getOpenCodeModelsCachePath } from './opencode-data-root.js';
+
+type OpenCodeTokenTotals = {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+};
+
+const buildTokenUsage = (totals: OpenCodeTokenTotals | undefined): AnyRecord | undefined => {
+  if (!totals) {
+    return undefined;
+  }
+
+  const inputTokens = totals.inputTokens;
+  const displayInputTokens = inputTokens + totals.cacheReadTokens;
+  const outputTokens = totals.outputTokens;
+  const used = inputTokens
+    + outputTokens
+    + totals.reasoningTokens
+    + totals.cacheReadTokens
+    + totals.cacheWriteTokens;
+
+  if (used <= 0) {
+    return undefined;
+  }
+
+  return {
+    used,
+    inputTokens: displayInputTokens,
+    outputTokens,
+    breakdown: {
+      input: displayInputTokens,
+      output: outputTokens,
+    },
+  };
+};
+
+/**
+ * Session-lifetime totals from the `session` row's token columns (older
+ * OpenCode databases), or from summing every assistant message's tokens.
+ */
+const readOpenCodeSessionColumnTokenUsage = (
+  db: Database.Database,
+  sessionId: string,
+): AnyRecord | undefined => {
+  const columns = db.prepare('PRAGMA table_info(session)').all() as { name: string }[];
+  const columnNames = new Set(columns.map((column) => column.name));
+  const requiredColumns = ['tokens_input', 'tokens_output', 'tokens_reasoning', 'tokens_cache_read', 'tokens_cache_write'];
+  if (!requiredColumns.every((column) => columnNames.has(column))) {
+    return undefined;
+  }
+
+  const row = db.prepare(`
+    SELECT
+      tokens_input AS inputTokens,
+      tokens_output AS outputTokens,
+      tokens_reasoning AS reasoningTokens,
+      tokens_cache_read AS cacheReadTokens,
+      tokens_cache_write AS cacheWriteTokens
+    FROM session
+    WHERE id = ?
+  `).get(sessionId) as OpenCodeTokenTotals | undefined;
+
+  if (!row) {
+    return undefined;
+  }
+
+  return buildTokenUsage({
+    inputTokens: Number(row.inputTokens ?? 0),
+    outputTokens: Number(row.outputTokens ?? 0),
+    reasoningTokens: Number(row.reasoningTokens ?? 0),
+    cacheReadTokens: Number(row.cacheReadTokens ?? 0),
+    cacheWriteTokens: Number(row.cacheWriteTokens ?? 0),
+  });
+};
+
+/**
+ * OpenCode stores per-message token counts on assistant `message.data` objects
+ * (see MessageV2.Assistant). Older DBs also had session-level counters; this
+ * matches current `opencode.db` layouts that only persist message JSON.
+ */
+const aggregateOpenCodeSessionTokenUsage = (
+  db: Database.Database,
+  sessionId: string,
+): AnyRecord | undefined => {
+  const sessionColumnUsage = readOpenCodeSessionColumnTokenUsage(db, sessionId);
+  if (sessionColumnUsage) {
+    return sessionColumnUsage;
+  }
+
+  const rows = db.prepare('SELECT data FROM message WHERE session_id = ?').all(sessionId) as { data: string }[];
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let reasoningTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
+
+  for (const row of rows) {
+    const info = readJsonRecord(row.data);
+    if (readOptionalString(info?.role) !== 'assistant') {
+      continue;
+    }
+
+    const tokens = readObjectRecord(info?.tokens);
+    if (!tokens) {
+      continue;
+    }
+
+    inputTokens += Number(tokens.input ?? 0);
+    outputTokens += Number(tokens.output ?? 0);
+    reasoningTokens += Number(tokens.reasoning ?? 0);
+    const cache = readObjectRecord(tokens.cache);
+    cacheReadTokens += Number(cache?.read ?? 0);
+    cacheWriteTokens += Number(cache?.write ?? 0);
+  }
+
+  return buildTokenUsage({
+    inputTokens,
+    outputTokens,
+    reasoningTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+  });
+};
+
+/**
+ * Latest per-message context occupancy of one OpenCode session.
+ *
+ * OpenCode stores each assistant message's own request usage on
+ * `message.data.tokens`; `tokens.total` is that request's whole prompt plus
+ * output (`input + output + reasoning + cache.read + cache.write`), i.e. what
+ * the context window held when that turn ran. Only the newest non-zero record
+ * matters — summing them (the session's cumulative columns) counts the same
+ * prefix once per turn and inflates the number by orders of magnitude.
+ *
+ * Returns null for message shapes that predate `tokens.total`, so callers can
+ * fall back to the cumulative columns.
+ */
+const readLatestOpenCodeMessageUsage = (
+  db: Database.Database,
+  sessionId: string,
+): {
+  providerId: string | null;
+  modelId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  used: number;
+} | null => {
+  const rows = db.prepare('SELECT data FROM message WHERE session_id = ? ORDER BY time_created DESC').all(sessionId) as { data: string }[];
+
+  for (const row of rows) {
+    const info = readJsonRecord(row.data);
+    if (readOptionalString(info?.role) !== 'assistant') {
+      continue;
+    }
+
+    const tokens = readObjectRecord(info?.tokens);
+    const used = readUsageNumber(tokens?.total);
+    if (!tokens || used <= 0) {
+      continue;
+    }
+
+    const cache = readObjectRecord(tokens.cache);
+    const cacheReadTokens = readUsageNumber(cache?.read);
+    const cacheWriteTokens = readUsageNumber(cache?.write);
+    let providerId = readOptionalString(info?.providerID) ?? null;
+    let modelId = readOptionalString(info?.modelID) ?? null;
+
+    // Some rows carry the routed id as `provider/model`; split it so the
+    // models.json lookup keys match the cache's per-provider sections.
+    if (modelId?.includes('/')) {
+      const [maybeProvider, ...modelParts] = modelId.split('/');
+      providerId = providerId ?? maybeProvider;
+      modelId = modelParts.join('/');
+    }
+
+    return {
+      providerId,
+      modelId,
+      inputTokens: readUsageNumber(tokens.input) + cacheReadTokens + cacheWriteTokens,
+      outputTokens: readUsageNumber(tokens.output) + readUsageNumber(tokens.reasoning),
+      cacheReadTokens,
+      cacheWriteTokens,
+      used,
+    };
+  }
+
+  return null;
+};
+
+/**
+ * Context window for one provider/model pair, read from OpenCode's model
+ * cache (`~/.cache/opencode/models.json`, models.dev data with
+ * `limit.context`).
+ *
+ * The cache is multi-megabyte JSON that OpenCode rewrites on registry
+ * refreshes, so the parsed window map is memoized by file identity (mtime +
+ * size) and only re-read when that identity changes. Returns undefined when
+ * the cache is missing, malformed, or carries no limit for the model.
+ */
+let openCodeContextWindowCache: { key: string; windows: Map<string, number> } | null = null;
+
+const readOpenCodeContextWindow = (providerId: string, modelId: string): number | undefined => {
+  const cachePath = getOpenCodeModelsCachePath();
+  let cacheKey: string;
+  try {
+    const stats = fsSync.statSync(cachePath);
+    cacheKey = `${cachePath}:${stats.mtimeMs}:${stats.size}`;
+  } catch {
+    return undefined;
+  }
+
+  if (openCodeContextWindowCache?.key !== cacheKey) {
+    try {
+      const parsed = readJsonRecord(fsSync.readFileSync(cachePath, 'utf8'));
+      const windows = new Map<string, number>();
+      for (const [catalogProviderId, providerValue] of Object.entries(parsed ?? {})) {
+        const models = readObjectRecord(readObjectRecord(providerValue)?.models);
+        if (!models) {
+          continue;
+        }
+        for (const [catalogModelId, modelValue] of Object.entries(models)) {
+          const contextLimit = readUsageNumber(readObjectRecord(readObjectRecord(modelValue)?.limit)?.context);
+          if (contextLimit > 0) {
+            windows.set(`${catalogProviderId}/${catalogModelId}`, contextLimit);
+          }
+        }
+      }
+      openCodeContextWindowCache = { key: cacheKey, windows };
+    } catch {
+      openCodeContextWindowCache = null;
+      return undefined;
+    }
+  }
+
+  return openCodeContextWindowCache?.windows.get(`${providerId}/${modelId}`);
+};
+
+/**
+ * Builds the context-usage answer for one OpenCode session: newest message
+ * occupancy plus the model's context window when it can be resolved, with the
+ * session-lifetime columns preserved as `cumulative` for the cost breakdown.
+ *
+ * Falls back to the cumulative columns unchanged for sessions whose messages
+ * predate `tokens.total`.
+ *
+ * Consumers: the sessions provider (`fetchHistory` / `getTokenUsage`) and the
+ * runtime's end-of-turn token-budget frame.
+ */
+export function readOpenCodeContextUsage(
+  db: Database.Database,
+  sessionId: string,
+): ProviderTokenUsageResult | undefined {
+  const cumulative = aggregateOpenCodeSessionTokenUsage(db, sessionId) as ProviderTokenUsageResult | undefined;
+  const latest = readLatestOpenCodeMessageUsage(db, sessionId);
+  if (!latest) {
+    return cumulative;
+  }
+
+  const contextWindow = latest.providerId && latest.modelId
+    ? readOpenCodeContextWindow(latest.providerId, latest.modelId)
+    : undefined;
+
+  return {
+    used: latest.used,
+    ...(contextWindow ? { total: contextWindow } : {}),
+    inputTokens: latest.inputTokens,
+    outputTokens: latest.outputTokens,
+    breakdown: { input: latest.inputTokens, output: latest.outputTokens },
+    ...(cumulative
+      ? {
+          cumulative: {
+            used: readUsageNumber(cumulative.used),
+            inputTokens: readUsageNumber(cumulative.inputTokens),
+            outputTokens: readUsageNumber(cumulative.outputTokens),
+          },
+        }
+      : {}),
+  };
+}

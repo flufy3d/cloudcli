@@ -10,9 +10,11 @@ import type {
   TouchEvent,
 } from 'react';
 import { useDropzone } from 'react-dropzone';
+import { useTranslation } from 'react-i18next';
 
 import { authenticatedFetch } from '@/shared/api';
 import type { MarkSessionProcessing, SessionActivityMap } from '@/shared/types';
+import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabilities';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
 import {
   clearQueuedMessage,
@@ -130,6 +132,14 @@ export type CostCommandData = {
   tokenBreakdown?: {
     input?: number;
     output?: number;
+  };
+  /** Engine-reported context-window percentage (Claude); otherwise derived from used/total. */
+  percentage?: number;
+  /** Session-lifetime totals for providers whose `tokenUsage.used` is the current context occupancy (codex, opencode). */
+  cumulative?: {
+    used?: number;
+    inputTokens?: number;
+    outputTokens?: number;
   };
   provider?: string;
   model?: string;
@@ -279,6 +289,11 @@ export function useChatComposerState({
   addMessage,
   setPendingPermissionRequests,
 }: UseChatComposerStateArgs) {
+  const { t } = useTranslation();
+  // Backend-owned capability for the active provider; while the matrix is
+  // loading the `/compact` entry simply stays hidden.
+  const { capabilities: providerCapabilities } = useProviderCapabilitiesMap();
+  const supportsCompaction = providerCapabilities?.[provider]?.supportsCompaction ?? false;
   const [input, setInput] = useState(() => {
     if (typeof window !== 'undefined' && selectedProject) {
       // Draft inputs are keyed by the DB projectId so per-project drafts
@@ -375,6 +390,8 @@ export function useChatComposerState({
               inputTokens: costData.tokenBreakdown?.input,
               outputTokens: costData.tokenBreakdown?.output,
               breakdown: costData.tokenBreakdown,
+              ...(costData.percentage ? { percentage: costData.percentage } : {}),
+              ...(costData.cumulative ? { cumulative: costData.cumulative } : {}),
             });
           }
           break;
@@ -456,6 +473,38 @@ export function useChatComposerState({
         return;
       }
 
+      // `/compact` is a runtime action, not a transcript command: it never
+      // reaches /api/commands/execute. The provider runtime consumes it over
+      // the chat socket, streams progress, and the terminal `complete`
+      // refreshes the transcript with the summary.
+      if (command.name === '/compact') {
+        const targetSessionId = currentSessionId || selectedSession?.id || null;
+        if (!targetSessionId) {
+          addMessage({
+            type: 'assistant',
+            content: t('chat:misc.compactNoSession', {
+              defaultValue: 'Start a conversation before compacting its context.',
+            }),
+            timestamp: Date.now(),
+          });
+          return;
+        }
+
+        sendMessage({
+          type: 'chat.compact',
+          sessionId: targetSessionId,
+          options: {
+            model: currentProviderModel,
+            effort: currentProviderEffort,
+          },
+        });
+        onSessionProcessing?.(targetSessionId, { statusText: null, canInterrupt: false });
+        if (!options?.preserveInput) {
+          updateInput('');
+        }
+        return;
+      }
+
       try {
         const effectiveInput = rawInput ?? input;
         const commandMatch = effectiveInput.match(new RegExp(`${escapeRegExp(command.name)}\\s*(.*)`));
@@ -528,6 +577,10 @@ export function useChatComposerState({
       addMessage,
       tokenBudget,
       updateInput,
+      currentProviderEffort,
+      onSessionProcessing,
+      sendMessage,
+      t,
     ],
   );
 
@@ -564,6 +617,7 @@ export function useChatComposerState({
     setInput,
     textareaRef,
     onExecuteCommand: executeCommand,
+    supportsCompaction,
   });
 
   const {
