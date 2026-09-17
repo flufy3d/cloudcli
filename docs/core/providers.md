@@ -44,6 +44,8 @@
 
 审批桥 `list/opencode/opencode-permissions.provider.ts` 就是 runtime 的 `permissions` 切面（`supportsPermissionRequests` 因此为 `true`）：`permission.asked` → `permission_request` 卡片 → `POST /permission/:id/reply`（`once/always/reject`）；`question.asked` → `AskUserQuestion` 卡片（`multiple → multiSelect`、`options` 原样映射）→ `POST /question/:id/reply`（跳过/拒绝走 `/reject`）。权限模式映射：`plan` → `plan` agent、`bypassPermissions` → 静默回 `once`（等价 `--auto`）、`acceptEdits` → edit/write/patch 静默放行、`default` → 由用户 opencode 配置决定（`ask` 才出卡片）。
 
+**fork**：`list/opencode/opencode-fork.provider.ts` 实现 `fork` 切面（`supportsSessionForking` 为 `true`），调 server `POST /session/:id/fork`。该接口是**排除式**切点（拷贝切点之前的消息，不带则全拷），所以把 anchor 之后的**第一条 user 消息**作为切点，得到「含 anchor 整轮」的结果；anchor 是最后一轮时省略切点、全量拷贝。opencode 转录在共享 DB 里没有文件，故 `requiresTranscriptFile=false`，`IProviderFork` 的 `jsonlPath` 允许为 `null`。
+
 ## 共享基础设施（写新引擎前先看）
 
 都在 `server/modules/providers/shared/`：

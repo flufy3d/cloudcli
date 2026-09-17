@@ -85,7 +85,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsTokenUsage: true,
     supportsEffort: true,
     supportsMessageEditing: false,
-    supportsSessionForking: false,
+    // The fork facet branches a conversation through the server's `fork`.
+    supportsSessionForking: true,
   },
   zcode: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],

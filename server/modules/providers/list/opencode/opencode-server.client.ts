@@ -404,6 +404,36 @@ export async function createOpenCodeSession(
 }
 
 /**
+ * Forks one session, returning the new provider-native session id.
+ *
+ * The endpoint's cut is exclusive: it copies the messages that precede
+ * `messageId`, and the whole conversation when it is omitted. Callers that want
+ * a turn-inclusive cut must pass the id of the message *after* the anchor.
+ */
+export async function forkOpenCodeSession(
+  handle: OpenCodeServerHandle,
+  directory: string,
+  sessionId: string,
+  messageId?: string | null,
+): Promise<string> {
+  const body: AnyRecord = messageId ? { messageID: messageId } : {};
+  const created = await requestJson(
+    handle,
+    'POST',
+    `/session/${encodeURIComponent(sessionId)}/fork`,
+    directory,
+    body,
+    60_000,
+  );
+
+  const id = readOptionalString(readObjectRecord(created)?.id);
+  if (!id) {
+    throw new Error('OpenCode did not return a session id for the fork.');
+  }
+  return id;
+}
+
+/**
  * Sends one user turn and resolves when the assistant turn completes. Live
  * output arrives through the event stream meanwhile.
  */
