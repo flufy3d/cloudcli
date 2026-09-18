@@ -67,6 +67,15 @@ flowchart LR
 
 因此剪枝阶段**必须保留乐观用户行**：它是回合边界的唯一记录，隐藏它是合并阶段的职责。两个锚点都不适用的行才退回时间戳排列。
 
+**判重同样按 `身份 > 因果 > 挂钟` 取。** 判定一条实时 assistant 行是否已被持久化（`isAssistantTextEchoedInSameTurnOnServer`），先定它属于哪个回合：
+
+1. `providerRowKey` 身份对账（见 [providers.md](./providers.md) 的行身份表）；
+2. 行自带 `transcriptAnchorId` 时按锚点定位服务端回合；
+3. 否则按**到达顺序**取 `realtimeMessages` 中它上方最近的用户行——上方没有用户行（他端标签页、重连后补看）就归属**最新的持久化回合**，因为实时行不可能早于已经落盘的回合；
+4. 仅当该回合的用户行已被分页移出 `serverMessages`、上述都定位不到时，才退到按挂钟计数的回合序号。
+
+第 4 条是**唯一仍由挂钟裁决的路径**，要去掉它需要把 store 的乐观行配对传下来。曾经第 3 步也是挂钟：浏览器落后于引擎时，一条真回复会被判成旧回合的回声而消失，一条真回声又会被保留成重复——同一个时钟问题同时造成两种现象。
+
 assistant 文本的 live/history 对账优先使用 provider 给出的 `providerRowKey`。流式缓冲从 delta 到 `__streaming_`、再到定稿 `text_` 全程保留该 key；key 变化以及有 key/无 key 的切换都会先闭合旧段，避免相邻 provider 行或普通 stdout 被拼成一条。历史刷新只在 provider、会话、key 唯一对应时裁决：完整历史接管；历史明确截断而实时完整时实时接管；两边都明确截断时保留较长正文。正文不参与身份猜测，标点、金额、版本号和否定词保持原样。不同 key、同 key 多候选或无 key 且无法定位同一用户回合的行全部保留。Antigravity 的纯 assistant 正文使用原生 `step_index` 派生 key，`complete` 仍只是终态信号，正文由随后的历史刷新接管。
 
 工具卡的跨路去重按 `toolIdentity.ts` 匹配：精确 toolId，或同一用户回合内的“规范工具名 + 完整参数指纹”（claimed 一对一，按 realtime 顺序配对）。同一回合由相同用户消息 id 或相同的非空 `transcriptAnchorId` 证明，正文和时间不能单独证明回合。Edit/Write 的指纹包含修改内容，不允许只因目标路径相同吞掉跨回合的真实卡片；仅当实时 Edit/Write 的两侧 diff 都未到达、历史端有完整 diff 时，才在已证明的同一回合按路径与顺序一对一认领。`__finalized_` 合成结算行随其卡片退役。

@@ -110,10 +110,108 @@ export function reconcileProviderRowText(
     : result('realtime');
 }
 
+/** The user row that opened this live row's turn, by arrival order alone. */
+function findTurnUserRowByArrival(
+  message: NormalizedMessage,
+  realtimeMessages: NormalizedMessage[],
+): NormalizedMessage | null {
+  const index = realtimeMessages.findIndex((candidate) => candidate.id === message.id);
+  if (index < 0) {
+    return null;
+  }
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const candidate = realtimeMessages[i];
+    if (candidate.kind === 'text' && candidate.role === 'user') {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+type ServerTurnRange = { start: number; end: number };
+
+function turnRangeFrom(serverMessages: NormalizedMessage[], start: number): ServerTurnRange {
+  const end = serverMessages.findIndex(
+    (candidate, index) => index > start && candidate.kind === 'text' && candidate.role === 'user',
+  );
+  return { start, end: end < 0 ? serverMessages.length : end };
+}
+
+function findNewestServerTurnRange(serverMessages: NormalizedMessage[]): ServerTurnRange | null {
+  for (let i = serverMessages.length - 1; i >= 0; i -= 1) {
+    const candidate = serverMessages[i];
+    if (candidate.kind === 'text' && candidate.role === 'user') {
+      return turnRangeFrom(serverMessages, i);
+    }
+  }
+  return null;
+}
+
+function findServerTurnRangeByAnchor(
+  serverMessages: NormalizedMessage[],
+  anchorId: string,
+): ServerTurnRange | null {
+  const start = serverMessages.findIndex(
+    (candidate) => candidate.kind === 'text'
+      && candidate.role === 'user'
+      && candidate.transcriptAnchorId === anchorId,
+  );
+  return start < 0 ? null : turnRangeFrom(serverMessages, start);
+}
+
+function findLatestServerTurnRangeByUserContent(
+  serverMessages: NormalizedMessage[],
+  userContent: string,
+): ServerTurnRange | null {
+  for (let i = serverMessages.length - 1; i >= 0; i -= 1) {
+    const candidate = serverMessages[i];
+    if (
+      candidate.kind === 'text'
+      && candidate.role === 'user'
+      && (candidate.content || '').trim() === userContent
+    ) {
+      return turnRangeFrom(serverMessages, i);
+    }
+  }
+  return null;
+}
+
+/** Whether one server turn already carries this assistant text. */
+function turnCarriesText(
+  serverMessages: NormalizedMessage[],
+  range: ServerTurnRange,
+  assistantText: string,
+): boolean {
+  const turnSegments = serverMessages
+    .slice(range.start + 1, range.end)
+    .filter((serverMessage) =>
+      serverMessage.kind === 'text'
+      && serverMessage.role === 'assistant'
+      && (serverMessage.content || '').length > 0,
+    );
+
+  if (turnSegments.some((serverMessage) => isAssistantTextMatch(serverMessage.content || '', assistantText))) {
+    return true;
+  }
+  // Segments are joined on their raw content so inter-segment whitespace
+  // survives, matching how the live deltas concatenated.
+  return isAssistantTextMatch(turnSegments.map((serverMessage) => serverMessage.content || '').join(''), assistantText);
+}
+
 /**
- * Count how many user turns precede `message` in a chronologically merged view
- * of server + realtime rows. Used to match a realtime row to the correct turn
- * on disk when several turns share identical assistant text.
+ * Counts how many user turns precede `message` in a chronologically merged
+ * view of server + realtime rows.
+ *
+ * **This is the one turn lookup still decided by wall clock, and it is the last
+ * resort.** Everything above it is causal: a provider row key, a transcript
+ * anchor, or arrival order inside `realtimeMessages`. This path only runs when
+ * a live row's own turn is not in `serverMessages` at all — the user row was
+ * paginated away — so neither identity nor arrival can locate it and position
+ * is the only remaining signal.
+ *
+ * Making it causal too needs the optimistic-row pairing the timeline store
+ * holds (`retiredAnchors`), which this pure module has no access to; passing it
+ * down is the remaining step.
  */
 function getUserTurnOrdinalBefore(
   message: NormalizedMessage,
@@ -244,59 +342,35 @@ export function isAssistantTextEchoedInSameTurnOnServer(
     }
   }
 
-  // 1. Precise preceding-user matching (robust against pagination slices and duplicate counts)
-  const targetTime = readMessageTime(message);
-  const allChronological = [...serverMessages, ...realtimeMessages].sort(compareMessagesChronologically);
-  let precedingUserContent: string | null = null;
-  let precedingUserTime: number | null = null;
+  // 1. Which turn this live row belongs to is a causal question. Arrival order
+  //    inside `realtimeMessages` answers it without consulting a clock: the
+  //    row belongs to the turn opened by the nearest user row above it. With
+  //    no user row above it — a tab that did not send the message, a session
+  //    resumed mid-run — the row belongs to the newest persisted turn, because
+  //    a live row cannot precede a turn that is already on disk.
+  const turnUserRow = findTurnUserRowByArrival(message, realtimeMessages);
 
-  for (const candidate of allChronological) {
-    if (candidate.id === message.id) {
-      break;
-    }
-    const candidateTime = readMessageTime(candidate);
-    if (targetTime !== null && candidateTime !== null && candidateTime > targetTime) {
-      break;
-    }
-    if (candidate.kind === 'text' && candidate.role === 'user') {
-      precedingUserContent = (candidate.content || '').trim();
-      precedingUserTime = candidateTime;
-    }
+  if (!turnUserRow) {
+    const newestTurn = findNewestServerTurnRange(serverMessages);
+    return newestTurn ? turnCarriesText(serverMessages, newestTurn, assistantText) : false;
   }
 
-  if (precedingUserContent) {
-    // Find the latest matching user message on server
-    for (let i = serverMessages.length - 1; i >= 0; i--) {
-      const sm = serverMessages[i];
-      if (sm.kind === 'text' && sm.role === 'user' && (sm.content || '').trim() === precedingUserContent) {
-        let turnEnd = serverMessages.length;
-        for (let j = i + 1; j < serverMessages.length; j++) {
-          if (serverMessages[j].kind === 'text' && serverMessages[j].role === 'user') {
-            turnEnd = j;
-            break;
-          }
-        }
-        const turnSegments = serverMessages
-          .slice(i + 1, turnEnd)
-          .filter((serverMessage) =>
-            serverMessage.kind === 'text'
-            && serverMessage.role === 'assistant'
-            && (serverMessage.content || '').length > 0,
-          );
+  const anchoredRange = turnUserRow.transcriptAnchorId
+    ? findServerTurnRangeByAnchor(serverMessages, turnUserRow.transcriptAnchorId)
+    : null;
+  if (anchoredRange) {
+    return turnCarriesText(serverMessages, anchoredRange, assistantText);
+  }
 
-        if (turnSegments.some((serverMessage) => isAssistantTextMatch(serverMessage.content || '', assistantText))) {
-          return true;
-        }
-        const joinedText = turnSegments.map((serverMessage) => serverMessage.content || '').join('');
-        if (isAssistantTextMatch(joinedText, assistantText)) {
-          return true;
-        }
-        // The inferred turn does not own this row. Continue through the
-        // ordinal and timestamp-guarded fallbacks: client/server clock skew can
-        // otherwise attach an older live row to a newer persisted user turn.
-        break;
-      }
+  const precedingUserContent = (turnUserRow.content || '').trim();
+  if (precedingUserContent) {
+    const contentRange = findLatestServerTurnRangeByUserContent(serverMessages, precedingUserContent);
+    if (contentRange && turnCarriesText(serverMessages, contentRange, assistantText)) {
+      return true;
     }
+    // The inferred turn does not own this row. Fall through to the ordinal
+    // fallback, which covers transcripts whose earlier turns were paginated
+    // away so the matching user row is not in `serverMessages` at all.
   }
 
   // 2. Fallback to turn-ordinal lookup for historical or legacy layouts
