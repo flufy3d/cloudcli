@@ -1336,6 +1336,38 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
 
   const subagentsByCallId = new Map<string, CodexSubagentRecord>();
   const subagentsByPath = new Map<string, CodexSubagentRecord>();
+
+  /**
+   * Records what one spawned-agent lifecycle event says about its agent.
+   *
+   * Codex has reported these under two shapes — a top-level
+   * `sub_agent_activity` payload, and a `SubAgentActivity` item inside
+   * `item_completed` — so both are routed here rather than each growing its
+   * own copy of the bookkeeping. `agent_thread_id` is the important part: it
+   * names the sibling rollout holding the agent's own transcript.
+   */
+  const applySubagentActivity = (activity: {
+    eventId?: string;
+    kind?: string;
+    agentPath?: string;
+    agentThreadId?: string;
+  }): void => {
+    const byCallId = activity.eventId ? subagentsByCallId.get(activity.eventId) : undefined;
+    const byPath = activity.agentPath ? subagentsByPath.get(activity.agentPath) : undefined;
+    const byThread = activity.agentThreadId
+      ? [...subagentsByCallId.values()].find((record) => record.agentThreadId === activity.agentThreadId)
+      : undefined;
+    const subagent = byCallId ?? byPath ?? byThread;
+    if (!subagent) {
+      return;
+    }
+
+    subagent.agentThreadId = activity.agentThreadId ?? subagent.agentThreadId;
+    if (activity.agentPath) {
+      subagent.agentPath = activity.agentPath;
+      subagentsByPath.set(activity.agentPath, subagent);
+    }
+  };
   const turns = createCodexTurnTracker();
   /** Turns whose prompt already carries the anchor, so only the first does. */
   const anchoredTurnIds = new Set<string>();
@@ -1386,17 +1418,12 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       }
 
       if (payload.type === 'sub_agent_activity' && payload.kind === 'started') {
-        const eventId = readNonEmptyString(payload.event_id);
-        const agentPath = readNonEmptyString(payload.agent_path);
-        const agentThreadId = readNonEmptyString(payload.agent_thread_id);
-        const subagent = eventId ? subagentsByCallId.get(eventId) : undefined;
-        if (subagent) {
-          subagent.agentThreadId = agentThreadId ?? subagent.agentThreadId;
-          if (agentPath) {
-            subagent.agentPath = agentPath;
-            subagentsByPath.set(agentPath, subagent);
-          }
-        }
+        applySubagentActivity({
+          eventId: readNonEmptyString(payload.event_id),
+          kind: 'started',
+          agentPath: readNonEmptyString(payload.agent_path),
+          agentThreadId: readNonEmptyString(payload.agent_thread_id),
+        });
         continue;
       }
 
@@ -1483,6 +1510,19 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       // leak guard the old `kind` check provided holds by construction.
       if (payload.type === 'item_completed') {
         const completedItem = readObjectRecord(payload.item);
+        // Current Codex reports spawned-agent lifecycle here rather than as a
+        // top-level `sub_agent_activity` payload. The thread id it carries is
+        // the only way to find the agent's own rollout, so a card whose id
+        // never arrives renders with an empty timeline.
+        if (completedItem && completedItem.type === 'SubAgentActivity') {
+          applySubagentActivity({
+            eventId: readNonEmptyString(completedItem.id),
+            kind: readNonEmptyString(completedItem.kind),
+            agentPath: readNonEmptyString(completedItem.agent_path),
+            agentThreadId: readNonEmptyString(completedItem.agent_thread_id),
+          });
+          continue;
+        }
         if (completedItem && completedItem.type === 'UserMessage') {
           const content = extractCodexTextContent(completedItem.content);
           if (content.trim()) {

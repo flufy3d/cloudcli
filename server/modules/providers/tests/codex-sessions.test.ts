@@ -1087,3 +1087,87 @@ test('a live command card already given a plain string keeps it unchanged', () =
   assert.deepEqual(toolUse.toolInput, { command: 'npm test' });
 });
 
+
+/**
+ * A spawned agent's timeline only loads if the adapter learns its thread id.
+ *
+ * Codex reports that id on a SubAgentActivity item. Current builds deliver it
+ * inside `item_completed` — a real session's rollout carries ten of them
+ * (started / completed / interacted) and not a single legacy
+ * `sub_agent_activity` payload, which is the only shape the adapter read. The
+ * id therefore never arrived, `findCodexSubagentRollout` was never called, and
+ * every Task card rendered with an empty timeline.
+ */
+test('a spawned agent picks up its thread id from a SubAgentActivity item', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-item-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+  const providerSessionId = 'codex-subagent-parent';
+  const agentThreadId = 'agent-thread-7c02';
+  const callId = 'call_spawn_1';
+
+  try {
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+
+    // The spawned agent's own transcript is a sibling rollout named by its
+    // thread id — the file the parent can only find once it knows that id.
+    await writeFile(path.join(sessionsDir, `rollout-${agentThreadId}.jsonl`), [
+      JSON.stringify({ type: 'session_meta', payload: { id: agentThreadId, cwd: workspacePath } }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'looked at the lighting code' }] },
+      }),
+    ].join('\n') + '\n', 'utf8');
+
+    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), [
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'u1', content: [{ type: 'text', text: 'check the lighting' }] } },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: callId,
+          id: 'fc_spawn_1',
+          arguments: JSON.stringify({ task_name: 'original_lighting', message: 'go look' }),
+        },
+      }),
+      // The shape current Codex emits: a SubAgentActivity inside item_completed.
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-1',
+          item: { type: 'SubAgentActivity', id: callId, kind: 'started', agent_thread_id: agentThreadId, agent_path: '/root/original_lighting' },
+        },
+      }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output: 'FINAL_ANSWER: done' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } }),
+    ].join('\n') + '\n', 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-subagent-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-subagent-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-subagent-1');
+      const spawned = history.messages.find((message) => message.subagent);
+
+      assert.ok(spawned, 'the spawn should produce a card carrying subagent info');
+      assert.equal(spawned.subagent?.id, agentThreadId, 'the thread id must reach the card');
+      assert.ok(
+        (spawned.subagentTools?.length ?? 0) > 0,
+        "the agent's own transcript must be attached, not an empty timeline",
+      );
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
