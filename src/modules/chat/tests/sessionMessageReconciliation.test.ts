@@ -100,6 +100,17 @@ test('a replacement echo survives a kept turn that repeats its text', () => {
   assert.deepEqual(removeOptimisticUserEchoes(persisted, [echo]), []);
 });
 
+test('a row without an id is not treated as an optimistic echo and never throws', () => {
+  const malformed = {
+    kind: 'text',
+    role: 'user',
+    content: 'x',
+    timestamp: '2026-01-01T00:00:00.000Z',
+  } as NormalizedMessage;
+
+  assert.deepEqual(removeOptimisticUserEchoes([], [malformed]), [malformed]);
+});
+
 test('upsertToolUseRow: a blank re-announce frame never blanks a populated card', () => {
   const toolRow = (id: string, toolId: string, toolInput: Record<string, unknown>) => ({
     id,
