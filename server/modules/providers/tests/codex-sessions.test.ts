@@ -1137,3 +1137,52 @@ test('a live command card unwraps the shell invocation the SDK reports as a stri
     assert.deepEqual(toolUse.toolInput, { command: expected }, `from ${reported}`);
   }
 });
+
+/**
+ * Splitting a multi-command script must not leave cards spinning.
+ *
+ * The call carries one output, which goes to the row that kept the call id.
+ * The rows split out beside it can never receive it, and a tool row without a
+ * result renders as still running — permanently, because the call is long
+ * finished. They are settled explicitly instead.
+ */
+test('every row split out of one exec script is settled, not left running', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-split-settle-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+  const providerSessionId = 'codex-split-settle';
+
+  try {
+    const script = 'const r = await Promise.all(['
+      + 'tools.exec_command({"cmd":"echo one"}),'
+      + 'tools.exec_command({"cmd":"echo two"})'
+      + ']);';
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), [
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'c1', input: script } }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'c1', output: 'one\ntwo' } }),
+    ].join('\n') + '\n', 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-split-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-split-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-split-1');
+      const shellRows = history.messages.filter(
+        (message) => message.kind === 'tool_use' && message.toolName === 'Bash',
+      );
+
+      assert.equal(shellRows.length, 2);
+      for (const row of shellRows) {
+        assert.ok(row.toolResult, `${row.toolId} would render as still running`);
+      }
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});

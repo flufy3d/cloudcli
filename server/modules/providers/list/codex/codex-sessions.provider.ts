@@ -1817,10 +1817,23 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
             toolCallId: nextRowId(),
           };
           messages.push(shellMessage);
-          // The call has one output, and it belongs to the row that kept the
-          // call id — the first one.
           if (index === 0) {
+            // The call has exactly one output and it lands on the row that
+            // kept the call id.
             shellCallMessages.set(callId, shellMessage);
+          } else {
+            // The others can never be handed that output, and a tool row with
+            // no result renders as still running — forever, since the call has
+            // already finished. Settle each with its own result row. The
+            // command's text is on the card; the output sits with the first
+            // row of the script, which is the only one the call can address.
+            messages.push({
+              type: 'tool_result',
+              timestamp,
+              toolCallId: shellMessage.toolCallId,
+              output: '',
+              isError: false,
+            });
           }
         });
 

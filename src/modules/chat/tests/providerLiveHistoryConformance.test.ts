@@ -89,6 +89,35 @@ for (const fixture of [antigravityTurn as Fixture, codexTurn as Fixture]) {
     );
   });
 
+  test(`${fixture.provider}: the reply never sorts above the prompt that caused it`, async () => {
+    const rows = await playTurn(fixture);
+    const promptIndex = rows.findIndex((row) => row.kind === 'text' && row.role === 'user');
+    assert.ok(promptIndex >= 0, 'the prompt must be in the transcript');
+
+    const laterRows = rows
+      .map((row, index) => ({ row, index }))
+      .filter(({ row }) => row.kind === 'tool_use'
+        || (row.kind === 'text' && row.role === 'assistant')
+        || row.kind === 'stream_delta');
+
+    for (const { row, index } of laterRows) {
+      assert.ok(
+        index > promptIndex,
+        `${row.kind} sorted above the prompt (row ${index}, prompt ${promptIndex})`,
+      );
+    }
+  });
+
+  test(`${fixture.provider}: a second refresh changes nothing`, async () => {
+    const once = await playTurn(fixture);
+    const twice = await playTurn(fixture);
+    assert.deepEqual(
+      twice.map((row) => `${row.kind}:${row.role ?? ''}:${(row.content ?? '').trim()}`),
+      once.map((row) => `${row.kind}:${row.role ?? ''}:${(row.content ?? '').trim()}`),
+      'replaying the same turn must settle on the same transcript',
+    );
+  });
+
   test(`${fixture.provider}: every tool call the live stream showed survives the refresh`, async () => {
     const rows = await playTurn(fixture);
     const liveToolIds = fixture.live
