@@ -160,6 +160,17 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
  */
 let engineReasoningDefaults = new Map<string, string>();
 
+/**
+ * Context window per `providerId/modelId`, captured from the engine's resolved
+ * catalog (`settings.model.available[].contextWindow`). The engine resolves
+ * every provider it can run — including user-added ones that never appear in
+ * `v2/config.json`, which is where a session's own model key gets its window
+ * from (`resolveZCodeModelContextWindow`).
+ *
+ * Consumers: `resolveZCodeModelContextWindow` (zcode context-usage reader).
+ */
+let engineContextWindows = new Map<string, number>();
+
 /** In-flight/settled engine catalog load, shared across providers and runs. */
 let engineCatalogPromise: Promise<ProviderModelsDefinition | null> | null = null;
 
@@ -187,6 +198,7 @@ function mapEngineModelCatalog(result: AnyRecord | undefined | null): ProviderMo
 
   const options: ProviderModelOption[] = [];
   const reasoningDefaults = new Map<string, string>();
+  const contextWindows = new Map<string, number>();
   const seenValues = new Set<string>();
 
   for (const entry of available) {
@@ -223,6 +235,9 @@ function mapEngineModelCatalog(result: AnyRecord | undefined | null): ProviderMo
     const contextWindow = typeof entryRecord?.contextWindow === 'number' ? entryRecord.contextWindow : undefined;
     const maxOutputTokens = typeof entryRecord?.maxOutputTokens === 'number' ? entryRecord.maxOutputTokens : undefined;
     const providerLabel = readOptionalString(entryRecord?.providerLabel);
+    if (contextWindow && contextWindow > 0) {
+      contextWindows.set(value, contextWindow);
+    }
 
     const descriptionParts: string[] = [];
     if (providerLabel) descriptionParts.push(providerLabel);
@@ -244,6 +259,7 @@ function mapEngineModelCatalog(result: AnyRecord | undefined | null): ProviderMo
   }
 
   engineReasoningDefaults = reasoningDefaults;
+  engineContextWindows = contextWindows;
   return { OPTIONS: options, DEFAULT: options[0].value };
 }
 
@@ -337,6 +353,85 @@ export function resolveZCodeModelDefaultReasoningLevel(modelKey: string): string
     match = level;
   }
   return match;
+}
+
+/**
+ * Context window of one model, as the engine declared it.
+ *
+ * The engine-resolved catalog wins because it is the only source that knows
+ * user-added providers (`opencode-go-chat/deepseek-v4.1-flash` never appears in
+ * `v2/config.json`); the on-disk config is the fallback for a process that has
+ * not resolved a catalog yet (a fresh server answering `/token-usage` before
+ * the first models request or run).
+ *
+ * Consumer: the zcode context-usage reader, which needs a window to turn a
+ * session's occupancy into a percentage.
+ */
+export function resolveZCodeModelContextWindow(modelKey: string): number | undefined {
+  const normalized = modelKey.trim();
+  if (!normalized) return undefined;
+
+  const direct = engineContextWindows.get(normalized);
+  if (direct) return direct;
+
+  // Catalog values are `providerId/modelId`; a bare model id still resolves
+  // when exactly one provider exposes it, mirroring the reasoning defaults.
+  const suffix = normalized.split('/').pop();
+  if (suffix) {
+    let match: number | undefined;
+    for (const [key, window] of engineContextWindows) {
+      if (key.split('/').pop() !== suffix) continue;
+      if (match) {
+        match = undefined; // Ambiguous across providers.
+        break;
+      }
+      match = window;
+    }
+    if (match) return match;
+  }
+
+  return readConfigContextWindow(suffix ?? normalized);
+}
+
+/**
+ * Parsed `limit.context` per bare model id from ZCode's v2 config, memoized by
+ * file identity. The editor and the CLI rewrite that file when providers
+ * change, so identity (mtime + size) is what invalidates the parse — not a TTL.
+ */
+let configContextWindowCache: { key: string; windows: Map<string, number> } | null = null;
+
+function readConfigContextWindow(modelId: string): number | undefined {
+  const configPath = path.join(getZCodeStorageDir(), 'v2', 'config.json');
+  let cacheKey: string;
+  try {
+    const stats = fsSync.statSync(configPath);
+    cacheKey = `${configPath}:${stats.mtimeMs}:${stats.size}`;
+  } catch {
+    return undefined;
+  }
+
+  if (configContextWindowCache?.key !== cacheKey) {
+    try {
+      const config = readObjectRecord(JSON.parse(fsSync.readFileSync(configPath, 'utf8')));
+      const providers = readObjectRecord(config?.provider) ?? {};
+      const windows = new Map<string, number>();
+      for (const providerConfig of Object.values(providers)) {
+        const models = readObjectRecord(readObjectRecord(providerConfig)?.models) ?? {};
+        for (const [configModelId, modelConfig] of Object.entries(models)) {
+          const contextLimit = readObjectRecord(readObjectRecord(modelConfig)?.limit)?.context;
+          if (typeof contextLimit === 'number' && contextLimit > 0) {
+            windows.set(configModelId, contextLimit);
+          }
+        }
+      }
+      configContextWindowCache = { key: cacheKey, windows };
+    } catch {
+      configContextWindowCache = null;
+      return undefined;
+    }
+  }
+
+  return configContextWindowCache?.windows.get(modelId);
 }
 
 /**

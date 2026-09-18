@@ -25,7 +25,7 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`），�
 
 ## Provider 相关前端（零分支原则）
 
-- **能力/目录的唯一来源是后端**：`useProviderCapabilities`（`GET /api/providers/capabilities`）+ `useChatProviderState`（`GET /api/providers/<p>/models` 拉统一模型目录，合成 `providerModelCatalog`）。
+- **能力/目录的唯一来源是后端**：`useProviderCapabilities`（`GET /api/providers/capabilities`，模块级缓存 + 失败按 2s/8s 退避重试后仍失败才回退，因为 `/compact` 这类能力项只靠这一次请求）+ `useChatProviderState`（`GET /api/providers/<p>/models` 拉统一模型目录，合成 `providerModelCatalog`）。
 - **回退镜像**：`src/shared/providerCatalogFallback.ts` 只用于首屏与请求失败兜底，由 parity 测试钉住与后端一致；**其 key 顺序是全应用引擎规范顺序**（一处改动不要在别处另排顺序）。
 - 本地选择持久化为 `<provider>-model` / `<provider>-effort`（`useChatProviderState` 直接读写 localStorage，设备本地，不经 preference store）。
 - 引擎外观：`src/shared/providerDisplay.ts`（显示名）、`src/shared/ui/LLMProviderLogo.tsx`（Logo）。

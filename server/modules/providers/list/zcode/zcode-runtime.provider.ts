@@ -24,6 +24,11 @@
  * @module zcode-runtime.provider
  */
 
+import fsSync from 'node:fs';
+import path from 'node:path';
+
+import Database from 'better-sqlite3';
+
 import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type { ChatAttachmentDescriptor } from '@/shared/image-attachments.js';
 import type {
@@ -32,15 +37,16 @@ import type {
   ProviderPermissionDecision,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
+  ProviderTokenUsageResult,
 } from '@/shared/types.js';
 import { createCompleteMessage, createNormalizedMessage, generateMessageId, readOptionalString } from '@/shared/utils.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 
-import path from 'node:path';
-
 import { SESSION_LOST_METHOD } from './zcode-codec.js';
 import { protocolClient } from './zcode-protocol.client.js';
+import { readZCodeContextUsage } from './zcode-context-usage.js';
+import { getZCodeDatabasePath } from './zcode-data-root.js';
 import { ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from './zcode-live-event-normalizer.js';
 import { buildZCodeRuntimeModel, ingestZCodeModelCatalog, readZCodeSessionModelInfoFromDb, resolveZCodeModelDefaultReasoningLevel, resolveZCodeModelRef } from './zcode-models.provider.js';
 import { EngineSilenceTimeoutError, ZCodeRunLifecycle, resolveSilenceTimeoutMs } from './zcode-run-lifecycle.js';
@@ -56,6 +62,43 @@ import type { RunHandle, RunSettle } from './zcode-run-lifecycle.js';
  * - bypassPermissions → yolo (zcode headless default)
  * - auto → auto
  */
+/**
+ * Shortest gap between two mid-turn `token_budget` frames. Each frame costs one
+ * read-only read of the engine store, and tool results arrive in bursts (one per
+ * parallel call), so the refresh is bounded on the way in rather than on the
+ * number of events.
+ */
+const LIVE_CONTEXT_MIN_INTERVAL_MS = 1500;
+
+/**
+ * Reads one session's current context occupancy straight from the engine store.
+ *
+ * The runtime cannot ask the engine for this mid-turn (no usage event exists
+ * before `turn.completed`), but every finished step is already persisted with
+ * its own request usage. Returns null when the store or session is unreadable,
+ * and never throws into an event listener.
+ *
+ * Consumers: `ZCodeRuntimeProvider.publishLiveContextUsage`.
+ */
+function readZCodeSessionContextUsage(providerSessionId: string): ProviderTokenUsageResult | null {
+  const dbPath = getZCodeDatabasePath();
+  if (!providerSessionId || !fsSync.existsSync(dbPath)) {
+    return null;
+  }
+
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    return readZCodeContextUsage(db, providerSessionId) ?? null;
+  } catch {
+    return null;
+  } finally {
+    if (db) {
+      db.close();
+    }
+  }
+}
+
 const PERMISSION_MODE_MAP: Record<string, string> = {
   default: 'build',
   acceptEdits: 'edit',
@@ -863,11 +906,56 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
           }
 
           writer.send(message);
+
+          if (message.kind === 'tool_result') {
+            // A tool result closes a step: that step's usage is already
+            // persisted, so the composer's context badge can move now instead
+            // of waiting for the completion refresh — which is what a long
+            // tool-heavy turn needs.
+            this.publishLiveContextUsage(handle, writer);
+          }
         }
       } catch (error) {
         console.error(`[ZCodeRuntime] Error processing session event:`, error);
       }
     };
+  }
+
+  /**
+   * Pushes one mid-turn `token_budget` frame when the session's context
+   * occupancy has moved since the last one.
+   *
+   * Deliberately silent about everything else: an unchanged reading (several
+   * tool results of the same step), an aborted or already-finished run, and a
+   * reading taken inside the rate-limit window all publish nothing. The payload
+   * is the same shape the `/token-usage` endpoint returns, so the badge, the
+   * percentage it derives, and a reloaded transcript cannot disagree.
+   */
+  private publishLiveContextUsage(handle: RunHandle, writer: ProviderRuntimeWriter): void {
+    if (handle.abortRequested || handle.state.completed) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - (handle.state.contextPublishedAt ?? 0) < LIVE_CONTEXT_MIN_INTERVAL_MS) {
+      return;
+    }
+    handle.state.contextPublishedAt = now;
+
+    const usage = readZCodeSessionContextUsage(handle.sessionId);
+    if (!usage || usage.used <= 0 || usage.used === handle.state.publishedContextUsed) {
+      return;
+    }
+
+    handle.state.publishedContextUsed = usage.used;
+    writer.send(createNormalizedMessage({
+      id: generateMessageId('zcode'),
+      sessionId: handle.sessionId,
+      provider: 'zcode',
+      kind: 'status',
+      text: 'token_budget',
+      tokenBudget: usage,
+    }));
   }
 
   /**

@@ -17,6 +17,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 
+import Database from 'better-sqlite3';
+
 import type {
   NormalizedMessage,
   ProviderRuntimeContext,
@@ -285,6 +287,15 @@ rl.on('line', (line) => {
       setTimeout(() => process.exit(1), 100);
       return;
     }
+    if (readMode() === 'tool-result') {
+      // One step finishes while the turn keeps running: the tool result is the
+      // moment the runtime re-reads the (already persisted) context usage.
+      send({ method: 'session/event', params: { sessionId, type: 'tool.updated', payload: { kind: 'result', toolCallId: 'call_live', resultPartId: 'part_live' } } });
+      setTimeout(() => {
+        send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
+      }, 200);
+      return;
+    }
     send({ method: 'session/event', params: { sessionId, type: 'model_streaming', payload: { kind: 'text_delta', delta: 'hi there' } } });
     send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
     return;
@@ -400,6 +411,86 @@ test('runtime completes a run when the engine asks for runtime preferences mid-c
   assert.equal(delta?.content, 'hi there');
   const complete = messages.find((msg) => msg.kind === 'complete');
   assert.equal(complete?.tokens, 7);
+});
+
+test('a running turn publishes the session context usage before it completes', async () => {
+  const previousStorageDir = process.env.ZCODE_STORAGE_DIR;
+  // The runtime reads the engine store, so the fixture lives under the
+  // storage-dir override rather than the real ~/.zcode.
+  process.env.ZCODE_STORAGE_DIR = stubDir;
+
+  try {
+    const dbDir = path.join(stubDir, 'cli', 'db');
+    fsSync.mkdirSync(dbDir, { recursive: true });
+    const db = new Database(path.join(dbDir, 'db.sqlite'));
+    try {
+      db.exec(`
+        CREATE TABLE message (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          time_created INTEGER NOT NULL,
+          time_updated INTEGER NOT NULL,
+          data TEXT NOT NULL,
+          sequence INTEGER
+        );
+      `);
+      // One finished step of the stub session; `total` is its occupancy.
+      db.prepare(
+        'INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?)',
+      ).run('msg_live', 'sess_stub_1', 1000, 1000, JSON.stringify({
+        role: 'assistant',
+        providerId: 'stub-provider',
+        modelId: 'stub-window-model',
+        tokens: { total: 4321, input: 4000, output: 321, reasoning: 0, cache: { read: 0, write: 0 } },
+      }), 0);
+    } finally {
+      db.close();
+    }
+
+    const configDir = path.join(stubDir, 'v2');
+    fsSync.mkdirSync(configDir, { recursive: true });
+    fsSync.writeFileSync(
+      path.join(configDir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'stub-provider': {
+            models: { 'stub-window-model': { limit: { context: 8000 } } },
+          },
+        },
+      }),
+      'utf8',
+    );
+
+    fsSync.writeFileSync(modeFilePath, 'tool-result\n');
+    const runtime = new ZCodeRuntimeProvider();
+    const { messages, writer } = createWriter();
+
+    await runtime.run('hello', { sessionId: 'app-sess-live-budget', cwd: stubDir }, writer, context);
+
+    const budgetFrame = messages.find((msg) => msg.kind === 'status' && msg.text === 'token_budget');
+    assert.ok(budgetFrame, 'a running turn must publish its context usage');
+    // Same shape the /token-usage endpoint returns: occupancy plus the window
+    // the composer turns into a percentage, with the lifetime totals kept for
+    // the cost breakdown.
+    assert.deepEqual(budgetFrame.tokenBudget, {
+      used: 4321,
+      total: 8000,
+      inputTokens: 4000,
+      outputTokens: 321,
+      breakdown: { input: 4000, output: 321 },
+      cumulative: { used: 4321, inputTokens: 4000, outputTokens: 321 },
+    });
+    assert.ok(
+      messages.indexOf(budgetFrame) < messages.findIndex((msg) => msg.kind === 'complete'),
+      'the context frame must arrive before the terminal complete',
+    );
+  } finally {
+    if (previousStorageDir === undefined) {
+      delete process.env.ZCODE_STORAGE_DIR;
+    } else {
+      process.env.ZCODE_STORAGE_DIR = previousStorageDir;
+    }
+  }
 });
 
 test('runtime surfaces session/create failures as error messages', async () => {
