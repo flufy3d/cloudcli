@@ -786,8 +786,16 @@ test('optimistic user, thinking, and same-turn assistant echoes are absorbed int
   await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
 
   const at = (n: number) => new Date(BASE_TIME + n * 1000).toISOString();
+  // Sent before this page existed, which is the only order reality produces:
+  // a prompt is not on disk until it has been sent. The stamp is what the
+  // store records at send time.
   store.appendRealtime(SESSION_ID,
-    msg(1, { id: 'local_user_echo', content: 'what is the answer?', timestamp: at(1) }));
+    msg(1, {
+      id: 'local_user_echo',
+      content: 'what is the answer?',
+      timestamp: at(1),
+      replacesAfterRowCount: 0,
+    }));
   store.appendRealtime(SESSION_ID, {
     id: 'rt_thinking_echo',
     sessionId: SESSION_ID,
@@ -1143,4 +1151,30 @@ test('two Codex replies with different provider row keys both survive the refres
     .map((row) => row.providerRowKey);
 
   assert.deepEqual(keys, ['msg_first', 'msg_second'], 'distinct keys are distinct rows');
+});
+
+/**
+ * Re-sending a prompt the transcript already contains must not make the new
+ * message disappear into the old turn.
+ */
+test('a repeated prompt is not retired by the identical prompt already on screen', async () => {
+  const earlier: NormalizedMessage = {
+    id: 'srv-old', sessionId: SESSION_ID, timestamp: new Date(BASE_TIME).toISOString(),
+    provider: 'antigravity', kind: 'text', role: 'user', content: 'continue',
+  };
+  const reply: NormalizedMessage = { ...earlier, id: 'srv-reply', role: 'assistant', content: 'done' };
+
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 50, offset: 0 }, page: { messages: [earlier, reply], total: 2, hasMore: false } },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+  await store.fetchFromServer(SESSION_ID, { limit: 50, offset: 0 });
+
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_repeat', sessionId: SESSION_ID, timestamp: new Date(BASE_TIME + 60_000).toISOString(),
+    provider: 'antigravity', kind: 'text', role: 'user', content: 'continue',
+  });
+
+  const userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
+  assert.equal(userRows.length, 2, 'the newly sent prompt must still be visible');
 });

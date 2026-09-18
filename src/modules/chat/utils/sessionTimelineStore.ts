@@ -1259,10 +1259,22 @@ export class SessionTimelineStore {
    */
   appendRealtime(sessionId: string, msg: NormalizedMessage): void {
     const slot = this.getSlot(sessionId);
-    const normalizedMessage =
+    const withSession =
       msg.sessionId === sessionId
         ? msg
         : { ...msg, sessionId };
+    // An optimistic prompt records how much transcript existed when it was
+    // sent. Retiring it later then needs no clock: only a row that arrived
+    // afterwards can be its persisted copy, which also stops an identical
+    // prompt from an earlier turn claiming it and making the new message
+    // vanish. The edit path sets its own value and is left alone.
+    const normalizedMessage =
+      withSession.id.startsWith('local_')
+      && withSession.kind === 'text'
+      && withSession.role === 'user'
+      && withSession.replacesAfterRowCount === undefined
+        ? { ...withSession, replacesAfterRowCount: slot.serverMessages.length }
+        : withSession;
     let updated = [...slot.realtimeMessages, normalizedMessage];
     if (updated.length > MAX_REALTIME_MESSAGES) {
       updated = updated.slice(-MAX_REALTIME_MESSAGES);
