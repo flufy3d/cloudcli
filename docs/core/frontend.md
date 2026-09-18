@@ -87,6 +87,7 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 4. **高亮**：`src/shared/syntaxHighlighter.ts` 用 PrismLight + 显式语言注册表（`codeHighlightLanguages.ts`），不要换回全量 Prism。
 5. **流式**：流式行必须经 `StreamingMarkdown`（前缀/尾块两段 `MarkdownBody`，前缀 memo 命中）+ store 的 100ms tick，别在每 delta 上重解析全文。
 6. **WS 帧**：任何新功能不得在帧回调里直接 setState；进 store，靠 notify 批量提交。
+7. **Git 变更面板按需取 diff**：`useGitPanelController` 只负责 `fetch` 单个文件的 diff，status 刷新时只清掉已不在变更列表里的缓存；`ChangesView` 在某行展开时才请求，`FileChangeItem` 折叠时**不挂载** `GitDiffViewer`。几百个变更文件若一次性预取并常驻 DOM（每行 diff 一个节点），移动端浏览器会被内存打死。
 
 ## i18n
 
