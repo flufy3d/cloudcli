@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.3.0 / 2026-09-16
+> 基准：2.3.3 / 2026-09-18
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -8,13 +8,13 @@
 
 ## 技术栈与入口
 
-React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`），测试 vitest，i18n 用 react-i18next。入口 `src/main.tsx` → `src/App.tsx`：两个工作区路由 `/` 与 `/session/:sessionId`，Context 挂载顺序也在 `App.tsx`。
+React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@shared` → 仓库根 `shared/`），测试 vitest，i18n 用 react-i18next。入口 `src/main.tsx` → `src/App.tsx`：两个工作区路由 `/` 与 `/session/:sessionId`，Context 挂载顺序也在 `App.tsx`。
 
 ## 全局状态分层
 
 | Context | 文件 | 管什么 |
 | --- | --- | --- |
-| `WebSocketContext` | `src/shared/context/WebSocketContext.tsx` | WS 单例；帧同步分发给订阅者，**帧不进 React state** |
+| `WebSocketContext` | `src/shared/context/WebSocketContext.tsx` | WS 单例；帧同步分发给订阅者，**帧不进 React state**；帧类型 `ServerEvent` 定义在 `src/shared/types.ts`，此处只 re-export |
 | `AuthContext` | `src/modules/auth/context/AuthContext.tsx` | token、登录态 |
 | `ThemeContext` / `UiPreferencesContext` | `src/shared/context/` | 主题与 UI 偏好（`userSettings.ts` 统一读写：服务端 `auth.db` 是 source of truth，localStorage 只做首屏镜像；主题、语言、六家引擎权限、代码编辑器设置、`uiPreferences` 开关包都归它） |
 | `SessionProtectionContext` | `src/shared/context/SessionProtectionContext.tsx` | 会话保护 / PWA 冷启动恢复 |
@@ -32,6 +32,18 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`），�
 - **回退镜像**：`src/shared/providerCatalogFallback.ts` 只用于首屏与请求失败兜底，由 parity 测试钉住与后端一致；**其 key 顺序是全应用引擎规范顺序**（一处改动不要在别处另排顺序）。
 - 本地选择持久化为 `<provider>-model` / `<provider>-effort`（`useChatProviderState` 直接读写 localStorage，设备本地，不经 preference store）。
 - 引擎外观：`src/shared/providerDisplay.ts`（显示名）、`src/shared/ui/LLMProviderLogo.tsx`（Logo）。
+
+### 消息类型的归属
+
+服务端↔客户端的消息形状**不在前端定义**，而在仓库根 `shared/protocol/chatEvents.ts`，`src/shared/types.ts` 从那里 re-export
+（细节见 [providers.md](./providers.md) 的「线上契约」）。前端曾另有一份自己的副本，与服务端悄悄漂移了七个字段。
+
+前端在协议之上的本地扩展写在 `src/shared/types.ts`，必须显式列出：
+
+- `TimelineMessageKind` = 协议的 `MessageKind` + `interactive_prompt`。后者由 composer 本地合成，引擎永不产出；把它挡在 `MessageKind` 之外，就不会有人误以为某家引擎该发这个 kind。
+- `NormalizedMessage` = 协议消息换上 `TimelineMessageKind`，再加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。这两个字段从不上线，只活在「发出去」与「持久化回合顶替掉它」之间。
+
+新增一个跨端字段时改协议文件，**不要**在前端这边补声明——那正是漂移的来路。
 - 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染。
 
 ## 性能守则（硬约束，都是踩过坑的）

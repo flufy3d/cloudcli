@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 
-import type { Project, ProjectSession } from '@/shared/types';
+import type { ServerEvent, Project, ProjectSession } from '@/shared/types';
 
 /**
  * Regression guard for the `session_upserted` alias rewrite.
@@ -43,7 +43,7 @@ const respondWith = (projects: Project[]) => {
   projectsResponse.mockResolvedValue({ ok: true, json: async () => projects });
 };
 
-type ServerEventListener = (event: Record<string, unknown>) => void;
+type ServerEventListener = (event: ServerEvent) => void;
 
 const listeners = new Set<ServerEventListener>();
 

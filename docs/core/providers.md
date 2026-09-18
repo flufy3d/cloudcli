@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.3.0 / 2026-09-16
+> 基准：2.3.3 / 2026-09-18
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -9,7 +9,7 @@
 
 ## 现状：六家引擎
 
-`claude | codex | cursor | opencode | zcode | antigravity`，联合类型定义在 `server/shared/types.ts` 的 `LLMProvider`。注册表 `server/modules/providers/provider.registry.ts` 用 `Record<LLMProvider, IProvider>` 硬编码六家实例——漏一家直接编译报错。
+`claude | codex | cursor | opencode | zcode | antigravity`，联合类型定义在 `shared/protocol/chatEvents.ts` 的 `LLMProvider`（前后端共用同一份，见下文「线上契约」）。注册表 `server/modules/providers/provider.registry.ts` 用 `Record<LLMProvider, IProvider>` 硬编码六家实例——漏一家直接编译报错。
 
 每家一个目录：`server/modules/providers/list/<name>/`，由 `<name>.provider.ts` 组装各切面。claude / cursor / opencode 的 runtime 是遗留 `.js` 适配器（`claude-runtime.provider.js` 等），codex、zcode / antigravity 是 TS（含协议客户端、配额、运行生命周期等更多切面文件）。
 
@@ -63,7 +63,7 @@
 
 ## 新增一个引擎：六步清单
 
-1. **类型**：`server/shared/types.ts` 扩展 `LLMProvider` 联合类型（全仓类型联动会指出所有必改点）；前端 `src/shared/types.ts` 同步。
+1. **类型**：`shared/protocol/chatEvents.ts` 扩展 `LLMProvider` 联合类型（全仓类型联动会指出所有必改点）。**只需改这一处**——前后端都从这里 re-export。
 2. **目录**：新建 `server/modules/providers/list/<name>/`，尽量复用基类（`AbstractProvider` / `McpProvider` / `SkillsProvider` / `SqliteSessionSynchronizer` / `cli-engine-path`），写 `<name>.provider.ts` 组装七切面。
 3. **注册**：`provider.registry.ts` 的 `providers` 记录加一行（漏了编译报错）。同步器声明 `getSessionWatchTarget()` 后，`sessions-watcher.service.ts` 自动纳管，**不需要改 watcher**。
 4. **能力**：`services/provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG` 补静态目录（权限模式、默认模型、images/files/abort/effort）；可选能力靠切面自动推导。同步更新前端镜像 `src/shared/providerCatalogFallback.ts`（parity 测试会强制）。
@@ -71,6 +71,22 @@
 6. **前端外观**：`src/shared/ui/LLMProviderLogo.tsx` 加 Logo、`src/shared/providerDisplay.ts` 加显示名。composer 无需改动——它按能力矩阵渲染。
 
 改完跑：`npm run typecheck && npm run lint && npm test`（provider 相关测试在 `server/modules/providers/tests/`）。
+
+## 线上契约：一份定义
+
+服务端↔客户端的消息形状定义在仓库根的 **`shared/protocol/chatEvents.ts`**，两端各自 re-export，谁都不再另写一份：
+`LLMProvider`、`MessageKind`、`GatewayEventKind`、`ServerEventKind`、`NormalizedMessage`、
+`SubagentActivity`、`SubagentInfo`、`MemoryCitation`、`SessionUpserted*` / `SessionRemovedEvent`。
+
+两个 tsconfig 都已把根 `shared/` 纳入编译范围；前端另有 `@shared/*` 别名。该文件不引 `node:*` 也不引 DOM/React，
+所以两边都能编译它。
+
+**`NormalizedMessage` 没有索引签名。** 引擎适配器写入一个未在协议里声明的字段会直接编译失败——
+这是「一致的输出格式」唯一靠得住的执行手段。需要新字段就先在协议里声明，并说明哪个 kind 会带它。
+
+各端在协议之上的本地扩展必须显式写出、不得混入协议本身。今天只有前端有：
+`kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
+外加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。
 
 **跨路文本身份要求**：`NormalizedMessage.providerRowKey` 是 provider 在同一会话内为一条最终可渲染行生成的稳定身份，只在 live 与历史两路都能从原生数据复建时设置；它不承担消息展示 id、WebSocket `seq`、provider 排序 `sequence` 或编辑锚点的职责。前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选或缺 key 且无法证明同一用户回合时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
 
