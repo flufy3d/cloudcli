@@ -614,6 +614,103 @@ test('canonical Antigravity transcript reader does not duplicate unindexed rows 
   }
 });
 
+test('canonical Antigravity transcript reader restores causal order when a result row is flushed before its call', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-canonical-order-'));
+  const sessionId = 'canonical-order-session';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(transcriptDir, { recursive: true });
+  await fs.writeFile(path.join(transcriptDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', content: 'call' }),
+    JSON.stringify({ type: 'CHECKPOINT', content: 'unindexed-after-1' }),
+    // Antigravity's writer flushes step 3 ahead of step 2.
+    JSON.stringify({ step_index: 3, type: 'GENERIC', content: 'result-3' }),
+    JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', content: 'call-2' }),
+  ].join('\n'));
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const rows = await readCanonicalAntigravityTranscript(sessionId);
+    assert.deepEqual(rows.map((row) => [row.entry.step_index, row.entry.content]), [
+      [1, 'call'],
+      [undefined, 'unindexed-after-1'],
+      [2, 'call-2'],
+      [3, 'result-3'],
+    ]);
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('AntigravitySessionsProvider fetchHistory pairs an out-of-order tool result with its own call', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-out-of-order-'));
+  const sessionId = 'hist-out-of-order';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(transcriptDir, { recursive: true });
+  await fs.writeFile(path.join(transcriptDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-09-18T05:17:20Z', content: '<USER_REQUEST>\nread it\n</USER_REQUEST>' }),
+    JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-09-18T05:17:21Z', tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/world.ts' } }] }),
+    JSON.stringify({ step_index: 2, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', created_at: '2026-09-18T05:17:22Z', content: 'Created At: 2026-09-18T13:17:20+08:00\nCompleted At: 2026-09-18T13:17:20+08:00\nFile Path: `/tmp/world.ts`\n1: world body' }),
+    // The result of step 3's call lands in the log before the call itself.
+    JSON.stringify({ step_index: 4, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', created_at: '2026-09-18T05:17:24Z', content: 'Created At: 2026-09-18T13:17:24+08:00\nCompleted At: 2026-09-18T13:17:24+08:00\nFile Path: `/tmp/lighting.ts`\n70: lighting body' }),
+    JSON.stringify({ step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-09-18T05:17:23Z', tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/lighting.ts' } }] }),
+    JSON.stringify({ step_index: 5, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-09-18T05:17:25Z', tool_calls: [{ name: 'find_by_name', args: { Pattern: '*Equip*' } }] }),
+    JSON.stringify({ step_index: 6, source: 'MODEL', type: 'FIND_BY_NAME', status: 'DONE', created_at: '2026-09-18T05:17:26Z', content: 'Created At: 2026-09-18T13:17:28+08:00\nCompleted At: 2026-09-18T13:17:32+08:00\nFound 2 matches' }),
+  ].join('\n') + '\n');
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const sessions = new AntigravitySessionsProvider();
+    const { messages } = await sessions.fetchHistory(sessionId, {});
+
+    // No result may surface as assistant prose: that is the symptom of a miss.
+    assert.equal(messages.some((msg) => msg.role === 'assistant' && /Created At:/.test(msg.content ?? '')), false);
+
+    const toolUses = messages.filter((msg) => msg.kind === 'tool_use');
+    assert.deepEqual(
+      toolUses.map((msg) => {
+        const input = msg.toolInput as { AbsolutePath?: string; Pattern?: string } | undefined;
+        return [msg.toolName, input?.AbsolutePath ?? input?.Pattern];
+      }),
+      [['view_file', '/tmp/world.ts'], ['view_file', '/tmp/lighting.ts'], ['find_by_name', '*Equip*']],
+    );
+    assert.match(toolUses[0]?.toolResult?.content ?? '', /world body/);
+    assert.match(toolUses[1]?.toolResult?.content ?? '', /lighting body/);
+    assert.match(toolUses[2]?.toolResult?.content ?? '', /Found 2 matches/);
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('AntigravitySessionsProvider fetchHistory drops raw tool output that has no call to pair with', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-orphan-result-'));
+  const sessionId = 'hist-orphan-result';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(transcriptDir, { recursive: true });
+  await fs.writeFile(path.join(transcriptDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-09-18T05:17:20Z', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }),
+    JSON.stringify({ step_index: 1, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', created_at: '2026-09-18T05:17:21Z', content: 'Created At: 2026-09-18T13:17:24+08:00\nCompleted At: 2026-09-18T13:17:24+08:00\nFile Path: `/tmp/lighting.ts`\n70: orphan body' }),
+    JSON.stringify({ step_index: 2, source: 'MODEL', type: 'GENERIC', status: 'DONE', created_at: '2026-09-18T05:17:22Z', content: 'Background task finished.' }),
+  ].join('\n') + '\n');
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const sessions = new AntigravitySessionsProvider();
+    const { messages } = await sessions.fetchHistory(sessionId, {});
+
+    assert.equal(messages.some((msg) => /orphan body/.test(msg.content ?? '')), false);
+    // Plain background-task status stays visible.
+    assert.equal(
+      messages.filter((msg) => msg.role === 'assistant').map((msg) => msg.content).join(''),
+      'Background task finished.',
+    );
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('AntigravitySessionsProvider fetchHistory renders replies and tool results from transcript fixtures', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-data-'));
   const sessionId = 'hist-sess-1';

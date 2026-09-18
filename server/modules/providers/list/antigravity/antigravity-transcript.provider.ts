@@ -73,7 +73,23 @@ export async function readCanonicalAntigravityTranscript(
     const step = row.entry.step_index;
     if (typeof step === 'number' && !compactSteps.has(step)) merged.push(row);
   }
-  // Compact order is the newest writer's causal order. Do not sort it: rows
-  // without a native step index still have a meaningful transcript position.
-  return merged;
+  return sortByStepIndex(merged);
+}
+
+/**
+ * Restores causal order by step index. Antigravity's writer occasionally
+ * flushes a tool result row ahead of the call row that produced it, which
+ * would otherwise make consumers pair a result with the wrong call. Rows
+ * without a native step index carry no ordering of their own, so they keep
+ * their position right after the row they followed.
+ */
+function sortByStepIndex(rows: CanonicalAntigravityTranscriptRow[]): CanonicalAntigravityTranscriptRow[] {
+  let previousKey = -1;
+  const keyed = rows.map((row, position) => {
+    const step = row.entry.step_index;
+    previousKey = typeof step === 'number' ? step : previousKey + 0.5;
+    return { row, key: previousKey, position };
+  });
+  keyed.sort((a, b) => (a.key - b.key) || (a.position - b.position));
+  return keyed.map(({ row }) => row);
 }

@@ -259,6 +259,16 @@ export function cleanAntigravityMessageContent(
 }
 
 /**
+ * Recognizes the header Antigravity's tool runner prepends to every tool
+ * result (`Created At:` / `Completed At:`, optionally followed by a file or
+ * command banner). Results that never find their call must not reach the UI as
+ * assistant prose, so this guards the last-resort text fallback.
+ */
+function looksLikeToolResultPayload(text: string): boolean {
+  return /^Created At:\s*\S+[\s\S]*?^Completed At:\s*\S+/m.test(text);
+}
+
+/**
  * Strips Antigravity engine internal wrapper blocks completely (used for user messages).
  */
 export function stripSystemMessageBlocks(text: string): string {
@@ -509,35 +519,37 @@ export class AntigravitySessionsProvider implements IProviderSessions {
 
           // Remaining MODEL entries are tool results (RUN_COMMAND, VIEW_FILE,
           // CODE_ACTION, LIST_DIRECTORY, GREP_SEARCH, ...) or GENERIC
-          // background-task output. Result entries arrive in call order, so
-          // pair each with the oldest tool_use still missing its result.
+          // background-task output. Rows reach here in step order, so pairing
+          // each with the oldest tool_use still missing its result is exact.
           if (source === 'MODEL' && rawContent) {
             const pendingToolUse = normalizedMessages.find(
               (msg) => msg.kind === 'tool_use' && !msg.toolResult,
             );
             if (pendingToolUse) {
-              const cleanedResult = cleanAntigravityMessageContent(rawContent, 'tool_result');
               pendingToolUse.toolResult = {
-                content: cleanedResult,
+                content: cleanAntigravityMessageContent(rawContent, 'tool_result'),
                 isError: entry.status === 'ERROR'
                   || (typeof entry.exit_code === 'number' && entry.exit_code !== 0),
               };
-            } else {
-              const cleanedContent = cleanAntigravityMessageContent(rawContent, 'assistant');
-              if (cleanedContent) {
-                // Nothing to pair with (task status without a visible call):
-                // surface the cleaned content as assistant text only if non-empty
-                normalizedMessages.push(createNormalizedMessage({
-                  id: baseId,
-                  sessionId,
-                  timestamp: createdAt,
-                  provider: PROVIDER,
-                  kind: 'text',
-                  role: 'assistant',
-                  content: cleanedContent,
-                  sequence: stepIndex,
-                }));
-              }
+              continue;
+            }
+
+            // Nothing to pair with. Genuine background-task status is surfaced
+            // as assistant text, but raw tool output must never be: that is a
+            // pairing miss, and rendering it dumps the tool's payload into the
+            // conversation as if the model had written it.
+            const cleanedContent = cleanAntigravityMessageContent(rawContent, 'assistant');
+            if (cleanedContent && !looksLikeToolResultPayload(cleanedContent)) {
+              normalizedMessages.push(createNormalizedMessage({
+                id: baseId,
+                sessionId,
+                timestamp: createdAt,
+                provider: PROVIDER,
+                kind: 'text',
+                role: 'assistant',
+                content: cleanedContent,
+                sequence: stepIndex,
+              }));
             }
           }
         } catch {
