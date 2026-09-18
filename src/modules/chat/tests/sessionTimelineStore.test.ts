@@ -982,3 +982,118 @@ test('an Edit for the same path in a later user turn cannot claim an earlier per
 
   assert.ok(store.getMessages(SESSION_ID).some((message) => message.id === 'rt-live-second-edit'));
 });
+
+// ─── Cross-source ordering: causal anchor over wall clock ────────────────────
+
+/**
+ * The reported Codex symptom: the live reply renders *above* the user message
+ * that caused it.
+ *
+ * The two sources carry timestamps from two machines — the streaming row is
+ * stamped by the browser, the persisted user turn by the engine. While the
+ * optimistic `local_` row is still present both rows sit in `realtimeMessages`
+ * and array order keeps them straight; once the history refresh retires the
+ * optimistic row, the pair is split across sources and a browser clock running
+ * slightly behind the engine's flips them.
+ *
+ * Ordering must come from the causal anchor (this stream belongs to that user
+ * turn), never from comparing two machines' clocks.
+ */
+test('a live stream stays below its user turn when the browser clock lags the engine', async () => {
+  const ENGINE_USER_TIME = new Date(BASE_TIME + 60_000).toISOString();
+  const BROWSER_SKEW_MS = 2_000;
+
+  const persistedUserTurn: NormalizedMessage = {
+    id: 'engine-user-1',
+    sessionId: SESSION_ID,
+    timestamp: ENGINE_USER_TIME,
+    provider: 'codex',
+    kind: 'text',
+    role: 'user',
+    content: 'explain the merge',
+  };
+
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 50, offset: 0 }, page: { messages: [persistedUserTurn], total: 1, hasMore: false } },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  // The browser stamps the optimistic user row and the stream that follows it
+  // with a clock running behind the engine's.
+  vi.setSystemTime(new Date(BASE_TIME + 60_000 - BROWSER_SKEW_MS));
+
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_1',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 60_000 - BROWSER_SKEW_MS).toISOString(),
+    provider: 'codex',
+    kind: 'text',
+    role: 'user',
+    content: 'explain the merge',
+  });
+
+  store.applyServerEvent(
+    { kind: 'stream_delta', sessionId: SESSION_ID, content: 'The merge interleaves' } as unknown as ServerEvent,
+    { provider: 'codex' },
+  );
+  await tickThrottle();
+
+  // The history refresh lands the engine's copy of the user turn, retiring the
+  // optimistic row and splitting the pair across the two sources.
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
+
+  const rows = store.getMessages(SESSION_ID);
+  const userIndex = rows.findIndex((row) => row.role === 'user');
+  const streamIndex = rows.findIndex((row) => row.id === `__streaming_${SESSION_ID}`);
+
+  assert.ok(userIndex >= 0, 'the user turn must survive the refresh');
+  assert.ok(streamIndex >= 0, 'the live stream must survive the refresh');
+  assert.ok(
+    userIndex < streamIndex,
+    `the live stream must stay below its user turn (user@${userIndex}, stream@${streamIndex})`,
+  );
+});
+
+/**
+ * The same split, minus the causal anchor: a second tab (or a tab that
+ * reconnected mid-run) never created an optimistic row, so nothing records
+ * which turn the live stream belongs to. Placement falls back to the clocks,
+ * and this tab's clock also lags the engine's.
+ */
+test('a live stream stays below its user turn even without an optimistic row to anchor it', async () => {
+  const ENGINE_USER_TIME = new Date(BASE_TIME + 60_000).toISOString();
+
+  const persistedUserTurn: NormalizedMessage = {
+    id: 'engine-user-1',
+    sessionId: SESSION_ID,
+    timestamp: ENGINE_USER_TIME,
+    provider: 'codex',
+    kind: 'text',
+    role: 'user',
+    content: 'explain the merge',
+  };
+
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 50, offset: 0 }, page: { messages: [persistedUserTurn], total: 1, hasMore: false } },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
+
+  vi.setSystemTime(new Date(BASE_TIME + 60_000 - 2_000));
+  store.applyServerEvent(
+    { kind: 'stream_delta', sessionId: SESSION_ID, content: 'The merge interleaves' } as unknown as ServerEvent,
+    { provider: 'codex' },
+  );
+  await tickThrottle();
+
+  const rows = store.getMessages(SESSION_ID);
+  const userIndex = rows.findIndex((row) => row.role === 'user');
+  const streamIndex = rows.findIndex((row) => row.id === `__streaming_${SESSION_ID}`);
+
+  assert.ok(userIndex >= 0 && streamIndex >= 0);
+  assert.ok(
+    userIndex < streamIndex,
+    `the live stream must stay below its user turn (user@${userIndex}, stream@${streamIndex})`,
+  );
+});

@@ -41,7 +41,7 @@
 
 import { authenticatedFetch } from '@/shared/api';
 import type { LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
-import { removeOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
+import { reconcileOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
 import { isThinkingRowEchoOnServer, upsertThinkingRow } from '@/modules/chat/utils/sessionThinkingRows';
 import {
   claimExactServerToolCall,
@@ -74,6 +74,14 @@ export type SessionStatus = 'idle' | 'loading' | 'streaming' | 'error';
 export type SessionSlot = {
   serverMessages: NormalizedMessage[];
   realtimeMessages: NormalizedMessage[];
+  /**
+   * For each realtime row, the id of the last server row that was already
+   * present when the row first arrived — everything the transcript held by
+   * then necessarily happened before it. Recorded once per row and never
+   * revised, this is the arrival half of the merge's causal ordering; the
+   * empty string means the transcript was empty and the row has no floor.
+   */
+  realtimeArrivalAnchors: Map<string, string>;
   merged: NormalizedMessage[];
   /** @internal Cache-invalidation refs for computeMerged */
   _lastServerRef: NormalizedMessage[];
@@ -104,6 +112,7 @@ function createEmptySlot(): SessionSlot {
   return {
     serverMessages: EMPTY,
     realtimeMessages: EMPTY,
+    realtimeArrivalAnchors: new Map(),
     merged: EMPTY,
     _lastServerRef: EMPTY,
     _lastRealtimeRef: EMPTY,
@@ -287,7 +296,10 @@ function pruneRealtimeSupersededByServer(
   }
 
   const serverIds = new Set(serverMessages.map((message) => message.id));
-  const reconciledRealtimeMessages = removeOptimisticUserEchoes(serverMessages, realtimeMessages);
+  // Optimistic user rows are deliberately kept here. They are what records
+  // which turn each live row belongs to, and the merge needs that boundary to
+  // anchor a live reply below its own user turn. Hiding them is the merge's
+  // job (`reconcileOptimisticUserEchoes`), not this prune's.
   const claimedServerRowIds = new Set<string>();
   const allServerTools = collectServerToolCalls(serverMessages);
 
@@ -318,7 +330,7 @@ function pruneRealtimeSupersededByServer(
     return serverMessages.slice(start, end < 0 ? undefined : end);
   };
 
-  const retained = reconciledRealtimeMessages.filter((message) => {
+  const retained = realtimeMessages.filter((message) => {
     if (serverIds.has(message.id)) {
       return false;
     }
@@ -379,30 +391,90 @@ function pruneRealtimeSupersededByServer(
 }
 
 /**
+ * Resolves, for each realtime row, the lowest server index it may be placed
+ * after.
+ *
+ * A realtime row belongs to the turn opened by the nearest optimistic user row
+ * above it — `realtimeMessages` is append-ordered, so that relationship is
+ * already recorded by position and needs no extra field. Once the persisted
+ * copy of that user turn retires the optimistic row, the pair is split across
+ * the two sources; `retiredAnchors` says which server row took over, and that
+ * row's index becomes the floor its turn's live rows may not sort above.
+ *
+ * Rows whose turn has no persisted counterpart yet get no floor and fall back
+ * to timestamp placement.
+ */
+function resolveRealtimeFloors(
+  serverMessages: NormalizedMessage[],
+  realtimeMessages: NormalizedMessage[],
+  retiredAnchors: Map<string, string>,
+  arrivalAnchors: Map<string, string>,
+): Map<string, number> {
+  const serverIndexById = new Map(serverMessages.map((message, index) => [message.id, index]));
+  const floors = new Map<string, number>();
+  let turnFloor: number | null = null;
+
+  for (const message of realtimeMessages) {
+    if (message.id.startsWith('local_')) {
+      const anchorServerId = retiredAnchors.get(message.id);
+      const anchorIndex = anchorServerId === undefined ? undefined : serverIndexById.get(anchorServerId);
+      // An optimistic row still awaiting its persisted copy ends the previous
+      // turn without opening a floored one: its own rows cannot be placed
+      // relative to a server row that does not exist yet.
+      turnFloor = anchorIndex === undefined ? null : anchorIndex;
+      continue;
+    }
+
+    const arrivalAnchorId = arrivalAnchors.get(message.id);
+    const arrivalFloor = arrivalAnchorId ? serverIndexById.get(arrivalAnchorId) : undefined;
+
+    // Both floors are statements about the same row, so the later one wins:
+    // the turn anchor knows which user turn caused it, the arrival anchor
+    // knows what the transcript already held when it appeared.
+    const floor = turnFloor !== null && arrivalFloor !== undefined
+      ? Math.max(turnFloor, arrivalFloor)
+      : turnFloor ?? arrivalFloor;
+
+    if (floor !== undefined && floor !== null) {
+      floors.set(message.id, floor);
+    }
+  }
+
+  return floors;
+}
+
+/**
  * Interleaves two already ordered sources without reordering either source.
- * History timestamps and live timestamps can come from different machines;
- * they locate the next row approximately, while source order preserves the
- * causal user → reply sequence and server transcript order.
+ *
+ * Each source's own order is authoritative — server rows follow the transcript,
+ * realtime rows follow arrival. Only the interleave has to be decided, and the
+ * two sources' timestamps come from different machines, so a causal anchor
+ * decides it wherever one exists: a realtime row is held back until every
+ * server row up to and including its turn's anchor has been emitted.
+ * Timestamps place only the rows no anchor covers.
  */
 function stableMergeMessageSources(
   serverMessages: NormalizedMessage[],
   realtimeMessages: NormalizedMessage[],
+  realtimeTurnFloors: Map<string, number> = new Map(),
 ): NormalizedMessage[] {
   const merged: NormalizedMessage[] = [];
   let serverIndex = 0;
   let realtimeIndex = 0;
 
   while (serverIndex < serverMessages.length && realtimeIndex < realtimeMessages.length) {
+    const realtimeMessage = realtimeMessages[realtimeIndex];
+    const floor = realtimeTurnFloors.get(realtimeMessage.id);
+    const heldBackByAnchor = floor !== undefined && serverIndex <= floor;
+
     if (
-      compareMessagesChronologically(
-        serverMessages[serverIndex],
-        realtimeMessages[realtimeIndex],
-      ) <= 0
+      heldBackByAnchor
+      || compareMessagesChronologically(serverMessages[serverIndex], realtimeMessage) <= 0
     ) {
       merged.push(serverMessages[serverIndex]);
       serverIndex++;
     } else {
-      merged.push(realtimeMessages[realtimeIndex]);
+      merged.push(realtimeMessage);
       realtimeIndex++;
     }
   }
@@ -414,7 +486,11 @@ function stableMergeMessageSources(
   return merged;
 }
 
-function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[]): NormalizedMessage[] {
+function computeMerged(
+  server: NormalizedMessage[],
+  realtime: NormalizedMessage[],
+  arrivalAnchors: Map<string, string>,
+): NormalizedMessage[] {
   if (realtime.length === 0) {
     return dedupeAdjacentAssistantEchoes(server);
   }
@@ -423,7 +499,7 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
   }
 
   const serverIds = new Set(server.map((message) => message.id));
-  const reconciledRealtime = removeOptimisticUserEchoes(server, realtime);
+  const { messages: reconciledRealtime, retiredAnchors } = reconcileOptimisticUserEchoes(server, realtime);
   const providerRowReconciliations = new Map<string, ReturnType<typeof reconcileProviderRowText>>();
   const reconcileRealtimeProviderRow = (message: NormalizedMessage) => {
     const cached = providerRowReconciliations.get(message.id);
@@ -470,20 +546,55 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
     return true;
   });
 
+  const prunedServer = server.filter((message) => !serverRowsSupersededByRealtime.has(message.id));
+
   if (extra.length === 0) {
-    return dedupeAdjacentAssistantEchoes(
-      server.filter((message) => !serverRowsSupersededByRealtime.has(message.id)),
-    );
+    return dedupeAdjacentAssistantEchoes(prunedServer);
   }
 
-  // Interleave the two sources by timestamp without reordering either one.
-  // Their clocks can disagree, but arrival order within realtime is causal.
+  // Interleave the two sources without reordering either one. Placement
+  // follows each live row's causal anchor where one exists; the clocks only
+  // place rows no anchor covers.
   return dedupeAdjacentAssistantEchoes(
     stableMergeMessageSources(
-      server.filter((message) => !serverRowsSupersededByRealtime.has(message.id)),
+      prunedServer,
       extra,
+      resolveRealtimeFloors(prunedServer, realtime, retiredAnchors, arrivalAnchors),
     ),
   );
+}
+
+/**
+ * Stamps every realtime row that does not have one yet with the transcript
+ * tail as it stands right now.
+ *
+ * This runs on the same pass that rebuilds the merged view, which happens
+ * after every slot mutation, so a row is stamped on the recompute triggered by
+ * its own arrival. An existing stamp is never revised — the point is what the
+ * transcript held *then*, not now.
+ */
+function recordRealtimeArrivalAnchors(slot: SessionSlot): void {
+  const anchors = slot.realtimeArrivalAnchors;
+  const serverTailId = slot.serverMessages.length > 0
+    ? slot.serverMessages[slot.serverMessages.length - 1].id
+    : '';
+
+  for (const message of slot.realtimeMessages) {
+    if (!anchors.has(message.id)) {
+      anchors.set(message.id, serverTailId);
+    }
+  }
+
+  // Rows retired by a prune or a replacement leave their stamps behind; drop
+  // them so a long-lived session's map stays proportional to its live rows.
+  if (anchors.size > slot.realtimeMessages.length) {
+    const liveIds = new Set(slot.realtimeMessages.map((message) => message.id));
+    for (const id of anchors.keys()) {
+      if (!liveIds.has(id)) {
+        anchors.delete(id);
+      }
+    }
+  }
 }
 
 /**
@@ -496,7 +607,8 @@ function recomputeMergedIfNeeded(slot: SessionSlot): boolean {
   }
   slot._lastServerRef = slot.serverMessages;
   slot._lastRealtimeRef = slot.realtimeMessages;
-  slot.merged = computeMerged(slot.serverMessages, slot.realtimeMessages);
+  recordRealtimeArrivalAnchors(slot);
+  slot.merged = computeMerged(slot.serverMessages, slot.realtimeMessages, slot.realtimeArrivalAnchors);
   return true;
 }
 

@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import { test } from 'vitest';
 
 import type { NormalizedMessage } from '@/shared/types';
-import { removeOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
+import { reconcileOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
+
+/** These cases assert which rows survive; the pairing has its own coverage. */
+const retireOptimisticUserEchoes = (
+  serverMessages: Parameters<typeof reconcileOptimisticUserEchoes>[0],
+  realtimeMessages: Parameters<typeof reconcileOptimisticUserEchoes>[1],
+) => reconcileOptimisticUserEchoes(serverMessages, realtimeMessages).messages;
 
 const createUserMessage = (
   id: string,
@@ -28,7 +34,7 @@ test('replaces an optimistic image-only turn with its persisted Claude copy', ()
     images: [{ data: 'data:image/png;base64,AAAA' }],
   });
 
-  assert.deepEqual(removeOptimisticUserEchoes([persisted], [local]), []);
+  assert.deepEqual(retireOptimisticUserEchoes([persisted], [local]), []);
 });
 
 test('does not collapse an attachment-only turn into a server row without attachments', () => {
@@ -37,7 +43,7 @@ test('does not collapse an attachment-only turn into a server row without attach
   });
   const persisted = createUserMessage('claude_empty', '2026-07-28T20:30:22.000Z');
 
-  assert.deepEqual(removeOptimisticUserEchoes([persisted], [local]), [local]);
+  assert.deepEqual(retireOptimisticUserEchoes([persisted], [local]), [local]);
 });
 
 test('matches optimistic attachment turns to persisted turns one-to-one', () => {
@@ -51,7 +57,7 @@ test('matches optimistic attachment turns to persisted turns one-to-one', () => 
     images: [{ data: 'data:image/png;base64,AAAA' }],
   });
 
-  const remainingRealtime = removeOptimisticUserEchoes(
+  const remainingRealtime = retireOptimisticUserEchoes(
     [firstPersisted],
     [firstLocal, secondLocal],
   );
@@ -67,7 +73,7 @@ test('keeps the existing optimistic text reconciliation behavior', () => {
     content: 'hello',
   });
 
-  assert.deepEqual(removeOptimisticUserEchoes([persisted], [local]), []);
+  assert.deepEqual(retireOptimisticUserEchoes([persisted], [local]), []);
 });
 
 test('a replacement echo survives a kept turn that repeats its text', () => {
@@ -92,12 +98,12 @@ test('a replacement echo survives a kept turn that repeats its text', () => {
     replacesAfterRowCount: kept.length,
   } as NormalizedMessage;
 
-  assert.deepEqual(removeOptimisticUserEchoes(kept, [echo]), [echo]);
+  assert.deepEqual(retireOptimisticUserEchoes(kept, [echo]), [echo]);
 
   // Once the provider has written the replacement, it is a row the cut did not
   // keep, so it retires the echo.
   const persisted = [...kept, userRow('persisted', 'continue', '2026-01-01T00:00:25.000Z')];
-  assert.deepEqual(removeOptimisticUserEchoes(persisted, [echo]), []);
+  assert.deepEqual(retireOptimisticUserEchoes(persisted, [echo]), []);
 });
 
 test('upsertToolUseRow: a blank re-announce frame never blanks a populated card', () => {

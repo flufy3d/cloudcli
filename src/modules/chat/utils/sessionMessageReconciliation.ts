@@ -93,16 +93,31 @@ function findServerEchoForLocalUser(
 }
 
 /**
- * Removes local optimistic user rows once a corresponding persisted turn is
- * available. Matches are one-to-one so repeated sends cannot claim one row.
+ * The result of retiring optimistic user rows against the persisted transcript.
+ *
+ * `retiredAnchors` is the pairing the filter had to compute anyway: which
+ * persisted turn took over from which optimistic row. It is what lets the
+ * merge keep a live reply below the user turn that caused it after the
+ * optimistic row is gone, so it is returned rather than discarded.
  */
-export function removeOptimisticUserEchoes(
+export type OptimisticUserEchoReconciliation = {
+  messages: NormalizedMessage[];
+  retiredAnchors: Map<string, string>;
+};
+
+/**
+ * Retires local optimistic user rows once a corresponding persisted turn is
+ * available, reporting which persisted row claimed each one. Matches are
+ * one-to-one so repeated sends cannot claim one row.
+ */
+export function reconcileOptimisticUserEchoes(
   serverMessages: NormalizedMessage[],
   realtimeMessages: NormalizedMessage[],
-): NormalizedMessage[] {
+): OptimisticUserEchoReconciliation {
   const claimedServerIds = new Set<string>();
+  const retiredAnchors = new Map<string, string>();
 
-  return realtimeMessages.filter((message) => {
+  const messages = realtimeMessages.filter((message) => {
     if (!message.id.startsWith('local_')) {
       return true;
     }
@@ -113,8 +128,11 @@ export function removeOptimisticUserEchoes(
     }
 
     claimedServerIds.add(serverEcho.id);
+    retiredAnchors.set(message.id, serverEcho.id);
     return false;
   });
+
+  return { messages, retiredAnchors };
 }
 
 /**
