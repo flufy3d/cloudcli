@@ -120,7 +120,10 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // provider today.
     supportsMessageEditing: false,
     supportsSessionForking: false,
-    supportsCompaction: false,
+    // The runtime's `compact` facet drives the engine's `session/compact` (a
+    // background summarization turn), which is what puts `/compact` in the
+    // composer menu for this provider.
+    supportsCompaction: true,
     editRevertsFiles: false,
   },
   antigravity: {

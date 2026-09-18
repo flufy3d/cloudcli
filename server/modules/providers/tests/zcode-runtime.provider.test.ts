@@ -327,6 +327,24 @@ rl.on('line', (line) => {
     return;
   }
 
+  if (msg.method === 'session/compact') {
+    log('compact', msg.params);
+    if (readMode() === 'compact-running') {
+      // The engine already has a compaction in flight: it answers with the
+      // accepted-but-busy state instead of queueing a second turn.
+      send({ id: msg.id, result: { response: '', compact: { state: 'already_running' } } });
+      return;
+    }
+    // Mirror the real engine: accept immediately, then run the summarization
+    // as a background prompt turn whose terminal event ends the run.
+    send({ id: msg.id, result: { response: '', compact: { state: 'accepted' } } });
+    setTimeout(() => {
+      send({ method: 'session/event', params: { sessionId, type: 'compact.completed', payload: { status: 'completed', summaryMessageId: 'msg_summary_stub' } } });
+      send({ method: 'session/event', params: { sessionId, type: 'turn.completed', payload: { usage: { inputTokens: 9, outputTokens: 5 } } } });
+    }, 100);
+    return;
+  }
+
   if (msg.method === 'session/setModel') {
     log('setModel', msg.params);
     send({ id: msg.id, result: {} });
@@ -491,6 +509,47 @@ test('a running turn publishes the session context usage before it completes', a
       process.env.ZCODE_STORAGE_DIR = previousStorageDir;
     }
   }
+});
+
+test('compact drives the engine compaction turn and completes once, without touching model or mode', async () => {
+  fsSync.writeFileSync(modeFilePath, 'ok\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+
+  const result = await runtime.compact!({ sessionId: 'app-sess-compact', cwd: stubDir }, writer, context);
+
+  assert.deepEqual(result, { sessionId: 'sess_stub_1', success: true });
+
+  // The request the engine answers as soon as it accepts the work (the log is
+  // shared across tests in this file, so the newest entry is this run's).
+  const compactRequest = readStubLog().filter((entry) => entry.name === 'compact').pop();
+  assert.ok(compactRequest, 'the engine must receive a session/compact request');
+  assert.deepEqual(compactRequest.value, { sessionId: 'sess_stub_1' });
+  assert.equal(
+    readStubLog().some((entry) => entry.name === 'setModel'),
+    false,
+    'a compaction runs with the session\'s own model, so no model configuration is sent',
+  );
+
+  // A compaction is one turn from the client's point of view: the summarization
+  // events stream, then exactly one terminal complete.
+  assert.equal(messages.filter((msg) => msg.kind === 'complete').length, 1);
+  assert.equal(messages.find((msg) => msg.kind === 'complete')?.tokens, 14);
+});
+
+test('compact reports an already-running compaction instead of attaching to it', async () => {
+  fsSync.writeFileSync(modeFilePath, 'compact-running\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+
+  await assert.rejects(
+    runtime.compact!({ sessionId: 'app-sess-compact-busy', cwd: stubDir }, writer, context),
+    /already running/,
+  );
+
+  const error = messages.find((msg) => msg.kind === 'error');
+  assert.ok(error, 'the refusal must reach the chat stream');
+  assert.match(error.text ?? '', /already running/);
 });
 
 test('runtime surfaces session/create failures as error messages', async () => {

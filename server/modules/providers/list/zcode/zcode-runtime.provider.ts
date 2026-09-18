@@ -39,7 +39,7 @@ import type {
   ProviderRuntimeWriter,
   ProviderTokenUsageResult,
 } from '@/shared/types.js';
-import { createCompleteMessage, createNormalizedMessage, generateMessageId, readOptionalString } from '@/shared/utils.js';
+import { createCompleteMessage, createNormalizedMessage, generateMessageId, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 
@@ -69,6 +69,14 @@ import type { RunHandle, RunSettle } from './zcode-run-lifecycle.js';
  * number of events.
  */
 const LIVE_CONTEXT_MIN_INTERVAL_MS = 1500;
+
+/**
+ * How long the engine may take to accept a `session/compact` request. The
+ * response carries a session snapshot but no turn result, so this only bounds
+ * the acceptance handshake — the summarization that follows is watched through
+ * the session's event stream like any other turn.
+ */
+const COMPACT_REQUEST_TIMEOUT_MS = 15_000;
 
 /**
  * Reads one session's current context occupancy straight from the engine store.
@@ -238,14 +246,84 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     writer: ProviderRuntimeWriter,
     context: ProviderRuntimeContext,
   ): Promise<unknown> {
-    const appSessionId = readOptionalString(options.sessionId) ?? null;
-    const sessionSummary = readOptionalString(options.sessionSummary);
     // Seed the engine's workspace model catalog with every session request:
     // remote clients start with an empty catalog, and a cold resume of a
     // session whose transcript references unresolvable models would
     // otherwise be poisoned with a permanent "model unavailable" warning
     // (-32031 on every send).
     const runtimeModel = await this.resolveRuntimeModelPayload(options, context);
+
+    return this.driveSessionTurn({
+      options,
+      writer,
+      context,
+      runtimeModel,
+      configureSession: true,
+      failureMessage: 'ZCode run failed',
+      startTurn: (zcodeSessionId) => this.sendUserMessage(zcodeSessionId, command, options, runtimeModel),
+    });
+  }
+
+  /**
+   * Compacts a session's carried conversation into a summary the next turn
+   * builds on (`/compact`).
+   *
+   * `session/compact` answers as soon as the engine accepts the work
+   * (`compact.state === 'accepted'`) and then runs the summarization as a
+   * background prompt turn, so the turn's own terminal event — not that
+   * response — ends this run; that is why the request rides the same plumbing
+   * as `run` (subscribe → listener → settle → exactly one `complete`).
+   *
+   * `expectedRevision` is deliberately omitted: the engine only validates it
+   * when present (-32009 on a stale value), and the app never tracks a
+   * session's revision. The engine compacts with the session's current model
+   * and refuses while a prompt is running, which is why the request reports
+   * that state instead of starting a second turn.
+   */
+  async compact(
+    options: AnyRecord = {},
+    writer: ProviderRuntimeWriter,
+    context: ProviderRuntimeContext,
+  ): Promise<unknown> {
+    const runtimeModel = await this.resolveRuntimeModelPayload(options, context);
+
+    return this.driveSessionTurn({
+      options,
+      writer,
+      context,
+      runtimeModel,
+      // Summarization uses whatever model the session already runs with and
+      // needs no permission mode, so the engine's session is left untouched.
+      configureSession: false,
+      failureMessage: 'ZCode compaction failed',
+      startTurn: (zcodeSessionId) => this.requestCompaction(zcodeSessionId),
+    });
+  }
+
+  /**
+   * Drives one engine turn to its terminal event and reports it.
+   *
+   * Shared by `run` (a user prompt via `session/send`) and `compact` (a
+   * summarization turn via `session/compact`): resolve or create the session,
+   * register the run, subscribe to its event stream, hand the turn to
+   * `startTurn`, then translate the settle result into exactly one terminal
+   * `complete` frame plus the notification every other runtime emits.
+   */
+  private async driveSessionTurn(input: {
+    options: AnyRecord;
+    writer: ProviderRuntimeWriter;
+    context: ProviderRuntimeContext;
+    runtimeModel?: Record<string, unknown>;
+    /** Whether the app's model/effort and permission mode are applied first. */
+    configureSession: boolean;
+    /** Failure text for the run notification when the engine ends the turn as failed. */
+    failureMessage: string;
+    /** Issues the turn itself; the settle wait observes its terminal event. */
+    startTurn: (zcodeSessionId: string) => Promise<void>;
+  }): Promise<unknown> {
+    const { options, writer, context, runtimeModel, configureSession, failureMessage, startTurn } = input;
+    const appSessionId = readOptionalString(options.sessionId) ?? null;
+    const sessionSummary = readOptionalString(options.sessionSummary);
 
     // Runs before the main try block below; without its own error emission a
     // session/create failure would never reach the chat stream and the page
@@ -276,15 +354,17 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
 
     try {
       await this.subscribeToSessionEvents(zcodeSessionId);
-      await this.configureSessionModel(zcodeSessionId, options, context, resumedSession);
-      await this.configureSessionMode(zcodeSessionId, options);
+      if (configureSession) {
+        await this.configureSessionModel(zcodeSessionId, options, context, resumedSession);
+        await this.configureSessionMode(zcodeSessionId, options);
+      }
 
       const eventListener = this.createSessionEventListener(handle, writer, context);
       protocolClient.addSessionListener(zcodeSessionId, eventListener);
 
       let settle: RunSettle | null = null;
       try {
-        await this.sendUserMessage(zcodeSessionId, command, options, runtimeModel);
+        await startTurn(zcodeSessionId);
         settle = await runLifecycle.waitForSettle(handle, silenceTimeoutMs);
 
         if (settle.kind === 'silent') {
@@ -332,7 +412,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
             sessionId: notifySessionId,
             sessionSummary,
             outcome: completion.failed
-              ? { failed: true, error: completion.failedMessage ?? 'ZCode run failed' }
+              ? { failed: true, error: completion.failedMessage ?? failureMessage }
               : { failed: false, stopReason: 'completed' },
           });
           return { sessionId: zcodeSessionId, success: !completion.failed };
@@ -792,6 +872,34 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       console.debug(`[ZCodeRuntime] Sent message to session ${sessionId}`);
     } catch (error) {
       console.error(`[ZCodeRuntime] Failed to send message to session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Asks the engine to compact one session's carried conversation.
+   *
+   * The response only reports acceptance (`compact.state`), so this resolves as
+   * soon as the engine has taken the work; the following `turn.completed` (or
+   * `compact.failed`) is what ends the run. `already_running` is reported as an
+   * error rather than waited out: the user asked for a compaction that is
+   * already in flight, and silently attaching to it would leave the UI unable
+   * to tell whose progress it is showing.
+   */
+  private async requestCompaction(sessionId: string): Promise<void> {
+    try {
+      const result = await protocolClient.sendRequest<AnyRecord>(
+        'session/compact',
+        { sessionId },
+        COMPACT_REQUEST_TIMEOUT_MS,
+      );
+      const state = readOptionalString(readObjectRecord(result?.compact)?.state);
+      if (state === 'already_running') {
+        throw new Error('A compaction is already running for this session.');
+      }
+      console.debug(`[ZCodeRuntime] Requested compaction for session ${sessionId} (state: ${state ?? 'unknown'})`);
+    } catch (error) {
+      console.error(`[ZCodeRuntime] Failed to request compaction for session ${sessionId}:`, error);
       throw error;
     }
   }
