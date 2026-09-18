@@ -1186,3 +1186,58 @@ test('every row split out of one exec script is settled, not left running', asyn
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+/**
+ * A failed script must not show a green tick on the command that broke.
+ *
+ * The call reports one outcome for the whole script. The rows split out beside
+ * the one that kept the call id inherit it, because claiming success on a
+ * command nobody verified is worse than the duplicate card the split prevents.
+ */
+test('every command of a failed exec script reports the failure', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-split-fail-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+  const providerSessionId = 'codex-split-fail';
+
+  try {
+    const script = 'await Promise.all(['
+      + 'tools.exec_command({"cmd":"echo one"}),'
+      + 'tools.exec_command({"cmd":"exit 1"})'
+      + ']);';
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), [
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'c1', input: script } }),
+      JSON.stringify({
+        type: 'response_item',
+        // The engine's own shape: the exit code leads the payload.
+        payload: { type: 'custom_tool_call_output', call_id: 'c1', output: 'Exit code: 1\nOutput:\none\n' },
+      }),
+    ].join('\n') + '\n', 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-split-fail', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-split-fail', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-split-fail');
+      const shellRows = history.messages.filter(
+        (message) => message.kind === 'tool_use' && message.toolName === 'Bash',
+      );
+
+      assert.equal(shellRows.length, 2);
+      const outcomes = shellRows.map((row) => row.toolResult?.isError);
+      assert.deepEqual(
+        outcomes,
+        [true, true],
+        'the second command must not render as a success when the script failed',
+      );
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});

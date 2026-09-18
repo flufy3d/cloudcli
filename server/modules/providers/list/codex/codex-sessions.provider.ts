@@ -1331,6 +1331,12 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
   /** Exec calls that own a shell row, so their output can be routed back. */
   const shellCallMessages = new Map<string, AnyRecord>();
   /**
+   * Rows split out of one exec script beside the row that kept the call id.
+   * The call reports a single outcome for the whole script, so they inherit it
+   * rather than claiming a success nobody verified.
+   */
+  const splitShellFollowers = new Map<string, string[]>();
+  /**
    * File rows produced by each patch call, so the authoritative
    * `patch_apply_end` diffs can replace what was reconstructed from the call
    * input, and so every row gets exactly one result.
@@ -1399,6 +1405,22 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     }
     completedExecCalls.add(callId);
     messages.push({ type: 'tool_result', timestamp, toolCallId: callId, output, isError });
+
+    // A script's other commands share the call's single outcome. The output
+    // itself belongs to the row the call addresses, so theirs says where to
+    // find it instead of repeating it.
+    for (const followerId of splitShellFollowers.get(callId) ?? []) {
+      messages.push({
+        type: 'tool_result',
+        timestamp,
+        toolCallId: followerId,
+        output: isError
+          ? 'This command ran as part of a script that failed; the output is on the first command of the script.'
+          : 'Output is on the first command of the script.',
+        isError,
+      });
+    }
+    splitShellFollowers.delete(callId);
   };
 
   for await (const line of rl) {
@@ -1822,18 +1844,15 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
             // kept the call id.
             shellCallMessages.set(callId, shellMessage);
           } else {
-            // The others can never be handed that output, and a tool row with
-            // no result renders as still running — forever, since the call has
-            // already finished. Settle each with its own result row. The
-            // command's text is on the card; the output sits with the first
-            // row of the script, which is the only one the call can address.
-            messages.push({
-              type: 'tool_result',
-              timestamp,
-              toolCallId: shellMessage.toolCallId,
-              output: '',
-              isError: false,
-            });
+            // The rest cannot be handed that output, but they must still be
+            // settled — a tool row with no result renders as running forever,
+            // and the call has long finished. They are settled when the real
+            // result arrives, so they can carry its outcome: reporting an
+            // unqualified success on a command that actually failed is worse
+            // than the duplicate card this split exists to prevent.
+            const followers = splitShellFollowers.get(callId) ?? [];
+            followers.push(String(shellMessage.toolCallId));
+            splitShellFollowers.set(callId, followers);
           }
         });
 
