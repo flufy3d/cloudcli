@@ -66,6 +66,11 @@ export type AuthenticatedWebSocketRequest = IncomingMessage & {
  * because the declarations below refer to these types by name.
  */
 import type {
+  ProviderQuotaBucket as QuotaBucketShape,
+  ProviderQuotaData as QuotaDataShape,
+  ProviderQuotaGroup as QuotaGroupShape,
+} from '../../shared/protocol/quota.js';
+import type {
   GatewayEventKind,
   LLMProvider,
   MemoryCitation,
@@ -94,40 +99,17 @@ export type {
 };
 
 
-/**
- * Single quota bucket representing rolling or windowed token limit information
- * returned by providers such as Antigravity.
- */
-export type ProviderQuotaBucket = {
-  id: string;
-  name: string;
-  description?: string;
-  window: '5h' | 'weekly' | string;
-  remainingFraction: number;
-  resetTime?: string;
-};
-
-/**
- * Group of quota buckets belonging to a family of models (e.g. Gemini Models, Claude/GPT models).
- */
-export type ProviderQuotaGroup = {
-  name: string;
-  description?: string;
-  buckets: ProviderQuotaBucket[];
-};
-
-/**
- * Account-level quota and rate limit status across model groups.
- */
-export type ProviderQuotaData = {
-  groups: ProviderQuotaGroup[];
-  updatedAt: string;
-};
+export type {
+  ProviderQuotaBucket,
+  ProviderQuotaData,
+  ProviderQuotaGroup,
+  ProviderQuotaGroupPartitioning,
+} from '../../shared/protocol/quota.js';
 
 /** Backwards-compatible aliases for Antigravity-specific callers */
-export type AntigravityQuotaBucket = ProviderQuotaBucket;
-export type AntigravityQuotaGroup = ProviderQuotaGroup;
-export type AntigravityQuotaData = ProviderQuotaData;
+export type AntigravityQuotaBucket = QuotaBucketShape;
+export type AntigravityQuotaGroup = QuotaGroupShape;
+export type AntigravityQuotaData = QuotaDataShape;
 
 // ---------------------------
 //----------------- PROVIDER SESSION TOKEN USAGE TYPES ------------

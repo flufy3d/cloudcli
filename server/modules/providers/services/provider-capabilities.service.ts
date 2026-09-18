@@ -20,6 +20,12 @@ export type ProviderCapabilities = {
   supportsAbort: boolean;
   supportsPermissionRequests: boolean;
   supportsTokenUsage: boolean;
+  /**
+   * Whether the provider can report the account's plan allowance (the 5-hour
+   * and weekly limits shown by the `/cost` modal), as opposed to the
+   * per-session token counts `supportsTokenUsage` covers.
+   */
+  supportsQuota: boolean;
   supportsEffort: boolean;
   /**
    * Whether an already-sent message can be replaced, which requires the
@@ -43,12 +49,15 @@ export type ProviderCapabilities = {
  * - message editing rides `sessions.resolveEditAnchor` (the anchor lookup the
  *   edit flow needs; both integrations that have it also provide the rest).
  * - the token-usage endpoint rides `sessions.getTokenUsage`.
+ * - account quota rides `auth.getQuota`, which is already how
+ *   `provider-token-usage.service.ts` dispatches the request.
  * - interactive permission prompts ride the runtime's optional `permissions`
  *   gateway (claude's SDK bridge; zcode's engine permission bridge).
  */
 function deriveCapabilities(providerId: LLMProvider, provider: {
   fork?: unknown;
   runtime?: { permissions?: unknown };
+  auth?: { getQuota?: unknown };
   sessions?: { resolveEditAnchor?: unknown; getTokenUsage?: unknown };
 }): ProviderCapabilities {
   const catalog = PROVIDER_CATALOG[providerId];
@@ -61,6 +70,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     supportsAbort: catalog.supportsAbort,
     supportsPermissionRequests: Boolean(provider.runtime?.permissions),
     supportsTokenUsage: typeof provider.sessions?.getTokenUsage === 'function',
+    supportsQuota: typeof provider.auth?.getQuota === 'function',
     supportsEffort: catalog.supportsEffort,
     supportsMessageEditing: typeof provider.sessions?.resolveEditAnchor === 'function',
     supportsSessionForking: provider.fork !== undefined,

@@ -44,6 +44,18 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 - `NormalizedMessage` = 协议消息换上 `TimelineMessageKind`，再加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。这两个字段从不上线，只活在「发出去」与「持久化回合顶替掉它」之间。
 
 新增一个跨端字段时改协议文件，**不要**在前端这边补声明——那正是漂移的来路。
+账号配额的形状（`ProviderQuotaData` 等）同样出自协议（`shared/protocol/quota.ts`），
+此前它在前后端共有三份、命名还不一致。
+
+### 能力一律读矩阵，不看引擎名
+
+判断"这家引擎能不能做某事"只有一个来源：`useProviderCapabilitiesMap()`。
+组件里不要出现 `provider === 'xxx'` 形式的能力判断——
+配额卡曾因为把显示名和引擎 id 相比而静默失效。矩阵未加载完成前不提供该功能，
+避免先给出再收回。
+
+引擎专属的**文案**（如某家为何查不到配额）走语言包按引擎 key 查找，缺 key 就不渲染，
+不要为它写分支；Logo 与登录说明这类天生因引擎而异的展示数据同理，不进能力矩阵。
 - 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染。
 
 ## 性能守则（硬约束，都是踩过坑的）

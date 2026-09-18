@@ -1,27 +1,14 @@
-/**
- * Supported providers with account-level quota reporting capabilities.
- *
- * Used by CommandResultModal to determine whether to render the quota card.
- */
-export type QuotaProvider = 'antigravity' | 'codex' | 'zcode';
-
-const QUOTA_PROVIDERS = new Set<string>(['antigravity', 'codex', 'zcode']);
+import type { ProviderQuotaGroupPartitioning } from '@/shared/types';
 
 /**
- * Resolves whether a provider supports account-level quota reporting.
+ * Builds the backend URL to query account quota for a provider.
  *
- * Used by CommandResultModal in the chat module.
+ * Whether to ask at all is the capability matrix's answer (`supportsQuota`),
+ * not this module's: the list of providers with a quota adapter used to be
+ * restated here, which is why adding one to the backend never showed up in the
+ * UI until someone remembered to edit the list too.
  */
-export function resolveQuotaProvider(provider: string | undefined): QuotaProvider | null {
-  return provider && QUOTA_PROVIDERS.has(provider) ? provider as QuotaProvider : null;
-}
-
-/**
- * Builds the backend URL to query account quota for a supported provider.
- *
- * Used by CommandResultModal in the chat module.
- */
-export function buildProviderQuotaUrl(provider: QuotaProvider, forceRefresh = false): string {
+export function buildProviderQuotaUrl(provider: string, forceRefresh = false): string {
   const searchParams = new URLSearchParams({ provider });
   if (forceRefresh) {
     searchParams.set('refresh', 'true');
@@ -47,22 +34,23 @@ function matchesFamily(groupText: string, normalizedModel: string): boolean | nu
  * Determines whether a quota group corresponds to the active session model.
  *
  * Rules:
- * 1. If provider only has 1 quota group (e.g. Codex, ZCode), it represents the active session.
- * 2. Antigravity splits quota into groups by model family (Gemini vs Claude/GPT); every
- *    group's own text names its family, so a family keyword match reliably tells them apart.
- * 3. Codex/ZCode instead split quota into buckets of the same family — e.g. Codex's
- *    "gpt-reserve" bucket is a carve-out that only backs gpt-5.6-luna, sitting alongside the
- *    main pool though both are GPT. A family match would wrongly tag the reserve bucket as
- *    active for every GPT model, so for these providers a bucket's own text must explicitly
- *    name the current model to win the "reserve" (or otherwise unmatched) bucket; an unmatched
- *    bucket that isn't a reserve carve-out falls back to being the account's general-purpose
- *    pool.
+ * 1. A single group is the active session's by definition.
+ * 2. `model-family` partitioning: each group's own text names its family, so a family
+ *    keyword match reliably tells them apart.
+ * 3. `bucket` partitioning: the groups share one family and split it by allowance — a
+ *    "reserve" carve-out sitting beside the main pool. A family match would wrongly tag the
+ *    reserve as active for every model of that family, so a reserve bucket's text must name
+ *    the running model explicitly; an unmatched non-reserve bucket is the account's
+ *    general-purpose pool.
+ *
+ * Which of the two applies is stated by the provider in its quota payload, never
+ * inferred here from the provider's name.
  */
 export function resolveIsActiveQuotaGroup(
   currentModel: string | undefined,
   group: { name: string; description?: string },
   totalGroupsCount: number,
-  provider?: string,
+  partitioning?: ProviderQuotaGroupPartitioning,
 ): boolean {
   if (totalGroupsCount <= 1) {
     return true;
@@ -70,7 +58,7 @@ export function resolveIsActiveQuotaGroup(
 
   const groupText = `${group.name} ${group.description || ''}`.toLowerCase();
   const normalizedModel = (currentModel || '').toLowerCase();
-  const bucketPartitioned = provider === 'codex' || provider === 'zcode';
+  const bucketPartitioned = partitioning === 'bucket';
 
   if (bucketPartitioned && groupText.includes('reserve')) {
     return Boolean(normalizedModel) && groupText.includes(normalizedModel);

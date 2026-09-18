@@ -17,6 +17,13 @@ import type {
 } from '@shared/protocol/chatEvents';
 
 export type {
+  ProviderQuotaBucket,
+  ProviderQuotaData,
+  ProviderQuotaGroup,
+  ProviderQuotaGroupPartitioning,
+} from '@shared/protocol/quota';
+
+export type {
   GatewayEventKind,
   LLMProvider,
   MemoryCitation,

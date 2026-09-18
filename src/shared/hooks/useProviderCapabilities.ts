@@ -24,6 +24,8 @@ export type ProviderCapabilities = {
   supportsAbort: boolean;
   supportsPermissionRequests: boolean;
   supportsTokenUsage: boolean;
+  /** Whether the account's plan allowance can be queried at all. */
+  supportsQuota?: boolean;
   supportsEffort?: boolean;
   supportsMessageEditing?: boolean;
   supportsSessionForking?: boolean;

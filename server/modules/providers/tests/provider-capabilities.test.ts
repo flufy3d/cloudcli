@@ -40,6 +40,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
+    supportsQuota: false,
     supportsEffort: true,
     supportsMessageEditing: true,
     supportsSessionForking: true,
@@ -52,6 +53,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: false,
     supportsTokenUsage: false,
+    supportsQuota: false,
     supportsEffort: false,
     supportsMessageEditing: false,
     supportsSessionForking: false,
@@ -64,6 +66,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: false,
     supportsTokenUsage: true,
+    supportsQuota: true,
     supportsEffort: true,
     // Not from the Codex SDK, which only starts and resumes threads: both ride
     // the same CLI's `app-server` protocol, whose `thread/fork` copies a
@@ -80,6 +83,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: false,
     supportsTokenUsage: true,
+    supportsQuota: false,
     supportsEffort: true,
     supportsMessageEditing: false,
     supportsSessionForking: false,
@@ -97,6 +101,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // present even though permission MODES are the primary gate.
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
+    supportsQuota: true,
     supportsEffort: true,
     // No resolveEditAnchor/fork facets: transcripts are append-only for this
     // provider today.
@@ -111,6 +116,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: false,
     supportsTokenUsage: true,
+    supportsQuota: true,
     supportsEffort: true,
     supportsMessageEditing: false,
     supportsSessionForking: false,

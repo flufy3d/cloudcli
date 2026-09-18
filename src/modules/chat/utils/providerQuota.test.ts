@@ -4,16 +4,7 @@ import { test } from 'vitest';
 import {
   buildProviderQuotaUrl,
   resolveIsActiveQuotaGroup,
-  resolveQuotaProvider,
 } from '@/modules/chat/utils/providerQuota';
-
-test('resolveQuotaProvider enables only providers with account quota adapters', () => {
-  assert.equal(resolveQuotaProvider('antigravity'), 'antigravity');
-  assert.equal(resolveQuotaProvider('codex'), 'codex');
-  assert.equal(resolveQuotaProvider('zcode'), 'zcode');
-  assert.equal(resolveQuotaProvider('claude'), null);
-  assert.equal(resolveQuotaProvider(undefined), null);
-});
 
 test('buildProviderQuotaUrl addresses the active provider and optional refresh', () => {
   assert.equal(buildProviderQuotaUrl('codex'), '/api/providers/quota?provider=codex');
@@ -51,9 +42,9 @@ test('resolveIsActiveQuotaGroup identifies active session group accurately', () 
   const codexMainGroup = { name: 'Codex', description: 'Codex Plus plan' };
   const codexReserveGroup = { name: 'gpt-reserve', description: 'Codex Plus plan' };
 
-  assert.equal(resolveIsActiveQuotaGroup('gpt-5.6-terra', codexMainGroup, 2, 'codex'), true);
-  assert.equal(resolveIsActiveQuotaGroup('gpt-5.6-terra', codexReserveGroup, 2, 'codex'), false);
+  assert.equal(resolveIsActiveQuotaGroup('gpt-5.6-terra', codexMainGroup, 2, 'bucket'), true);
+  assert.equal(resolveIsActiveQuotaGroup('gpt-5.6-terra', codexReserveGroup, 2, 'bucket'), false);
 
   const codexLunaReserveGroup = { name: 'gpt-reserve', description: 'gpt-5.6-luna only' };
-  assert.equal(resolveIsActiveQuotaGroup('gpt-5.6-luna', codexLunaReserveGroup, 2, 'codex'), true);
+  assert.equal(resolveIsActiveQuotaGroup('gpt-5.6-luna', codexLunaReserveGroup, 2, 'bucket'), true);
 });
