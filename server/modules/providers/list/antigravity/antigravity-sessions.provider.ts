@@ -312,7 +312,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       messages.push(createNormalizedMessage({
         kind: 'session_created',
         sessionId: conversationId,
-        newSessionId: conversationId,
+        newSessionId: conversationId ?? undefined,
         provider: PROVIDER,
         content: `Session initialized: ${conversationId}`,
       }));

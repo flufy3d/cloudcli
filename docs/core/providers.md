@@ -118,8 +118,19 @@
 两个 tsconfig 都已把根 `shared/` 纳入编译范围；前端另有 `@shared/*` 别名。该文件不引 `node:*` 也不引 DOM/React，
 所以两边都能编译它。
 
-**`NormalizedMessage` 没有索引签名。** 引擎适配器写入一个未在协议里声明的字段会直接编译失败——
-这是「一致的输出格式」唯一靠得住的执行手段。需要新字段就先在协议里声明，并说明哪个 kind 会带它。
+**`NormalizedMessage` 没有索引签名**，`createNormalizedMessage` 的入参也没有。
+引擎适配器写入一个未在协议里声明的字段会直接编译失败——需要新字段就先在协议里声明，并说明哪个 kind 会带它。
+
+类型只管得到编译器看得见的地方，而 claude / cursor 的 runtime 是 `checkJs: false` 的 `.js`。
+因此出站还有一道**运行时闸门** `server/shared/normalized-message-contract.ts`，
+由 `ChatSessionWriter.send` 调用：
+
+- 信封坏了（不是对象、缺 `kind` 或 `provider`）→ 整条丢弃并记录原因
+- 带了协议未声明的字段 → **剥掉该字段后放行**，并在日志里点名
+
+剥离而非抛异常，是为了让违规既无法抵达前端、又不会因为一个字段杀掉用户正在跑的 run。
+闸门的字段清单由类型层的完整性断言钉住：往协议加字段却忘了登记会**编译失败并报出字段名**，
+所以它不会变成又一面陈旧的镜子。
 
 各端在协议之上的本地扩展必须显式写出、不得混入协议本身。今天只有前端有：
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），

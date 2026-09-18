@@ -51,13 +51,14 @@ export const IS_PLATFORM = process.env.VITE_IS_PLATFORM === 'true';
  * `timestamp`) in a consistent way.
  */
 type NormalizedMessageInput =
-  {
+  Omit<Partial<NormalizedMessage>, 'kind' | 'provider' | 'id' | 'sessionId' | 'timestamp'>
+  & {
     kind: NormalizedMessage['kind'];
     provider: NormalizedMessage['provider'];
     id?: string | null;
     sessionId?: string | null;
     timestamp?: string | null;
-  } & Record<string, unknown>;
+  };
 
 // ---------------------------
 //----------------- HTTP HANDLER UTILITIES ------------
@@ -405,7 +406,7 @@ export function createCompleteMessage(opts: {
     kind: 'complete',
     provider: opts.provider,
     sessionId: opts.sessionId || null,
-    actualSessionId: opts.actualSessionId || opts.sessionId || null,
+    actualSessionId: opts.actualSessionId || opts.sessionId || undefined,
     exitCode,
     success: exitCode === 0 && !aborted,
     aborted,

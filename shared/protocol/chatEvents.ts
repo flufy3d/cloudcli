@@ -284,6 +284,12 @@ export type NormalizedMessage = {
   context?: unknown;
   reason?: string;
   newSessionId?: string;
+  /**
+   * The transcript row a `history_truncated` frame cuts from. Editing a sent
+   * message replaces its turn and everything after it, and this names where
+   * the client's timeline has to be trimmed back to.
+   */
+  anchorId?: string;
   status?: string;
   summary?: string;
   /**
@@ -312,6 +318,14 @@ export type NormalizedMessage = {
    * reported with the app id before the frame goes out.
    */
   actualSessionId?: string;
+  /**
+   * Whether a terminal `complete` reports a clean finish. Derived from the
+   * exit code and whether the user stopped the run, so a caller reads this
+   * rather than re-deriving it.
+   */
+  success?: boolean;
+  /** Whether a terminal `complete` is the result of the user stopping the run. */
+  aborted?: boolean;
   /**
    * Process exit code carried by a terminal frame from CLI-backed engines.
    * Absent for SDK-backed runs, which have no process to exit.

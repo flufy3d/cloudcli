@@ -109,7 +109,8 @@
           "server/shared/frontmatter.ts",
           "server/shared/claude-cli-path.ts",
           "server/shared/image-attachments.ts",
-          "server/shared/message-unification.ts"
+          "server/shared/message-unification.ts",
+          "server/shared/normalized-message-contract.ts"
         ],
         "mode": "file"
       },
