@@ -39,6 +39,10 @@ export type OpenCodeServerEvent = {
 const SERVER_READY_TIMEOUT_MS = 30_000;
 const SERVER_IDLE_SHUTDOWN_MS = 60_000;
 const SERVER_HEALTH_TIMEOUT_MS = 3_000;
+const STREAM_RECONNECT_DELAY_MS = 1_000;
+const SESSION_STATUS_TIMEOUT_MS = 15_000;
+const SESSION_IDLE_POLL_INTERVAL_MS = 1_500;
+const SESSION_IDLE_WAIT_TIMEOUT_MS = 60 * 60_000;
 const RESPONSE_TIMEOUT_MS = 10 * 60_000;
 
 type ServerState = {
@@ -123,7 +127,7 @@ async function waitForServer(baseUrl: string, headers: Record<string, string>, c
   throw new Error('OpenCode server did not become ready in time.');
 }
 
-async function readOpenCodeServerEventStream(state: ServerState): Promise<void> {
+async function consumeOpenCodeServerEventStream(state: ServerState): Promise<void> {
   let response: Response;
   try {
     response = await fetch(`${state.baseUrl}/global/event`, {
@@ -159,7 +163,25 @@ async function readOpenCodeServerEventStream(state: ServerState): Promise<void> 
       }
     }
   } catch {
-    // Stream aborted at shutdown, or the server died; the next run restarts it.
+    // Cancelled at shutdown, or the connection dropped; the loop reconnects.
+  }
+}
+
+/**
+ * Keeps the shared event stream connected for the server's lifetime.
+ *
+ * The stream is the only channel for live output; a single dropped connection
+ * used to end live updates silently while runs stayed "in progress". Reconnect
+ * until the server is stopped or replaced. opencode does not replay past events
+ * on a new connection, so a gap is possible but a duplicate never is.
+ */
+async function readOpenCodeServerEventStream(state: ServerState): Promise<void> {
+  while (!state.streamAbort.signal.aborted && !state.stopping) {
+    await consumeOpenCodeServerEventStream(state);
+    if (state.streamAbort.signal.aborted || state.stopping) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, STREAM_RECONNECT_DELAY_MS));
   }
 }
 
@@ -621,6 +643,53 @@ export async function sendOpenCodeMessage(
   }
 
   await requestJson(handle, 'POST', `/session/${encodeURIComponent(sessionId)}/message`, directory, body);
+}
+
+/** The engine's view of one session: idle, running a turn, or retrying a failed one. */
+export type OpenCodeSessionStatus = 'idle' | 'busy' | 'retry';
+
+/**
+ * Reads the engine's status for one session, or null when it is not tracked.
+ *
+ * Consumers: `opencode-runtime.provider.js`, to decide whether a run whose
+ * blocking prompt request dropped is still executing and should keep waiting.
+ */
+export async function getOpenCodeSessionStatus(
+  handle: OpenCodeServerHandle,
+  directory: string | null,
+  sessionId: string,
+): Promise<OpenCodeSessionStatus | null> {
+  const payload = await requestJson(handle, 'GET', '/session/status', directory, undefined, SESSION_STATUS_TIMEOUT_MS);
+  const record = readObjectRecord(payload);
+  const status = readOptionalString(readObjectRecord(record?.[sessionId])?.type);
+  return status === 'idle' || status === 'busy' || status === 'retry' ? status : null;
+}
+
+/**
+ * Blocks until the session goes idle, polling the engine for its status.
+ *
+ * Consumers: `opencode-runtime.provider.js`, which resumes a run this way when
+ * the blocking prompt request dropped but the engine kept working. Throws when
+ * the poll itself fails (the server went away), so the caller fails the run for
+ * real instead of waiting forever.
+ */
+export async function waitForOpenCodeSessionIdle(
+  handle: OpenCodeServerHandle,
+  directory: string | null,
+  sessionId: string,
+  timeoutMs = SESSION_IDLE_WAIT_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, SESSION_IDLE_POLL_INTERVAL_MS));
+    const status = await getOpenCodeSessionStatus(handle, directory, sessionId);
+    if (status === 'idle') {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`OpenCode session ${sessionId} did not finish within the wait window.`);
+    }
+  }
 }
 
 /** Requests cancellation of the running turn for one session. */

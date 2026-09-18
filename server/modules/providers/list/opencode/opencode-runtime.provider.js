@@ -26,10 +26,12 @@ import {
   abortOpenCodeSession as abortOpenCodeServerSession,
   acquireOpenCodeServer,
   createOpenCodeSession,
+  getOpenCodeSessionStatus,
   releaseOpenCodeServer,
   resolveOpenCodeAgent,
   sendOpenCodeMessage,
   subscribeOpenCodeEvents,
+  waitForOpenCodeSessionIdle,
 } from './opencode-server.client.js';
 import {
   announceOpenCodePermission,
@@ -125,6 +127,35 @@ function readOpenCodeTokenUsage(sessionId) {
     if (db) {
       db.close();
     }
+  }
+}
+
+/**
+ * Decides whether a dropped prompt request should fail the run or keep waiting.
+ *
+ * The blocking `POST /session/:id/message` holds a socket for the whole turn and
+ * can lose it (idle timeout, proxy, process hiccup) while the engine keeps
+ * executing. When the session is still busy/retrying, wait for it to go idle so
+ * the run finishes normally instead of surfacing a spurious transport error.
+ * Returns false when the server is unreachable or the session is already done,
+ * so the caller can fail the run for real. Consumers: `spawnOpenCode`'s
+ * send-failure path.
+ */
+async function resumeOpenCodeRun(run, workingDir) {
+  if (!run.providerSessionId) {
+    return false;
+  }
+
+  try {
+    const status = await getOpenCodeSessionStatus(run.handle, workingDir, run.providerSessionId);
+    if (status !== 'busy' && status !== 'retry') {
+      return false;
+    }
+    await waitForOpenCodeSessionIdle(run.handle, workingDir, run.providerSessionId);
+    return true;
+  } catch (error) {
+    console.warn('[OpenCode] Could not confirm the dropped turn is still running:', error);
+    return false;
   }
 }
 
@@ -425,12 +456,17 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     });
   } catch (error) {
     if (!run.aborted) {
-      failure = error;
-      const installed = await context.isProviderInstalled();
-      const content = !installed
-        ? 'OpenCode CLI is not installed. Install it from https://opencode.ai/docs/'
-        : (error instanceof Error ? error.message : String(error));
-      sendError(content);
+      // A dropped prompt socket does not mean the turn died: the engine often
+      // keeps going. Only fail the run when it truly is not running anymore.
+      const resumed = await resumeOpenCodeRun(run, workingDir);
+      if (!resumed) {
+        failure = error;
+        const installed = await context.isProviderInstalled();
+        const content = !installed
+          ? 'OpenCode CLI is not installed. Install it from https://opencode.ai/docs/'
+          : (error instanceof Error ? error.message : String(error));
+        sendError(content);
+      }
     }
   } finally {
     unsubscribe();

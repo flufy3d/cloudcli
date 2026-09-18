@@ -11,7 +11,11 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 
-import { createOpenCodeSession } from '@/modules/providers/list/opencode/opencode-server.client.js';
+import {
+  createOpenCodeSession,
+  getOpenCodeSessionStatus,
+  waitForOpenCodeSessionIdle,
+} from '@/modules/providers/list/opencode/opencode-server.client.js';
 import type { OpenCodeServerHandle } from '@/modules/providers/list/opencode/opencode-server.client.js';
 
 function handleFor(baseUrl: string): OpenCodeServerHandle {
@@ -64,4 +68,31 @@ test('a refused connection is reported as unreachable', async () => {
 
   assert.ok(failure instanceof Error);
   assert.match(failure.message, /could not reach the local OpenCode server/);
+});
+
+test('the status map is read per session and idle-wait blocks until it clears', async () => {
+  let statusCalls = 0;
+  const server = http.createServer((_req, res) => {
+    statusCalls += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ses_test: { type: statusCalls < 2 ? 'busy' : 'idle' } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const handle = handleFor(`http://127.0.0.1:${address.port}`);
+
+  try {
+    // First read sees the running turn; the wait then polls until it is idle.
+    assert.equal(await getOpenCodeSessionStatus(handle, '/tmp/project', 'ses_test'), 'busy');
+    await waitForOpenCodeSessionIdle(handle, '/tmp/project', 'ses_test', 30_000);
+    assert.ok(statusCalls >= 2);
+  } finally {
+    server.close();
+  }
+});
+
+test('idle-wait rejects when the server disappears mid-turn', async () => {
+  const port = await reserveClosedPort();
+  await assert.rejects(waitForOpenCodeSessionIdle(handleFor(`http://127.0.0.1:${port}`), '/tmp/project', 'ses_test', 30_000));
 });
