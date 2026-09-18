@@ -65,7 +65,15 @@ run('pnpm', ['build']);
 const deployDir = path.join(os.homedir(), '.cloudcli', 'deploy');
 fs.mkdirSync(deployDir, { recursive: true });
 
-// 清理全局 package.json 中可能残留的已失效的本地 file: 路径，防止 pnpm 校验旧依赖时抛 ENOENT
+// pnpm v10 默认拦截依赖的安装脚本。实测唯一生效的白名单落点是**全局 package.json
+// 的 `pnpm.onlyBuiltDependencies`**：写在全局 rc（`only-built-dependencies=`）或全局
+// `pnpm-workspace.yaml` 里都不被读取，`pnpm approve-builds` 没有 `-y`，
+// `onlyBuiltDependenciesGlobally` 这个设置在 pnpm 10 里根本不存在。
+// 没有它，本包的 postinstall（scripts/fix-node-pty.js）和 better-sqlite3 的 install
+// 都会被静默跳过。
+const BUILD_ALLOWLIST = [APP_NAME, 'better-sqlite3'];
+
+// 同时清理全局 package.json 中可能残留的已失效的本地 file: 路径，防止 pnpm 校验旧依赖时抛 ENOENT
 try {
   const globalDir = path.dirname(capture('pnpm', ['root', '-g']) || '');
   const globalPkgJson = path.join(globalDir, 'package.json');
@@ -79,6 +87,16 @@ try {
         modified = true;
       }
     }
+
+    // 只增不删：这份名单是全局共享的，别的全局包可能也往里加过条目。
+    const current = Array.isArray(pkg.pnpm?.onlyBuiltDependencies) ? pkg.pnpm.onlyBuiltDependencies : [];
+    const missing = BUILD_ALLOWLIST.filter((name) => !current.includes(name));
+    if (missing.length) {
+      pkg.pnpm = { ...pkg.pnpm, onlyBuiltDependencies: [...current, ...missing].sort() };
+      modified = true;
+      console.log(`[deploy] 已把 ${missing.join('、')} 加入全局构建白名单（pnpm v10 默认拦安装脚本）`);
+    }
+
     if (modified) {
       fs.writeFileSync(globalPkgJson, JSON.stringify(pkg, null, 2) + '\n');
     }
@@ -128,8 +146,9 @@ if (!fs.existsSync(sqliteBinary)) {
 // 这里不调那个脚本 —— 它按相对路径找 node_modules，pnpm 的全局布局是软链到
 // .pnpm 虚拟目录的，靠不住 —— 直接从安装好的包解析 node-pty 的真实位置再补。
 //
-// 顺带说明为什么不用 `pnpm add --allow-build`：实测它只让「Ignored build scripts」
-// 警告消失，对 file: 依赖并不会真的执行脚本。那比现状更糟，信号没了活也没干。
+// 上面的全局构建白名单正常时这一步不会触发；保留它是因为那份名单是全局共享的，
+// 被别的工具改写过一次（条目被按字符拆碎）就会重新失效，而这里的后果是开终端直接
+// posix_spawnp failed。兜底比信号可靠。
 const ptyProbe = capture('node', [
   '-e',
   `const fs=require('fs'),path=require('path');` +
