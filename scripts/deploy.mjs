@@ -122,16 +122,60 @@ if (!fs.existsSync(sqliteBinary)) {
   if (!fs.existsSync(sqliteBinary)) fail(`补跑 install 后仍未生成 ${sqliteBinary}`);
 }
 
-// ── 4. 切换 pm2 服务（delete + start，确保重读 ecosystem 配置） ──
+// ── 3.6 node-pty 执行权限兜底 ──────────────────────────────
+// 同样是 pnpm v10 拦构建脚本的后果：本包的 postinstall（scripts/fix-node-pty.js）
+// 负责给 node-pty 的 spawn-helper 补上执行位，缺了它开终端就 posix_spawnp failed。
+// 这里不调那个脚本 —— 它按相对路径找 node_modules，pnpm 的全局布局是软链到
+// .pnpm 虚拟目录的，靠不住 —— 直接从安装好的包解析 node-pty 的真实位置再补。
+//
+// 顺带说明为什么不用 `pnpm add --allow-build`：实测它只让「Ignored build scripts」
+// 警告消失，对 file: 依赖并不会真的执行脚本。那比现状更糟，信号没了活也没干。
+const ptyProbe = capture('node', [
+  '-e',
+  `const fs=require('fs'),path=require('path');` +
+  `try{const dir=fs.realpathSync(${JSON.stringify(pkgDir)});` +
+  `console.log(fs.realpathSync(path.dirname(require.resolve('node-pty/package.json',{paths:[dir]}))))}catch{}`,
+]);
+if (ptyProbe) {
+  const prebuilds = path.join(ptyProbe, 'prebuilds');
+  let fixed = 0;
+  if (fs.existsSync(prebuilds)) {
+    for (const entry of fs.readdirSync(prebuilds)) {
+      const helper = path.join(prebuilds, entry, 'spawn-helper');
+      if (!fs.existsSync(helper)) continue;
+      if ((fs.statSync(helper).mode & 0o111) === 0) {
+        fs.chmodSync(helper, 0o755);
+        fixed += 1;
+      }
+    }
+  }
+  if (fixed > 0) {
+    console.log(`[deploy] node-pty spawn-helper 缺执行位，已补 ${fixed} 个`);
+  }
+} else {
+  console.log('[deploy] 未解析到 node-pty，跳过 spawn-helper 权限检查');
+}
+
+// ── 4. 切换 pm2 服务（原地重启，绝不 delete） ──
+//
+// 从 cloudcli 自己的会话里跑部署时，这个脚本是被部署服务的子孙进程。
+// `pm2 delete` 连着进程树一起杀，脚本在第二条命令（start）之前就没了，
+// 服务再也起不来 —— 部署把自己锁死。`pm2 restart` 是一条命令，由 pm2 守护
+// 进程执行，脚本死了也照样把服务拉回来，进程条目自始至终存在。
+//
+// 带上 ecosystem 路径与 --update-env，重启时重读配置与环境变量，
+// 这正是当初选择 delete + start 想要的效果。
 if (!fs.existsSync(ECOSYSTEM)) fail(`pm2 配置不存在：${ECOSYSTEM}`);
 const jlist = capture('pm2', ['jlist']);
 const running = jlist ? JSON.parse(jlist).find((a) => a.name === APP_NAME) : null;
 if (running) {
-  console.log(`\n[deploy] $ pm2 delete ${APP_NAME}`);
-  capture('pm2', ['delete', APP_NAME]);
+  run('pm2', ['restart', ECOSYSTEM, '--only', APP_NAME, '--update-env']);
+} else {
+  run('pm2', ['start', ECOSYSTEM, '--only', APP_NAME]);
+  // 进程条目是新建的，落盘一次，pm2 resurrect 才认得它。重启路径不改条目，
+  // 无需落盘 —— 也正好避免在脚本可能被重启打断时多做一步。
+  run('pm2', ['save']);
 }
-run('pm2', ['start', ECOSYSTEM, '--only', APP_NAME]);
-run('pm2', ['save']);
 
 // ── 5. 健康检查 ────────────────────────────────────────────
 console.log(`\n[deploy] 等待 http://127.0.0.1:${PORT} 就绪…`);
