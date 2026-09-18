@@ -89,3 +89,25 @@ test('a boundary latched for one session does not relabel another session prompt
   assert.equal(messages[0].role, 'user');
   assert.notEqual(messages[0].isCompactSummary, true);
 });
+
+/**
+ * The real transcript interleaves `attachment` rows between the boundary and
+ * the summary (session 0ca3d73a, lines 4003-4007). They carry no `message`, so
+ * they must not consume the one-shot latch on their way through.
+ */
+test('attachment rows between the boundary and the summary do not consume the latch', () => {
+  const provider = new ClaudeSessionsProvider();
+  const attachmentRow = {
+    type: 'attachment',
+    uuid: 'a0000000-0000-4000-8000-000000000001',
+    attachment: { type: 'file', path: '/tmp/x' },
+  };
+
+  provider.normalizeMessage(compactBoundaryEvent, SESSION_ID);
+  for (let i = 0; i < 3; i++) provider.normalizeMessage(attachmentRow, SESSION_ID);
+  const messages = provider.normalizeMessage(liveSummaryMessage, SESSION_ID);
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, 'assistant');
+  assert.equal(messages[0].isCompactSummary, true);
+});
