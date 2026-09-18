@@ -169,7 +169,10 @@ test('Codex history translates wrapped exec scripts into the tools they ran', { 
         callId: 'shell-command-1',
         input: 'const cmds = ["echo one", "echo two"]; await Promise.all(cmds.map(command => tools.shell_command({ command })));',
         expectedToolName: 'Bash',
-        expectedToolInput: JSON.stringify({ command: 'echo one\necho two' }),
+        // One row per command now: the live stream emits a command_execution
+        // item each, and a joined card matches none of them. The first row
+        // keeps the call id; the second is asserted separately below.
+        expectedToolInput: JSON.stringify({ command: 'echo one' }),
       },
       {
         callId: 'json-shell-command-1',
@@ -222,7 +225,14 @@ test('Codex history translates wrapped exec scripts into the tools they ran', { 
       const toolUses = history.messages.filter((message) => message.kind === 'tool_use');
       const toolUsesById = new Map(toolUses.map((message) => [message.toolId, message]));
 
-      assert.equal(toolUses.length, wrappedCalls.length);
+      // The two-command script contributes one extra row beyond its call.
+      assert.equal(toolUses.length, wrappedCalls.length + 1);
+      const secondCommandRow = toolUses.find(
+        (message) => message.toolId?.startsWith('shell-command-1~'),
+      );
+      assert.ok(secondCommandRow, 'the script\'s second command needs its own row');
+      assert.equal(secondCommandRow.toolInput, JSON.stringify({ command: 'echo two' }));
+
       for (const call of wrappedCalls) {
         const toolUse = toolUsesById.get(call.callId);
         assert.ok(toolUse, `missing row for ${call.callId}`);
@@ -1032,3 +1042,48 @@ test('a Codex reply carries the same row identity live and from history', { conc
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+/**
+ * Tool cards have to describe the same call the same way on both transports,
+ * or the client cannot pair them and renders each call twice.
+ *
+ * Verified against a real rollout: the persisted side parses the `cmd`
+ * argument out of the exec script, while the live item reports the command as
+ * the shell invocation that ran it — `["/bin/zsh", "-lc", "<cmd>"]` in every
+ * one of that session's 124 command executions. Storing the array verbatim can
+ * never fingerprint-match the parsed string.
+ */
+test('a live command card reports the command, not the shell that ran it', () => {
+  const provider = new CodexSessionsProvider();
+
+  const rows = provider.normalizeMessage({
+    type: 'item',
+    itemType: 'command_execution',
+    itemId: 'exec-1',
+    command: ['/bin/zsh', '-lc', "sed -n '1,240p' /tmp/notes.md"],
+    status: 'completed',
+    output: '',
+  }, 'sess-cmd');
+
+  const toolUse = rows.find((row) => row.kind === 'tool_use');
+  assert.ok(toolUse);
+  assert.deepEqual(toolUse.toolInput, { command: "sed -n '1,240p' /tmp/notes.md" });
+});
+
+test('a live command card already given a plain string keeps it unchanged', () => {
+  const provider = new CodexSessionsProvider();
+
+  const rows = provider.normalizeMessage({
+    type: 'item',
+    itemType: 'command_execution',
+    itemId: 'exec-2',
+    command: 'npm test',
+    status: 'completed',
+    output: '',
+  }, 'sess-cmd');
+
+  const toolUse = rows.find((row) => row.kind === 'tool_use');
+  assert.ok(toolUse);
+  assert.deepEqual(toolUse.toolInput, { command: 'npm test' });
+});
+

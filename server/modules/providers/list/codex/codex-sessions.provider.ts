@@ -226,6 +226,31 @@ function extractCodexTextContent(content: unknown): string {
 }
 
 /**
+ * The command a live `command_execution` item ran, as the persisted transcript
+ * spells it.
+ *
+ * Codex reports the shell invocation — `["/bin/zsh", "-lc", "<cmd>"]` — while
+ * the rollout records the `cmd` argument the script passed. Storing the
+ * invocation verbatim leaves the two transports describing one call
+ * differently, which is enough to stop the client pairing them and render the
+ * card twice. A plain string is already the command and passes through.
+ */
+function readCodexCommandLine(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (!Array.isArray(value)) {
+    return '';
+  }
+  const parts = value.filter((part): part is string => typeof part === 'string');
+  const shellFlagIndex = parts.findIndex((part) => part === '-lc' || part === '-c');
+  if (shellFlagIndex >= 0 && shellFlagIndex + 1 < parts.length) {
+    return parts.slice(shellFlagIndex + 1).join(' ');
+  }
+  return parts.join(' ');
+}
+
+/**
  * Reads the markdown out of Codex's `<proposed_plan>` envelope.
  *
  * Codex delivers a plan as a wrapped assistant message while Claude delivers
@@ -1723,20 +1748,28 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
           return `${callId}~${messages.length}`;
         };
 
-        if (shellCommands.length > 0) {
+        // One row per command, matching both the live stream (which emits a
+        // `command_execution` item each) and this adapter's own subagent path.
+        // Joining them produced a card whose text matched nothing live, so the
+        // two transports rendered the call twice over.
+        shellCommands.forEach((operation, index) => {
           const shellMessage: AnyRecord = {
             type: 'tool_use',
             timestamp,
             toolName: 'Bash',
             toolInput: JSON.stringify({
-              command: shellCommands.map((operation) => operation.command).join('\n'),
-              description: shellCommands.find((operation) => operation.justification)?.justification,
+              command: operation.command,
+              description: operation.justification,
             }),
             toolCallId: nextRowId(),
           };
           messages.push(shellMessage);
-          shellCallMessages.set(callId, shellMessage);
-        }
+          // The call has one output, and it belongs to the row that kept the
+          // call id — the first one.
+          if (index === 0) {
+            shellCallMessages.set(callId, shellMessage);
+          }
+        });
 
         for (const search of searches) {
           messages.push({
@@ -2265,7 +2298,7 @@ export class CodexSessionsProvider implements IProviderSessions {
             provider: PROVIDER,
             kind: 'tool_use',
             toolName: 'Bash',
-            toolInput: { command: raw.command },
+            toolInput: { command: readCodexCommandLine(raw.command) },
             toolId: itemId,
             status: raw.status,
           });

@@ -150,6 +150,12 @@
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
 外加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。
 
+**工具卡同样要两路描述一致。** Codex 的实时与历史 `toolId` 来自两个 id 空间
+（SDK item id ／ rollout `call_id`），精确匹配结构性地不可能，只能靠「工具名 + 完整入参」指纹。
+因此入参必须逐字相同：命令文本统一成 shell 包装里的那条命令（`readCodexCommandLine`），
+多命令脚本在历史侧**按命令拆行**，与实时每条命令一个 item 的粒度对齐，
+也与本适配器子代理路径的既有做法一致。
+
 **跨路行身份是适配器的责任，不是前端的猜测活。** `providerRowKey` 一旦缺席，
 前端只能退回按挂钟定位回合、按文本相似度判重——重复回复正是这么来的。
 六家引擎目前的实现情况：
