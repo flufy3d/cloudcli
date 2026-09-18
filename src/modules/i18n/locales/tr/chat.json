@@ -282,6 +282,7 @@
     "resetHoursMinutes": "{{hours}}sa {{minutes}}dk sonra sıfırlanır",
     "resetMinutes": "{{minutes}}dk sonra sıfırlanır",
     "emptyQuotaHint": {
+      "claude": "API anahtarı, Bedrock ve Vertex girişlerinde claude.ai abonelik limitleri bulunmaz",
       "codex": "API Anahtarı ile girişler genellikle 5 saatlik veya haftalık limitleri bildirmez"
     }
   }

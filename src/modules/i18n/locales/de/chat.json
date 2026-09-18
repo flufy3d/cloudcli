@@ -282,6 +282,7 @@
     "resetHoursMinutes": "Zurücksetzung in {{hours}}Std {{minutes}}Min",
     "resetMinutes": "Zurücksetzung in {{minutes}}Min",
     "emptyQuotaHint": {
+      "claude": "API-Schlüssel-, Bedrock- und Vertex-Anmeldungen haben keine Abo-Limits von Claude.ai",
       "codex": "API-Schlüssel-Anmeldungen liefern in der Regel keine 5-Stunden- oder Wochenlimits"
     }
   }

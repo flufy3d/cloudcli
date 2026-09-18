@@ -282,6 +282,7 @@
     "resetHoursMinutes": "Сброс через {{hours}}ч {{minutes}}мин",
     "resetMinutes": "Сброс через {{minutes}}мин",
     "emptyQuotaHint": {
+      "claude": "Вход по API-ключу, через Bedrock или Vertex не имеет лимитов подписки claude.ai",
       "codex": "Вход по API Key обычно не сообщает о 5-часовых и недельных лимитах"
     }
   }

@@ -325,6 +325,7 @@
     "resetHoursMinutes": "{{hours}} 小時 {{minutes}} 分鐘後重設",
     "resetMinutes": "{{minutes}} 分鐘後重設",
     "emptyQuotaHint": {
+      "claude": "API Key、Bedrock、Vertex 登入沒有 claude.ai 訂閱限額",
       "codex": "API Key 登入通常不會提供 5 小時和週限額"
     }
   }

@@ -40,7 +40,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
-    supportsQuota: false,
+    supportsQuota: true,
     supportsEffort: true,
     supportsMessageEditing: true,
     supportsSessionForking: true,

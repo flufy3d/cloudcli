@@ -269,6 +269,7 @@
     "resetHoursMinutes": "{{hours}}時間{{minutes}}分後にリセット",
     "resetMinutes": "{{minutes}}分後にリセット",
     "emptyQuotaHint": {
+      "claude": "API キー・Bedrock・Vertex でのログインには claude.ai のサブスクリプション制限がありません",
       "codex": "API キーでのログインでは通常、5時間や週間の制限は提供されません"
     }
   }

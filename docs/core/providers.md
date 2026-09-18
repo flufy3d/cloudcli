@@ -87,6 +87,14 @@
 由各家配额适配器声明，前端不再记忆哪家是哪样。新增一家配额引擎只需给它的 auth 切面加 `getQuota`
 并声明 `partitioning`，前端一行都不用改。
 
+**配额的数据源各家不同，但都收在 auth 切面背后**：codex 起一次 `app-server` 走
+`account/rateLimits/read`，zcode 直接打 BigModel / Z.AI 的 HTTP 端点，
+claude 则借 Agent SDK 的 control request（`/usage` 背后那个实验接口）——
+因为 OAuth 令牌与静默续期都归 SDK 管，绕过它就得自己碰凭据。
+三家都要拉起进程或走网络，因此统一用 `createProviderQuotaCache`（TTL 两分钟）挡在前面，
+`?refresh=true` 才穿透。claude 那条路额外有一点要守住：喂给 SDK 的输入流一条消息都不产出，
+CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在汇报的额度。
+
 **MCP 配置格式的能力同样由切面声明**：`IProviderMcp.capabilities` 给出可用 scope、transport、
 是否支持工作目录、是否支持环境变量间接（`env_vars` / `bearer_token_env_var` / `env_http_headers`，
 目前只有 codex 有；普通 `env` 与 HTTP `headers` 六家都写，不需要开关）。

@@ -309,6 +309,7 @@
     "resetHoursMinutes": "Se reinicia en {{hours}}h {{minutes}}m",
     "resetMinutes": "Se reinicia en {{minutes}}m",
     "emptyQuotaHint": {
+      "claude": "Los inicios de sesión con API key, Bedrock o Vertex no tienen límites de suscripción de claude.ai",
       "codex": "Los inicios de sesión con API Key no suelen indicar límites de 5 horas o semanales"
     }
   }

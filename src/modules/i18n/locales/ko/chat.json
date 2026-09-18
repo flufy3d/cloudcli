@@ -303,6 +303,7 @@
     "resetHoursMinutes": "{{hours}}시간 {{minutes}}분 후 리셋",
     "resetMinutes": "{{minutes}}분 후 리셋",
     "emptyQuotaHint": {
+      "claude": "API 키, Bedrock, Vertex 로그인에는 claude.ai 구독 한도가 없습니다",
       "codex": "API 키 로그인은 일반적으로 5시간 또는 주간 한도를 제공하지 않습니다"
     }
   }
