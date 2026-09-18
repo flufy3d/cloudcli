@@ -236,18 +236,35 @@ function extractCodexTextContent(content: unknown): string {
  * card twice. A plain string is already the command and passes through.
  */
 function readCodexCommandLine(value: unknown): string {
-  if (typeof value === 'string') {
-    return value;
+  // Two serializations reach this: the SDK reports a string
+  // (`/bin/zsh -lc ls`), the rollout's own event format an array
+  // (`["/bin/zsh", "-lc", "ls"]`). Both wrap the command in a shell
+  // invocation, and the transcript records only what was inside it, so the
+  // wrapper comes off either way — otherwise the live card and the persisted
+  // one describe the same call differently and both render.
+  if (Array.isArray(value)) {
+    const parts = value.filter((part): part is string => typeof part === 'string');
+    const shellFlagIndex = parts.findIndex((part) => part === '-lc' || part === '-c');
+    return shellFlagIndex >= 0 && shellFlagIndex + 1 < parts.length
+      ? parts.slice(shellFlagIndex + 1).join(' ')
+      : parts.join(' ');
   }
-  if (!Array.isArray(value)) {
+
+  if (typeof value !== 'string') {
     return '';
   }
-  const parts = value.filter((part): part is string => typeof part === 'string');
-  const shellFlagIndex = parts.findIndex((part) => part === '-lc' || part === '-c');
-  if (shellFlagIndex >= 0 && shellFlagIndex + 1 < parts.length) {
-    return parts.slice(shellFlagIndex + 1).join(' ');
+
+  // `<shell> -lc <command>`: everything after the flag is the command, which
+  // may itself contain quotes and spaces, so the split is on the flag alone.
+  const wrapped = value.match(/^\S*(?:sh|bash|zsh)\s+-l?c\s+([\s\S]+)$/);
+  if (!wrapped) {
+    return value;
   }
-  return parts.join(' ');
+  const command = wrapped[1].trim();
+  // The shell payload is usually quoted as one argument; unwrap a balanced
+  // pair rather than stripping quotes that belong to the command itself.
+  const quoted = command.match(/^(['"])([\s\S]*)\1$/);
+  return quoted ? quoted[2] : command;
 }
 
 /**
@@ -1599,10 +1616,6 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
         timestamp,
         message: { role: 'assistant', content: textContent },
         memoryCitations: cited.memoryCitations,
-        // The rollout's own id for this reply. It is the same identity the SDK
-        // reports live as `item.id`, which is what lets the two transports
-        // recognise one row instead of comparing clocks and body text.
-        providerRowKey: readNonEmptyString(payload.id),
       });
       continue;
     }
@@ -2226,12 +2239,13 @@ export class CodexSessionsProvider implements IProviderSessions {
         role: 'assistant',
         content,
         memoryCitations: raw.memoryCitations,
-        // Both transports converge here: a live `agent_message` arrives with
-        // `message.role` set and is routed in above, carrying the SDK's
-        // `itemId`, while a persisted row arrives with the rollout's own id
-        // already read out as `providerRowKey`. They are the same identity.
-        providerRowKey: readNonEmptyString(raw.providerRowKey)
-          ?? readNonEmptyString(raw.itemId),
+        // Deliberately unkeyed. The two transports do not share a row
+        // identity: the SDK stream numbers items per turn (`item_0`,
+        // `item_1`), while the rollout records the model's own response id
+        // (`msg_…`). Keying each side with its own value is worse than having
+        // no key at all — reconciliation takes the identity branch, finds no
+        // match, calls the rows distinct, and renders the reply twice with no
+        // fallback. Codex assistant text reconciles causally instead.
       })];
     }
 
@@ -2317,8 +2331,6 @@ export class CodexSessionsProvider implements IProviderSessions {
             role: 'assistant',
             content: text,
             memoryCitations: cited.memoryCitations,
-            // Same identity the rollout records as the response item's `id`.
-            providerRowKey: readNonEmptyString(raw.itemId as string | undefined),
           })];
         }
         case 'reasoning':
