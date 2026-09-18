@@ -1534,6 +1534,10 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
         timestamp,
         message: { role: 'assistant', content: textContent },
         memoryCitations: cited.memoryCitations,
+        // The rollout's own id for this reply. It is the same identity the SDK
+        // reports live as `item.id`, which is what lets the two transports
+        // recognise one row instead of comparing clocks and body text.
+        providerRowKey: readNonEmptyString(payload.id),
       });
       continue;
     }
@@ -2149,6 +2153,12 @@ export class CodexSessionsProvider implements IProviderSessions {
         role: 'assistant',
         content,
         memoryCitations: raw.memoryCitations,
+        // Both transports converge here: a live `agent_message` arrives with
+        // `message.role` set and is routed in above, carrying the SDK's
+        // `itemId`, while a persisted row arrives with the rollout's own id
+        // already read out as `providerRowKey`. They are the same identity.
+        providerRowKey: readNonEmptyString(raw.providerRowKey)
+          ?? readNonEmptyString(raw.itemId),
       })];
     }
 
@@ -2234,6 +2244,8 @@ export class CodexSessionsProvider implements IProviderSessions {
             role: 'assistant',
             content: text,
             memoryCitations: cited.memoryCitations,
+            // Same identity the rollout records as the response item's `id`.
+            providerRowKey: readNonEmptyString(raw.itemId as string | undefined),
           })];
         }
         case 'reasoning':

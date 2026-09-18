@@ -953,3 +953,82 @@ test('readCodexProposedPlan ignores an unmatched terminal closing tag', () => {
     null,
   );
 });
+
+/**
+ * Cross-transport row identity.
+ *
+ * `providerRowKey` is the contract's answer to "is this live row and this
+ * persisted row the same row". Without it the client falls back to comparing
+ * wall clocks and body text, which is where duplicated replies come from.
+ * Codex has a native id on both paths — the SDK's `item.id` live and the
+ * rollout's `payload.id` on disk — and the plan-card branch already treats the
+ * two as one identity, so the assistant text rows can carry it too.
+ */
+test('a Codex reply carries the same row identity live and from history', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-row-key-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+  const providerSessionId = 'codex-row-key-session';
+  const responseItemId = 'msg_0abc123';
+
+  try {
+    const lines = [
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'explain the merge' }] } },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          id: responseItemId,
+          content: [{ type: 'output_text', text: 'The merge interleaves two sources.' }],
+        },
+      }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } }),
+    ];
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${lines.join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-row-key-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-row-key-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const provider = new CodexSessionsProvider();
+
+      const history = await provider.fetchHistory('app-row-key-1');
+      const persisted = history.messages.find(
+        (message) => message.kind === 'text' && message.role === 'assistant',
+      );
+      assert.ok(persisted, 'the persisted reply must be there to compare against');
+
+      const live = provider.normalizeMessage({
+        type: 'item',
+        itemType: 'agent_message',
+        itemId: responseItemId,
+        message: { role: 'assistant', content: 'The merge interleaves two sources.' },
+      }, 'app-row-key-1');
+
+      assert.equal(live.length, 1);
+      assert.equal(
+        live[0].providerRowKey,
+        responseItemId,
+        'the live row must be keyed by the provider id, not an app-generated one',
+      );
+      assert.equal(
+        persisted.providerRowKey,
+        live[0].providerRowKey,
+        'both transports must describe the same row with the same key',
+      );
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});

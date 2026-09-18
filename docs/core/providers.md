@@ -150,6 +150,21 @@
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
 外加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。
 
+**跨路行身份是适配器的责任，不是前端的猜测活。** `providerRowKey` 一旦缺席，
+前端只能退回按挂钟定位回合、按文本相似度判重——重复回复正是这么来的。
+六家引擎目前的实现情况：
+
+| 引擎 | 行身份 | 依据 |
+| --- | --- | --- |
+| codex | 有 | 两路同一个响应项 id（实时 SDK `item.id`／rollout `payload.id`） |
+| antigravity | 有 | `assistant-step:<step_index>` |
+| claude | **无** | 历史行有 `uuid`，实时 SDK 事件不暴露同一个 id；宁可没有也不能伪造 |
+| cursor / opencode / zcode | **未盘点** | 见 `docs/design/跨路行身份.md` |
+
+Codex 的两路在 `normalizeHistoryEntry` 汇合——实时 `agent_message` 带 `message.role`，
+在 `normalizeMessage` 开头就被转到这里，所以 key 在汇合点统一取，
+而不是在看似对应的实时分支里各取一次。
+
 **跨路文本身份要求**：`NormalizedMessage.providerRowKey` 是 provider 在同一会话内为一条最终可渲染行生成的稳定身份，只在 live 与历史两路都能从原生数据复建时设置；它不承担消息展示 id、WebSocket `seq`、provider 排序 `sequence` 或编辑锚点的职责。前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选或缺 key 且无法证明同一用户回合时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
 
 **工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（codex/antigravity 现状——三命名空间无桥、锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。

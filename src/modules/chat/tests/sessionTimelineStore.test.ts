@@ -1097,3 +1097,50 @@ test('a live stream stays below its user turn even without an optimistic row to 
     `the live stream must stay below its user turn (user@${userIndex}, stream@${streamIndex})`,
   );
 });
+
+/**
+ * With a provider row key present, reconciliation is decided by identity.
+ *
+ * This is what the key is for: two bodies that differ only because one was
+ * still streaming used to be judged by a text-similarity rule, and two bodies
+ * that genuinely differ could be collapsed by it. A key says outright whether
+ * these are one row, and a *different* key says outright that they are two.
+ */
+test('two Codex replies with different provider row keys both survive the refresh', async () => {
+  const first: NormalizedMessage = {
+    id: 'hist-1',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 1000).toISOString(),
+    provider: 'codex',
+    kind: 'text',
+    role: 'assistant',
+    providerRowKey: 'msg_first',
+    content: 'Checking the merge helper to see how the two sources interleave today.',
+  };
+
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 50, offset: 0 }, page: { messages: [first], total: 1, hasMore: false } },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  // A second reply that begins with the same long prefix — the shape the
+  // text-similarity rule would have collapsed into the first one.
+  store.appendRealtime(SESSION_ID, {
+    id: 'live-2',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 2000).toISOString(),
+    provider: 'codex',
+    kind: 'text',
+    role: 'assistant',
+    providerRowKey: 'msg_second',
+    content: 'Checking the merge helper to see how the two sources interleave today, and the anchors now decide it.',
+  });
+
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
+
+  const keys = store.getMessages(SESSION_ID)
+    .filter((row) => row.kind === 'text' && row.role === 'assistant')
+    .map((row) => row.providerRowKey);
+
+  assert.deepEqual(keys, ['msg_first', 'msg_second'], 'distinct keys are distinct rows');
+});
