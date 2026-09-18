@@ -2122,6 +2122,24 @@ export class CodexSessionsProvider implements IProviderSessions {
       if (!content.trim()) {
         return [];
       }
+      // Same unification the live and session-reader paths apply: a proposed
+      // plan is a plan card, not an assistant paragraph that happens to open
+      // with a tag. Leaving it to the client is what put a provider-specific
+      // branch in a renderer shared by every provider.
+      const proposedPlan = readCodexProposedPlan(content);
+      if (proposedPlan) {
+        return [createNormalizedMessage({
+          id: baseId,
+          sessionId,
+          timestamp: ts,
+          provider: PROVIDER,
+          kind: 'tool_use',
+          toolName: 'ExitPlanMode',
+          toolInput: { plan: proposedPlan },
+          toolId: baseId,
+          memoryCitations: raw.memoryCitations,
+        })];
+      }
       return [createNormalizedMessage({
         id: baseId,
         sessionId,

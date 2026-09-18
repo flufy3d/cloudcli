@@ -143,8 +143,14 @@ export type ScheduledMessage = {
 export type ProjectSession = {
   id: string;
   title?: string;
+  /**
+   * The session's label. Every provider's row carries it here: the
+   * synchronizers write what they derive into `custom_name` and the row
+   * surfaces that as `summary`. There is deliberately no `name` alternative —
+   * one used to be declared, nothing ever sent it, and the readers that
+   * preferred it showed a placeholder instead of the real label.
+   */
   summary?: string;
-  name?: string;
   createdAt?: string;
   created_at?: string;
   updated_at?: string;

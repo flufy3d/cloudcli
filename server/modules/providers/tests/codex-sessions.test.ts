@@ -7,7 +7,7 @@ import test from 'node:test';
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { CodexSessionSynchronizer } from '@/modules/providers/list/codex/codex-session-synchronizer.provider.js';
 import { AppError } from '@/shared/utils.js';
-import { CodexSessionsProvider, parseCodexExecScript, readCodexMemoryCitations } from '@/modules/providers/list/codex/codex-sessions.provider.js';
+import { CodexSessionsProvider, parseCodexExecScript, readCodexMemoryCitations, readCodexProposedPlan } from '@/modules/providers/list/codex/codex-sessions.provider.js';
 
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
@@ -887,3 +887,69 @@ test('normalizeMessage on file_change with empty or non-array changes returns em
 });
 
 
+
+/**
+ * A proposed plan is a plan card on every path into the normalizer.
+ *
+ * Codex wraps a plan in `<proposed_plan>` instead of calling a tool the way
+ * Claude does, and the adapter unwraps it onto the same `ExitPlanMode` card so
+ * the two providers render identically. Two of the three assistant paths did
+ * that; the persisted-message path did not, and the envelope reached the
+ * transcript intact — which is why a shared renderer had grown a
+ * `provider === 'codex'` branch to strip the tags itself.
+ */
+test('a persisted assistant plan normalizes to the same plan card as a live one', () => {
+  const provider = new CodexSessionsProvider();
+  const plan = '# Rework the merge\n\n1. Anchor the order\n2. Delete the guess';
+
+  const persisted = provider.normalizeMessage({
+    uuid: 'row-1',
+    timestamp: '2026-01-01T00:00:00.000Z',
+    message: { role: 'assistant', content: `<proposed_plan>\n${plan}\n</proposed_plan>` },
+  }, 'session-1');
+
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].kind, 'tool_use');
+  assert.equal(persisted[0].toolName, 'ExitPlanMode');
+  assert.deepEqual(persisted[0].toolInput, { plan });
+});
+
+test('a persisted assistant message without a plan envelope stays prose', () => {
+  const provider = new CodexSessionsProvider();
+
+  const persisted = provider.normalizeMessage({
+    uuid: 'row-2',
+    timestamp: '2026-01-01T00:00:00.000Z',
+    message: { role: 'assistant', content: 'Here is what I found.' },
+  }, 'session-1');
+
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].kind, 'text');
+  assert.equal(persisted[0].content, 'Here is what I found.');
+});
+
+/**
+ * Envelope edge cases. These moved here with the unwrapping itself: they used
+ * to guard a client-side copy that stripped the tags at render time.
+ */
+test('readCodexProposedPlan reads a complete outer envelope', () => {
+  assert.equal(
+    readCodexProposedPlan('<proposed_plan>\n# Session Timeline\n\nPlan body\n</proposed_plan>'),
+    '# Session Timeline\n\nPlan body',
+  );
+});
+
+test('readCodexProposedPlan reads a plan whose closing tag has not streamed yet', () => {
+  assert.equal(readCodexProposedPlan('<proposed_plan>\n# Partial plan'), '# Partial plan');
+});
+
+test('readCodexProposedPlan ignores a tag that is not the outer envelope', () => {
+  assert.equal(readCodexProposedPlan('Use `<proposed_plan>` only for plans.'), null);
+});
+
+test('readCodexProposedPlan ignores an unmatched terminal closing tag', () => {
+  assert.equal(
+    readCodexProposedPlan('Ordinary text that mentions a terminal tag.\n</proposed_plan>'),
+    null,
+  );
+});

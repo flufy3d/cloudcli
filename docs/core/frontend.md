@@ -33,6 +33,12 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 - 本地选择持久化为 `<provider>-model` / `<provider>-effort`（`useChatProviderState` 直接读写 localStorage，设备本地，不经 preference store）。
 - 引擎外观：`src/shared/providerDisplay.ts`（显示名）、`src/shared/ui/LLMProviderLogo.tsx`（Logo）。
 
+### 会话标签只有一个字段
+
+会话的显示名一律取 `ProjectSession.summary`，`getSessionTitle()` 是唯一入口。
+类型里**没有** `name` 备选字段：曾经有过，后端从未下发，而优先读它的代码因此显示占位名。
+新增读取点不要再加 `|| session.name` 之类的兜底。
+
 ### 消息类型的归属
 
 服务端↔客户端的消息形状**不在前端定义**，而在仓库根 `shared/protocol/chatEvents.ts`，`src/shared/types.ts` 从那里 re-export
