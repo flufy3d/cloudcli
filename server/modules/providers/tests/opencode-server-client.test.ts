@@ -92,6 +92,29 @@ test('the status map is read per session and idle-wait blocks until it clears', 
   }
 });
 
+test('idle-wait finishes when a finished session leaves the status map', async () => {
+  // The engine omits sessions with no work in flight instead of reporting
+  // `idle`, so an untracked session must end the wait. It used to keep the
+  // poll spinning until the one-hour deadline, leaving the run "processing"
+  // long after the turn had completed.
+  let statusCalls = 0;
+  const server = http.createServer((_req, res) => {
+    statusCalls += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(statusCalls < 2 ? { ses_test: { type: 'busy' } } : {}));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+
+  try {
+    await waitForOpenCodeSessionIdle(handleFor(`http://127.0.0.1:${address.port}`), '/tmp/project', 'ses_test', 5_000);
+    assert.ok(statusCalls >= 2);
+  } finally {
+    server.close();
+  }
+});
+
 test('idle-wait rejects when the server disappears mid-turn', async () => {
   const port = await reserveClosedPort();
   await assert.rejects(waitForOpenCodeSessionIdle(handleFor(`http://127.0.0.1:${port}`), '/tmp/project', 'ses_test', 30_000));

@@ -651,6 +651,9 @@ export type OpenCodeSessionStatus = 'idle' | 'busy' | 'retry';
 /**
  * Reads the engine's status for one session, or null when it is not tracked.
  *
+ * The engine lists only sessions with work in flight: a finished session drops
+ * out of the map entirely, so `null` means "no running turn", not "unknown".
+ *
  * Consumers: `opencode-runtime.provider.js`, to decide whether a run whose
  * blocking prompt request dropped is still executing and should keep waiting.
  */
@@ -666,7 +669,13 @@ export async function getOpenCodeSessionStatus(
 }
 
 /**
- * Blocks until the session goes idle, polling the engine for its status.
+ * Blocks until the session stops running, polling the engine for its status.
+ *
+ * A finished session leaves the status map instead of flipping to `idle`
+ * (verified against the engine: only sessions with work in flight are listed),
+ * so both `idle` and an untracked (`null`) session mean the run is over. The
+ * null case is what used to keep the poll spinning until the one-hour deadline
+ * — the engine had finished, but the gateway never saw the run end.
  *
  * Consumers: `opencode-runtime.provider.js`, which resumes a run this way when
  * the blocking prompt request dropped but the engine kept working. Throws when
@@ -683,7 +692,7 @@ export async function waitForOpenCodeSessionIdle(
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, SESSION_IDLE_POLL_INTERVAL_MS));
     const status = await getOpenCodeSessionStatus(handle, directory, sessionId);
-    if (status === 'idle') {
+    if (status === null || status === 'idle') {
       return;
     }
     if (Date.now() >= deadline) {
