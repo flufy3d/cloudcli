@@ -10,12 +10,21 @@ import type { NavigateFunction } from 'react-router-dom';
  * had silently drifted from the server's by seven fields.
  */
 import type { McpScope, McpTransport } from '@shared/protocol/capabilities';
+import type { LoadingProgressEvent as LoadingProgress } from '@shared/protocol/frames';
 import type {
   LLMProvider,
   MessageKind,
-  ServerEventKind,
   NormalizedMessage as WireNormalizedMessage,
 } from '@shared/protocol/chatEvents';
+
+export type {
+  ChatSubscribedEvent,
+  LoadingProgressEvent,
+  LoadingProgressEvent as LoadingProgress,
+  ProtocolErrorEvent,
+  ServerEvent,
+  WebsocketReconnectedEvent,
+} from '@shared/protocol/frames';
 
 export type {
   McpScope,
@@ -196,15 +205,6 @@ export type Project = {
   [key: string]: unknown;
 }
 
-/** Progress payload streamed while the backend enumerates projects, used to drive the sidebar loading bar. */
-export type LoadingProgress = {
-  kind?: 'loading_progress';
-  phase?: string;
-  current: number;
-  total: number;
-  currentProject?: string;
-  [key: string]: unknown;
-}
 
 // ---------------------------
 
@@ -272,20 +272,6 @@ export type SessionActivitySnapshot = {
 
 //----------------- REALTIME TRANSPORT ------------
 
-/**
- * One frame received from the chat websocket. The server guarantees every
- * frame carries a `kind` (provider message kinds plus gateway kinds such as
- * `chat_subscribed`, `session_upserted`, `loading_progress`,
- * `protocol_error`). The synthetic `websocket_reconnected` kind is injected
- * client-side when the socket re-opens after a drop.
- */
-export type ServerEvent = {
-  kind?: ServerEventKind | 'websocket_reconnected';
-  type?: string;
-  sessionId?: string;
-  seq?: number;
-  [key: string]: unknown;
-};
 
 
 // ---------------------------

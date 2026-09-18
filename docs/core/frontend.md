@@ -53,6 +53,17 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 账号配额的形状（`ProviderQuotaData` 等）同样出自协议（`shared/protocol/quota.ts`），
 此前它在前后端共有三份、命名还不一致。
 
+### 帧是联合类型，不是字典
+
+WebSocket 进来的帧类型 `ServerEvent` 定义在 `shared/protocol/frames.ts`，是按 `kind` 判别的联合，
+**没有索引签名**。读任何字段之前必须先确定是哪种帧，用 `shared/protocol/frameNarrowing.ts` 的谓词；
+`sessionId` 与 `seq` 并非每种帧都有（重连通知、加载进度就没有），用 `readFrameSessionId()` /
+`readFrameSeq()` 读。
+
+此前它是 `{ kind?, type?, sessionId?, seq?, [key: string]: unknown }`，
+时间线 store 从中读 22 个字段，全部未经检查。三种网关帧
+（`chat_subscribed`、`protocol_error`、`loading_progress`）的载荷当时根本没有定义。
+
 ### 能力一律读矩阵，不看引擎名
 
 判断"这家引擎能不能做某事"只有一个来源：`useProviderCapabilitiesMap()`。

@@ -41,6 +41,13 @@
 
 import { authenticatedFetch } from '@/shared/api';
 import type { LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
+import {
+  isChatSubscribedEvent,
+  isNormalizedMessageEvent,
+  isProtocolErrorEvent,
+  readFrameSeq,
+  readFrameSessionId,
+} from '@shared/protocol/frameNarrowing';
 import { reconcileOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
 import { isThinkingRowEchoOnServer, upsertThinkingRow } from '@/modules/chat/utils/sessionThinkingRows';
 import {
@@ -794,17 +801,20 @@ export class SessionTimelineStore {
     msg: ServerEvent,
     options: ApplyServerEventOptions = {},
   ): ServerEventDirective | null {
-    const sid = (typeof msg.sessionId === 'string' && msg.sessionId)
-      || options.fallbackSessionId
-      || null;
+    const sid = readFrameSessionId(msg) || options.fallbackSessionId || null;
     const provider = options.provider ?? 'claude';
 
     // Replay progress first — before any routing (order-sensitive contract).
-    if (sid && typeof msg.seq === 'number') {
-      this.noteSeq(sid, msg.seq);
+    const frameSeq = readFrameSeq(msg);
+    if (sid && frameSeq !== null) {
+      this.noteSeq(sid, frameSeq);
     }
 
-    const route = SERVER_EVENT_ROUTES[msg.kind ?? ''] ?? UNKNOWN_EVENT_ROUTE;
+    const route = SERVER_EVENT_ROUTES[msg.kind] ?? UNKNOWN_EVENT_ROUTE;
+    // Everything the route table dispatches beyond the gateway's own frames is
+    // a provider message; narrowing once here is what lets those branches read
+    // message fields at all.
+    const message = isNormalizedMessageEvent(msg) ? msg : null;
     if (sid && route.flushesStream) {
       // Any content-bearing frame ends the current text segment: once the
       // model moves from prose to a tool call or its next thinking block, the
@@ -823,14 +833,14 @@ export class SessionTimelineStore {
         // An already-sent message was replaced. Every client watching this
         // session drops the superseded turns before the replacement streams
         // in, so a second tab does not end up showing the question twice.
-        if (sid && typeof msg.anchorId === 'string') {
-          this.truncateAt(sid, msg.anchorId);
+        if (sid && message && typeof message.anchorId === 'string') {
+          this.truncateAt(sid, message.anchorId);
         }
         return null;
       }
 
       case 'protocolError': {
-        if (!sid) return null;
+        if (!sid || !isProtocolErrorEvent(msg)) return null;
         // Surface the failure in the conversation — the run never started (or
         // was rejected), so no `complete` follows.
         this.appendRealtime(sid, {
@@ -845,27 +855,27 @@ export class SessionTimelineStore {
       }
 
       case 'ack': {
-        if (!sid) return null;
+        if (!sid || !isChatSubscribedEvent(msg)) return null;
         // The ack's `lastSeq` is the server's per-session watermark (max-
         // merged in, so the client's replay cursor can only move forward).
-        if (typeof msg.lastSeq === 'number' && msg.lastSeq > 0) {
+        if (msg.lastSeq > 0) {
           this.noteSeq(sid, msg.lastSeq);
         }
         return {
           effect: 'chat_subscribed',
           sessionId: sid,
-          stale: msg.stale === true,
-          isProcessing: Boolean(msg.isProcessing),
+          stale: msg.stale,
+          isProcessing: msg.isProcessing,
           pendingPermissions: Array.isArray(msg.pendingPermissions)
-            ? (msg.pendingPermissions as unknown[])
+            ? msg.pendingPermissions
             : null,
         };
       }
 
       case 'streamDelta': {
-        const text = (msg.content as string) || '';
-        if (!text || !sid) return null;
-        this.appendStreamDelta(sid, msg as NormalizedMessage, provider);
+        const text = message?.content || '';
+        if (!text || !sid || !message) return null;
+        this.appendStreamDelta(sid, message, provider);
         return null;
       }
 
@@ -900,8 +910,8 @@ export class SessionTimelineStore {
         return {
           effect: 'complete',
           sessionId: sid,
-          success: msg.success !== false,
-          aborted: msg.aborted === true,
+          success: message?.success !== false,
+          aborted: message?.aborted === true,
         };
       }
 
@@ -909,26 +919,26 @@ export class SessionTimelineStore {
         return {
           effect: 'status',
           sessionId: sid,
-          text: (msg.text as string) || null,
-          canInterrupt: msg.canInterrupt !== false,
-          tokenBudget: msg.tokenBudget,
+          text: message?.text || null,
+          canInterrupt: message?.canInterrupt !== false,
+          tokenBudget: message?.tokenBudget,
         };
 
       case 'permissionRequest':
         return {
           effect: 'permission_request',
           sessionId: sid,
-          requestId: (msg.requestId as string) || null,
-          toolName: (msg.toolName as string) || 'UnknownTool',
-          input: msg.input,
-          context: msg.context,
+          requestId: message?.requestId || null,
+          toolName: message?.toolName || 'UnknownTool',
+          input: message?.input,
+          context: message?.context,
         };
 
       case 'permissionCancelled':
         return {
           effect: 'permission_cancelled',
           sessionId: sid,
-          requestId: (msg.requestId as string) || null,
+          requestId: message?.requestId || null,
         };
 
       case 'append':

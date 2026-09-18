@@ -9,6 +9,9 @@ export default defineConfig({
     alias: {
       'node:assert/strict': fileURLToPath(new URL('./vitest.assert-shim.ts', import.meta.url)),
       '@': fileURLToPath(new URL('./src', import.meta.url)),
+      // Mirrors vite.config.js: the wire contract lives at the repository root
+      // so both builds compile exactly one copy of it.
+      '@shared': fileURLToPath(new URL('./shared', import.meta.url)),
     },
   },
   define: {

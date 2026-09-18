@@ -198,7 +198,7 @@ test('a websocket reconnect re-syncs the project list', async () => {
   ]);
 
   await act(async () => {
-    emit({ kind: 'websocket_reconnected' });
+    emit({ kind: 'websocket_reconnected', timestamp: Date.now() });
     await Promise.resolve();
   });
 
