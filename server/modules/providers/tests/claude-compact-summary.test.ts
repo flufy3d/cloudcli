@@ -111,3 +111,24 @@ test('attachment rows between the boundary and the summary do not consume the la
   assert.equal(messages[0].role, 'assistant');
   assert.equal(messages[0].isCompactSummary, true);
 });
+
+/**
+ * `isVisibleInTranscriptOnly` is the CLI's own "keep this out of the normal
+ * conversation view" marker. A row carrying it is never something the user
+ * sent, so it must not become a user bubble even when no other marker applies.
+ */
+test('a transcript-only row is dropped instead of rendering as a user message', () => {
+  const provider = new ClaudeSessionsProvider();
+
+  const messages = provider.normalizeMessage(
+    {
+      type: 'user',
+      uuid: 'c0000000-0000-4000-8000-000000000001',
+      isVisibleInTranscriptOnly: true,
+      message: { role: 'user', content: '注入给模型看的内容' },
+    },
+    SESSION_ID,
+  );
+
+  assert.deepEqual(messages, []);
+});

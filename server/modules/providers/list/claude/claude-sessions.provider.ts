@@ -832,7 +832,20 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       }
     }
 
-    if (raw.message?.role === 'user' && raw.message?.content && raw.isMeta !== true) {
+    /**
+     * `isMeta` and `isVisibleInTranscriptOnly` both mean "not a conversation
+     * message": the CLI injected this row so the model can keep working, and
+     * even Claude Code's own TUI keeps the latter out of the normal view. The
+     * compact-summary gate above runs first, so the one row that carries both
+     * still gets its quiet system line; anything else transcript-only is
+     * dropped rather than attributed to a prompt the user never sent.
+     */
+    if (
+      raw.message?.role === 'user'
+      && raw.message?.content
+      && raw.isMeta !== true
+      && raw.isVisibleInTranscriptOnly !== true
+    ) {
       if (Array.isArray(raw.message.content)) {
         // Image attachments sent through the SDK are persisted as base64
         // `image` blocks next to the prompt text. Collect them so the UI can
