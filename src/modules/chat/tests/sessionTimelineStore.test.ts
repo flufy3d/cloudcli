@@ -1178,3 +1178,49 @@ test('a repeated prompt is not retired by the identical prompt already on screen
   const userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
   assert.equal(userRows.length, 2, 'the newly sent prompt must still be visible');
 });
+
+/**
+ * The send-time row count has to survive the pages that arrive after it.
+ *
+ * `replacesAfterRowCount` records how much transcript was on screen when a
+ * prompt was sent, and retiring the optimistic echo trusts it as an index into
+ * `serverMessages`. Loading an older page prepends rows, so every index shifts;
+ * left unadjusted, the stamp points into the middle of history and an
+ * identical earlier prompt retires the message the user just sent.
+ */
+test('an older page prepended after sending does not strand the optimistic prompt', async () => {
+  const newest: NormalizedMessage = {
+    id: 'srv-new', sessionId: SESSION_ID, timestamp: new Date(BASE_TIME + 10_000).toISOString(),
+    provider: 'claude', kind: 'text', role: 'assistant', content: 'newest reply',
+  };
+  const older: NormalizedMessage = {
+    id: 'srv-older', sessionId: SESSION_ID, timestamp: new Date(BASE_TIME).toISOString(),
+    provider: 'claude', kind: 'text', role: 'user', content: 'continue',
+  };
+
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 20, offset: 0 }, page: { messages: [newest], total: 2, hasMore: true } },
+    { params: { limit: 20, offset: 1 }, page: { messages: [older], total: 2, hasMore: false } },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  // Sent when one row was on screen.
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_repeat', sessionId: SESSION_ID, timestamp: new Date(BASE_TIME + 20_000).toISOString(),
+    provider: 'claude', kind: 'text', role: 'user', content: 'continue',
+  });
+  assert.equal(
+    store.getSessionSlot(SESSION_ID)?.realtimeMessages.find((row) => row.id === 'local_repeat')?.replacesAfterRowCount,
+    1,
+  );
+
+  await store.fetchMore(SESSION_ID, { limit: 20 });
+
+  const stamp = store.getSessionSlot(SESSION_ID)
+    ?.realtimeMessages.find((row) => row.id === 'local_repeat')?.replacesAfterRowCount;
+  assert.equal(stamp, 2, 'the stamp must shift by the number of rows prepended');
+
+  const userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
+  assert.equal(userRows.length, 2, 'the sent prompt must not be retired by the older identical one');
+});

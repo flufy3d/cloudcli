@@ -572,6 +572,35 @@ function computeMerged(
 }
 
 /**
+ * Keeps every pending optimistic prompt's send-time row count pointing at the
+ * same place after the server array is rewritten.
+ *
+ * The stamp is an index into `serverMessages`, so prepending an older page
+ * shifts it; a wholesale replacement invalidates it entirely, and the only
+ * honest answer then is the new tail — a row that arrived before the refresh
+ * cannot be the copy of a prompt sent after it. Left unadjusted, a repeated
+ * prompt is retired by an identical one from an earlier turn and the message
+ * the user just sent disappears.
+ */
+function restampPendingPrompts(slot: SessionSlot, adjust: (stamp: number) => number): void {
+  let changed = false;
+  const next = slot.realtimeMessages.map((row) => {
+    if (!row.id.startsWith('local_') || row.replacesAfterRowCount === undefined) {
+      return row;
+    }
+    const restamped = adjust(row.replacesAfterRowCount);
+    if (restamped === row.replacesAfterRowCount) {
+      return row;
+    }
+    changed = true;
+    return { ...row, replacesAfterRowCount: restamped };
+  });
+  if (changed) {
+    slot.realtimeMessages = next;
+  }
+}
+
+/**
  * Stamps every realtime row that does not have one yet with the transcript
  * tail as it stands right now.
  *
@@ -977,6 +1006,10 @@ export class SessionTimelineStore {
       try {
         const data = await this.fetchPage(sessionId, requestOptions);
         slot.serverMessages = data.messages;
+        // A wholesale replacement leaves no way to translate an old index, so
+        // a pending prompt can only be retired by something that arrives after
+        // this page.
+        restampPendingPrompts(slot, () => data.messages.length);
         slot.total = data.total;
         slot.hasMore = data.hasMore;
         slot.offset = (requestOptions.offset ?? 0) + data.messages.length;
@@ -1058,6 +1091,7 @@ export class SessionTimelineStore {
           slot.total = data.total;
           slot.offset = slot.serverMessages.length;
           prependedCount = olderMerge.prependedCount;
+          restampPendingPrompts(slot, (stamp) => stamp + olderMerge.prependedCount);
           if (data.tokenUsage !== undefined) {
             slot.tokenUsage = data.tokenUsage;
           }
