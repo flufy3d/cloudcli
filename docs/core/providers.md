@@ -156,6 +156,12 @@
 多命令脚本在历史侧**按命令拆行**，与实时每条命令一个 item 的粒度对齐，
 也与本适配器子代理路径的既有做法一致。
 
+**历史只能包含转录行。** `complete`、`stream_delta`、`stream_end`、`session_created`
+描述的是"一次运行正在进行"，历史里没有运行，也就不该出现这些 kind。
+zcode 曾为每个持久化 step 产出一条 `complete`——真实会话里占全部行数的 35%，
+一行都渲染不出来，却照样计入分页、计入每一次遍历转录的扫描、计入客户端发送时记录的行数。
+`history-kind-standard.test.ts` 对四家逐一把关。
+
 **子代理的线程 id 也是适配器的责任。** Codex 用 `agent_thread_id` 指向子代理自己的同级 rollout；
 该 id 曾只从 `sub_agent_activity` 顶层事件读取，而当前版本把它放在 `item_completed` 的
 `SubAgentActivity` 项里，于是 id 永远拿不到、子代理卡片一律空时间线。
