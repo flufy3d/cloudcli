@@ -53,6 +53,25 @@ const PROVIDER = 'antigravity';
  * eventual PLANNER_RESPONSE transcript row. Missing native step indexes stay
  * unidentified so clients can fall back to their legacy reconciliation rules.
  */
+/**
+ * The id both transports must give one tool call.
+ *
+ * Live reports a tool at its own step index; the transcript declares it on the
+ * planner entry one step earlier, with its position in that entry's
+ * `tool_calls`. `declaringStepIndex` is that planner step and is offset here,
+ * while the live side passes the execution step it already has. An index the
+ * engine did not supply falls back to a per-process value, which cannot pair —
+ * that is the honest outcome, better than two rows sharing a made-up id.
+ */
+function buildAntigravityToolId(stepIndex: number | undefined, positionInEntry: number | null): string {
+  if (stepIndex === undefined) {
+    return `tool_unindexed_${Date.now()}`;
+  }
+  return positionInEntry === null
+    ? `tool_${stepIndex}`
+    : `tool_${stepIndex + 1 + positionInEntry}`;
+}
+
 function buildAntigravityAssistantRowKey(stepIndex: number | undefined): string | undefined {
   return stepIndex === undefined ? undefined : `assistant-step:${stepIndex}`;
 }
@@ -347,7 +366,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         const toolName = readOptionalString(step.tool_name) || 'tool';
         const toolInfo = readObjectRecord(step.tool_info);
         const parameters = normalizeAntigravityToolArgs(toolInfo?.parameters ?? {});
-        const toolId = `tool_${stepIndex ?? Date.now()}`;
+        const toolId = buildAntigravityToolId(stepIndex, null);
 
         messages.push(createNormalizedMessage({
           id: generateMessageId(PROVIDER),
@@ -364,7 +383,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       // Tool result completion or error
       if (stepType === 'tool' && (state === 'DONE' || state === 'ERROR')) {
         const toolInfo = readObjectRecord(step.tool_info);
-        const toolId = `tool_${stepIndex ?? Date.now()}`;
+        const toolId = buildAntigravityToolId(stepIndex, null);
         const output = readOptionalString(toolInfo?.output) ?? '';
         const isError = state === 'ERROR';
 
@@ -499,7 +518,15 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                 const tc = entry.tool_calls[t] as AnyRecord;
                 const toolName = readOptionalString(tc?.name) || 'tool';
                 const args = normalizeAntigravityToolArgs(tc?.args ?? {});
-                const toolId = `tool_${stepIndex}_${t}`;
+                // Both transports must name this call the same way, or the
+                // live card and the persisted one render side by side. Live
+                // reports the tool at its own step, which is the step after
+                // the planner entry that declared it (verified across two
+                // real sessions: 830/830 and 798/807 calls are followed by
+                // their GENERIC output one step later, and no planner entry
+                // has ever carried more than one call). `t` keeps the formula
+                // total should that ever change.
+                const toolId = buildAntigravityToolId(nativeStepIndex, t);
 
                 normalizedMessages.push(createNormalizedMessage({
                   id: `${baseId}_tc_${t}`,

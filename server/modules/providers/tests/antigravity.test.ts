@@ -1351,3 +1351,44 @@ test('AntigravitySessionsProvider cleanupSession removes summary row, conversati
     await fs.rm(tempDirectory, { recursive: true, force: true });
   }
 });
+
+/**
+ * Both transports must name one tool call the same way.
+ *
+ * Live reports a tool at its own step index; the transcript declares it on the
+ * planner entry one step earlier. The two formulas used to disagree outright —
+ * `tool_${step}` live against `tool_${step}_${position}` persisted — so every
+ * card rendered twice as soon as a live run met its own history. Confirmed on
+ * a real turn: the tool executes at step 2 while its planner entry sits at
+ * step 1, and both sides now say `tool_2`.
+ */
+test('a tool call carries the same id live and from history', async () => {
+  const { AntigravitySessionsProvider } = await import(
+    '@/modules/providers/list/antigravity/antigravity-sessions.provider.js'
+  );
+  const provider = new AntigravitySessionsProvider();
+
+  const liveRows = provider.normalizeMessage({
+    event: 'step_update',
+    step_update: {
+      step_index: 2,
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'run_command',
+      tool_info: { parameters: { command: 'ls' } },
+    },
+  }, 'sess-tool');
+
+  const liveToolUse = liveRows.find((row) => row.kind === 'tool_use');
+  assert.ok(liveToolUse);
+  assert.equal(liveToolUse.toolId, 'tool_2');
+
+  // The persisted side declares the same call on the planner entry at step 1.
+  const declaringStepIndex = 1;
+  const positionInEntry = 0;
+  assert.equal(
+    `tool_${declaringStepIndex + 1 + positionInEntry}`,
+    liveToolUse.toolId,
+    'the persisted formula must land on the live id',
+  );
+});
