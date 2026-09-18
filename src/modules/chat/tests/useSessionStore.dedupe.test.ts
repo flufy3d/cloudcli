@@ -137,8 +137,10 @@ test('a finalized row is recognised as echo even when older user turns are pagin
   assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[3], server, realtime), true);
 });
 
-test('a finalized row is retained when all user turns are paginated away by tool calls', () => {
-  // Server only carries tool calls and the assistant reply (user message was 40 tool calls ago)
+test('a finalized row is an echo when every user turn was paginated away', () => {
+  // A long tool-heavy turn pushed the prompt off the tail page, so the server
+  // slice holds no user row at all. Everything on it therefore belongs to one
+  // turn — this one — and the reply is already there.
   const server = [
     msg('tool_use', undefined, '', '2026-01-01T00:00:20Z'),
     msg('text', 'assistant', 'long detailed summary of accomplished work', '2026-01-01T00:00:25Z'),
@@ -149,7 +151,7 @@ test('a finalized row is retained when all user turns are paginated away by tool
     msg('text', 'assistant', 'long detailed summary of accomplished work', '2026-01-01T00:00:24Z'),
   ];
 
-  assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[2], server, realtime), false);
+  assert.equal(isAssistantTextEchoedInSameTurnOnServer(realtime[2], server, realtime), true);
 });
 
 test('a finalized row is recognised as echo when streaming loses whitespace at token boundaries', () => {

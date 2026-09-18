@@ -243,7 +243,7 @@ test('complete flushes the stream and requests the persisted tail only for the v
 
 // ─── suspension return: a pruned streaming row must not revive ───────────────
 
-test('a paged-away user turn preserves unprovable stream text instead of deleting it', async () => {
+test('a paged-away user turn still dedupes the reply against its persisted copy', async () => {
   // The production shape of the "two identical replies after leaving the PWA
   // mid-stream" bug: a long agent turn pushed the current user row past the
   // 20-row tail page, so the return refresh lands a server view whose only
@@ -301,19 +301,23 @@ test('a paged-away user turn preserves unprovable stream text instead of deletin
   const renderedTexts = () => timeline.sessionStore.getMessages(SESSION_ID)
     .filter((row) => row.kind === 'text' && row.role === 'assistant')
     .map((row) => row.content ?? '');
+  // The turn's own user row is beyond the tail page, but a live row cannot
+  // belong to a turn older than the newest one on disk — and that turn already
+  // carries this segment.
   assert.equal(
     renderedTexts().filter((content) => content.includes('Segment one.')).length,
-    2,
-    `'Segment one.' stays visible when its turn cannot be proved, got: ${JSON.stringify(renderedTexts())}`,
+    1,
+    `'Segment one.' must render once, got: ${JSON.stringify(renderedTexts())}`,
   );
 
   // The complete-driven tail refresh must converge to one row per segment.
   await act(async () => {
     await timeline.sessionStore.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
   });
+  // One row per segment, and no concatenated third copy of the whole reply.
   assert.deepEqual(
     renderedTexts().filter((content) => content.includes('Segment')),
-    ['Segment one.', 'Segment two.', 'Segment one.Segment two.'],
+    ['Segment one.', 'Segment two.'],
   );
 
   timeline.cleanup();
@@ -427,7 +431,7 @@ test('an aborted complete still settles unmatched tool cards', () => {
 
 // ─── tool identity: live id ≠ persisted id ───────────────────────────────────
 
-test('a refresh without a provable user turn preserves a different-id tool card', async () => {
+test('a refresh whose persisted card carries a different toolId replaces the shadow card', async () => {
   // zcode-style split: the live card holds the engine payload's toolCallId,
   // the persisted transcript keys the same call by its part id. Before the
   // identity matcher this refresh produced two Write cards, one of them
@@ -475,8 +479,12 @@ test('a refresh without a provable user turn preserves a different-id tool card'
 
   const rows = timeline.sessionStore.getMessages(SESSION_ID);
   const toolCards = rows.filter((row) => row.kind === 'tool_use');
-  assert.equal(toolCards.length, 2, 'an unanchored tool card stays visible');
-  assert.ok(rows.some((row) => row.id === 'rt-tool-shadow'));
+  // No optimistic user row sits above the live card, so it belongs to the
+  // newest persisted turn — and that turn already carries this call under the
+  // transcript's own id. One call, one card.
+  assert.equal(toolCards.length, 1, 'the same logical call must render exactly one card');
+  assert.equal(toolCards[0]?.toolId, 'msg_1_part_2', 'the persisted card is the survivor');
+  assert.ok(!rows.some((row) => row.id === 'rt-tool-shadow'));
   assert.ok(!rows.some((row) => row.id.startsWith('__finalized_')), 'no synthetic may linger');
   const attached = normalizedToChatMessages(rows).find((row) => row.toolId === 'msg_1_part_2');
   assert.equal(attached!.toolResult?.content, 'real output', 'the real result attaches to the survivor');

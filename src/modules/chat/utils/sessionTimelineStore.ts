@@ -310,6 +310,30 @@ function pruneRealtimeSupersededByServer(
   const claimedServerRowIds = new Set<string>();
   const allServerTools = collectServerToolCalls(serverMessages);
 
+  // Which persisted turn a live row belongs to, answered causally.
+  //
+  // The optimistic user row above it names the turn, and
+  // `reconcileOptimisticUserEchoes` has already worked out which persisted row
+  // took that echo's place — so the pairing is used rather than re-derived.
+  // With no user row above it (a tab that did not send, a session resumed
+  // mid-run) the row belongs to the newest persisted turn, because a live row
+  // cannot precede a turn already on disk.
+  //
+  // Demanding that the live and persisted user rows share an id or a
+  // transcript anchor, as this once did, can never hold in the sending tab:
+  // the optimistic row's id is `local_*` and only history normalization
+  // produces anchors. The turn was therefore never provable, the index came
+  // back empty, and fingerprint pairing — the only thing that can match a
+  // provider whose two transports use different tool ids — was unreachable.
+  const { retiredAnchors } = reconcileOptimisticUserEchoes(serverMessages, realtimeMessages);
+
+  const turnRangeFromStart = (start: number): NormalizedMessage[] => {
+    const end = serverMessages.findIndex(
+      (candidate, index) => index > start && candidate.kind === 'text' && candidate.role === 'user',
+    );
+    return serverMessages.slice(start, end < 0 ? undefined : end);
+  };
+
   const serverTurnForRealtimeMessage = (message: NormalizedMessage): NormalizedMessage[] => {
     const realtimeIndex = realtimeMessages.findIndex((candidate) => candidate.id === message.id);
     if (realtimeIndex < 0) return [];
@@ -321,20 +345,31 @@ function pruneRealtimeSupersededByServer(
         break;
       }
     }
-    if (!userMessage) return [];
-    const matchingUserIndexes = serverMessages.flatMap((candidate, index) => {
-      if (candidate.kind !== 'text' || candidate.role !== 'user') return [];
-      const sharedMessageId = Boolean(candidate.id) && candidate.id === userMessage!.id;
-      const sharedTranscriptAnchor = Boolean(candidate.transcriptAnchorId)
-        && candidate.transcriptAnchorId === userMessage!.transcriptAnchorId;
-      return sharedMessageId || sharedTranscriptAnchor ? [index] : [];
-    });
-    if (matchingUserIndexes.length !== 1) return [];
-    const start = matchingUserIndexes[0];
-    const end = serverMessages.findIndex(
-      (candidate, index) => index > start && candidate.kind === 'text' && candidate.role === 'user',
-    );
-    return serverMessages.slice(start, end < 0 ? undefined : end);
+
+    if (!userMessage) {
+      for (let index = serverMessages.length - 1; index >= 0; index -= 1) {
+        const candidate = serverMessages[index];
+        if (candidate.kind === 'text' && candidate.role === 'user') {
+          return turnRangeFromStart(index);
+        }
+      }
+      return [];
+    }
+
+    const pairedServerId = retiredAnchors.get(userMessage.id);
+    if (pairedServerId) {
+      const start = serverMessages.findIndex((candidate) => candidate.id === pairedServerId);
+      if (start >= 0) return turnRangeFromStart(start);
+    }
+
+    if (userMessage.transcriptAnchorId) {
+      const start = serverMessages.findIndex((candidate) => candidate.kind === 'text'
+        && candidate.role === 'user'
+        && candidate.transcriptAnchorId === userMessage!.transcriptAnchorId);
+      if (start >= 0) return turnRangeFromStart(start);
+    }
+
+    return [];
   };
 
   const retained = realtimeMessages.filter((message) => {

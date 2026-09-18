@@ -63,8 +63,20 @@ async function playTurn(fixture: Fixture): Promise<NormalizedMessage[]> {
   return store.getMessages(SESSION_ID);
 }
 
+/** Tool input reaches the two transports as an object on one and JSON text on
+ * the other, so it is parsed before comparison — otherwise the same call looks
+ * like two different rows and a duplicate slips past this suite. */
+function readToolInput(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 function describeRow(row: NormalizedMessage): string {
-  if (row.kind === 'tool_use') return `tool_use:${row.toolName}:${JSON.stringify(row.toolInput)}`;
+  if (row.kind === 'tool_use') return `tool_use:${row.toolName}:${JSON.stringify(readToolInput(row.toolInput))}`;
   if (row.kind === 'text') return `text:${row.role}:${(row.content ?? '').trim()}`;
   return '';
 }
@@ -118,17 +130,18 @@ for (const fixture of [antigravityTurn as Fixture, codexTurn as Fixture]) {
     );
   });
 
-  test(`${fixture.provider}: every tool call the live stream showed survives the refresh`, async () => {
+  test(`${fixture.provider}: every tool call the live stream showed is still represented`, async () => {
     const rows = await playTurn(fixture);
-    const liveToolIds = fixture.live
-      .filter((row) => row.kind === 'tool_use')
-      .map((row) => row.toolId);
+    const liveCalls = fixture.live.filter((row) => row.kind === 'tool_use');
 
-    for (const toolId of liveToolIds) {
-      assert.ok(
-        rows.some((row) => row.kind === 'tool_use' && row.toolId === toolId),
-        `the card for ${toolId} disappeared once history arrived`,
-      );
+    // The card may survive under its live id or be replaced by the persisted
+    // row for the same call — those are the same outcome on screen. What must
+    // not happen is the call vanishing, and (checked by the duplicate test
+    // above) both copies rendering.
+    for (const call of liveCalls) {
+      const represented = rows.some((row) => row.kind === 'tool_use'
+        && (row.toolId === call.toolId || describeRow(row) === describeRow(call)));
+      assert.ok(represented, `the call ${call.toolId} is no longer in the transcript`);
     }
   });
 }

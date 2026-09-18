@@ -198,83 +198,7 @@ function turnCarriesText(
   return isAssistantTextMatch(turnSegments.map((serverMessage) => serverMessage.content || '').join(''), assistantText);
 }
 
-/**
- * Counts how many user turns precede `message` in a chronologically merged
- * view of server + realtime rows.
- *
- * **This is the one turn lookup still decided by wall clock, and it is the last
- * resort.** Everything above it is causal: a provider row key, a transcript
- * anchor, or arrival order inside `realtimeMessages`. This path only runs when
- * a live row's own turn is not in `serverMessages` at all — the user row was
- * paginated away — so neither identity nor arrival can locate it and position
- * is the only remaining signal.
- *
- * Making it causal too needs the optimistic-row pairing the timeline store
- * holds (`retiredAnchors`), which this pure module has no access to; passing it
- * down is the remaining step.
- */
-function getUserTurnOrdinalBefore(
-  message: NormalizedMessage,
-  serverMessages: NormalizedMessage[],
-  realtimeMessages: NormalizedMessage[],
-): number {
-  const messageTime = readMessageTime(message);
-  let userCount = 0;
 
-  for (const candidate of [...serverMessages, ...realtimeMessages].sort(compareMessagesChronologically)) {
-    if (candidate.id === message.id) {
-      break;
-    }
-
-    const candidateTime = readMessageTime(candidate);
-    if (
-      messageTime !== null
-      && candidateTime !== null
-      && candidateTime > messageTime
-    ) {
-      break;
-    }
-
-    if (candidate.kind === 'text' && candidate.role === 'user') {
-      userCount++;
-    }
-  }
-
-  return Math.max(0, userCount - 1);
-}
-
-function findServerTurnRangeByOrdinal(
-  serverMessages: NormalizedMessage[],
-  turnOrdinal: number,
-): { start: number; end: number } | null {
-  let userCount = -1;
-  let start = -1;
-
-  for (let index = 0; index < serverMessages.length; index++) {
-    const message = serverMessages[index];
-    if (message.kind === 'text' && message.role === 'user') {
-      userCount++;
-      if (userCount === turnOrdinal) {
-        start = index;
-        break;
-      }
-    }
-  }
-
-  if (start < 0) {
-    return null;
-  }
-
-  let end = serverMessages.length;
-  for (let index = start + 1; index < serverMessages.length; index++) {
-    if (serverMessages[index].kind === 'text' && serverMessages[index].role === 'user') {
-      end = index;
-      break;
-    }
-  }
-
-  return { start, end };
-}
 
 /**
  * Tests whether a realtime assistant text row (a finalized streaming bubble)
@@ -362,42 +286,33 @@ export function isAssistantTextEchoedInSameTurnOnServer(
     return turnCarriesText(serverMessages, anchoredRange, assistantText);
   }
 
+  // The turn's own user row can be paginated out of `serverMessages` entirely.
+  // When no user row is left there at all, every server row on hand belongs to
+  // one turn — the newest — and that is the turn this live row is part of.
+  // Without this the comparison has nothing to run against and the reply is
+  // kept beside the persisted copy of itself: the duplicated answer seen after
+  // a long tool-heavy turn pushes the prompt off the tail page.
+  const serverHasUserRow = serverMessages.some(
+    (candidate) => candidate.kind === 'text' && candidate.role === 'user',
+  );
+  if (!serverHasUserRow) {
+    return turnCarriesText(serverMessages, { start: -1, end: serverMessages.length }, assistantText);
+  }
+
   const precedingUserContent = (turnUserRow.content || '').trim();
   if (precedingUserContent) {
     const contentRange = findLatestServerTurnRangeByUserContent(serverMessages, precedingUserContent);
-    if (contentRange && turnCarriesText(serverMessages, contentRange, assistantText)) {
-      return true;
-    }
-    // The inferred turn does not own this row. Fall through to the ordinal
-    // fallback, which covers transcripts whose earlier turns were paginated
-    // away so the matching user row is not in `serverMessages` at all.
-  }
-
-  // 2. Fallback to turn-ordinal lookup for historical or legacy layouts
-  const turnOrdinal = getUserTurnOrdinalBefore(message, serverMessages, realtimeMessages);
-  const turnRange = findServerTurnRangeByOrdinal(serverMessages, turnOrdinal);
-  let ordinalTurnMatched = false;
-  if (turnRange) {
-    const turnSegments = serverMessages
-      .slice(turnRange.start + 1, turnRange.end)
-      .filter((serverMessage) =>
-        serverMessage.kind === 'text'
-        && serverMessage.role === 'assistant'
-        && (serverMessage.content || '').length > 0,
-      );
-
-    ordinalTurnMatched = turnSegments.some((serverMessage) =>
-      isAssistantTextMatch(serverMessage.content || '', assistantText),
-    );
-
-    // Segments are joined on their raw content so inter-segment whitespace
-    // survives, matching how the live deltas concatenated; only the outer
-    // edges are trimmed, same as `assistantText` above.
-    if (!ordinalTurnMatched) {
-      const joinedText = turnSegments.map((serverMessage) => serverMessage.content || '').join('');
-      ordinalTurnMatched = isAssistantTextMatch(joinedText, assistantText);
+    if (contentRange) {
+      return turnCarriesText(serverMessages, contentRange, assistantText);
     }
   }
 
-  return Boolean(turnRange && ordinalTurnMatched);
+  // The turn's user row is not in `serverMessages` — it sits beyond the tail
+  // page. The live row still cannot belong to a turn older than the newest one
+  // on disk, so that is the turn to compare against. This replaces a fallback
+  // that counted turns in a clock-merged view of both sources, which is the
+  // last place a wall clock decided anything here.
+  const newestTurn = findNewestServerTurnRange(serverMessages);
+  return newestTurn ? turnCarriesText(serverMessages, newestTurn, assistantText) : false;
 }
+
