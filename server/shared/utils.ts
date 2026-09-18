@@ -19,11 +19,14 @@ import { fileURLToPath } from 'node:url';
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
+import type { MessageInputForKind } from '../../shared/protocol/messageKinds.js';
+
 import { parseFrontMatter } from './frontmatter.js';
 import type {
   AnyRecord,
   ApiSuccessShape,
   AppErrorOptions,
+  MessageKind,
   NormalizedMessage,
   ProviderCurrentActiveModel,
   ProviderModelsDefinition,
@@ -50,15 +53,7 @@ export const IS_PLATFORM = process.env.VITE_IS_PLATFORM === 'true';
  * pair; this helper fills missing envelope fields (`id`, `sessionId`,
  * `timestamp`) in a consistent way.
  */
-type NormalizedMessageInput =
-  Omit<Partial<NormalizedMessage>, 'kind' | 'provider' | 'id' | 'sessionId' | 'timestamp'>
-  & {
-    kind: NormalizedMessage['kind'];
-    provider: NormalizedMessage['provider'];
-    id?: string | null;
-    sessionId?: string | null;
-    timestamp?: string | null;
-  };
+
 
 // ---------------------------
 //----------------- HTTP HANDLER UTILITIES ------------
@@ -366,7 +361,9 @@ export function generateMessageId(prefix = 'msg'): string {
  * while this helper guarantees every emitted event has an id, session id,
  * timestamp, and provider marker.
  */
-export function createNormalizedMessage(fields: NormalizedMessageInput): NormalizedMessage {
+export function createNormalizedMessage<K extends MessageKind>(
+  fields: MessageInputForKind<K>,
+): NormalizedMessage {
   return {
     ...fields,
     id: fields.id || generateMessageId(fields.kind),

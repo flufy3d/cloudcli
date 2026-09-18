@@ -132,6 +132,20 @@
 闸门的字段清单由类型层的完整性断言钉住：往协议加字段却忘了登记会**编译失败并报出字段名**，
 所以它不会变成又一面陈旧的镜子。
 
+### 字段按 kind 归属
+
+哪个 kind 能带哪些字段，定义在 `shared/protocol/messageKinds.ts` 的 `MessageFieldsByKind`，
+并由 `createNormalizedMessage` 按 kind 泛型强制执行：拿 `toolName` 去构造一条 `text`、
+拿 `newSessionId` 去构造一条 `tool_use`，**构造那一行直接编译失败**。
+每个 `MessageKind` 都必须有条目，漏了同样编译失败并报出 kind 名。
+
+**读取侧仍是扁平的**——`NormalizedMessage` 有四百多处消费点，把它硬改成联合等于一次性重写全部。
+纪律装在构造处，因为漂移正是从那里产生的。消费点按需用
+`shared/protocol/messageNarrowing.ts` 的收窄谓词逐个迁移：`isToolUseMessage(m)` 之后，
+编译器知道 `toolName` 可用，也知道 `newSessionId` 不可用。
+谓词逐个 kind 写死而非泛型生成——泛型 `K` 会让 TypeScript 无法证明可赋值，
+收窄会静默退化成什么都不保证。
+
 各端在协议之上的本地扩展必须显式写出、不得混入协议本身。今天只有前端有：
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
 外加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。
