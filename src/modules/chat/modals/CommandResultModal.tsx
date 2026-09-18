@@ -842,6 +842,7 @@ function CostContent({ data }: { data: CostCommandData }) {
                   data.model,
                   group,
                   quotaGroups.length,
+                  provider,
                 );
 
                 return (
