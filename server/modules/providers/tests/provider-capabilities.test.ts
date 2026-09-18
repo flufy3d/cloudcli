@@ -44,6 +44,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsEffort: true,
     supportsMessageEditing: true,
     supportsSessionForking: true,
+    mcp: {
+      scopes: ['user', 'local', 'project'],
+      transports: ['stdio', 'http', 'sse'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -57,6 +63,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsEffort: false,
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: true,
+      supportsEnvVarIndirection: false,
+    },
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -74,6 +86,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // which is how Codex's own IDE clients do it.
     supportsMessageEditing: true,
     supportsSessionForking: true,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: true,
+      supportsEnvVarIndirection: true,
+    },
   },
   opencode: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -87,6 +105,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsEffort: true,
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
   zcode: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -107,6 +131,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // provider today.
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -120,6 +150,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsEffort: true,
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http', 'sse'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
 };
 

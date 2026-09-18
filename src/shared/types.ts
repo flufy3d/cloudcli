@@ -9,12 +9,20 @@ import type { NavigateFunction } from 'react-router-dom';
  * The client re-exports it instead of restating it: the previous second copy
  * had silently drifted from the server's by seven fields.
  */
+import type { McpScope, McpTransport } from '@shared/protocol/capabilities';
 import type {
   LLMProvider,
   MessageKind,
   ServerEventKind,
   NormalizedMessage as WireNormalizedMessage,
 } from '@shared/protocol/chatEvents';
+
+export type {
+  McpScope,
+  McpTransport,
+  ProviderCapabilities,
+  ProviderMcpCapabilities,
+} from '@shared/protocol/capabilities';
 
 export type {
   ProviderQuotaBucket,
@@ -829,11 +837,7 @@ export type CommitGraphRow = {
 /** The LLM provider whose MCP server configuration is being read or written; use it to key provider-specific MCP capabilities such as supported scopes and transports. */
 export type McpProvider = LLMProvider;
 
-/** Where an MCP server definition is stored - the user's global provider config, Claude's project-local config, or a project workspace config - and therefore which config file a read or write targets. */
-export type McpScope = 'user' | 'local' | 'project';
 
-/** How a client connects to an MCP server (a stdio subprocess, streamable HTTP, or SSE); use it to decide which connection fields of a server or form apply. */
-export type McpTransport = 'stdio' | 'http' | 'sse';
 
 /** A plain string-to-string map used for the MCP environment variables and HTTP headers that are edited as `KEY=value` lines and sent as objects. */
 export type KeyValueMap = Record<string, string>;

@@ -56,6 +56,10 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 
 引擎专属的**文案**（如某家为何查不到配额）走语言包按引擎 key 查找，缺 key 就不渲染，
 不要为它写分支；Logo 与登录说明这类天生因引擎而异的展示数据同理，不进能力矩阵。
+
+MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求失败回退到
+`src/shared/mcpCapabilitiesFallback.ts`——该文件**零 import**，因为跨树 parity 测试要从服务端目录读它；
+改后端声明而忘了改它会直接让测试红。
 - 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染。
 
 ## 性能守则（硬约束，都是踩过坑的）

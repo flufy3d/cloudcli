@@ -5,21 +5,22 @@ import type {
   LLMProvider,
   McpScope,
   NormalizedMessage,
-  ProviderSkill,
-  ProviderSkillListOptions,
   ProviderAuthStatus,
   ProviderCurrentActiveModel,
-  ProviderModelsDefinition,
+  ProviderMcpCapabilities,
   ProviderMcpServer,
+  ProviderModelsDefinition,
   ProviderQuotaData,
-  ProviderSessionFileSynchronizationDelta,
-  ProviderSessionUsageInput,
-  ProviderSessionWatchTarget,
-  ProviderSkillCreateInput,
-  ProviderSkillRemoveInput,
   ProviderRuntimeContext,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
+  ProviderSessionFileSynchronizationDelta,
+  ProviderSessionUsageInput,
+  ProviderSessionWatchTarget,
+  ProviderSkill,
+  ProviderSkillCreateInput,
+  ProviderSkillListOptions,
+  ProviderSkillRemoveInput,
   ProviderTokenUsageResult,
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
@@ -178,6 +179,12 @@ export interface IProviderSkills {
  * `ProviderMcpServer` records used by routes and frontend state.
  */
 export interface IProviderMcp {
+  /**
+   * What this provider's MCP config format supports. Declared rather than
+   * inferred: the server form used to decide it by comparing provider ids,
+   * which is how Cursor lost its working-directory field despite writing one.
+   */
+  readonly capabilities: ProviderMcpCapabilities;
   listServers(options?: { workspacePath?: string }): Promise<Record<McpScope, ProviderMcpServer[]>>;
   listServersForScope(scope: McpScope, options?: { workspacePath?: string }): Promise<ProviderMcpServer[]>;
   upsertServer(input: UpsertProviderMcpServerInput): Promise<ProviderMcpServer>;

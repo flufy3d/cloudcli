@@ -65,6 +65,7 @@ export type AuthenticatedWebSocketRequest = IncomingMessage & {
  * cannot declare a second, drifting copy of it. Imported as well as re-exported
  * because the declarations below refer to these types by name.
  */
+import type { McpScope, McpTransport } from '../../shared/protocol/capabilities.js';
 import type {
   ProviderQuotaBucket as QuotaBucketShape,
   ProviderQuotaData as QuotaDataShape,
@@ -98,6 +99,13 @@ export type {
   SubagentInfo,
 };
 
+
+export type {
+  McpScope,
+  McpTransport,
+  ProviderCapabilities,
+  ProviderMcpCapabilities,
+} from '../../shared/protocol/capabilities.js';
 
 export type {
   ProviderQuotaBucket,
@@ -517,18 +525,7 @@ export type AppErrorOptions = {
 
 // ---------------------------
 //----------------- MCP TYPES ------------
-/**
- * Scope where an MCP server definition is stored and resolved.
- *
- * `user` is global for a user account, `local` is provider-local, and `project`
- * is tied to a specific project path.
- */
-export type McpScope = 'user' | 'local' | 'project';
 
-/**
- * Transport protocol used by an MCP server definition.
- */
-export type McpTransport = 'stdio' | 'http' | 'sse';
 
 /**
  * Normalized MCP server model exposed to frontend and route handlers.

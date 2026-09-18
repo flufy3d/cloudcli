@@ -87,6 +87,15 @@
 由各家配额适配器声明，前端不再记忆哪家是哪样。新增一家配额引擎只需给它的 auth 切面加 `getQuota`
 并声明 `partitioning`，前端一行都不用改。
 
+**MCP 配置格式的能力同样由切面声明**：`IProviderMcp.capabilities` 给出可用 scope、transport、
+是否支持工作目录、是否支持环境变量间接（`env_vars` / `bearer_token_env_var` / `env_http_headers`，
+目前只有 codex 有；普通 `env` 与 HTTP `headers` 六家都写，不需要开关）。
+矩阵原样透出，服务器表单据此渲染。
+
+前端为首屏与请求失败保留一份镜像 `src/shared/mcpCapabilitiesFallback.ts`，
+由 `provider-catalog-parity.test.ts` 跨树钉住——这正是它此前缺的：
+旧的三张散表没有守卫，Cursor 明明会写 `cwd`，表里却写着不支持，工作目录字段因此对 Cursor 用户一直不可见。
+
 ## 线上契约：一份定义
 
 服务端↔客户端的消息形状定义在仓库根的 **`shared/protocol/chatEvents.ts`**，两端各自 re-export，谁都不再另写一份：

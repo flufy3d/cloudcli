@@ -1,4 +1,4 @@
-import type { LLMProvider } from '@/shared/types.js';
+import type { LLMProvider, ProviderCapabilities, ProviderMcpCapabilities } from '@/shared/types.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 
 import { PROVIDER_CATALOG } from './provider-capabilities.catalog.js';
@@ -11,32 +11,7 @@ import { PROVIDER_CATALOG } from './provider-capabilities.catalog.js';
  * free of per-provider conditionals. New provider features should be exposed
  * here instead of branching on the provider id in React components.
  */
-export type ProviderCapabilities = {
-  provider: LLMProvider;
-  permissionModes: string[];
-  defaultPermissionMode: string;
-  supportsImages: boolean;
-  supportsFiles: boolean;
-  supportsAbort: boolean;
-  supportsPermissionRequests: boolean;
-  supportsTokenUsage: boolean;
-  /**
-   * Whether the provider can report the account's plan allowance (the 5-hour
-   * and weekly limits shown by the `/cost` modal), as opposed to the
-   * per-session token counts `supportsTokenUsage` covers.
-   */
-  supportsQuota: boolean;
-  supportsEffort: boolean;
-  /**
-   * Whether an already-sent message can be replaced, which requires the
-   * provider to re-run a conversation truncated at a chosen point.
-   */
-  supportsMessageEditing: boolean;
-  /**
-   * Whether a session's transcript can be branched into an independent one.
-   */
-  supportsSessionForking: boolean;
-};
+export type { ProviderCapabilities } from '@/shared/types.js';
 
 /**
  * Derives the capability matrix from the provider's registered facets instead
@@ -51,6 +26,7 @@ export type ProviderCapabilities = {
  * - the token-usage endpoint rides `sessions.getTokenUsage`.
  * - account quota rides `auth.getQuota`, which is already how
  *   `provider-token-usage.service.ts` dispatches the request.
+ * - the MCP block is the provider's own declaration, passed through verbatim.
  * - interactive permission prompts ride the runtime's optional `permissions`
  *   gateway (claude's SDK bridge; zcode's engine permission bridge).
  */
@@ -59,6 +35,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
   runtime?: { permissions?: unknown };
   auth?: { getQuota?: unknown };
   sessions?: { resolveEditAnchor?: unknown; getTokenUsage?: unknown };
+  mcp: { capabilities: ProviderMcpCapabilities };
 }): ProviderCapabilities {
   const catalog = PROVIDER_CATALOG[providerId];
   return {
@@ -74,6 +51,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     supportsEffort: catalog.supportsEffort,
     supportsMessageEditing: typeof provider.sessions?.resolveEditAnchor === 'function',
     supportsSessionForking: provider.fork !== undefined,
+    mcp: provider.mcp.capabilities,
   };
 }
 
