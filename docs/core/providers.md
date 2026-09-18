@@ -159,7 +159,14 @@
 | codex | 有 | 两路同一个响应项 id（实时 SDK `item.id`／rollout `payload.id`） |
 | antigravity | 有 | `assistant-step:<step_index>` |
 | claude | **无** | 历史行有 `uuid`，实时 SDK 事件不暴露同一个 id；宁可没有也不能伪造 |
-| cursor / opencode / zcode | **未盘点** | 见 `docs/design/跨路行身份.md` |
+| zcode | **无** | 落盘行身份是 `(message_id, part_id)`，而实时文本事件只带 `messageId`——一条 message 可以有多个 part，用 message 级 id 会是 1:N |
+| cursor / opencode | **未盘点** | 见 `docs/design/跨路行身份.md` |
+
+没有行身份的引擎**不要伪造一个**。用序号、行号或本端生成值顶替，会让对账从"知道自己不知道"
+变成"自信地答错"；没有 key 时前端至少还会走 [chat.md](./chat.md) 里那套因果回退。
+
+zcode 要具备行身份，需要**引擎侧**在文本流事件上带出 part id——它的 `tool_result`
+事件已经带了 `resultPartId`，文本事件没有对应字段。这是引擎的改动，不是适配器能补的。
 
 Codex 的两路在 `normalizeHistoryEntry` 汇合——实时 `agent_message` 带 `message.role`，
 在 `normalizeMessage` 开头就被转到这里，所以 key 在汇合点统一取，
