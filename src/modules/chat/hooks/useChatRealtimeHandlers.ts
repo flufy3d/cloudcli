@@ -96,8 +96,15 @@ export function useChatRealtimeHandlers({
         return;
       }
 
-      // Sidebar/global events — owned by useProjectsState.
-      if (msg.kind === 'session_upserted' || msg.kind === 'loading_progress') {
+      // Sidebar/global events — owned by useProjectsState. `session_removed`
+      // carries a batch of `sessionIds` and no sessionId of its own, so the
+      // store must never see it: the unknown-kind fallback would attach it to
+      // whichever session is being viewed.
+      if (
+        msg.kind === 'session_upserted'
+        || msg.kind === 'session_removed'
+        || msg.kind === 'loading_progress'
+      ) {
         return;
       }
 
