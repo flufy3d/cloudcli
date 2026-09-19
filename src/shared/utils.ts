@@ -287,3 +287,114 @@ export function formatBuildVersion(version: string, commit: string): string {
   }
   return `v${version}(${commit})`;
 }
+
+// ---------------------------
+
+//----------------- MARKDOWN LATEX DELIMITERS ------------
+
+/** A fenced code block opener: up to three spaces of indent, then a ``` or ~~~ run. */
+const FENCE_LINE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
+
+/** An inline code span: a backtick run closed by an equal-length run. */
+const INLINE_CODE_SPAN_PATTERN = /(`+)[\s\S]*?\1/g;
+
+/** A LaTeX display-math pair: `\[ ... \]`. */
+const DISPLAY_MATH_PATTERN = /\\\[([\s\S]*?)\\\]/g;
+
+/** A LaTeX inline-math pair: `\( ... \)`. */
+const INLINE_MATH_PATTERN = /\\\(([\s\S]*?)\\\)/g;
+
+type OpenFence = { marker: string; length: number };
+
+/** Reads a fence line's marker, or null when the line is not a fence. Private to the math normalizer. */
+function readFence(line: string): OpenFence | null {
+  const match = FENCE_LINE_PATTERN.exec(line);
+  return match ? { marker: match[1][0], length: match[1].length } : null;
+}
+
+/** CommonMark: a closing fence repeats the opener's marker, at least as long, with no info string. */
+function closesFence(open: OpenFence, candidate: OpenFence, line: string): boolean {
+  return (
+    candidate.marker === open.marker &&
+    candidate.length >= open.length &&
+    line.trim().replace(/^[`~]+/, '').trim() === ''
+  );
+}
+
+/**
+ * Rewrites the delimiters in one run of non-fence lines, masking inline code
+ * spans so LaTeX samples inside them survive. The run is converted as a whole
+ * so a display formula can open on one line and close on another.
+ */
+function convertMathDelimiters(source: string): string {
+  if (!source.includes('\\[') && !source.includes('\\(')) {
+    return source;
+  }
+
+  const convert = (value: string) =>
+    value
+      .replace(DISPLAY_MATH_PATTERN, (_match, body: string) => '$$' + body + '$$')
+      .replace(INLINE_MATH_PATTERN, (_match, body: string) => '$$' + body + '$$');
+
+  if (!source.includes('`')) {
+    return convert(source);
+  }
+
+  const codeSpans: string[] = [];
+  const masked = source.replace(INLINE_CODE_SPAN_PATTERN, (span) => {
+    codeSpans.push(span);
+    return `\u0000${codeSpans.length - 1}\u0000`;
+  });
+  return convert(masked).replace(/\u0000(\d+)\u0000/g, (_match, index: string) => codeSpans[Number(index)]);
+}
+
+/**
+ * Rewrites LaTeX bracket delimiters (`\[...\]`, `\(...\)`) into the `$$...$$`
+ * form remark-math parses. CommonMark treats the backslash before a bracket as
+ * an escape and drops it, so without this pass the formula renders as literal
+ * text. Fenced code blocks and inline code spans pass through untouched. Apply
+ * it to every Markdown string before handing it to react-markdown; the chat
+ * transcript and MarkdownPreview both do.
+ */
+export function normalizeLatexMathDelimiters(text: string): string {
+  if (!text.includes('\\[') && !text.includes('\\(')) {
+    return text;
+  }
+
+  const lines = text.split('\n');
+  const output: string[] = [];
+  let openFence: OpenFence | null = null;
+  // Non-fence lines accumulate here and convert as one run, so the formula
+  // delimiters may sit on different lines. A fence line flushes the run.
+  let run: string[] = [];
+
+  const flushRun = () => {
+    if (run.length > 0) {
+      output.push(...convertMathDelimiters(run.join('\n')).split('\n'));
+      run = [];
+    }
+  };
+
+  for (const line of lines) {
+    const candidate = readFence(line);
+    if (candidate) {
+      if (!openFence) {
+        flushRun();
+        openFence = candidate;
+      } else if (closesFence(openFence, candidate, line)) {
+        openFence = null;
+      }
+      output.push(line);
+      continue;
+    }
+
+    if (openFence) {
+      output.push(line);
+    } else {
+      run.push(line);
+    }
+  }
+
+  flushRun();
+  return output.join('\n');
+}
