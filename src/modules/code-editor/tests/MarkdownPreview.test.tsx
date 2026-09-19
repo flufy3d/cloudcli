@@ -24,3 +24,14 @@ test('renders inline math written with parenthesis delimiters', () => {
 
   assert.ok(html.includes('class="katex"'), html);
 });
+
+test('renders single-dollar inline math without turning currency into math', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(MarkdownPreview, {
+      content: '每层维护一个 $64\\times 64$ 矩阵，售价 $5，成本 $10。',
+    }),
+  );
+
+  assert.ok(html.includes('class="katex"'), html);
+  assert.ok(html.includes('$5，成本 $10'), html);
+});
