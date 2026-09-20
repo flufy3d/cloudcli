@@ -1,0 +1,89 @@
+{
+  "provider": "claude",
+  "prompt": "用 ls 列出当前目录，然后只回答文件名",
+  "live": [
+    {
+      "id": "cd61edd1-26ea-43ef-8493-468575586854_0",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:46.713Z",
+      "provider": "claude",
+      "kind": "tool_use",
+      "toolName": "Bash",
+      "toolInput": {
+        "command": "ls",
+        "description": "列出当前目录文件"
+      },
+      "toolId": "toolu_0134KKgMD24q4JtEAdnAuyGv"
+    },
+    {
+      "id": "6050da34-a4e6-4ffc-a929-43120ba31ea5_tr_toolu_0134KKgMD24q4JtEAdnAuyGv",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:47.320Z",
+      "provider": "claude",
+      "kind": "tool_result",
+      "toolId": "toolu_0134KKgMD24q4JtEAdnAuyGv",
+      "content": "a.txt",
+      "isError": false
+    },
+    {
+      "id": "e2f39840-7fc0-4ffc-b117-5cddda8801f5_0",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:49.153Z",
+      "provider": "claude",
+      "kind": "text",
+      "role": "assistant",
+      "content": "a.txt"
+    }
+  ],
+  "history": [
+    {
+      "id": "6fe29b48-f1d4-4d0b-8426-c70d1ca02b20",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:43.100Z",
+      "provider": "claude",
+      "kind": "text",
+      "role": "user",
+      "content": "用 ls 列出当前目录，然后只回答文件名",
+      "transcriptAnchorId": "6fe29b48-f1d4-4d0b-8426-c70d1ca02b20"
+    },
+    {
+      "id": "cd61edd1-26ea-43ef-8493-468575586854_0",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:46.713Z",
+      "provider": "claude",
+      "kind": "tool_use",
+      "toolName": "Bash",
+      "toolInput": {
+        "command": "ls",
+        "description": "列出当前目录文件"
+      },
+      "toolId": "toolu_0134KKgMD24q4JtEAdnAuyGv"
+    },
+    {
+      "id": "6050da34-a4e6-4ffc-a929-43120ba31ea5_tr_toolu_0134KKgMD24q4JtEAdnAuyGv",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:47.320Z",
+      "provider": "claude",
+      "kind": "tool_result",
+      "toolId": "toolu_0134KKgMD24q4JtEAdnAuyGv",
+      "content": "a.txt",
+      "isError": false,
+      "toolUseResult": {
+        "stdout": "a.txt",
+        "stderr": "",
+        "interrupted": false,
+        "isImage": false,
+        "noOutputExpected": false
+      }
+    },
+    {
+      "id": "e2f39840-7fc0-4ffc-b117-5cddda8801f5_0",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:49.153Z",
+      "provider": "claude",
+      "kind": "text",
+      "role": "assistant",
+      "content": "a.txt"
+    }
+  ]
+}

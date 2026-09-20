@@ -22,6 +22,7 @@ import { test } from 'vitest';
 import type { NormalizedMessage, ServerEvent } from '@/shared/types';
 import { SessionTimelineStore } from '@/modules/chat/utils/sessionTimelineStore';
 import antigravityTurn from '@/modules/chat/tests/fixtures/antigravity-turn.json';
+import claudeTurn from '@/modules/chat/tests/fixtures/claude-turn.json';
 import codexTurn from '@/modules/chat/tests/fixtures/codex-turn.json';
 
 type Fixture = {
@@ -81,7 +82,7 @@ function describeRow(row: NormalizedMessage): string {
   return '';
 }
 
-for (const fixture of [antigravityTurn as Fixture, codexTurn as Fixture]) {
+for (const fixture of [antigravityTurn as Fixture, claudeTurn as Fixture, codexTurn as Fixture]) {
   test(`${fixture.provider}: a live turn and its own history render one transcript`, async () => {
     const rows = await playTurn(fixture);
 

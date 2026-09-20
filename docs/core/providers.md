@@ -176,15 +176,16 @@ zcode 曾为每个持久化 step 产出一条 `complete`——真实会话里占
 两种形状现在都路由到同一个处理函数（`applySubagentActivity`）——
 引擎换事件形状是常态，认一种就等于埋一颗定时炸弹。
 
-**跨路行身份是适配器的责任，不是前端的猜测活。** `providerRowKey` 一旦缺席，
-前端只能退回按挂钟定位回合、按文本相似度判重——重复回复正是这么来的。
-六家引擎目前的实现情况：
+**跨路行身份是适配器的责任，不是前端的猜测活。** 一条行在两路上无从对认时，
+前端只能退回按因果锚点定位回合、按文本相似度判重——重复回复正是这么来的。
+身份可以承载在 `providerRowKey` 上，也可以是两路本就相等的行 `id`；
+后者不必再设 key。六家引擎目前的实现情况：
 
 | 引擎 | 行身份 | 依据 |
 | --- | --- | --- |
-| codex | 有 | 两路同一个响应项 id（实时 SDK `item.id`／rollout `payload.id`） |
-| antigravity | 有 | `assistant-step:<step_index>` |
-| claude | **无** | 历史行有 `uuid`，实时 SDK 事件不暴露同一个 id；宁可没有也不能伪造 |
+| antigravity | 有（`providerRowKey`） | `assistant-step:<step_index>` |
+| claude | 有（承载在 `id`，不需要 key） | 实时 `SDKAssistantMessage.uuid` 与该行落盘后的 `uuid` 同值，且完整消息模式下一条消息一个内容块，与转录同粒度，故两路归一化出的行 `id` 逐行相同 |
+| codex | **无** | 两路各自编号：实时 SDK 按回合编 `item_<n>`，rollout 记模型响应 id `msg_…`，不在同一 id 空间 |
 | zcode | **无** | 落盘行身份是 `(message_id, part_id)`，而实时文本事件只带 `messageId`——一条 message 可以有多个 part，用 message 级 id 会是 1:N |
 | cursor / opencode | **未盘点** | 见 `docs/design/跨路行身份.md` |
 
