@@ -17,6 +17,10 @@ import {
   waitForOpenCodeSessionIdle,
 } from '@/modules/providers/list/opencode/opencode-server.client.js';
 import type { OpenCodeServerHandle } from '@/modules/providers/list/opencode/opencode-server.client.js';
+import {
+  OPENCODE_SERVER_RESPONSE_TIMEOUT_MS,
+  OPENCODE_SERVER_TRANSPORT_TIMEOUT_MS,
+} from '@/modules/providers/list/opencode/opencode-http.client.js';
 
 function handleFor(baseUrl: string): OpenCodeServerHandle {
   return { baseUrl, headers: {} };
@@ -68,6 +72,46 @@ test('a refused connection is reported as unreachable', async () => {
 
   assert.ok(failure instanceof Error);
   assert.match(failure.message, /could not reach the local OpenCode server/);
+});
+
+test('the client talks over its own transport, not the global fetch', async () => {
+  // undici's default five-minute headersTimeout used to kill the blocking
+  // prompt request before the client's own deadline could apply. Every call
+  // must therefore carry the dedicated agent; breaking that would make this
+  // test fail, because the global fetch is replaced with a throwing stub.
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'ses_created' }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (() => {
+    throw new Error('the opencode client must not use the global fetch');
+  }) as typeof fetch;
+
+  try {
+    const id = await createOpenCodeSession(
+      handleFor(`http://127.0.0.1:${address.port}`),
+      '/tmp/project',
+      null,
+      undefined,
+    );
+    assert.equal(id, 'ses_created');
+  } finally {
+    globalThis.fetch = originalFetch;
+    server.close();
+  }
+});
+
+test('transport timeouts outlive every request deadline', () => {
+  // The transport caps must stay above the client's own deadline, or undici
+  // kills long turns (and drops quiet event streams) before the provider can
+  // apply its own recovery.
+  assert.ok(OPENCODE_SERVER_TRANSPORT_TIMEOUT_MS > OPENCODE_SERVER_RESPONSE_TIMEOUT_MS);
+  assert.ok(OPENCODE_SERVER_RESPONSE_TIMEOUT_MS > 5 * 60_000);
 });
 
 test('the status map is read per session and idle-wait blocks until it clears', async () => {

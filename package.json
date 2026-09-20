@@ -202,6 +202,7 @@
     "remark-gfm": "^4.0.0",
     "remark-math": "^6.0.0",
     "tailwind-merge": "^3.3.1",
+    "undici": "^7.29.1",
     "web-push": "^3.6.7",
     "ws": "^8.14.2"
   },

@@ -6,6 +6,8 @@ import crossSpawn from 'cross-spawn';
 import type { AnyRecord } from '@/shared/types.js';
 import { readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
+import { OPENCODE_SERVER_RESPONSE_TIMEOUT_MS, openCodeFetch } from './opencode-http.client.js';
+
 /**
  * HTTP/SSE client for the OpenCode server (`opencode serve`).
  *
@@ -43,7 +45,6 @@ const STREAM_RECONNECT_DELAY_MS = 1_000;
 const SESSION_STATUS_TIMEOUT_MS = 15_000;
 const SESSION_IDLE_POLL_INTERVAL_MS = 1_500;
 const SESSION_IDLE_WAIT_TIMEOUT_MS = 60 * 60_000;
-const RESPONSE_TIMEOUT_MS = 10 * 60_000;
 
 type ServerState = {
   process: ChildProcess;
@@ -110,7 +111,7 @@ async function waitForServer(baseUrl: string, headers: Record<string, string>, c
     }
 
     try {
-      const response = await fetch(`${baseUrl}/global/health`, {
+      const response = await openCodeFetch(`${baseUrl}/global/health`, {
         headers,
         signal: AbortSignal.timeout(2000),
       });
@@ -130,7 +131,7 @@ async function waitForServer(baseUrl: string, headers: Record<string, string>, c
 async function consumeOpenCodeServerEventStream(state: ServerState): Promise<void> {
   let response: Response;
   try {
-    response = await fetch(`${state.baseUrl}/global/event`, {
+    response = await openCodeFetch(`${state.baseUrl}/global/event`, {
       headers: { accept: 'text/event-stream', ...state.headers },
       signal: state.streamAbort.signal,
     });
@@ -318,7 +319,7 @@ function describeRequestFailure(method: string, path: string, error: unknown): E
  */
 async function isOpenCodeServerResponsive(handle: OpenCodeServerHandle): Promise<boolean> {
   try {
-    const response = await fetch(`${handle.baseUrl}/global/health`, {
+    const response = await openCodeFetch(`${handle.baseUrl}/global/health`, {
       headers: handle.headers,
       signal: AbortSignal.timeout(SERVER_HEALTH_TIMEOUT_MS),
     });
@@ -494,12 +495,12 @@ async function requestJson(
   path: string,
   directory: string | null,
   body: unknown,
-  timeoutMs = RESPONSE_TIMEOUT_MS,
+  timeoutMs = OPENCODE_SERVER_RESPONSE_TIMEOUT_MS,
 ): Promise<unknown> {
   const url = buildUrl(handle.baseUrl, path, directory);
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await openCodeFetch(url, {
       method,
       headers: handle.headers,
       body: body === undefined ? undefined : JSON.stringify(body),

@@ -22,6 +22,7 @@ import {
 
 import { readOpenCodeContextUsage } from './opencode-context-usage.js';
 import { getOpenCodeDatabasePath } from './opencode-data-root.js';
+import { openCodeFetch } from './opencode-http.client.js';
 import {
   abortOpenCodeSession as abortOpenCodeServerSession,
   acquireOpenCodeServer,
@@ -599,7 +600,9 @@ function openCodeServerAuthHeaders() {
 }
 
 const COMPACT_SERVER_READY_TIMEOUT_MS = 20_000;
-const COMPACT_REQUEST_TIMEOUT_MS = 10 * 60_000;
+// A summarize of a large context can outlive undici's default five-minute
+// transport cap; the shared openCodeFetch agent carries the request instead.
+const COMPACT_REQUEST_TIMEOUT_MS = 30 * 60_000;
 
 async function waitForOpenCodeServer(baseUrl, headers, serverProcess) {
   const deadline = Date.now() + COMPACT_SERVER_READY_TIMEOUT_MS;
@@ -609,7 +612,7 @@ async function waitForOpenCodeServer(baseUrl, headers, serverProcess) {
     }
 
     try {
-      const response = await fetch(`${baseUrl}/config`, {
+      const response = await openCodeFetch(`${baseUrl}/config`, {
         headers,
         signal: AbortSignal.timeout(2000),
       });
@@ -667,7 +670,7 @@ async function compactOpenCodeSession(options = {}, ws, context) {
   try {
     await waitForOpenCodeServer(baseUrl, headers, serverProcess);
 
-    const response = await fetch(`${baseUrl}/session/${encodeURIComponent(providerSessionId)}/summarize`, {
+    const response = await openCodeFetch(`${baseUrl}/session/${encodeURIComponent(providerSessionId)}/summarize`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ providerID: model.providerId, modelID: model.modelId, auto: false }),
