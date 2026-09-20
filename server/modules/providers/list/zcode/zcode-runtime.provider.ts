@@ -473,9 +473,15 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       );
     }
 
+    // No spawn-cwd fallback: the server's own cwd is the pnpm virtual store
+    // of the deployed build, and a session created there gets indexed by the
+    // synchronizer as a garbage project. A run without a workspace is a
+    // caller bug — fail it visibly instead.
     const workspacePath = readOptionalString(options.workspacePath)
-      ?? readOptionalString(options.cwd)
-      ?? process.cwd();
+      ?? readOptionalString(options.cwd);
+    if (!workspacePath) {
+      throw new Error('ZCode session needs a workspace: the run carried neither workspacePath nor cwd.');
+    }
 
     console.info(`[ZCodeRuntime] Creating new session for workspace: ${workspacePath}`);
 

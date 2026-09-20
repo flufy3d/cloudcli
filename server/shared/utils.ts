@@ -592,6 +592,32 @@ export const readTrimmedStringRecord = (value: unknown): Record<string, string> 
 };
 
 // ---------------------------
+//----------------- INFRASTRUCTURE WORKSPACE FILTER ------------
+/**
+ * Detects workspace paths that are package-manager or runtime internals
+ * rather than user projects.
+ *
+ * Sessions recording such directories must never surface as projects: every
+ * `pnpm run deploy` creates a fresh pnpm virtual store directory for the
+ * globally installed app, and a session created there (a spawn-cwd fallback)
+ * would otherwise register a new empty project per deployment. Filters cover
+ * pnpm's `.pnpm` virtual store, any `node_modules` segment, and system temp
+ * roots (`os.tmpdir()`, macOS `/var/folders`, `/tmp`).
+ *
+ * Consumers: the SQLite session synchronizer skeleton (row admission) and
+ * its tests.
+ */
+export const isInfrastructureWorkspacePath = (projectPath: string): boolean => {
+  const normalized = projectPath.trim().replace(/\/+$/, '');
+  if (!normalized) return true;
+  const segments = normalized.split('/');
+  if (segments.includes('node_modules') || segments.includes('.pnpm')) return true;
+  const tempRoots = [os.tmpdir(), '/var/folders', '/private/var/folders', '/tmp', '/private/tmp']
+    .map((root) => root.replace(/\/+$/, ''));
+  return tempRoots.some((root) => normalized === root || normalized.startsWith(`${root}/`));
+};
+
+// ---------------------------
 //----------------- PROVIDER MODEL LOOKUP UTILITIES ------------
 /**
  * Builds the standard "default current model" result used when a provider
