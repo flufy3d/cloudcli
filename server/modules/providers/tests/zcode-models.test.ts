@@ -8,7 +8,7 @@ import Database from 'better-sqlite3';
 
 import {
   ZCodeProviderModels,
-  readZCodeSessionModelFromDb,
+  buildZCodeSendModelParams,
   resolveZCodeModelRef,
 } from '@/modules/providers/list/zcode/zcode-models.provider.js';
 
@@ -129,57 +129,27 @@ test('getSupportedModels ignores disabled providers and deduplicates model optio
   });
 });
 
-test('readZCodeSessionModelFromDb returns the latest message model', async () => {
-  await withZCodeStorage(async (storageDir) => {
-    const dbDir = path.join(storageDir, 'cli', 'db');
-    await mkdir(dbDir, { recursive: true });
-
-    const db = new Database(path.join(dbDir, 'db.sqlite'));
-    try {
-      db.exec(`
-        CREATE TABLE message (
-          id TEXT PRIMARY KEY,
-          session_id TEXT NOT NULL,
-          time_created INTEGER NOT NULL,
-          time_updated INTEGER NOT NULL,
-          data TEXT NOT NULL,
-          sequence INTEGER
-        );
-      `);
-      const insert = db.prepare(
-        'INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?)'
-      );
-      insert.run('m1', 'sess_m', 1000, 1000, JSON.stringify({ role: 'user' }), 0);
-      insert.run('m2', 'sess_m', 2000, 2000, JSON.stringify({ role: 'assistant', modelID: 'GLM-4.7' }), 1);
-    } finally {
-      db.close();
-    }
-
-    assert.equal(readZCodeSessionModelFromDb('sess_m'), 'GLM-4.7');
-    assert.equal(readZCodeSessionModelFromDb('sess_unknown'), null);
-  });
-});
-
-test('readZCodeSessionModelFromDb returns null without a database', async () => {
+test('readZCodeSessionModelInfoFromDb returns null without a database', async () => {
   await withZCodeStorage(async () => {
-    assert.equal(readZCodeSessionModelFromDb('sess_any'), null);
+    const { readZCodeSessionModelInfoFromDb } = await import('@/modules/providers/list/zcode/zcode-models.provider.js');
+    assert.equal(readZCodeSessionModelInfoFromDb('sess_any'), null);
   });
 });
 
 test('resolveZCodeModelRef parses full ref and bare model key', async () => {
   // Case 1: Full ref with slash
-  const full = resolveZCodeModelRef('builtin:zai/GLM-5.3');
+  const full = resolveZCodeModelRef('custom:zai/GLM-5.3');
   assert.deepEqual(full, {
-    providerId: 'builtin:zai',
+    providerId: 'custom:zai',
     modelId: 'GLM-5.3',
   });
 
   // Case 2: With reasoning effort variant
-  const fullWithVariant = resolveZCodeModelRef('builtin:zai/GLM-5.3', 'high');
+  const fullWithVariant = resolveZCodeModelRef('custom:zai/GLM-5.3', 'high');
   assert.deepEqual(fullWithVariant, {
-    providerId: 'builtin:zai',
+    providerId: 'custom:zai',
     modelId: 'GLM-5.3',
-    variant: 'high',
+    options: { reasoningLevel: 'high' },
   });
 
   // Case 3: Bare model with config and variant
@@ -190,7 +160,7 @@ test('resolveZCodeModelRef parses full ref and bare model key', async () => {
       path.join(v2Dir, 'config.json'),
       JSON.stringify({
         provider: {
-          'builtin:custom-provider': {
+          'custom-provider': {
             enabled: true,
             models: {
               'GLM-5.3': {},
@@ -203,10 +173,81 @@ test('resolveZCodeModelRef parses full ref and bare model key', async () => {
 
     const resolved = resolveZCodeModelRef('GLM-5.3', 'max');
     assert.deepEqual(resolved, {
-      providerId: 'builtin:custom-provider',
+      providerId: 'custom-provider',
       modelId: 'GLM-5.3',
-      variant: 'max',
+      options: { reasoningLevel: 'max' },
     });
+  });
+});
+
+test('buildZCodeSendModelParams maps the selected model, reasoning level, and auth for 0.16.9', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const cliDir = path.join(storageDir, 'cli');
+    await mkdir(cliDir, { recursive: true });
+    await writeFile(
+      path.join(cliDir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'bigmodel-coding-plan': {
+            kind: 'anthropic',
+            options: { apiKey: 'fixture-key', baseURL: 'https://example.invalid/api/anthropic' },
+            models: {
+              'GLM-5.3-Flash': {
+                reasoning: { enabled: true, levels: ['low', 'max'], defaultLevel: 'max' },
+              },
+            },
+          },
+        },
+      }),
+      'utf8'
+    );
+
+    assert.deepEqual(buildZCodeSendModelParams('GLM-5.3-Flash', 'low'), {
+      modelSelection: {
+        providerId: 'bigmodel-coding-plan',
+        modelId: 'GLM-5.3-Flash',
+        options: { reasoningLevel: 'low' },
+      },
+      modelExecution: {
+        selectionScope: 'execution',
+        requestAuth: { apiKey: 'fixture-key' },
+      },
+    });
+    assert.deepEqual(
+      buildZCodeSendModelParams('builtin:bigmodel-coding-plan/GLM-5.3-Flash'),
+      {
+        modelSelection: {
+          providerId: 'bigmodel-coding-plan',
+          modelId: 'GLM-5.3-Flash',
+          options: { reasoningLevel: 'max' },
+        },
+        modelExecution: {
+          selectionScope: 'execution',
+          requestAuth: { apiKey: 'fixture-key' },
+        },
+      },
+    );
+  });
+});
+
+test('buildZCodeSendModelParams degrades to null instead of blocking the send when config is incomplete', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    // No cli/config.json at all.
+    assert.equal(buildZCodeSendModelParams('GLM-5.3'), null);
+
+    // Provider present but without credentials or base URL.
+    const cliDir = path.join(storageDir, 'cli');
+    await mkdir(cliDir, { recursive: true });
+    await writeFile(
+      path.join(cliDir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'bigmodel-coding-plan': { kind: 'anthropic', models: { 'GLM-5.3': {} } },
+        },
+      }),
+      'utf8'
+    );
+    assert.equal(buildZCodeSendModelParams('GLM-5.3'), null);
   });
 });
 
@@ -245,4 +286,3 @@ test('readZCodeSessionModelInfoFromDb returns model and variant from latest mess
     });
   });
 });
-

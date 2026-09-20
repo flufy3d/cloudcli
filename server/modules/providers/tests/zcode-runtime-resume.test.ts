@@ -18,13 +18,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 
+import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
 import type {
   NormalizedMessage,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/types.js';
 
-import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
 import { protocolClient } from '../list/zcode/zcode-protocol.client.js';
 import { ZCodeRuntimeProvider } from '../list/zcode/zcode-runtime.provider.js';
 import { ZCodeSessionsProvider } from '../list/zcode/zcode-sessions.provider.js';
@@ -32,6 +32,7 @@ import { ZCodeSessionsProvider } from '../list/zcode/zcode-sessions.provider.js'
 const stubDir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'zcode-resume-stub-'));
 const stubPath = path.join(stubDir, 'zcode-stub.cjs');
 const modeFilePath = path.join(stubDir, 'mode.txt');
+const logFilePath = path.join(stubDir, 'stub-log.jsonl');
 
 // Same contract as the shared runtime stub, plus a `session/resume` branch:
 // mode "resume-fail" rejects with -32004, any other mode resumes cleanly.
@@ -40,9 +41,13 @@ const fs = require('fs');
 const readline = require('readline');
 
 const modeFile = process.env.ZCODE_STUB_MODE_FILE;
+const logFile = process.env.ZCODE_STUB_LOG;
 const sessionId = 'sess_stub_resume';
 
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+const log = (name, value) => {
+  try { fs.appendFileSync(logFile, JSON.stringify({ name, value }) + '\\n'); } catch {}
+};
 const readMode = () => {
   try { return fs.readFileSync(modeFile, 'utf8').trim(); } catch { return 'ok'; }
 };
@@ -67,6 +72,13 @@ rl.on('line', (line) => {
   }
 
   if (msg.method === 'session/resume') {
+    log('session_resume_attempt', msg.params);
+    for (const key of Object.keys(msg.params ?? {})) {
+      if (key !== 'sessionId') {
+        send({ id: msg.id, error: { code: -32602, message: 'Invalid params — (root): Unrecognized key: "' + key + '"' } });
+        return;
+      }
+    }
     if (readMode() === 'resume-fail') {
       send({ id: msg.id, error: { code: -32004, message: 'Session is not active: ' + (msg.params?.sessionId ?? '') } });
       return;
@@ -95,9 +107,32 @@ rl.on('line', (line) => {
 
 fsSync.writeFileSync(stubPath, stubScript);
 fsSync.writeFileSync(modeFilePath, 'ok\n');
+fsSync.writeFileSync(logFilePath, '');
+
+const cliConfigDir = path.join(stubDir, 'cli');
+fsSync.mkdirSync(cliConfigDir, { recursive: true });
+fsSync.writeFileSync(path.join(cliConfigDir, 'config.json'), JSON.stringify({
+  provider: {
+    'bigmodel-coding-plan': {
+      kind: 'anthropic',
+      options: {
+        apiKey: 'resume-test-key',
+        baseURL: 'https://example.invalid/api/anthropic',
+      },
+      models: {
+        'GLM-5.3-Flash': {
+          reasoning: { enabled: true, levels: ['low', 'high', 'max'], defaultLevel: 'max' },
+        },
+      },
+    },
+  },
+  model: 'bigmodel-coding-plan/GLM-5.3-Flash',
+}));
 
 process.env.CLOUDCLI_ZCODE_ENGINE = stubPath;
 process.env.ZCODE_STUB_MODE_FILE = modeFilePath;
+process.env.ZCODE_STUB_LOG = logFilePath;
+process.env.ZCODE_STORAGE_DIR = stubDir;
 
 // See the shared runtime test file: the run reads the session row via
 // sessionsDb, which needs a migrated app database to exist.
@@ -118,7 +153,7 @@ const sessionsProvider = new ZCodeSessionsProvider();
 
 const resumedContext: ProviderRuntimeContext = {
   resolveProviderSessionId: () => 'sess_existing_1',
-  resolveResumeModel: async () => undefined,
+  resolveResumeModel: async () => 'GLM-5.3-Flash',
   getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'GLM-5.3-Flash' }),
   normalizeMessage: (raw, sessionId) => sessionsProvider.normalizeMessage(raw, sessionId),
   isProviderInstalled: async () => true,
@@ -147,6 +182,14 @@ test('runtime resumes an existing provider session without creating a new one', 
   assert.equal(messages.filter((msg) => msg.kind === 'session_created').length, 0);
   const delta = messages.find((msg) => msg.kind === 'stream_delta');
   assert.equal(delta?.content, 'hi there');
+
+  const resumeAttempts = fsSync.readFileSync(logFilePath, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line) as { name: string; value: { runtimeModel?: unknown } })
+    .filter((entry) => entry.name === 'session_resume_attempt');
+  assert.equal(resumeAttempts.length, 1);
+  assert.deepEqual(resumeAttempts[0]?.value, { sessionId: 'sess_existing_1' });
 });
 
 test('runtime falls back to a replacement session when resume fails', async () => {

@@ -15,8 +15,11 @@ import {
   buildDefaultProviderCurrentActiveModel,
   readObjectRecord,
   readOptionalString,
+  readTrimmedStringRecord,
 } from '@/shared/utils.js';
+
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
+import { resolveZCodeProviderApiType } from './zcode-provider-config.js';
 
 /**
  * ZCode builtin models definition as fallback when config read fails.
@@ -53,15 +56,24 @@ const EFFORT_DESCRIPTIONS: Record<string, string> = {
 };
 
 /**
- * Reads and parses ZCode's v2 config.json to extract model definitions.
- * Based on integration plan §3.2.5: `provider.*.models` entries with
- * `reasoning.variants` and `limit.context`/`limit.output`.
+ * Reads ZCode's user-facing provider config to extract model definitions.
+ * 0.16.9 stores the active catalog in `cli/config.json`; the older v2 path is
+ * retained as a fallback for installations that have not rewritten it yet.
  */
 const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
   try {
-    const configPath = path.join(getZCodeStorageDir(), 'v2', 'config.json');
-    const content = await readFile(configPath, 'utf8');
-    const config = readObjectRecord(JSON.parse(content));
+    let config: Record<string, unknown> | null = null;
+    for (const configPath of [
+      path.join(getZCodeStorageDir(), 'cli', 'config.json'),
+      path.join(getZCodeStorageDir(), 'v2', 'config.json'),
+    ]) {
+      try {
+        config = readObjectRecord(JSON.parse(await readFile(configPath, 'utf8')));
+        if (readObjectRecord(config?.provider)) break;
+      } catch {
+        // Try the next supported config location.
+      }
+    }
 
     if (!config) {
       return ZCODE_BUILTIN_MODELS;
@@ -92,7 +104,7 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
         seenModelKeys.add(modelKey);
 
         const reasoning = readObjectRecord(modelRecord.reasoning);
-        const variants = reasoning?.variants;
+        const variants = Array.isArray(reasoning?.levels) ? reasoning.levels : reasoning?.variants;
         const hasReasoning = Array.isArray(variants) && variants.length > 0;
 
         const limits = readObjectRecord(modelRecord.limit);
@@ -113,9 +125,12 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
 
         let effort: ProviderModelOption['effort'] | undefined;
         if (hasReasoning && Array.isArray(variants)) {
-          const sortedVariants = [...variants].sort();
+          const sortedVariants = variants
+            .filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0)
+            .map((variant) => variant.trim().toLowerCase())
+            .sort();
           effort = {
-            default: 'max',
+            default: readOptionalString(reasoning?.defaultLevel)?.toLowerCase() ?? 'max',
             values: sortedVariants.map((variant: string) => {
               const normalized = variant.toLowerCase();
               return {
@@ -153,10 +168,10 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
  * Reads the model a ZCode session last ran with from ZCode's own SQLite
  * store (most recent `message.data.modelID` per integration plan §3.2.5).
  *
- * Consumers: `ZCodeProviderModels.getCurrentActiveModel` (app session id
- * mapped to the provider id first) and the zcode runtime provider (which
- * already holds the provider session id and skips redundant `session/setModel`
- * calls when the requested model matches). Returns null when unknown.
+ * Consumer: `ZCodeProviderModels.getCurrentActiveModel` in this file (app
+ * session id mapped to the provider id first); also exercised directly by
+ * `server/modules/providers/tests/zcode-models.test.ts`. Returns null when
+ * unknown.
  */
 export function readZCodeSessionModelInfoFromDb(providerSessionId: string): { modelId: string; variant?: string } | null {
   const dbPath = getZCodeDatabasePath();
@@ -205,144 +220,32 @@ export function readZCodeSessionModelInfoFromDb(providerSessionId: string): { mo
 }
 
 /**
- * Reads the model a ZCode session last ran with from ZCode's own SQLite
- * store (most recent `message.data.modelID` per integration plan §3.2.5).
- *
- * Consumers: `ZCodeProviderModels.getCurrentActiveModel` (app session id
- * mapped to the provider id first) and the zcode runtime provider (which
- * already holds the provider session id and skips redundant `session/setModel`
- * calls when the requested model matches). Returns null when unknown.
- */
-export function readZCodeSessionModelFromDb(providerSessionId: string): string | null {
-  return readZCodeSessionModelInfoFromDb(providerSessionId)?.modelId ?? null;
-}
-
-/**
- * Builds the engine's `runtimeModel` payload for a model selection.
- *
- * The app-server engine keeps a per-workspace model catalog that only the
- * embedding host normally populates. A remote client's catalogs start empty,
- * so cold-resuming a session whose transcript references models the catalog
- * cannot resolve marks it with a permanent "model unavailable" warning
- * (-32031 on every send, immune to session/setModel). Attaching a
- * `runtimeModel` to session/resume|send both seeds the catalog and clears that
- * warning. ZCode 0.16.9 rejects the field on session/create, so new sessions
- * receive it with their first send instead.
- *
- * Shape (engine schema `Of`, strict): `revision` (string), `generatedAt`
- * (epoch ms), `model` ({providerId, modelId, variant?}), `provider` (the
- * provider definition with at least one model). The provider entry comes
- * from the engine's own cli/config.json so the ids match what the engine
- * validates against; returns undefined when it cannot be built reliably.
- *
- * Consumer: `server/modules/providers/list/zcode/zcode-runtime.provider.ts`
- */
-export function buildZCodeRuntimeModel(
-  modelKey: string,
-  variant?: string,
-): Record<string, unknown> | undefined {
-  const ref = resolveZCodeModelRef(modelKey, variant);
-  let providerRecord: Record<string, unknown> | undefined;
-
-  for (const configPath of [
-    path.join(getZCodeStorageDir(), 'cli', 'config.json'),
-    path.join(getZCodeStorageDir(), 'v2', 'config.json'),
-  ]) {
-    try {
-      const config = readObjectRecord(JSON.parse(fsSync.readFileSync(configPath, 'utf8')));
-      const candidate = readObjectRecord(readObjectRecord(config?.provider)?.[ref.providerId]);
-      if (candidate) {
-        providerRecord = candidate;
-        break;
-      }
-    } catch {
-      // Try the next config source
-    }
-  }
-
-  if (!providerRecord) {
-    return undefined;
-  }
-
-  const options = readObjectRecord(providerRecord.options);
-  const apiKey = readOptionalString(options?.apiKey);
-  const configModels = readObjectRecord(providerRecord.models) ?? {};
-  const engineModels = Object.entries(configModels).map(([modelId, modelConfig]) => {
-    const record = readObjectRecord(modelConfig);
-    const limit = readObjectRecord(record?.limit);
-    const reasoning = readObjectRecord(record?.reasoning);
-    return {
-      modelId,
-      ...(readOptionalString(record?.name) ? { label: readOptionalString(record?.name) } : {}),
-      ...(typeof limit?.context === 'number' ? { contextWindow: limit.context } : {}),
-      ...(typeof limit?.output === 'number' ? { maxOutputTokens: limit.output } : {}),
-      ...(reasoning && reasoning.enabled === true
-        ? {
-            reasoning: {
-              enabled: true,
-              // Engine schema: levels are {value, label} objects, not strings.
-              ...(Array.isArray(reasoning.levels)
-                ? {
-                    levels: reasoning.levels
-                      .map((level) => (typeof level === 'string' ? level.trim() : ''))
-                      .filter((level) => level.length > 0)
-                      .map((level) => ({ value: level, label: EFFORT_DESCRIPTIONS[level] ?? level })),
-                  }
-                : {}),
-              ...(readOptionalString(reasoning.defaultLevel)
-                ? { defaultLevel: readOptionalString(reasoning.defaultLevel) }
-                : {}),
-            },
-          }
-        : {}),
-    };
-  });
-
-  if (engineModels.length === 0) {
-    // The engine requires at least one model entry on the provider.
-    engineModels.push({ modelId: ref.modelId });
-  }
-
-  return {
-    revision: `${ref.providerId}/${ref.modelId}`,
-    generatedAt: Date.now(),
-    model: { providerId: ref.providerId, modelId: ref.modelId, ...(ref.variant ? { variant: ref.variant } : {}) },
-    provider: {
-      providerId: ref.providerId,
-      kind: readOptionalString(providerRecord.kind) ?? 'anthropic',
-      ...(readOptionalString(providerRecord.name) ? { label: readOptionalString(providerRecord.name) } : {}),
-      ...(readOptionalString(options?.baseURL) ? { baseURL: readOptionalString(options?.baseURL) } : {}),
-      // Engine schema Rbn: inline credentials travel as {source, value}. The
-      // payload only ever goes to the local engine subprocess over stdio.
-      ...(apiKey ? { apiKey: { source: 'inline', value: apiKey } } : {}),
-      models: engineModels,
-    },
-    ...(ref.variant ? { thoughtLevel: ref.variant } : {}),
-  };
-}
-
-/**
- * Resolves a model name/key string into ZCode's protocol model object `{ providerId, modelId, variant? }`.
+ * Resolves a model name/key string into ZCode 0.16.9's model selection.
  *
  * Handles:
  * - Full model refs formatted as `providerId/modelId` (e.g. `builtin:bigmodel-coding-plan/GLM-5.3`)
  * - Bare model keys (e.g. `GLM-5.3`), by looking up the active/enabled provider from config or defaulting
- * - Optional reasoning effort variant (e.g. `low`, `medium`, `high`, `max`)
+ * - Optional reasoning effort in `options.reasoningLevel`
  *
- * Consumer: `server/modules/providers/list/zcode/zcode-runtime.provider.ts`
+ * Consumer: `buildZCodeSendModelParams` in this file, plus direct ref-parsing
+ * coverage in `server/modules/providers/tests/zcode-models.test.ts`.
  */
 export function resolveZCodeModelRef(
   modelKey: string,
-  variant?: string,
-): { providerId: string; modelId: string; variant?: string } {
+  reasoningLevel?: string,
+): { providerId: string; modelId: string; options?: { reasoningLevel: string } } {
   const trimmed = modelKey.trim();
-  const trimmedVariant = variant && variant !== 'default' ? variant.trim() : undefined;
+  const normalizedReasoningLevel = reasoningLevel && reasoningLevel !== 'default'
+    ? reasoningLevel.trim().toLowerCase()
+    : undefined;
   const slashIndex = trimmed.indexOf('/');
-  if (slashIndex >= 0) {
+  const requestedProviderId = slashIndex >= 0 ? trimmed.slice(0, slashIndex).trim() : undefined;
+  const requestedModelId = slashIndex >= 0 ? trimmed.slice(slashIndex + 1).trim() : trimmed;
+  if (requestedProviderId && !requestedProviderId.startsWith('builtin:') && !requestedProviderId.startsWith('account:')) {
     return {
-      providerId: trimmed.slice(0, slashIndex).trim(),
-      modelId: trimmed.slice(slashIndex + 1).trim(),
-      ...(trimmedVariant ? { variant: trimmedVariant } : {}),
+      providerId: requestedProviderId,
+      modelId: requestedModelId,
+      ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
     };
   }
 
@@ -360,26 +263,28 @@ export function resolveZCodeModelRef(
       const providers = readObjectRecord(config?.provider);
       if (!providers) continue;
       for (const [providerId, providerConfig] of Object.entries(providers)) {
+        if (providerId.startsWith('builtin:') || providerId.startsWith('account:')) continue;
         const providerRecord = readObjectRecord(providerConfig);
         if (providerRecord?.enabled === false) continue;
         const models = readObjectRecord(providerRecord?.models);
-        if (models && trimmed in models) {
+        if (models && requestedModelId in models) {
           return {
             providerId,
-            modelId: trimmed,
-            ...(trimmedVariant ? { variant: trimmedVariant } : {}),
+            modelId: requestedModelId,
+            ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
           };
         }
       }
       // Fallback: search even disabled providers if matching model
       for (const [providerId, providerConfig] of Object.entries(providers)) {
+        if (providerId.startsWith('builtin:') || providerId.startsWith('account:')) continue;
         const providerRecord = readObjectRecord(providerConfig);
         const models = readObjectRecord(providerRecord?.models);
-        if (models && trimmed in models) {
+        if (models && requestedModelId in models) {
           return {
             providerId,
-            modelId: trimmed,
-            ...(trimmedVariant ? { variant: trimmedVariant } : {}),
+            modelId: requestedModelId,
+            ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
           };
         }
       }
@@ -389,9 +294,89 @@ export function resolveZCodeModelRef(
   }
 
   return {
-    providerId: 'builtin:bigmodel-coding-plan',
-    modelId: trimmed,
-    ...(trimmedVariant ? { variant: trimmedVariant } : {}),
+    providerId: requestedProviderId ?? 'builtin:bigmodel-coding-plan',
+    modelId: requestedModelId,
+    ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
+  };
+}
+
+/**
+ * Builds the per-turn model fields accepted by ZCode app-server 0.16.9's
+ * `session/send`.
+ *
+ * The provider identity and request authentication are resolved from the same
+ * `cli/config.json` record so they cannot drift apart. The runtime consumes
+ * this result directly as `session/send` params; credentials only travel to
+ * the local engine subprocess over stdio.
+ *
+ * Returns null when the local config cannot produce a complete, executable
+ * selection (missing provider/model record, unsupported API kind, no base
+ * URL, or no credentials). Both fields are optional in the engine's schema
+ * (verified live against 0.16.9: a send without them runs on the engine's
+ * own default model), so an incomplete local config degrades to a plain send
+ * instead of blocking the turn.
+ *
+ * Consumer: zcode-runtime.provider.ts (per-turn model resolution).
+ */
+export function buildZCodeSendModelParams(
+  modelKey: string,
+  reasoningLevel?: string,
+): {
+  modelSelection: { providerId: string; modelId: string; options?: { reasoningLevel: string } };
+  modelExecution: {
+    selectionScope: 'execution';
+    requestAuth?: { apiKey?: string; headers?: Record<string, string> };
+  };
+} | null {
+  const explicitSelection = resolveZCodeModelRef(modelKey, reasoningLevel);
+  const configPath = path.join(getZCodeStorageDir(), 'cli', 'config.json');
+  let providerRecord: Record<string, unknown> | null = null;
+  let modelRecord: Record<string, unknown> | null = null;
+
+  try {
+    const config = readObjectRecord(JSON.parse(fsSync.readFileSync(configPath, 'utf8')));
+    providerRecord = readObjectRecord(readObjectRecord(config?.provider)?.[explicitSelection.providerId]);
+    modelRecord = readObjectRecord(readObjectRecord(providerRecord?.models)?.[explicitSelection.modelId]);
+  } catch {
+    // Treated as "not configured" below; the send degrades to the engine default.
+  }
+  if (!providerRecord || !modelRecord) {
+    return null;
+  }
+  const providerOptions = readObjectRecord(providerRecord.options);
+  const baseUrl = readOptionalString(providerOptions?.baseURL)
+    ?? readOptionalString(providerOptions?.baseUrl);
+  if (!resolveZCodeProviderApiType(providerRecord.kind) || !baseUrl) {
+    return null;
+  }
+
+  const configuredDefault = readOptionalString(readObjectRecord(modelRecord?.reasoning)?.defaultLevel);
+  const selectedReasoningLevel = explicitSelection.options?.reasoningLevel
+    ?? configuredDefault?.toLowerCase();
+  const modelSelection = {
+    providerId: explicitSelection.providerId,
+    modelId: explicitSelection.modelId,
+    ...(selectedReasoningLevel ? { options: { reasoningLevel: selectedReasoningLevel } } : {}),
+  };
+
+  const apiKey = readOptionalString(providerOptions?.apiKey);
+  const headers = readTrimmedStringRecord(providerOptions?.headers);
+  const requestAuth = apiKey || headers
+    ? {
+        ...(apiKey ? { apiKey } : {}),
+        ...(headers ? { headers } : {}),
+      }
+    : undefined;
+  if (!requestAuth) {
+    return null;
+  }
+
+  return {
+    modelSelection,
+    modelExecution: {
+      selectionScope: 'execution',
+      requestAuth,
+    },
   };
 }
 

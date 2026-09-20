@@ -24,6 +24,8 @@
  * @module zcode-runtime.provider
  */
 
+import path from 'node:path';
+
 import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type { ChatAttachmentDescriptor } from '@/shared/image-attachments.js';
 import type {
@@ -37,12 +39,10 @@ import { createCompleteMessage, createNormalizedMessage, generateMessageId, read
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 
-import path from 'node:path';
-
 import { SESSION_LOST_METHOD } from './zcode-codec.js';
 import { protocolClient } from './zcode-protocol.client.js';
 import { ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from './zcode-live-event-normalizer.js';
-import { buildZCodeRuntimeModel, readZCodeSessionModelInfoFromDb, resolveZCodeModelRef } from './zcode-models.provider.js';
+import { buildZCodeSendModelParams } from './zcode-models.provider.js';
 import { EngineSilenceTimeoutError, ZCodeRunLifecycle, resolveSilenceTimeoutMs } from './zcode-run-lifecycle.js';
 import type { RunHandle, RunSettle } from './zcode-run-lifecycle.js';
 
@@ -184,7 +184,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * 1. Resolve existing session via context.resolveProviderSessionId()
    * 2. Create session if needed and announce it back to the gateway
    * 3. Subscribe to session events so the event stream starts flowing
-   * 4. Set model if different from the session's current model
+   * 4. Resolve the window's model and reasoning selection for this turn
    * 5. Map permission mode and call session/setMode
    * 6. Send user message via session/send
    * 7. Wait for the run end event, then send exactly one complete with tokens
@@ -197,23 +197,14 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
   ): Promise<unknown> {
     const appSessionId = readOptionalString(options.sessionId) ?? null;
     const sessionSummary = readOptionalString(options.sessionSummary);
-    // Seed the engine's workspace model catalog where the protocol accepts it:
-    // remote clients start with an empty catalog, and a cold resume of a
-    // session whose transcript references unresolvable models would otherwise
-    // be poisoned with a permanent "model unavailable" warning (-32031 on
-    // every send). ZCode 0.16.9 rejects this field on session/create, so new
-    // sessions receive the catalog with their first session/send instead.
-    const runtimeModel = await this.resolveRuntimeModelPayload(options, context);
 
     // Runs before the main try block below; without its own error emission a
     // session/create failure would never reach the chat stream and the page
     // would stay silent (the gateway only logs runtime rejections).
     let zcodeSessionId: string;
-    let resumedSession = false;
     try {
-      const resolved = await this.resolveOrCreateSession(appSessionId, options, context, writer, runtimeModel);
+      const resolved = await this.resolveOrCreateSession(appSessionId, options, context, writer);
       zcodeSessionId = resolved.sessionId;
-      resumedSession = resolved.resumed;
     } catch (error) {
       this.sendRuntimeError(writer, appSessionId, error);
       this.notifyRunOutcome({
@@ -234,15 +225,15 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
 
     try {
       await this.subscribeToSessionEvents(zcodeSessionId);
-      await this.configureSessionModel(zcodeSessionId, options, context, resumedSession);
       await this.configureSessionMode(zcodeSessionId, options);
+      const modelParams = await this.resolveSendModelParams(options, context);
 
       const eventListener = this.createSessionEventListener(handle, writer, context);
       protocolClient.addSessionListener(zcodeSessionId, eventListener);
 
       let settle: RunSettle | null = null;
       try {
-        await this.sendUserMessage(zcodeSessionId, command, options, runtimeModel);
+        await this.sendUserMessage(zcodeSessionId, command, options, modelParams);
         settle = await runLifecycle.waitForSettle(handle, silenceTimeoutMs);
 
         if (settle.kind === 'silent') {
@@ -458,27 +449,21 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    *    claude-runtime pattern). `writer.setSessionId` updates the stored
    *    mapping, so the replacement is sticky across subsequent sends.
    *
-   * Resume carries `runtimeModel` when a model selection is available: it
-   * seeds the engine's workspace model catalog (remote clients start with an
-   * empty one) and prevents the cold-resume "model unavailable" warning from
-   * poisoning sessions whose transcripts reference other provider ids. Create
-   * deliberately sends only `workspace`: ZCode 0.16.9 rejects `runtimeModel`
-   * there with a strict-schema "Unrecognized key" error. The first send seeds
-   * the catalog for newly created sessions instead.
+   * ZCode 0.16.9 validates all session requests strictly. Resume sends only
+   * the session id, while create sends only the workspace descriptor.
    */
   private async resolveOrCreateSession(
     appSessionId: string | null,
     options: AnyRecord,
     context: ProviderRuntimeContext,
     writer: ProviderRuntimeWriter,
-    runtimeModel?: Record<string, unknown>,
   ): Promise<{ sessionId: string; resumed: boolean }> {
     const existingSessionId = appSessionId
       ? context.resolveProviderSessionId(appSessionId)
       : null;
 
     if (existingSessionId) {
-      const resumed = await this.tryResumeSession(existingSessionId, runtimeModel);
+      const resumed = await this.tryResumeSession(existingSessionId);
       if (resumed) {
         console.debug(`[ZCodeRuntime] Resumed existing session: ${existingSessionId}`);
         return { sessionId: existingSessionId, resumed: true };
@@ -544,15 +529,9 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * transport errors) must propagate so the run surfaces the real cause
    * instead of silently forking a fresh session on every send.
    */
-  private async tryResumeSession(
-    sessionId: string,
-    runtimeModel?: Record<string, unknown>,
-  ): Promise<boolean> {
+  private async tryResumeSession(sessionId: string): Promise<boolean> {
     try {
-      await protocolClient.sendRequest('session/resume', {
-        sessionId,
-        ...(runtimeModel ? { runtimeModel } : {}),
-      });
+      await protocolClient.sendRequest('session/resume', { sessionId });
       return true;
     } catch (error) {
       const code = (error as AnyRecord | undefined)?.code;
@@ -589,72 +568,6 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
   }
 
   /**
-   * Configures session model and reasoning effort when it differs from the session's current configuration.
-   *
-   * The current model and variant are read from ZCode's own database (most recent
-   * `message.data.modelID` / `model.variant`).
-   *
-   * `forceModelSync` skips the database early-return: a resumed session's
-   * stored model reference may name a provider that no longer exists in the
-   * engine's config (provider ids drift across engine lifetimes), which makes
-   * the next send fail with -32031 until the model is explicitly re-selected.
-   */
-  private async configureSessionModel(
-    sessionId: string,
-    options: AnyRecord,
-    context: ProviderRuntimeContext,
-    forceModelSync = false,
-  ): Promise<void> {
-    const appSessionId = readOptionalString(options.sessionId);
-    // The composer's explicit choice wins; without one, fall back to the model
-    // recorded on the app session row, and finally to the provider's default —
-    // a forced sync (resumed session) must always re-select *some* valid model
-    // instead of silently keeping a dead engine-side reference.
-    const requestedModel = readOptionalString(options.model)
-      ?? await context.resolveResumeModel(appSessionId ?? undefined, undefined)
-      ?? (forceModelSync ? (await context.getProviderModels()).DEFAULT : undefined);
-    let requestedEffort = readOptionalString(options.effort);
-    if ((!requestedEffort || requestedEffort === 'default') && appSessionId) {
-      const sessionRow = sessionsDb.getSessionById(appSessionId);
-      if (sessionRow?.effort && sessionRow.effort !== 'default') {
-        requestedEffort = sessionRow.effort;
-      }
-    }
-
-    if (!requestedModel) {
-      return; // No model change requested
-    }
-
-    const normalizedVariant = requestedEffort && requestedEffort !== 'default'
-      ? requestedEffort.toLowerCase().trim()
-      : undefined;
-
-    const currentModelInfo = readZCodeSessionModelInfoFromDb(sessionId);
-    if (
-      !forceModelSync
-      && currentModelInfo
-      && currentModelInfo.modelId === requestedModel
-      && (currentModelInfo.variant || undefined) === normalizedVariant
-    ) {
-      return; // Session already runs the requested model and effort variant
-    }
-
-    const modelObj = resolveZCodeModelRef(requestedModel, normalizedVariant);
-
-    try {
-      await protocolClient.sendRequest('session/setModel', {
-        sessionId,
-        model: modelObj,
-      });
-
-      console.debug(`[ZCodeRuntime] Set model for session ${sessionId}: ${JSON.stringify(modelObj)}`);
-    } catch (error) {
-      console.warn(`[ZCodeRuntime] Failed to set model ${requestedModel} for session ${sessionId}:`, error);
-      // Continue anyway - use session's existing model
-    }
-  }
-
-  /**
    * Configures session permission mode using mapping from §5.
    *
    * Maps CloudCLI permission modes to ZCode modes and calls session/setMode.
@@ -686,10 +599,10 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * `session/send` is issued without a request timeout: the response only
    * acknowledges acceptance (observed immediate on engine 0.16.5), while the
    * turn itself completes on the event stream — a timeout here could fire
-   * after acceptance on slow engines. The params are strict-schema validated
-   * by the engine (validated against engine 0.16.3 and 0.16.5), so only
-   * `sessionId`, `content`, `attachments`, and the `runtimeModel` catalog
-   * seed are sent.
+   * after acceptance on slow engines. `modelSelection`/`modelExecution` are
+   * optional in 0.16.9's schema (verified live): when the local config cannot
+   * build them the send proceeds without them and the engine runs the turn on
+   * its own default model.
    *
    * Attachments arrive as app descriptors `{path, name, mimeType, size}` and
    * must be re-shaped into the engine's native items before sending — the
@@ -700,12 +613,13 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     sessionId: string,
     command: string,
     options: AnyRecord,
-    runtimeModel?: Record<string, unknown>,
+    modelParams: ReturnType<typeof buildZCodeSendModelParams>,
   ): Promise<void> {
     const messagePayload: AnyRecord = {
       sessionId,
       // Message content field: content (not message) per protocol findings
       content: command,
+      ...(modelParams ?? {}),
     };
 
     if (Array.isArray(options.attachments)) {
@@ -713,12 +627,6 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       if (engineAttachments.length > 0) {
         messagePayload.attachments = engineAttachments;
       }
-    }
-
-    if (runtimeModel) {
-      // Refreshes the engine's workspace model catalog and clears any
-      // lingering "model unavailable" restore warning before the turn starts.
-      messagePayload.runtimeModel = runtimeModel;
     }
 
     try {
@@ -731,27 +639,47 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
   }
 
   /**
-   * Resolves the model selection carried by a run into the engine's
-   * `runtimeModel` catalog payload, or undefined when nothing was requested
-   * and no recorded/default model exists.
+   * Resolves the chat window's model and reasoning controls into the per-turn
+   * `modelSelection`/`modelExecution` fields for `session/send`, or null to
+   * let the engine's default model take the turn.
    *
-   * Mirrors the resolution order of `configureSessionModel`: the composer's
-   * explicit choice, then the model recorded on the app session row.
+   * Explicit composer values win, followed by the app session's saved values
+   * and finally the provider catalog default. The model config supplies its
+   * own default reasoning level when the window has no explicit selection.
+   * A model that cannot be resolved into a complete executable selection is
+   * not a send-blocking error — both fields are optional in 0.16.9 (verified
+   * live) — so it degrades to a plain send with a warning.
    */
-  private async resolveRuntimeModelPayload(
+  private async resolveSendModelParams(
     options: AnyRecord,
     context: ProviderRuntimeContext,
-  ): Promise<Record<string, unknown> | undefined> {
+  ): Promise<ReturnType<typeof buildZCodeSendModelParams>> {
     const appSessionId = readOptionalString(options.sessionId);
     const requestedModel = readOptionalString(options.model)
-      ?? await context.resolveResumeModel(appSessionId ?? undefined, undefined);
-    if (!requestedModel) {
-      return undefined;
+      ?? await context.resolveResumeModel(appSessionId ?? undefined, undefined)
+      ?? (await context.getProviderModels()).DEFAULT;
+    if (!requestedModel?.trim()) {
+      return null;
     }
 
-    const effort = readOptionalString(options.effort);
-    const variant = effort && effort !== 'default' ? effort.toLowerCase().trim() : undefined;
-    return buildZCodeRuntimeModel(requestedModel, variant);
+    let requestedEffort = readOptionalString(options.effort);
+    if ((!requestedEffort || requestedEffort === 'default') && appSessionId) {
+      const sessionRow = sessionsDb.getSessionById(appSessionId);
+      if (sessionRow?.effort && sessionRow.effort !== 'default') {
+        requestedEffort = sessionRow.effort;
+      }
+    }
+
+    const modelParams = buildZCodeSendModelParams(
+      requestedModel,
+      requestedEffort && requestedEffort !== 'default' ? requestedEffort : undefined,
+    );
+    if (!modelParams) {
+      console.warn(
+        `[ZCodeRuntime] Model ${requestedModel} is not fully configured in cli/config.json; sending without a per-turn model selection so the engine default applies.`,
+      );
+    }
+    return modelParams;
   }
 
   /**

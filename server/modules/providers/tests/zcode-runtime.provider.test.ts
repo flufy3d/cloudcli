@@ -48,6 +48,14 @@ const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
 const log = (name, value) => {
   try { fs.appendFileSync(logFile, JSON.stringify({ name, value }) + '\\n'); } catch {}
 };
+// The stub log outlives the test run; never write the API key that the send
+// params carry in modelExecution.requestAuth.
+const redactSendParams = (params) => {
+  const { modelExecution, ...rest } = params ?? {};
+  return modelExecution
+    ? { ...rest, modelExecution: { ...modelExecution, requestAuth: '<redacted>' } }
+    : rest;
+};
 const readMode = () => {
   try { return fs.readFileSync(modeFile, 'utf8').trim(); } catch { return 'ok'; }
 };
@@ -189,14 +197,21 @@ rl.on('line', (line) => {
   }
 
   if (msg.method === 'session/send') {
+    log('session_send_attempt', redactSendParams(msg.params));
     // Mirror the engine's strict schema: unknown keys are rejected.
     for (const key of Object.keys(msg.params ?? {})) {
-      if (key !== 'sessionId' && key !== 'content' && key !== 'attachments' && key !== 'runtimeModel') {
-        send({ id: msg.id, error: { code: -32600, message: 'Invalid params — (root): Unrecognized key: "' + key + '"' } });
+      if (
+        key !== 'sessionId'
+        && key !== 'content'
+        && key !== 'attachments'
+        && key !== 'modelSelection'
+        && key !== 'modelExecution'
+      ) {
+        send({ id: msg.id, error: { code: -32602, message: 'Invalid params — (root): Unrecognized key: "' + key + '"' } });
         return;
       }
     }
-    log('session_send', msg.params);
+    log('session_send', redactSendParams(msg.params));
     send({ id: msg.id, result: {} });
     if (readMode() === 'send-fail') {
       send({ method: 'session/event', params: { sessionId, type: 'turn.failed', payload: { error: { message: 'provider auth failed', attribution: { statusCode: 401, reason: 'auth_failed' } } } } });
@@ -345,15 +360,20 @@ const cliConfigDir = path.join(stubDir, 'cli');
 fsSync.mkdirSync(cliConfigDir, { recursive: true });
 fsSync.writeFileSync(path.join(cliConfigDir, 'config.json'), JSON.stringify({
   provider: {
-    'builtin:bigmodel-coding-plan': {
+    'bigmodel-coding-plan': {
       kind: 'anthropic',
+      options: {
+        apiKey: 'test-api-key',
+        baseURL: 'https://example.invalid/api/anthropic',
+      },
       models: {
         'GLM-5.3': {
-          reasoning: { enabled: true, levels: ['low', 'high', 'max'], defaultLevel: 'high' },
+          reasoning: { enabled: true, levels: ['low', 'high', 'max'], defaultLevel: 'max' },
         },
       },
     },
   },
+  model: 'bigmodel-coding-plan/GLM-5.3',
 }));
 
 process.env.CLOUDCLI_ZCODE_ENGINE = stubPath;
@@ -378,7 +398,7 @@ const sessionsProvider = new ZCodeSessionsProvider();
 const context: ProviderRuntimeContext = {
   resolveProviderSessionId: () => null,
   resolveResumeModel: async () => undefined,
-  getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'glm-5.3' }),
+  getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'GLM-5.3' }),
   normalizeMessage: (raw, sessionId) => sessionsProvider.normalizeMessage(raw, sessionId),
   isProviderInstalled: async () => true,
 };
@@ -474,10 +494,7 @@ test('runtime configures model and reasoning effort variant', async () => {
   }, writer, context);
 
   const setModelEntry = readStubLog().find((entry) => entry.name === 'setModel');
-  assert.ok(setModelEntry, 'session/setModel must be called when model and effort are specified');
-  const setModelPayload = setModelEntry.value as { model: { modelId: string; variant?: string } };
-  assert.equal(setModelPayload.model.modelId, 'GLM-5.3');
-  assert.equal(setModelPayload.model.variant, 'high');
+  assert.equal(setModelEntry, undefined, '0.16.9 selects the model on session/send, not session/setModel');
 
   const createEntry = readStubLog().filter((entry) => entry.name === 'session_create').at(-1);
   assert.deepEqual(createEntry?.value, {
@@ -487,15 +504,28 @@ test('runtime configures model and reasoning effort variant', async () => {
     },
   });
 
-  const sendEntry = readStubLog().filter((entry) => entry.name === 'session_send').at(-1);
-  const sendPayload = sendEntry?.value as {
-    runtimeModel?: { model?: { providerId?: string; modelId?: string; variant?: string } };
-  };
-  assert.deepEqual(sendPayload.runtimeModel?.model, {
-    providerId: 'builtin:bigmodel-coding-plan',
+  const sendAttempts = readStubLog().filter((entry) => entry.name === 'session_send_attempt');
+  const latestSendAttempt = sendAttempts.at(-1)?.value as {
+    runtimeModel?: unknown;
+    modelSelection?: unknown;
+    modelExecution?: unknown;
+  } | undefined;
+  assert.ok(latestSendAttempt, 'session/send must reach the engine');
+  assert.equal(latestSendAttempt.runtimeModel, undefined);
+  assert.deepEqual(latestSendAttempt.modelSelection, {
+    providerId: 'bigmodel-coding-plan',
     modelId: 'GLM-5.3',
-    variant: 'high',
+    options: { reasoningLevel: 'high' },
   });
+  assert.deepEqual(latestSendAttempt.modelExecution, {
+    selectionScope: 'execution',
+    requestAuth: '<redacted>',
+  });
+
+  const acceptedSend = readStubLog().filter((entry) => entry.name === 'session_send').at(-1);
+  const acceptedSendPayload = acceptedSend?.value as { modelSelection?: unknown } | undefined;
+  assert.ok(acceptedSendPayload, 'strict-schema session/send must be accepted');
+  assert.deepEqual(acceptedSendPayload.modelSelection, latestSendAttempt.modelSelection);
 });
 
 test('runtime bridges interaction/requestPermission to the chat stream and answers the engine', async () => {

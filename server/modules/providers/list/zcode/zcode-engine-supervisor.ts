@@ -26,7 +26,11 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { setTimeout as setTimeoutFn, clearTimeout as clearTimeoutFn } from 'node:timers';
 
 import { getZCodeStorageDir } from './zcode-data-root.js';
-import { resolveZCodeProviderConfigEnv } from './zcode-provider-config.js';
+import {
+  resolveZCodeProviderConfigEnv,
+  ZCODE_BUILTIN_PROVIDER_CONFIG_ENV,
+  ZCODE_PERSONAL_PROVIDER_CONFIG_ENV,
+} from './zcode-provider-config.js';
 import { tryResolveEnginePath } from './zcode-engine-path.js';
 
 /** How much of the engine's stderr to keep for crash explanations. */
@@ -105,6 +109,12 @@ export class EngineSupervisor {
           // Ensure ZCode uses the expected storage directory (shared data-root
           // helper, so ZCODE_STORAGE_DIR isolation applies uniformly).
           ZCODE_STORAGE_DIR: getZCodeStorageDir(),
+          // Ambient ZCODE_* provider-config values inherited from a parent
+          // ZCode App session point at the App's runtime files, not at this
+          // engine's config; strip them so the engine runs only on the config
+          // resolved below (see zcode-provider-config).
+          [ZCODE_BUILTIN_PROVIDER_CONFIG_ENV]: undefined,
+          [ZCODE_PERSONAL_PROVIDER_CONFIG_ENV]: undefined,
           // The packaged engine cannot locate its own built-in provider config
           // (see zcode-provider-config); hand it the resolved paths instead.
           ...resolveZCodeProviderConfigEnv(enginePath),

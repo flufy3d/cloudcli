@@ -563,6 +563,34 @@ export const readStringRecord = (value: unknown): Record<string, string> | undef
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 };
 
+/**
+ * Reads an optional string-to-string map from unknown input, trimming keys and
+ * values and dropping entries where either side is empty after trimming.
+ *
+ * Used where the map feeds a strict downstream schema — the ZCode engine's
+ * provider registry validates every header with min(1), so an untrimmed or
+ * empty entry would make the whole registry file invalid. Returns `undefined`
+ * when no usable entry remains.
+ *
+ * Consumers: the zcode provider-config materializer and the zcode send-model
+ * builder.
+ */
+export const readTrimmedStringRecord = (value: unknown): Record<string, string> | undefined => {
+  const record = readObjectRecord(value);
+  if (!record) {
+    return undefined;
+  }
+
+  const entries = Object.entries(record).flatMap(([key, entry]) => {
+    const normalizedKey = key.trim();
+    const normalizedValue = readOptionalString(entry);
+    return normalizedKey && normalizedValue
+      ? [[normalizedKey, normalizedValue] as [string, string]]
+      : [];
+  });
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+};
+
 // ---------------------------
 //----------------- PROVIDER MODEL LOOKUP UTILITIES ------------
 /**
