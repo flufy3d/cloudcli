@@ -29,6 +29,54 @@ function userTurnFingerprintsMatch(
   );
 }
 
+/**
+ * Used by the session timeline store to fold a provider's live user-message
+ * echo into the optimistic row that already represents the same send.
+ *
+ * The local id and timestamp stay in place until persisted history arrives:
+ * they are the causal marker that later keeps this turn's live reply below its
+ * server-backed prompt. Provider-owned fields such as `transcriptAnchorId`
+ * are adopted immediately so edit and fork controls can use the real anchor.
+ */
+export function mergeProviderUserEchoIntoOptimisticRow(
+  realtimeMessages: NormalizedMessage[],
+  providerEcho: NormalizedMessage,
+): NormalizedMessage[] | null {
+  if (providerEcho.id.startsWith('local_')) {
+    return null;
+  }
+
+  const providerFingerprint = userTurnFingerprint(providerEcho);
+  if (!providerFingerprint) {
+    return null;
+  }
+
+  for (let index = realtimeMessages.length - 1; index >= 0; index -= 1) {
+    const candidate = realtimeMessages[index];
+    if (!candidate.id.startsWith('local_')) {
+      continue;
+    }
+
+    const localFingerprint = userTurnFingerprint(candidate);
+    if (!localFingerprint || !userTurnFingerprintsMatch(localFingerprint, providerFingerprint)) {
+      continue;
+    }
+
+    const merged = {
+      ...providerEcho,
+      id: candidate.id,
+      timestamp: candidate.timestamp,
+      replacesAnchorId: candidate.replacesAnchorId,
+      replacesAfterRowCount: candidate.replacesAfterRowCount,
+    };
+    const next = [...realtimeMessages];
+    next[index] = merged;
+    return next;
+  }
+
+  return null;
+}
+
 function findServerEchoForLocalUser(
   localMessage: NormalizedMessage,
   serverMessages: NormalizedMessage[],

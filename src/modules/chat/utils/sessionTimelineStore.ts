@@ -48,7 +48,11 @@ import {
   readFrameSeq,
   readFrameSessionId,
 } from '@shared/protocol/frameNarrowing';
-import { reconcileOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
+import {
+  mergeProviderUserEchoIntoOptimisticRow,
+  reconcileOptimisticUserEchoes,
+  upsertToolUseRow,
+} from '@/modules/chat/utils/sessionMessageReconciliation';
 import { isThinkingRowEchoOnServer, upsertThinkingRow } from '@/modules/chat/utils/sessionThinkingRows';
 import {
   claimExactServerToolCall,
@@ -1344,7 +1348,10 @@ export class SessionTimelineStore {
       && withSession.replacesAfterRowCount === undefined
         ? { ...withSession, replacesAfterRowCount: slot.serverMessages.length }
         : withSession;
-    let updated = [...slot.realtimeMessages, normalizedMessage];
+    let updated = mergeProviderUserEchoIntoOptimisticRow(
+      slot.realtimeMessages,
+      normalizedMessage,
+    ) ?? [...slot.realtimeMessages, normalizedMessage];
     if (updated.length > MAX_REALTIME_MESSAGES) {
       updated = updated.slice(-MAX_REALTIME_MESSAGES);
     }

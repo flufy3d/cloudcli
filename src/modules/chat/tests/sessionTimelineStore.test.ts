@@ -820,6 +820,37 @@ test('optimistic user, thinking, and same-turn assistant echoes are absorbed int
   );
 });
 
+test('a live provider echo merges into its optimistic user row before history refreshes', async () => {
+  const prompt = 'archive the architecture docs, then discuss resource management';
+  const providerEcho = msg(2, {
+    id: 'claude-user-uuid',
+    content: prompt,
+    role: 'user',
+    timestamp: '2026-09-20T00:40:13.139Z',
+    transcriptAnchorId: 'claude-user-uuid',
+  });
+  const store = new SessionTimelineStore({
+    fetchPage: async () => ({ messages: [providerEcho], total: 1, hasMore: false }),
+  });
+
+  store.appendRealtime(SESSION_ID, msg(1, {
+    id: 'local_prompt',
+    content: prompt,
+    timestamp: '2026-09-20T00:39:58.000Z',
+  }));
+  emit(store, providerEcho);
+
+  let userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
+  assert.deepEqual(
+    userRows.map((row) => ({ id: row.id, transcriptAnchorId: row.transcriptAnchorId })),
+    [{ id: 'local_prompt', transcriptAnchorId: 'claude-user-uuid' }],
+  );
+
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
+  userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
+  assert.deepEqual(userRows.map((row) => row.id), ['claude-user-uuid']);
+});
+
 test('a live assistant reply cannot overtake the optimistic user row when clocks disagree', async () => {
   const fetchPage = scriptedFetcher([
     {
