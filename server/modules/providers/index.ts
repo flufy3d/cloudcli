@@ -33,6 +33,10 @@ export { shutdownOpenCodeServer } from './list/opencode/opencode-server.client.j
 // read-only allowlist for workspace-external Antigravity plan documents.
 export { getAntigravityBrainRoots } from './list/antigravity/index.js';
 
+// getClaudeExternalReadOnlyRoots: used by the File Tree composition root as
+// the read-only allowlist for Claude project artifacts referenced from chat.
+export { getClaudeExternalReadOnlyRoots } from './list/claude/claude-data-root.js';
+
 // getZcodeExternalReadOnlyRoots: used by the File Tree composition root as the
 // read-only allowlist for workspace-external ZCode files (memories, skills,
 // AGENTS.md) referenced from chat.

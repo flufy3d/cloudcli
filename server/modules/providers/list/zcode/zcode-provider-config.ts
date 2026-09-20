@@ -30,6 +30,17 @@ import path from 'node:path';
 import { getZCodeStorageDir } from './zcode-data-root.js';
 
 /**
+ * Engine env override names, exported so the supervisor can strip ambient
+ * values inherited from a parent ZCode App session before merging CloudCLI's
+ * own resolution (see {@link resolveZCodeProviderConfigEnv}).
+ *
+ * Consumers: zcode-engine-supervisor.ts and the provider-config tests.
+ */
+export const ZCODE_BUILTIN_PROVIDER_CONFIG_ENV = 'ZCODE_BUILTIN_PROVIDER_CONFIG_FILE';
+export const ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV = 'ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE';
+export const ZCODE_PERSONAL_PROVIDER_CONFIG_ENV = 'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE';
+
+/**
  * Path to a provider config file, when it exists on disk.
  */
 type ProviderConfigPaths = {
@@ -157,13 +168,13 @@ export function resolveZCodeProviderConfigEnv(enginePath: string): Record<string
 
   const activeCatalog = runtime ?? bundled;
   if (activeCatalog) {
-    env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = activeCatalog;
+    env[ZCODE_BUILTIN_PROVIDER_CONFIG_ENV] = activeCatalog;
   }
   if (bundled) {
-    env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE = bundled;
+    env[ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV] = bundled;
   }
   if (personal) {
-    env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = personal;
+    env[ZCODE_PERSONAL_PROVIDER_CONFIG_ENV] = personal;
   }
 
   return env;

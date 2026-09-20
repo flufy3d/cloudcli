@@ -136,20 +136,7 @@ feat!: redesign settings page layout
 
 ## Releases
 
-Releases are managed by maintainers using [release-it](https://github.com/release-it/release-it) with the [conventional changelog plugin](https://github.com/release-it/conventional-changelog).
-
-```bash
-npm run release           # interactive (prompts for version bump)
-npm run release -- patch  # patch release
-npm run release -- minor  # minor release
-```
-
-This automatically:
-- Bumps the version based on commit types (`feat` = minor, `fix` = patch)
-- Generates categorized release notes
-- Updates `CHANGELOG.md`
-- Creates a git tag and GitHub Release
-- Publishes to npm
+Releases follow this fork's manual pipeline, documented in [`AGENTS.md`](AGENTS.md#release-pipeline): a three-file version bump, an annotated tag, a clean-worktree `deploy.mjs --no-bump` deployment, `git push --follow-tags`, and a `gh release` with notes written in Chinese. `CHANGELOG.md` carries upstream history only and is not updated for fork releases.
 
 ## License
 

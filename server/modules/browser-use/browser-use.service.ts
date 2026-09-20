@@ -1,4 +1,3 @@
-import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,8 +11,8 @@ import { providerMcpService } from '@/modules/providers/index.js';
 import { getModuleDirectory } from '@/shared/utils.js';
 
 import { getBrowserUseRuntime } from './browser-use-runtime.js';
+import { resolveBrowserPlaywright } from './browser-use-playwright.js';
 
-const require = createRequire(import.meta.url);
 const __dirname = getModuleDirectory(import.meta.url);
 const MAX_SESSIONS_PER_OWNER = Number.parseInt(process.env.CLOUDCLI_BROWSER_USE_MAX_SESSIONS_PER_OWNER || '3', 10);
 const SESSION_TTL_MS = Number.parseInt(process.env.CLOUDCLI_BROWSER_USE_SESSION_TTL_MS || String(30 * 60 * 1000), 10);
@@ -142,23 +141,6 @@ function getSetupMessage(settings: BrowserUseSettings, readiness: RuntimeReadine
   return readiness.installMessage || 'Browser runtime is not ready.';
 }
 
-function getPlaywright(): any | null {
-  try {
-    return require('playwright');
-  } catch {
-    // Not in the repository's node_modules; fall through to the
-    // out-of-repo runtime install under ~/.cloudcli.
-  }
-
-  try {
-    // Anchoring resolution at the runtime dir's package.json (which does not
-    // need to exist) resolves playwright from ~/.cloudcli/browser-use/runtime.
-    return createRequire(path.join(RUNTIME_INSTALL_DIR, 'package.json'))('playwright');
-  } catch {
-    return null;
-  }
-}
-
 function ensureRuntimeInstallDir(): string {
   fs.mkdirSync(RUNTIME_INSTALL_DIR, { recursive: true });
   const manifestPath = path.join(RUNTIME_INSTALL_DIR, 'package.json');
@@ -221,7 +203,7 @@ function getProfilePath(profileName: string): string {
 }
 
 function probeRuntime(): RuntimeProbe {
-  const playwright = getPlaywright();
+  const playwright = resolveBrowserPlaywright({ runtimeInstallDir: RUNTIME_INSTALL_DIR });
   const readiness: RuntimeProbe = {
     playwright,
     playwrightInstalled: Boolean(playwright),

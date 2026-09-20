@@ -56,15 +56,24 @@ const EFFORT_DESCRIPTIONS: Record<string, string> = {
 };
 
 /**
- * Reads and parses ZCode's v2 config.json to extract model definitions.
- * Based on integration plan §3.2.5: `provider.*.models` entries with
- * `reasoning.variants` and `limit.context`/`limit.output`.
+ * Reads ZCode's user-facing provider config to extract model definitions.
+ * 0.16.9 stores the active catalog in `cli/config.json`; the v2 path is
+ * retained as a fallback for installations that have not rewritten it yet.
  */
 const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
   try {
-    const configPath = path.join(getZCodeStorageDir(), 'v2', 'config.json');
-    const content = await readFile(configPath, 'utf8');
-    const config = readObjectRecord(JSON.parse(content));
+    let config: AnyRecord | null = null;
+    for (const configPath of [
+      path.join(getZCodeStorageDir(), 'cli', 'config.json'),
+      path.join(getZCodeStorageDir(), 'v2', 'config.json'),
+    ]) {
+      try {
+        config = readObjectRecord(JSON.parse(await readFile(configPath, 'utf8')));
+        if (readObjectRecord(config?.provider)) break;
+      } catch {
+        // Try the next supported config location.
+      }
+    }
 
     if (!config) {
       return ZCODE_BUILTIN_MODELS;
@@ -95,7 +104,7 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
         seenModelKeys.add(modelKey);
 
         const reasoning = readObjectRecord(modelRecord.reasoning);
-        const variants = reasoning?.variants;
+        const variants = Array.isArray(reasoning?.levels) ? reasoning.levels : reasoning?.variants;
         const hasReasoning = Array.isArray(variants) && variants.length > 0;
 
         const limits = readObjectRecord(modelRecord.limit);
@@ -116,9 +125,12 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
 
         let effort: ProviderModelOption['effort'] | undefined;
         if (hasReasoning && Array.isArray(variants)) {
-          const sortedVariants = [...variants].sort();
+          const sortedVariants = variants
+            .filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0)
+            .map((variant) => variant.trim().toLowerCase())
+            .sort();
           effort = {
-            default: 'max',
+            default: readOptionalString(reasoning?.defaultLevel)?.toLowerCase() ?? 'max',
             values: sortedVariants.map((variant: string) => {
               const normalized = variant.toLowerCase();
               return {
@@ -500,109 +512,6 @@ export function readZCodeSessionModelInfoFromDb(providerSessionId: string): { mo
  */
 export function readZCodeSessionModelFromDb(providerSessionId: string): string | null {
   return readZCodeSessionModelInfoFromDb(providerSessionId)?.modelId ?? null;
-}
-
-/**
- * Builds the engine's `runtimeModel` payload for a model selection.
- *
- * The app-server engine keeps a per-workspace model catalog that only the
- * embedding host normally populates. A remote client's catalogs start empty,
- * so cold-resuming a session whose transcript references models the catalog
- * cannot resolve marks it with a permanent "model unavailable" warning
- * (-32031 on every send, immune to session/setModel). Attaching a
- * `runtimeModel` to session/resume|create|send both seeds the catalog and
- * clears that warning.
- *
- * Shape (engine schema `Of`, strict): `revision` (string), `generatedAt`
- * (epoch ms), `model` ({providerId, modelId, variant?}), `provider` (the
- * provider definition with at least one model). The provider entry comes
- * from the engine's own cli/config.json so the ids match what the engine
- * validates against; returns undefined when it cannot be built reliably.
- *
- * Consumer: `server/modules/providers/list/zcode/zcode-runtime.provider.ts`
- */
-export function buildZCodeRuntimeModel(
-  modelKey: string,
-  variant?: string,
-): Record<string, unknown> | undefined {
-  const ref = resolveZCodeModelRef(modelKey, variant);
-  let providerRecord: Record<string, unknown> | undefined;
-
-  for (const configPath of [
-    path.join(getZCodeStorageDir(), 'cli', 'config.json'),
-    path.join(getZCodeStorageDir(), 'v2', 'config.json'),
-  ]) {
-    try {
-      const config = readObjectRecord(JSON.parse(fsSync.readFileSync(configPath, 'utf8')));
-      const candidate = readObjectRecord(readObjectRecord(config?.provider)?.[ref.providerId]);
-      if (candidate) {
-        providerRecord = candidate;
-        break;
-      }
-    } catch {
-      // Try the next config source
-    }
-  }
-
-  if (!providerRecord) {
-    return undefined;
-  }
-
-  const options = readObjectRecord(providerRecord.options);
-  const apiKey = readOptionalString(options?.apiKey);
-  const configModels = readObjectRecord(providerRecord.models) ?? {};
-  const engineModels = Object.entries(configModels).map(([modelId, modelConfig]) => {
-    const record = readObjectRecord(modelConfig);
-    const limit = readObjectRecord(record?.limit);
-    const reasoning = readObjectRecord(record?.reasoning);
-    return {
-      modelId,
-      ...(readOptionalString(record?.name) ? { label: readOptionalString(record?.name) } : {}),
-      ...(typeof limit?.context === 'number' ? { contextWindow: limit.context } : {}),
-      ...(typeof limit?.output === 'number' ? { maxOutputTokens: limit.output } : {}),
-      ...(reasoning && reasoning.enabled === true
-        ? {
-            reasoning: {
-              enabled: true,
-              // Engine schema: levels are {value, label} objects, not strings.
-              ...(Array.isArray(reasoning.levels)
-                ? {
-                    levels: reasoning.levels
-                      .map((level) => (typeof level === 'string' ? level.trim() : ''))
-                      .filter((level) => level.length > 0)
-                      .map((level) => ({ value: level, label: EFFORT_DESCRIPTIONS[level] ?? level })),
-                  }
-                : {}),
-              ...(readOptionalString(reasoning.defaultLevel)
-                ? { defaultLevel: readOptionalString(reasoning.defaultLevel) }
-                : {}),
-            },
-          }
-        : {}),
-    };
-  });
-
-  if (engineModels.length === 0) {
-    // The engine requires at least one model entry on the provider.
-    engineModels.push({ modelId: ref.modelId });
-  }
-
-  return {
-    revision: `${ref.providerId}/${ref.modelId}`,
-    generatedAt: Date.now(),
-    model: { providerId: ref.providerId, modelId: ref.modelId, ...(ref.variant ? { variant: ref.variant } : {}) },
-    provider: {
-      providerId: ref.providerId,
-      kind: readOptionalString(providerRecord.kind) ?? 'anthropic',
-      ...(readOptionalString(providerRecord.name) ? { label: readOptionalString(providerRecord.name) } : {}),
-      ...(readOptionalString(options?.baseURL) ? { baseURL: readOptionalString(options?.baseURL) } : {}),
-      // Engine schema Rbn: inline credentials travel as {source, value}. The
-      // payload only ever goes to the local engine subprocess over stdio.
-      ...(apiKey ? { apiKey: { source: 'inline', value: apiKey } } : {}),
-      models: engineModels,
-    },
-    ...(ref.variant ? { thoughtLevel: ref.variant } : {}),
-  };
 }
 
 /**

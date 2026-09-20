@@ -40,6 +40,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
+    supportsQuota: true,
     supportsEffort: true,
     supportsMessageEditing: true,
     supportsSessionForking: true,
@@ -47,6 +48,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // exactly what the runtime's compact primitive feeds it.
     supportsCompaction: true,
     editRevertsFiles: false,
+    mcp: {
+      scopes: ['user', 'local', 'project'],
+      transports: ['stdio', 'http', 'sse'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -56,11 +63,18 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: false,
     supportsTokenUsage: false,
+    supportsQuota: false,
     supportsEffort: false,
     supportsMessageEditing: false,
     supportsSessionForking: false,
     supportsCompaction: false,
     editRevertsFiles: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: true,
+      supportsEnvVarIndirection: false,
+    },
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -70,6 +84,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: false,
     supportsTokenUsage: true,
+    supportsQuota: true,
     supportsEffort: true,
     // Not from the Codex SDK, which only starts and resumes threads: both ride
     // the same CLI's `app-server` protocol, whose `thread/fork` copies a
@@ -80,6 +95,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // `thread/compact/start` on the same app-server transport the fork rides.
     supportsCompaction: true,
     editRevertsFiles: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: true,
+      supportsEnvVarIndirection: true,
+    },
   },
   opencode: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -92,6 +113,9 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // its runtime.permissions facet is present.
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
+    // OpenCode Go exposes the official usage endpoint (5-hour/weekly/monthly
+    // windows), so its auth facet carries getQuota.
+    supportsQuota: true,
     supportsEffort: true,
     // The sessions provider resolves an edit anchor and rewinds through the
     // server's `revert` primitive, so editing an already-sent message works.
@@ -101,6 +125,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // `opencode run --command compact` runs the CLI's own compaction command.
     supportsCompaction: true,
     editRevertsFiles: true,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
   zcode: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -115,6 +145,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // present even though permission MODES are the primary gate.
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
+    supportsQuota: true,
     supportsEffort: true,
     // No resolveEditAnchor/fork facets: transcripts are append-only for this
     // provider today.
@@ -125,6 +156,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // composer menu for this provider.
     supportsCompaction: true,
     editRevertsFiles: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -134,6 +171,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsAbort: true,
     supportsPermissionRequests: false,
     supportsTokenUsage: true,
+    supportsQuota: true,
     supportsEffort: true,
     supportsMessageEditing: false,
     supportsSessionForking: false,
@@ -142,6 +180,12 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // subcommand or flag. Slash expansion only covers skills/custom commands.
     supportsCompaction: false,
     editRevertsFiles: false,
+    mcp: {
+      scopes: ['user', 'project'],
+      transports: ['stdio', 'http', 'sse'],
+      supportsWorkingDirectory: false,
+      supportsEnvVarIndirection: false,
+    },
   },
 };
 

@@ -189,6 +189,8 @@ function normalizeQuotaPayload(payload: unknown, nowTimestamp: number): Provider
       },
     ],
     updatedAt: new Date(nowTimestamp).toISOString(),
+    // One family (OpenCode Go), split by allowance window rather than by model.
+    partitioning: 'bucket',
   };
 }
 

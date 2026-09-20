@@ -20,9 +20,9 @@ import { createCliEnginePathResolver } from '../../shared/engine-path/cli-engine
 
 /**
  * Expected ZCode version for protocol compatibility checks.
- * Current validated version: 0.16.3 (ZCode Desktop App 3.7.7 embedded CLI).
+ * Current validated version: 0.16.9.
  */
-const EXPECTED_ZCODE_VERSION = '0.16.3';
+const EXPECTED_ZCODE_VERSION = '0.16.9';
 
 /**
  * Default install locations by platform. The engine is a `.cjs` bundle always

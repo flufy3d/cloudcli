@@ -1,22 +1,14 @@
 import { memo, useMemo, useState } from 'react';
 import { ChevronRight } from 'lucide-react';
 
-import type { DiffLine,  ChatMessage, Provider } from '@/shared/types';
-import type { Project } from '@/shared/types';
+import type { ChatMessage, DiffLine, Project, Provider } from '@/shared/types';
 import type { ToolGroupItem } from '@/modules/chat/utils/toolGrouping';
 import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRenderContext';
 import { getToolConfig, isCommandTool, isFilePreviewTool, pickCommandField, unwrapNestedCommand } from '@/modules/chat/tools';
 import { formatToolDisplayName, getMcpExecHint } from '@/modules/chat/tools/configs/toolConfigs';
 import LLMProviderLogo from '@/shared/ui/LLMProviderLogo';
 import { getProviderDisplayName } from '@/shared/providerDisplay';
-
 import MessageComponent from '@/modules/chat/transcript/MessageComponent';
-
-type ForkDiffLine = {
-  type: string;
-  content: string;
-  lineNum: number;
-};
 
 type ToolGroupContainerProps = {
   group: ToolGroupItem;
@@ -164,7 +156,9 @@ export default memo(function ToolGroupContainer({
     return added > 0 || removed > 0 ? { added, removed } : null;
   }, [group.messages, group.toolName, createDiff]);
 
-  const [isExpanded, setIsExpanded] = useState(hasError);
+  // Group details open only on explicit user action; failure stays visible in
+  // the red border and Failed badge without dumping every tool row onscreen.
+  const [isExpanded, setIsExpanded] = useState(false);
   // A statically rendered document has no JavaScript: the group becomes a
   // native <details> the reader can still fold. It starts collapsed — a
   // document that auto-expanded every group buries the conversation — except

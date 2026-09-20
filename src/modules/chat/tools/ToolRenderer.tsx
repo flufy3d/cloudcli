@@ -133,7 +133,6 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
         output={output}
         isError={Boolean(toolResult?.isError)}
         status={toolStatus !== 'completed' ? toolStatus : undefined}
-        defaultOpen={Boolean(toolResult?.isError)}
       />
     );
   }

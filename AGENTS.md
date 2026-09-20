@@ -27,7 +27,7 @@ For every task that creates, modifies, refactors, or reviews backend code under 
 The **production instance** runs from a global pnpm install (`~/Library/pnpm/global/5/node_modules/cloudcli`) as a static copy fully detached from this repo — editing repo code or running dev here never affects it. PM2 persists its config in `~/.pm2/ecosystem.config.cjs` (process env vars must live there; PM2-managed processes never read `.zshrc`).
 
 - Application name: `cloudcli`
-- Publish a new build: `pnpm run deploy` (build → pack → global install → PM2 cutover → `pm2 save`). Run it in a terminal **outside** any cloudcli-hosted session — the cutover drops the session's own server.
+- Publish a new build: `pnpm run deploy` (build → pack → global install → PM2 cutover → `pm2 save`); the script auto-increments the patch version and commits it. Release-pipeline deploys pass `--no-bump` to keep the tagged release version instead. Run it in a terminal **outside** any cloudcli-hosted session — the cutover drops the session's own server.
 - Service port: `3030` (`http://localhost:3030`)
 - Restart command: `pm2 restart cloudcli`
 - Logs command: `pm2 logs cloudcli`
@@ -38,6 +38,19 @@ Always use PM2 commands when restarting or inspecting the server process, rather
 
 **Important Note on Server Restarts**:
 Restarting the PM2 service will abruptly drop the live websocket/HTTP connection with the user interface. Before triggering `pm2 restart cloudcli`, always send a message to the user informing them in advance that the service is about to restart and connection will temporarily drop. After the restart, wait for the user to send a prompt to resume and continue the work.
+
+## Release pipeline
+
+Saying "发布/发版本" (release a version) means running this whole pipeline unattended, in this exact order — the tag must exist before the build, or the sidebar version string drifts:
+
+1. Draft release notes from `git log <last-tag>..HEAD`: user-facing changes grouped under 新功能/问题修复 (内部 only when notable), drop internal refactors/tests/chore, append the compare link. Bump minor when features landed, patch otherwise.
+2. Bump three places: `npm version X.Y.Z --no-git-tag-version` (package.json + lock) and hand-edit `redirect-package/package.json`.
+3. `git commit --no-verify -m "chore(release): bump version to X.Y.Z"`, scoped to exactly those three files.
+4. `git tag -a vX.Y.Z -m "CloudCLI X.Y.Z"` (annotated, before any build).
+5. Build and deploy **from a clean worktree of the tag** — the main tree is routinely dirtied by parallel sessions, which bakes `-dirty` into the build fingerprint: `git worktree add --detach /tmp/rel-vX.Y.Z vX.Y.Z`, `cp -Rc node_modules /tmp/rel-vX.Y.Z/` (the repo has no pnpm-lock, so `pnpm install` there fails), then build in the worktree and verify the fingerprint is `vX.Y.Z-<hash>` without `-dirty`.
+6. `git push origin main --follow-tags`, then `gh release create vX.Y.Z -R iazrael/cloudcli --title "CloudCLI X.Y.Z" --notes-file ...` — always pass `-R`; gh defaults to the upstream repo.
+7. Announce the restart (see the note above), then `node scripts/deploy.mjs --no-bump` from the worktree. Non-interactive shells need `PATH="$HOME/Library/pnpm:$PATH" PNPM_HOME="$HOME/Library/pnpm"` or `pnpm add -g` fails with `ERR_PNPM_NO_GLOBAL_BIN_DIR`.
+8. Verify four things: pm2 online with the new version, `curl http://localhost:3030/` returns 200, the global copy's `dist/assets/*.js` fingerprint has no `-dirty`, and `gh release view` confirms the release.
 
 ## Frontend code
 
