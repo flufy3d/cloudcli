@@ -77,6 +77,49 @@ export function mergeProviderUserEchoIntoOptimisticRow(
   return null;
 }
 
+/**
+ * Claims the persisted copy of a user row that never was an optimistic prompt,
+ * so the live copy can be dropped instead of rendering beside it.
+ *
+ * Optimistic `local_*` rows are excluded on purpose: they anchor their turn
+ * until the merge stage hides them, and retiring one here would destroy the
+ * only record of where that turn begins. A row without the prefix carries no
+ * anchor duty — it reached the stream because a second tab sent it or the
+ * engine echoed it back — so an unclaimed transcript row with the same
+ * fingerprint is that row, not a coincidence.
+ *
+ * Claims are one-to-one: sending the same text twice pairs each live row with
+ * its own persisted turn rather than letting one row retire both.
+ */
+export function claimServerUserEcho(
+  liveMessage: NormalizedMessage,
+  serverMessages: NormalizedMessage[],
+  claimedServerIds: Set<string>,
+): boolean {
+  if (liveMessage.id.startsWith('local_')) {
+    return false;
+  }
+
+  const liveFingerprint = userTurnFingerprint(liveMessage);
+  if (!liveFingerprint) {
+    return false;
+  }
+
+  for (const serverMessage of serverMessages) {
+    if (claimedServerIds.has(serverMessage.id)) {
+      continue;
+    }
+    const serverFingerprint = userTurnFingerprint(serverMessage);
+    if (!serverFingerprint || !userTurnFingerprintsMatch(liveFingerprint, serverFingerprint)) {
+      continue;
+    }
+    claimedServerIds.add(serverMessage.id);
+    return true;
+  }
+
+  return false;
+}
+
 function findServerEchoForLocalUser(
   localMessage: NormalizedMessage,
   serverMessages: NormalizedMessage[],

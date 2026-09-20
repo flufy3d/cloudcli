@@ -49,6 +49,7 @@ import {
   readFrameSessionId,
 } from '@shared/protocol/frameNarrowing';
 import {
+  claimServerUserEcho,
   mergeProviderUserEchoIntoOptimisticRow,
   reconcileOptimisticUserEchoes,
   upsertToolUseRow,
@@ -343,6 +344,11 @@ function pruneRealtimeSupersededByServer(
     retiredOptimisticUserAnchors.set(localId, serverId);
   }
 
+  // Persisted user rows an optimistic prompt already took over. Kept apart
+  // from the tool-card claims so the two never compete for one row, and
+  // seeded here so a provider echo cannot re-claim a turn already retired.
+  const claimedServerUserIds = new Set<string>(retiredAnchors.values());
+
   const turnRangeFromStart = (start: number): NormalizedMessage[] => {
     const end = serverMessages.findIndex(
       (candidate, index) => index > start && candidate.kind === 'text' && candidate.role === 'user',
@@ -412,7 +418,13 @@ function pruneRealtimeSupersededByServer(
     }
 
     if (message.kind === 'text' && message.role === 'user') {
-      return true;
+      // The optimistic row stays: it is this turn's only boundary marker, and
+      // hiding it is the merge stage's job. A row that never was optimistic
+      // has no such duty, so the transcript's own copy supersedes it.
+      if (message.id.startsWith('local_')) {
+        return true;
+      }
+      return !claimServerUserEcho(message, serverMessages, claimedServerUserIds);
     }
 
     if (message.kind === 'tool_use' && message.toolId) {

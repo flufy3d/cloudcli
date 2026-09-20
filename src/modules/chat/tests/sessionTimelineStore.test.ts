@@ -1320,3 +1320,55 @@ test('returning to a tool-heavy tail does not resurrect retired user echoes', as
     'only the current prompt survives when older server rows fall outside the returned tail page',
   );
 });
+
+/**
+ * A user row can reach the live stream without ever having been an optimistic
+ * prompt: a second tab (or phone) sent it, or the engine echoed it back on a
+ * resume. Retirement keys off the `local_` prefix, so such a row was retained
+ * forever and rendered beside its own persisted copy — the prompt appeared
+ * twice, and a reload did not clear it.
+ */
+test('a user row that never was an optimistic prompt is pruned once the transcript holds it', async () => {
+  const store = new SessionTimelineStore({
+    fetchPage: async () => ({
+      messages: [
+        msg(1, { id: 'srv_user', content: 'ship it' }),
+        msg(2, { id: 'srv_reply', content: 'done' }),
+      ],
+      total: 2,
+      hasMore: false,
+    }),
+  });
+
+  store.appendRealtime(SESSION_ID, msg(1, { id: 'live_user', content: 'ship it' }));
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
+
+  const prompts = store.getMessages(SESSION_ID).filter(
+    (row) => row.kind === 'text' && row.role === 'user' && row.content === 'ship it',
+  );
+  assert.equal(prompts.length, 1, 'the prompt must not render as both a live copy and a persisted one');
+});
+
+/** Two genuinely distinct sends of the same text must both survive: the claim
+ * is one-to-one, so the second live row keeps its own persisted counterpart. */
+test('repeated identical prompts each keep exactly one row', async () => {
+  const store = new SessionTimelineStore({
+    fetchPage: async () => ({
+      messages: [
+        msg(1, { id: 'srv_a', content: 'again' }),
+        msg(3, { id: 'srv_b', content: 'again' }),
+      ],
+      total: 2,
+      hasMore: false,
+    }),
+  });
+
+  store.appendRealtime(SESSION_ID, msg(1, { id: 'live_a', content: 'again' }));
+  store.appendRealtime(SESSION_ID, msg(3, { id: 'live_b', content: 'again' }));
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
+
+  const prompts = store.getMessages(SESSION_ID).filter(
+    (row) => row.kind === 'text' && row.role === 'user' && row.content === 'again',
+  );
+  assert.equal(prompts.length, 2, 'two real sends must not collapse into one');
+});
