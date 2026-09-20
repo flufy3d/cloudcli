@@ -29,6 +29,10 @@ const everyDiff: GitDiffMap = {
   'src/c.ts': '@@ -1 +1 @@\n-old c\n+new c',
 };
 
+function createFileDiffFetcher() {
+  return vi.fn<(filePath: string) => Promise<void>>(async () => {});
+}
+
 function renderChangesView(gitDiff: GitDiffMap, onFetchFileDiff: (filePath: string) => Promise<void>) {
   const noop = async () => {};
   return render(
@@ -66,7 +70,7 @@ function expandToggles(container: HTMLElement): HTMLElement[] {
 }
 
 test('no diff is requested until a file row is expanded', () => {
-  const onFetchFileDiff = vi.fn(async () => {});
+  const onFetchFileDiff = createFileDiffFetcher();
 
   renderChangesView({}, onFetchFileDiff);
 
@@ -74,7 +78,7 @@ test('no diff is requested until a file row is expanded', () => {
 });
 
 test('expanding one row requests only that file diff', () => {
-  const onFetchFileDiff = vi.fn(async () => {});
+  const onFetchFileDiff = createFileDiffFetcher();
 
   const { container } = renderChangesView({}, onFetchFileDiff);
   fireEvent.click(expandToggles(container)[1]);
@@ -86,7 +90,7 @@ test('expanding one row requests only that file diff', () => {
 });
 
 test('collapsed rows keep their diff out of the DOM', () => {
-  const onFetchFileDiff = vi.fn(async () => {});
+  const onFetchFileDiff = createFileDiffFetcher();
 
   const { container } = renderChangesView(everyDiff, onFetchFileDiff);
   assert.equal(container.querySelectorAll('.diff-viewer').length, 0);
