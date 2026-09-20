@@ -8,7 +8,11 @@ import multer from 'multer';
 import { projectsDb } from '@/modules/database/index.js';
 import { createFileTreeRouter } from '@/modules/file-tree/file-tree.routes.js';
 import { createFileTreeService } from '@/modules/file-tree/file-tree.service.js';
-import { getAntigravityBrainRoots, getZcodeExternalReadOnlyRoots } from '@/modules/providers/index.js';
+import {
+  getAntigravityBrainRoots,
+  getClaudeExternalReadOnlyRoots,
+  getZcodeExternalReadOnlyRoots,
+} from '@/modules/providers/index.js';
 import { getGlobalImageAssetsDir } from '@/shared/image-attachments.js';
 import type {
   FileTreeFileSystem,
@@ -100,14 +104,15 @@ const fileTreeServices = createFileTreeService({
   resolveMimeType: (filePath) => mime.lookup(filePath) || 'application/octet-stream',
   fileSystemConcurrency: readFileSystemConcurrency(),
   logger: fileTreeLogger,
-  // Antigravity writes plan documents into its brain directories, chat
-  // file attachments live in ~/.cloudcli/assets, provider runtimes stage
-  // generated reports and other throwaway artifacts in the OS temp directories,
-  // and ZCode references its memories, skills and AGENTS.md from chat;
-  // this allowlist lets the editor open and preview those files read-only
-  // without widening project-scoped access.
+  // Providers store chat-referenced artifacts outside the active workspace:
+  // Antigravity uses brain directories, Claude uses its per-project tree, and
+  // ZCode uses narrow memory/skill/instruction paths. Attachments live in
+  // ~/.cloudcli/assets, while provider runtimes stage temporary reports under
+  // OS temp directories. The editor may open these roots read-only without
+  // widening project-scoped write access.
   externalReadOnlyRoots: [
     ...getAntigravityBrainRoots(),
+    ...getClaudeExternalReadOnlyRoots(),
     getGlobalImageAssetsDir(),
     ...getExternalTempRoots(),
     ...getZcodeExternalReadOnlyRoots(),

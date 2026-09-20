@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.3.3 / 2026-09-18
+> 基准：2.3.10 / 2026-09-20
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -55,7 +55,7 @@
 
 | 引擎 | 数据根 | 会话产物 |
 | --- | --- | --- |
-| claude | `~/.claude` | `projects/**/*.jsonl` |
+| claude | `~/.claude` | `projects/**/*.jsonl`；`projects/` 作为聊天引用文件的只读根暴露给 file-tree，凭据与设置所在的上层目录不暴露 |
 | codex | `~/.codex` | `sessions/**/*.jsonl` |
 | cursor | `~/.cursor` | `projects/**/*.jsonl` + `store.db` |
 | opencode | `~/.local/share/opencode` | `opencode.db`（共享 SQLite，`jsonl_path` 存 null） |
