@@ -167,6 +167,16 @@ rl.on('line', (line) => {
   }
 
   if (msg.method === 'session/create') {
+    // ZCode 0.16.9 validates create params strictly and no longer accepts the
+    // runtimeModel catalog here. Keep this boundary aligned with the real
+    // engine so a provider upgrade cannot silently reintroduce the breakage.
+    for (const key of Object.keys(msg.params ?? {})) {
+      if (key !== 'workspace') {
+        send({ id: msg.id, error: { code: -32602, message: 'Invalid params — (root): Unrecognized key: "' + key + '"' } });
+        return;
+      }
+    }
+    log('session_create', msg.params);
     if (readMode() === 'create-fail') {
       send({ id: msg.id, error: { code: -32022, message: 'Client request timed out: session/requestRuntimePreferences', data: { timeoutMs: 15000 } } });
       return;
@@ -331,9 +341,25 @@ fsSync.writeFileSync(stubPath, stubScript);
 fsSync.writeFileSync(modeFilePath, 'ok\n');
 fsSync.writeFileSync(logFilePath, '');
 
+const cliConfigDir = path.join(stubDir, 'cli');
+fsSync.mkdirSync(cliConfigDir, { recursive: true });
+fsSync.writeFileSync(path.join(cliConfigDir, 'config.json'), JSON.stringify({
+  provider: {
+    'builtin:bigmodel-coding-plan': {
+      kind: 'anthropic',
+      models: {
+        'GLM-5.3': {
+          reasoning: { enabled: true, levels: ['low', 'high', 'max'], defaultLevel: 'high' },
+        },
+      },
+    },
+  },
+}));
+
 process.env.CLOUDCLI_ZCODE_ENGINE = stubPath;
 process.env.ZCODE_STUB_MODE_FILE = modeFilePath;
 process.env.ZCODE_STUB_LOG = logFilePath;
+process.env.ZCODE_STORAGE_DIR = stubDir;
 
 // The runtime reads the session row (model/effort) via sessionsDb during a
 // run, so the tests need a migrated app database. Without this the lazy
@@ -452,6 +478,24 @@ test('runtime configures model and reasoning effort variant', async () => {
   const setModelPayload = setModelEntry.value as { model: { modelId: string; variant?: string } };
   assert.equal(setModelPayload.model.modelId, 'GLM-5.3');
   assert.equal(setModelPayload.model.variant, 'high');
+
+  const createEntry = readStubLog().filter((entry) => entry.name === 'session_create').at(-1);
+  assert.deepEqual(createEntry?.value, {
+    workspace: {
+      workspacePath: stubDir,
+      workspaceKey: stubDir,
+    },
+  });
+
+  const sendEntry = readStubLog().filter((entry) => entry.name === 'session_send').at(-1);
+  const sendPayload = sendEntry?.value as {
+    runtimeModel?: { model?: { providerId?: string; modelId?: string; variant?: string } };
+  };
+  assert.deepEqual(sendPayload.runtimeModel?.model, {
+    providerId: 'builtin:bigmodel-coding-plan',
+    modelId: 'GLM-5.3',
+    variant: 'high',
+  });
 });
 
 test('runtime bridges interaction/requestPermission to the chat stream and answers the engine', async () => {

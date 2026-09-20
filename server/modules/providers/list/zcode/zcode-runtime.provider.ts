@@ -197,11 +197,12 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
   ): Promise<unknown> {
     const appSessionId = readOptionalString(options.sessionId) ?? null;
     const sessionSummary = readOptionalString(options.sessionSummary);
-    // Seed the engine's workspace model catalog with every session request:
+    // Seed the engine's workspace model catalog where the protocol accepts it:
     // remote clients start with an empty catalog, and a cold resume of a
-    // session whose transcript references unresolvable models would
-    // otherwise be poisoned with a permanent "model unavailable" warning
-    // (-32031 on every send).
+    // session whose transcript references unresolvable models would otherwise
+    // be poisoned with a permanent "model unavailable" warning (-32031 on
+    // every send). ZCode 0.16.9 rejects this field on session/create, so new
+    // sessions receive the catalog with their first session/send instead.
     const runtimeModel = await this.resolveRuntimeModelPayload(options, context);
 
     // Runs before the main try block below; without its own error emission a
@@ -457,10 +458,13 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    *    claude-runtime pattern). `writer.setSessionId` updates the stored
    *    mapping, so the replacement is sticky across subsequent sends.
    *
-   * Both requests carry `runtimeModel` when a model selection is available:
-   * it seeds the engine's workspace model catalog (remote clients start with
-   * an empty one) and prevents the cold-resume "model unavailable" warning
-   * from poisoning sessions whose transcripts reference other provider ids.
+   * Resume carries `runtimeModel` when a model selection is available: it
+   * seeds the engine's workspace model catalog (remote clients start with an
+   * empty one) and prevents the cold-resume "model unavailable" warning from
+   * poisoning sessions whose transcripts reference other provider ids. Create
+   * deliberately sends only `workspace`: ZCode 0.16.9 rejects `runtimeModel`
+   * there with a strict-schema "Unrecognized key" error. The first send seeds
+   * the catalog for newly created sessions instead.
    */
   private async resolveOrCreateSession(
     appSessionId: string | null,
@@ -498,7 +502,6 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
             workspacePath,
             workspaceKey: workspacePath,
           },
-          ...(runtimeModel ? { runtimeModel } : {}),
         }
       );
 

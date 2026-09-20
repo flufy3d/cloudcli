@@ -225,8 +225,9 @@ export function readZCodeSessionModelFromDb(providerSessionId: string): string |
  * so cold-resuming a session whose transcript references models the catalog
  * cannot resolve marks it with a permanent "model unavailable" warning
  * (-32031 on every send, immune to session/setModel). Attaching a
- * `runtimeModel` to session/resume|create|send both seeds the catalog and
- * clears that warning.
+ * `runtimeModel` to session/resume|send both seeds the catalog and clears that
+ * warning. ZCode 0.16.9 rejects the field on session/create, so new sessions
+ * receive it with their first send instead.
  *
  * Shape (engine schema `Of`, strict): `revision` (string), `generatedAt`
  * (epoch ms), `model` ({providerId, modelId, variant?}), `provider` (the
