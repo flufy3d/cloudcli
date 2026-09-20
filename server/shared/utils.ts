@@ -600,9 +600,15 @@ export const readTrimmedStringRecord = (value: unknown): Record<string, string> 
  * Sessions recording such directories must never surface as projects: every
  * `pnpm run deploy` creates a fresh pnpm virtual store directory for the
  * globally installed app, and a session created there (a spawn-cwd fallback)
- * would otherwise register a new empty project per deployment. Filters cover
- * pnpm's `.pnpm` virtual store, any `node_modules` segment, and system temp
- * roots (`os.tmpdir()`, macOS `/var/folders`, `/tmp`).
+ * would otherwise register a new empty project per deployment. The filters are
+ * pnpm's `.pnpm` virtual store and any `node_modules` segment.
+ *
+ * A system temp root is **not** infrastructure. Working out of `/tmp` is
+ * ordinary — a scratch clone, a bug repro — and rejecting it made those
+ * sessions vanish from the project list with no error to explain it. The
+ * deployment leak this guard exists for lands in the pnpm store, which the
+ * segment filters already cover, and the runtime no longer falls back to its
+ * own cwd, so the temp-root rule only ever cost real projects.
  *
  * Consumers: the SQLite session synchronizer skeleton (row admission) and
  * its tests.
@@ -611,10 +617,7 @@ export const isInfrastructureWorkspacePath = (projectPath: string): boolean => {
   const normalized = projectPath.trim().replace(/\/+$/, '');
   if (!normalized) return true;
   const segments = normalized.split('/');
-  if (segments.includes('node_modules') || segments.includes('.pnpm')) return true;
-  const tempRoots = [os.tmpdir(), '/var/folders', '/private/var/folders', '/tmp', '/private/tmp']
-    .map((root) => root.replace(/\/+$/, ''));
-  return tempRoots.some((root) => normalized === root || normalized.startsWith(`${root}/`));
+  return segments.includes('node_modules') || segments.includes('.pnpm');
 };
 
 // ---------------------------

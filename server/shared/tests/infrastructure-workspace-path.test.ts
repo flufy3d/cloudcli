@@ -5,7 +5,7 @@ import { test } from 'node:test';
 
 import { isInfrastructureWorkspacePath } from '@/shared/utils.js';
 
-test('isInfrastructureWorkspacePath rejects package-manager stores and temp roots', () => {
+test('isInfrastructureWorkspacePath rejects package-manager stores', () => {
   // pnpm virtual store of the deployed build (one new directory per deploy).
   assert.equal(
     isInfrastructureWorkspacePath(
@@ -15,11 +15,6 @@ test('isInfrastructureWorkspacePath rejects package-manager stores and temp root
   );
   // Any node_modules segment.
   assert.equal(isInfrastructureWorkspacePath('/srv/app/node_modules/fixtures/demo'), true);
-  // System temp roots, including macOS os.tmpdir() and its /private prefix.
-  assert.equal(isInfrastructureWorkspacePath(path.join(os.tmpdir(), 'probe-ws-abc')), true);
-  assert.equal(isInfrastructureWorkspacePath('/var/folders/8d/T/tmp.P0y7IJ0uww'), true);
-  assert.equal(isInfrastructureWorkspacePath('/tmp/agy-repro'), true);
-  assert.equal(isInfrastructureWorkspacePath('/private/tmp/agy-repro'), true);
   // Empty / whitespace-only paths are treated as infrastructure.
   assert.equal(isInfrastructureWorkspacePath(''), true);
   assert.equal(isInfrastructureWorkspacePath('   '), true);
@@ -27,6 +22,13 @@ test('isInfrastructureWorkspacePath rejects package-manager stores and temp root
 
 test('isInfrastructureWorkspacePath keeps real user projects', () => {
   assert.equal(isInfrastructureWorkspacePath('/Users/azrael/workspaces/cloudcli'), false);
+  // A scratch clone or bug repro under a temp root is a real project: rejecting
+  // it dropped the session from the list with nothing to explain the absence.
+  assert.equal(isInfrastructureWorkspacePath(path.join(os.tmpdir(), 'probe-ws-abc')), false);
+  assert.equal(isInfrastructureWorkspacePath('/tmp/agy-repro'), false);
+  assert.equal(isInfrastructureWorkspacePath('/private/tmp/agy-repro'), false);
+  // Infrastructure nested under a temp root is still infrastructure.
+  assert.equal(isInfrastructureWorkspacePath('/tmp/build/node_modules/pkg'), true);
   assert.equal(isInfrastructureWorkspacePath('/Users/azrael/workspaces/MirLite'), false);
   // Trailing slashes must not break the match.
   assert.equal(isInfrastructureWorkspacePath('/home/dev/my-project/'), false);
