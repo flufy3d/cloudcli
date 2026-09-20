@@ -45,30 +45,35 @@ function capture(cmd, args) {
   }
 }
 
-// ── 0. 更新版本号（自增第三位 patch 版本） ──────────────────
+// ── 0. 更新版本号（自增第三位 patch；--no-bump 沿用当前版本号） ──
 const pkgJsonPath = path.join(REPO_ROOT, 'package.json');
-const pkgData = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
-const semverParts = (pkgData.version || '1.0.0').split('.');
-if (semverParts.length >= 3) {
-  semverParts[2] = String(parseInt(semverParts[2], 10) + 1);
-  pkgData.version = semverParts.join('.');
+const pkgData = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+if (process.argv.includes('--no-bump')) {
+  // 发版流水线已提交版本号并打 tag，再自增会让线上版本串偏离 release 版本号。
+  console.log(`\n[deploy] --no-bump：沿用版本号 v${pkgData.version}`);
 } else {
-  pkgData.version = `${pkgData.version || '1.0'}.1`;
-}
-fs.writeFileSync(pkgJsonPath, JSON.stringify(pkgData, null, 2) + '\n');
-console.log(`\n[deploy] 版本号自增至：v${pkgData.version}`);
+  const semverParts = (pkgData.version || '1.0.0').split('.');
+  if (semverParts.length >= 3) {
+    semverParts[2] = String(parseInt(semverParts[2], 10) + 1);
+    pkgData.version = semverParts.join('.');
+  } else {
+    pkgData.version = `${pkgData.version || '1.0'}.1`;
+  }
+  fs.writeFileSync(pkgJsonPath, JSON.stringify(pkgData, null, 2) + '\n');
+  console.log(`\n[deploy] 版本号自增至：v${pkgData.version}`);
 
-// 自增本身会把工作区弄脏，而构建指纹（vite.config.js）按 `git status --porcelain`
-// 判定 -dirty，于是每次部署的版本号都被自己标成 dirty。把这一行改动单独提交掉，
-// dirty 就只在真有未提交改动时出现。只提交 package.json，不碰工作区其它改动；
-// 钩子跳过 —— 这里改的只是一个版本号。
-const versionCommit = capture('git', [
-  'commit', '--no-verify', '-m', `chore(release): v${pkgData.version}`, '--', pkgJsonPath,
-]);
-if (versionCommit === null) {
-  console.warn('[deploy] ! 版本号提交失败（不在 git 仓库、或有冲突未解决），构建指纹会带 -dirty');
-} else {
-  console.log(`[deploy] 已提交版本号变更：chore(release): v${pkgData.version}`);
+  // 自增本身会把工作区弄脏，而构建指纹（vite.config.js）按 `git status --porcelain`
+  // 判定 -dirty，于是每次部署的版本号都被自己标成 dirty。把这一行改动单独提交掉，
+  // dirty 就只在真有未提交改动时出现。只提交 package.json，不碰工作区其它改动；
+  // 钩子跳过 —— 这里改的只是一个版本号。
+  const versionCommit = capture('git', [
+    'commit', '--no-verify', '-m', `chore(release): v${pkgData.version}`, '--', pkgJsonPath,
+  ]);
+  if (versionCommit === null) {
+    console.warn('[deploy] ! 版本号提交失败（不在 git 仓库、或有冲突未解决），构建指纹会带 -dirty');
+  } else {
+    console.log(`[deploy] 已提交版本号变更：chore(release): v${pkgData.version}`);
+  }
 }
 
 // ── 1. 编译 ────────────────────────────────────────────────

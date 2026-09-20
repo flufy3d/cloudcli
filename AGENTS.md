@@ -27,7 +27,7 @@ For every task that creates, modifies, refactors, or reviews backend code under 
 The **production instance** runs from a global pnpm install (`~/Library/pnpm/global/5/node_modules/cloudcli`) as a static copy fully detached from this repo — editing repo code or running dev here never affects it. PM2 persists its config in `~/.pm2/ecosystem.config.cjs` (process env vars must live there; PM2-managed processes never read `.zshrc`).
 
 - Application name: `cloudcli`
-- Publish a new build: `pnpm run deploy` (build → pack → global install → PM2 cutover → `pm2 save`). Run it in a terminal **outside** any cloudcli-hosted session — the cutover drops the session's own server.
+- Publish a new build: `pnpm run deploy` (build → pack → global install → PM2 cutover → `pm2 save`); the script auto-increments the patch version and commits it. Release-pipeline deploys pass `--no-bump` to keep the tagged release version instead. Run it in a terminal **outside** any cloudcli-hosted session — the cutover drops the session's own server.
 - Service port: `3030` (`http://localhost:3030`)
 - Restart command: `pm2 restart cloudcli`
 - Logs command: `pm2 logs cloudcli`
