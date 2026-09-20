@@ -1210,6 +1210,26 @@ test('a repeated prompt is not retired by the identical prompt already on screen
   assert.equal(userRows.length, 2, 'the newly sent prompt must still be visible');
 });
 
+test('a wholesale session reload keeps a genuinely pending repeated prompt', async () => {
+  const earlier = msg(1, { id: 'srv-old', content: 'continue' });
+  const reply = msg(2, { id: 'srv-reply', content: 'done' });
+  const page = { messages: [earlier, reply], total: 2, hasMore: false };
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 20, offset: 0 }, page },
+    { params: { limit: 20, offset: 0 }, page: { ...page, messages: [earlier, reply] } },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  store.appendRealtime(SESSION_ID, msg(3, { id: 'local_repeat', content: 'continue' }));
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.role === 'user').map((row) => row.id),
+    ['srv-old', 'local_repeat'],
+  );
+});
+
 /**
  * The send-time row count has to survive the pages that arrive after it.
  *
@@ -1254,4 +1274,49 @@ test('an older page prepended after sending does not strand the optimistic promp
 
   const userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
   assert.equal(userRows.length, 2, 'the sent prompt must not be retired by the older identical one');
+});
+
+test('returning to a tool-heavy tail does not resurrect retired user echoes', async () => {
+  const turn1 = [
+    msg(1, { id: 'server-u1', content: 'u1' }),
+    msg(2, { id: 'server-a1', content: 'a1' }),
+  ];
+  const turn2 = [
+    ...turn1,
+    msg(3, { id: 'server-u2', content: 'u2' }),
+    msg(4, { id: 'server-a2', content: 'a2' }),
+  ];
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 20, offset: 0 }, page: { messages: turn1, total: 2, hasMore: false } },
+    { params: { limit: 20, offset: 0 }, page: { messages: turn2, total: 4, hasMore: false } },
+    {
+      params: { limit: 20, offset: 0 },
+      page: {
+        messages: [msg(6, { id: 'tail-tool', kind: 'tool_use', role: undefined, content: '' })],
+        total: 6,
+        hasMore: true,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  store.appendRealtime(SESSION_ID, msg(1, { id: 'local_u1', content: 'u1' }));
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 20 });
+  store.appendRealtime(SESSION_ID, msg(3, { id: 'local_u2', content: 'u2' }));
+  await store.refreshLatestFromServer(SESSION_ID, { limit: 20 });
+  store.appendRealtime(SESSION_ID, msg(5, { id: 'local_u3', content: 'u3' }));
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.role === 'user').map((row) => row.id),
+    ['server-u1', 'server-u2', 'local_u3'],
+    'precondition: two persisted turns precede the current pending prompt',
+  );
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.role === 'user').map((row) => row.id),
+    ['local_u3'],
+    'only the current prompt survives when older server rows fall outside the returned tail page',
+  );
 });

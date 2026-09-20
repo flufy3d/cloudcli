@@ -86,6 +86,13 @@ export type SessionSlot = {
   serverMessages: NormalizedMessage[];
   realtimeMessages: NormalizedMessage[];
   /**
+   * Remembers which persisted user row took over each optimistic `local_*`
+   * echo. The pairing outlives paginated server windows so a session reload
+   * cannot revive already-retired prompts when their server rows fall outside
+   * the latest page; the retained local row still anchors unfinished live work.
+   */
+  retiredOptimisticUserAnchors: Map<string, string>;
+  /**
    * For each realtime row, the id of the last server row that was already
    * present when the row first arrived — everything the transcript held by
    * then necessarily happened before it. Recorded once per row and never
@@ -123,6 +130,7 @@ function createEmptySlot(): SessionSlot {
   return {
     serverMessages: EMPTY,
     realtimeMessages: EMPTY,
+    retiredOptimisticUserAnchors: new Map(),
     realtimeArrivalAnchors: new Map(),
     merged: EMPTY,
     _lastServerRef: EMPTY,
@@ -301,6 +309,7 @@ function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedM
 function pruneRealtimeSupersededByServer(
   serverMessages: NormalizedMessage[],
   realtimeMessages: NormalizedMessage[],
+  retiredOptimisticUserAnchors: Map<string, string>,
 ): NormalizedMessage[] {
   if (realtimeMessages.length === 0) {
     return realtimeMessages;
@@ -330,6 +339,9 @@ function pruneRealtimeSupersededByServer(
   // back empty, and fingerprint pairing — the only thing that can match a
   // provider whose two transports use different tool ids — was unreachable.
   const { retiredAnchors } = reconcileOptimisticUserEchoes(serverMessages, realtimeMessages);
+  for (const [localId, serverId] of retiredAnchors) {
+    retiredOptimisticUserAnchors.set(localId, serverId);
+  }
 
   const turnRangeFromStart = (start: number): NormalizedMessage[] => {
     const end = serverMessages.findIndex(
@@ -360,7 +372,7 @@ function pruneRealtimeSupersededByServer(
       return [];
     }
 
-    const pairedServerId = retiredAnchors.get(userMessage.id);
+    const pairedServerId = retiredOptimisticUserAnchors.get(userMessage.id);
     if (pairedServerId) {
       const start = serverMessages.findIndex((candidate) => candidate.id === pairedServerId);
       if (start >= 0) return turnRangeFromStart(start);
@@ -536,16 +548,23 @@ function computeMerged(
   server: NormalizedMessage[],
   realtime: NormalizedMessage[],
   arrivalAnchors: Map<string, string>,
+  retiredOptimisticUserAnchors: Map<string, string>,
 ): NormalizedMessage[] {
   if (realtime.length === 0) {
     return dedupeAdjacentAssistantEchoes(server);
   }
-  if (server.length === 0) {
-    return dedupeAdjacentAssistantEchoes(realtime);
-  }
 
   const serverIds = new Set(server.map((message) => message.id));
-  const { messages: reconciledRealtime, retiredAnchors } = reconcileOptimisticUserEchoes(server, realtime);
+  const reconciliation = reconcileOptimisticUserEchoes(server, realtime);
+  for (const [localId, serverId] of reconciliation.retiredAnchors) {
+    retiredOptimisticUserAnchors.set(localId, serverId);
+  }
+  const reconciledRealtime = reconciliation.messages.filter(
+    (message) => !retiredOptimisticUserAnchors.has(message.id),
+  );
+  if (server.length === 0) {
+    return dedupeAdjacentAssistantEchoes(reconciledRealtime);
+  }
   const providerRowReconciliations = new Map<string, ReturnType<typeof reconcileProviderRowText>>();
   const reconcileRealtimeProviderRow = (message: NormalizedMessage) => {
     const cached = providerRowReconciliations.get(message.id);
@@ -605,7 +624,12 @@ function computeMerged(
     stableMergeMessageSources(
       prunedServer,
       extra,
-      resolveRealtimeFloors(prunedServer, realtime, retiredAnchors, arrivalAnchors),
+      resolveRealtimeFloors(
+        prunedServer,
+        realtime,
+        retiredOptimisticUserAnchors,
+        arrivalAnchors,
+      ),
     ),
   );
 }
@@ -624,7 +648,11 @@ function computeMerged(
 function restampPendingPrompts(slot: SessionSlot, adjust: (stamp: number) => number): void {
   let changed = false;
   const next = slot.realtimeMessages.map((row) => {
-    if (!row.id.startsWith('local_') || row.replacesAfterRowCount === undefined) {
+    if (
+      !row.id.startsWith('local_')
+      || row.replacesAfterRowCount === undefined
+      || slot.retiredOptimisticUserAnchors.has(row.id)
+    ) {
       return row;
     }
     const restamped = adjust(row.replacesAfterRowCount);
@@ -662,11 +690,19 @@ function recordRealtimeArrivalAnchors(slot: SessionSlot): void {
 
   // Rows retired by a prune or a replacement leave their stamps behind; drop
   // them so a long-lived session's map stays proportional to its live rows.
-  if (anchors.size > slot.realtimeMessages.length) {
+  if (
+    anchors.size > slot.realtimeMessages.length
+    || slot.retiredOptimisticUserAnchors.size > slot.realtimeMessages.length
+  ) {
     const liveIds = new Set(slot.realtimeMessages.map((message) => message.id));
     for (const id of anchors.keys()) {
       if (!liveIds.has(id)) {
         anchors.delete(id);
+      }
+    }
+    for (const id of slot.retiredOptimisticUserAnchors.keys()) {
+      if (!liveIds.has(id)) {
+        slot.retiredOptimisticUserAnchors.delete(id);
       }
     }
   }
@@ -683,7 +719,12 @@ function recomputeMergedIfNeeded(slot: SessionSlot): boolean {
   slot._lastServerRef = slot.serverMessages;
   slot._lastRealtimeRef = slot.realtimeMessages;
   recordRealtimeArrivalAnchors(slot);
-  slot.merged = computeMerged(slot.serverMessages, slot.realtimeMessages, slot.realtimeArrivalAnchors);
+  slot.merged = computeMerged(
+    slot.serverMessages,
+    slot.realtimeMessages,
+    slot.realtimeArrivalAnchors,
+    slot.retiredOptimisticUserAnchors,
+  );
   return true;
 }
 
@@ -1058,6 +1099,7 @@ export class SessionTimelineStore {
         slot.realtimeMessages = pruneRealtimeSupersededByServer(
           slot.serverMessages,
           slot.realtimeMessages,
+          slot.retiredOptimisticUserAnchors,
         );
         this.discardStreamBufferIfPruned(sessionId, realtimeBeforePrune, slot.realtimeMessages);
         recomputeMergedIfNeeded(slot);
@@ -1302,6 +1344,7 @@ export class SessionTimelineStore {
     const prunedRealtimeMessages = pruneRealtimeSupersededByServer(
       nextServerMessages,
       slot.realtimeMessages,
+      slot.retiredOptimisticUserAnchors,
     );
     if (
       nextServerMessages.length === previousServerMessages.length
