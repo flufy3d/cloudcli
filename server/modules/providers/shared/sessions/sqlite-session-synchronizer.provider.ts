@@ -22,7 +22,9 @@ import Database from 'better-sqlite3';
 import { sessionsDb } from '@/modules/database/index.js';
 import type { IProviderSessionSynchronizer } from '@/shared/interfaces.js';
 import type { LLMProvider, ProviderSessionWatchTarget } from '@/shared/types.js';
-import { isInfrastructureWorkspacePath, normalizeProviderTimestamp, normalizeSessionName, readOptionalString } from '@/shared/utils.js';
+import { normalizeProviderTimestamp, normalizeSessionName, readOptionalString } from '@/shared/utils.js';
+
+import { admitsWorkspacePath } from './workspace-admission.js';
 
 /**
  * Minimal row contract every adapter's SQL must satisfy; adapters declare
@@ -201,10 +203,7 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
       return null;
     }
 
-    // Engine-internal workspaces (package-manager stores, temp dirs) are
-    // runtime artifacts, not user projects; indexing them would register one
-    // garbage project per deployment.
-    if (isInfrastructureWorkspacePath(projectPath)) {
+    if (!admitsWorkspacePath(projectPath)) {
       return null;
     }
 

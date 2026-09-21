@@ -13,6 +13,8 @@ import {
 import type { IProviderSessionSynchronizer } from '@/shared/interfaces.js';
 import type { ProviderSessionWatchTarget } from '@/shared/types.js';
 
+import { admitsWorkspacePath } from '../../shared/sessions/workspace-admission.js';
+
 type ParsedSession = {
   sessionId: string;
   projectPath: string;
@@ -132,6 +134,12 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
     });
 
     if (!parsed || parsed.isSubagent) {
+      return null;
+    }
+
+    // A transcript whose cwd is engine infrastructure, or a sandbox directory
+    // the system has since reaped, is not a project.
+    if (!admitsWorkspacePath(parsed.projectPath)) {
       return null;
     }
 

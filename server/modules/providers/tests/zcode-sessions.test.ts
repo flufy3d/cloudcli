@@ -1011,6 +1011,11 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
   await withZCodeStorage(async (storageDir) => {
     await createFixtureDatabase(storageDir, 'sess_sync');
 
+    // Session indexing only admits a workspace that exists on disk, so the
+    // fixture's directory has to be a real one.
+    const workspaceDir = path.join(storageDir, 'workspace');
+    await mkdir(workspaceDir, { recursive: true });
+
     // The synchronizer reads the session table, which the history fixture
     // does not create: add the top-level row plus a subagent row to filter.
     const Database = (await import('better-sqlite3')).default;
@@ -1029,8 +1034,8 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
       const insertSession = db.prepare(
         'INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)',
       );
-      insertSession.run('sess_sync', null, '/workspace/sess_sync', 'Fixture session', 1000, 2000);
-      insertSession.run('sess_subagent_agent_x', 'sess_sync', '/workspace/sess_sync', 'Subagent', 9000, 9500);
+      insertSession.run('sess_sync', null, workspaceDir, 'Fixture session', 1000, 2000);
+      insertSession.run('sess_subagent_agent_x', 'sess_sync', workspaceDir, 'Subagent', 9000, 9500);
     } finally {
       db.close();
     }
@@ -1041,7 +1046,7 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
 
       const indexed = sessionsDb.getSessionByProviderSessionId('sess_sync');
       assert.equal(indexed?.provider, 'zcode');
-      assert.equal(indexed?.project_path, '/workspace/sess_sync');
+      assert.equal(indexed?.project_path, workspaceDir);
       assert.equal(indexed?.custom_name, 'Fixture session');
       assert.equal(indexed?.jsonl_path, null);
 
