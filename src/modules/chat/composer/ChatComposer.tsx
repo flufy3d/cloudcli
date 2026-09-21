@@ -98,6 +98,8 @@ type ChatComposerProps = {
   scheduledMessages: ScheduledMessage[];
   /** Recurring jobs bound to this session, shown above the input. */
   scheduledJobs: ScheduledJob[];
+  /** Whether the scheduled-tasks feature is on; hides the repeat entry when off. */
+  scheduledJobsEnabled: boolean;
   onScheduleMessage: (scheduledFor: Date) => void;
   onScheduleRecurring: (schedule: { cronExpression: string; timezone: string }) => void;
   onCancelScheduledMessage: (id: string) => void;
@@ -175,6 +177,7 @@ function ChatComposer({
   onCancelEditMessage,
   scheduledMessages,
   scheduledJobs,
+  scheduledJobsEnabled,
   onScheduleMessage,
   onScheduleRecurring,
   onCancelScheduledMessage,
@@ -523,6 +526,7 @@ function ChatComposer({
               onSchedule={onScheduleMessage}
               onScheduleRecurring={onScheduleRecurring}
               supportsNativeScheduling={supportsNativeScheduling}
+              recurringEnabled={scheduledJobsEnabled}
             />
 
             <ComposerModelMenu

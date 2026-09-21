@@ -44,6 +44,7 @@ function ChatInterface({
   externalMessageUpdate,
   newSessionTrigger,
   onShowAllTasks,
+  scheduledJobsEnabled = false,
 }: ChatInterfaceProps) {
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
   const { subscribe } = useWebSocket();
@@ -579,7 +580,8 @@ function ChatInterface({
           editRevertsFiles={editRevertsFiles}
           onCancelEditMessage={cancelEditMessage}
           scheduledMessages={scheduledMessages}
-          scheduledJobs={scheduledJobs}
+          scheduledJobs={scheduledJobsEnabled ? scheduledJobs : []}
+          scheduledJobsEnabled={scheduledJobsEnabled}
           onScheduleMessage={handleScheduleMessage}
           onScheduleRecurring={handleScheduleRecurring}
           onCancelScheduledMessage={cancelScheduledMessage}

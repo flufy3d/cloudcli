@@ -12,6 +12,8 @@ type WorkspaceTabsProps = {
   setActiveTab: Dispatch<SetStateAction<AppTab>>;
   shouldShowTasksTab: boolean;
   shouldShowBrowserTab: boolean;
+  /** The Scheduled tab only exists while the feature is enabled in settings. */
+  shouldShowScheduledTab: boolean;
   /** Defaults to true so callers that predate the terminal-tab preference keep the tab. */
   shouldShowShellTab?: boolean;
 };
@@ -73,6 +75,7 @@ export default function WorkspaceTabs({
   setActiveTab,
   shouldShowTasksTab,
   shouldShowBrowserTab,
+  shouldShowScheduledTab,
   shouldShowShellTab = true,
 }: WorkspaceTabsProps) {
   const { t } = useTranslation();
@@ -83,7 +86,7 @@ export default function WorkspaceTabs({
     ...(shouldShowShellTab ? [SHELL_TAB] : []),
     ...(shouldShowBrowserTab ? [BROWSER_TAB] : []),
     ...(shouldShowTasksTab ? [TASKS_TAB] : []),
-    SCHEDULED_TAB,
+    ...(shouldShowScheduledTab ? [SCHEDULED_TAB] : []),
   ];
 
   const pluginTabs: PluginTab[] = plugins
