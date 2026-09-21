@@ -244,6 +244,7 @@ function ChatMessagesPane({
             messages={chatMessages}
             sessionTitle={selectedSession?.title}
             provider={selectedSession?.provider || provider}
+            sessionId={selectedSession?.id ?? null}
             createDiff={createDiff}
           />
         </div>

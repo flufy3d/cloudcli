@@ -43,6 +43,13 @@
 - 批准记忆（`rememberEntry`）各引擎语义不同：claude 往 `allowedTools` 追加一条规则，codex 改答 `acceptForSession`（由引擎自己记住本会话）。
 - **谁来复核由引擎配置决定，适配器不覆盖**：codex 的 `approvals_reviewer`（`user` / `auto_review` / `guardian_subagent`）决定请求是否在到达客户端前就被自动裁决；在 `thread/start` 里写死这个值等于悄悄推翻用户自己的设置。
 
+## 诊断报告
+
+聊天导出菜单里的「Diagnostics (.json)」导出 WebSocket **双向**帧的常驻录制
+（`src/shared/diagnostics/frameRecorder.ts`）加上当前会话的时间线状态。它补的是引擎
+transcript 永远给不出的三类事实：客户端自己多画的行、到了两次的帧、被服务端拒绝的发送。
+细节见 [frontend.md](./frontend.md)。
+
 ## 落盘同步（run 之外的第二条持久化路）
 
 run 结束 → `sessions-watcher.service.ts`（chokidar，watch 根由各引擎 `getSessionWatchTarget()` 声明）→ `session-synchronizer.service.ts` `synchronizeFile` → `sessionsDb` upsert → `session-upserted-broadcast.service.ts` 推 `session_upserted`（侧边栏增量，归 projects 状态管，不归 chat）。会话离开活跃列表（归档：自动归档手动/定时、单会话归档；强制删除）由同一服务推 `session_removed`（批量 `sessionIds` 一帧，前端按 id 从 projects 树剔除，幂等）。历史读取走 `GET /api/providers/sessions/:sessionId/messages`（尾偏移分页：`offset: 0` 是最新一页），读密集缓存见 `session-history-cache.service.ts`。

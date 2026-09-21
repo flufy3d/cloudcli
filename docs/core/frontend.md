@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.4.8 / 2026-09-21
+> 基准：2.5.2 / 2026-09-22
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -78,6 +78,24 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 `src/shared/mcpCapabilitiesFallback.ts`——该文件**零 import**，因为跨树 parity 测试要从服务端目录读它；
 改后端声明而忘了改它会直接让测试红。
 - 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染。
+
+## 诊断报告（帧录制）
+
+`src/shared/diagnostics/frameRecorder.ts` 常驻录制 WebSocket 的**双向**帧，聊天导出菜单里的
+「Diagnostics (.json)」把它连同当前会话的时间线状态一起写成文件。
+
+为什么需要它：消息重复是这个项目反复出现的缺陷，而历次排查都只能依赖**引擎落盘的 transcript**——
+那份记录只能证明引擎收到/写出了什么，永远证明不了「客户端自己多画了一行」「同一帧到了两次」
+「某次发送被服务端拒了」。报告补的正是这三类事实：每帧只留决定行身份的字段
+（`kind` / `id` / `toolId` / `role` / `seq` + 截断摘要），加上导出时刻的
+`serverMessages` / `realtimeMessages` 行 id 列表、乐观行的退休映射、`runEnded`。
+
+两条设计约束：
+
+- **默认开着**。环形缓冲有上限、正文只存摘要，代价是几百 KB；需要先打开才录的日志，
+  等于在真正出问题的那一次没有日志。
+- **store 是按挂载创建的，不是模块单例**，所以报告不能直接 import 它；由 `useSessionStore`
+  注册一个读取器，导出控件按当前会话 id 取。
 
 ## 性能守则（硬约束，都是踩过坑的）
 
