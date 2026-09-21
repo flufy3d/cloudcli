@@ -114,8 +114,20 @@ test('the recorded window drives the live frames, with the model heuristic as fa
     },
   };
 
-  assert.equal(extractTokenBudget(assistantMessage, 1_000_000)?.total, 1_000_000);
+  const recorded = { recorded: 1_000_000, selectedModel: 'opus[1m]' };
+  assert.equal(extractTokenBudget(assistantMessage, recorded)?.total, 1_000_000);
   assert.equal(extractTokenBudget(assistantMessage)?.total, 200_000);
+
+  // Never run here yet, but the user picked the 1M variant: the row's model
+  // still carries the tag the transcript's resolved id drops.
+  assert.equal(
+    extractTokenBudget(assistantMessage, { recorded: null, selectedModel: 'opus[1m]' })?.total,
+    1_000_000,
+  );
+  assert.equal(
+    extractTokenBudget(assistantMessage, { recorded: null, selectedModel: 'claude-opus-5' })?.total,
+    200_000,
+  );
   assert.equal(
     extractTokenBudget({
       ...assistantMessage,
@@ -127,7 +139,7 @@ test('the recorded window drives the live frames, with the model heuristic as fa
   assert.equal(
     extractCumulativeTokenBudget(
       { type: 'result', usage: { input_tokens: 18, output_tokens: 166 } },
-      1_000_000,
+      recorded,
     )?.total,
     1_000_000,
   );

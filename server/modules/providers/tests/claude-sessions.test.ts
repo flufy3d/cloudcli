@@ -687,6 +687,11 @@ test('claude: the recorded context window drives both usage paths identically', 
       // Nothing recorded yet: CONTEXT_WINDOW is the only thing left to go on.
       assert.equal((await provider.getTokenUsage(usageInput)).total, 180_000);
 
+      // The model the user picked for the session keeps the `[1m]` tag the
+      // transcript drops — but it is a heuristic, so CONTEXT_WINDOW still wins.
+      sessionsDb.setSessionModel(sessionId, 'opus[1m]');
+      assert.equal((await provider.getTokenUsage(usageInput)).total, 180_000);
+
       sessionsDb.setSessionContextWindow(sessionId, 1_000_000);
 
       const endpointUsage = await provider.getTokenUsage(usageInput);

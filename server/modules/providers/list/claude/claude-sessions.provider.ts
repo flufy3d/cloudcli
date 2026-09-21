@@ -29,7 +29,7 @@ import {
   truncateSubagentActivity,
 } from '@/shared/utils.js';
 import { sessionsDb } from '@/modules/database/index.js';
-import { readClaudeSessionContextWindow } from '@/modules/providers/services/claude-context-window.js';
+import { readClaudeSessionWindowSources } from '@/modules/providers/services/claude-context-window.js';
 import { summarizeClaudeTokenUsage } from '@/modules/providers/services/claude-usage.js';
 
 const PROVIDER = 'claude';
@@ -1199,7 +1199,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       // composer's counter tracks the conversation instead of being frozen at
       // whatever it was when the session was opened.
       tokenUsage: summarizeClaudeTokenUsage(rawMessages, {
-        recorded: readClaudeSessionContextWindow(sessionId),
+        ...readClaudeSessionWindowSources(sessionId),
         configured: process.env.CONTEXT_WINDOW,
       }),
     };
@@ -1251,7 +1251,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     // Same summarizer the history page uses, so the endpoint and the page can
     // never report a different occupancy or a different window for one session.
     return summarizeClaudeTokenUsage(parseClaudeTranscriptEntries(fileContent), {
-      recorded: readClaudeSessionContextWindow(input.appSessionId),
+      ...readClaudeSessionWindowSources(input.appSessionId),
       configured: process.env.CONTEXT_WINDOW,
     });
   }

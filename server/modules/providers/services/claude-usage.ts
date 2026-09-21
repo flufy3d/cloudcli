@@ -98,6 +98,12 @@ export type ClaudeContextWindowSources = {
   recorded?: number | null;
   /** Raw `CONTEXT_WINDOW` deployment override, unparsed. */
   configured?: string | undefined;
+  /**
+   * Model variant the app recorded for the session (`opus[1m]`). The user's
+   * own selection, so it still carries the window tag that the transcript's
+   * resolved model id drops.
+   */
+  selectedModel?: string | null;
 };
 
 /**
@@ -112,12 +118,15 @@ export type ClaudeContextWindowSources = {
  *    run that actually happened, and it is the same number the live
  *    `token_budget` frames carry, so preferring it is what keeps the reload
  *    path and the realtime path in agreement.
- * 2. `CONTEXT_WINDOW`. A deployment-wide guess, and the only thing available
- *    for a session CloudCLI has never run.
- * 3. The model id. `[1m]` variants carry the 1M-context beta; every other
- *    current model is 200k. This only ever fires for transcripts written
- *    outside CloudCLI, because a transcript records the resolved model id
- *    (`claude-opus-5`) and never the variant tag.
+ * 2. `CONTEXT_WINDOW`. A deployment-wide override, above the heuristics below
+ *    so an operator can still pin a window, and below the measurement above
+ *    because a measurement of this session beats a guess about all of them.
+ * 3. The model. `[1m]` variants carry the 1M-context beta; every other current
+ *    model is 200k. The session's *selected* model is tried first because it
+ *    keeps the tag (`opus[1m]`), which is how a 1M session reopened before it
+ *    has run here still reads as 1M; the transcript's model is the last
+ *    resort, and it only ever decides anything for transcripts written outside
+ *    CloudCLI, since it records the resolved id (`claude-opus-5`).
  */
 export function resolveClaudeContextWindow(
   sources: ClaudeContextWindowSources,
@@ -133,5 +142,7 @@ export function resolveClaudeContextWindow(
     return parsedContextWindow;
   }
 
-  return model?.includes('[1m]') ? 1_000_000 : 200_000;
+  const taggedModel = [sources.selectedModel, model]
+    .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+  return taggedModel?.includes('[1m]') ? 1_000_000 : 200_000;
 }

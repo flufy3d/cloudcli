@@ -49,29 +49,51 @@ export function recordClaudeSessionContextWindow(
 }
 
 /**
- * Reads the recorded context window for one Claude session, or null when the
- * app has never run it (or cannot reach the database).
+ * What one session row knows about its own context window.
+ *
+ * Both fields come from the same row, so they are read together rather than
+ * through two lookups.
+ */
+export type ClaudeSessionWindowSources = {
+  /** Window the SDK reported for this session, or null if it never ran here. */
+  recorded: number | null;
+  /**
+   * Model variant the app recorded for the session (`opus[1m]`, `sonnet[1m]`,
+   * `claude-opus-5`, ...). Unlike the transcript's resolved model id, this is
+   * the selection the user made, so it still carries the `[1m]` window tag —
+   * which is what lets a 1M session reopened before its first turn on this
+   * build show 1M instead of 200k.
+   */
+  selectedModel: string | null;
+};
+
+/**
+ * Reads what one Claude session row knows about its window. Everything is null
+ * when the app has never run the session (or cannot reach the database).
  *
  * Consumers: the Claude sessions provider, which feeds it to the usage
  * resolver for both `/token-usage` and every history page, and the Claude
  * runtime provider, so the per-assistant frames of a resumed session already
  * report the real window instead of waiting for the turn to end.
  */
-export function readClaudeSessionContextWindow(
+export function readClaudeSessionWindowSources(
   sessionId: string | null | undefined,
-): number | null {
+): ClaudeSessionWindowSources {
   if (!sessionId) {
-    return null;
+    return { recorded: null, selectedModel: null };
   }
 
   try {
     const row = sessionsDb.getSessionById(sessionId)
       ?? sessionsDb.getSessionByProviderSessionId(sessionId);
     const recorded = row?.context_window ?? null;
-    return typeof recorded === 'number' && Number.isFinite(recorded) && recorded > 0
-      ? recorded
-      : null;
+    return {
+      recorded: typeof recorded === 'number' && Number.isFinite(recorded) && recorded > 0
+        ? recorded
+        : null,
+      selectedModel: row?.model ?? null,
+    };
   } catch {
-    return null;
+    return { recorded: null, selectedModel: null };
   }
 }

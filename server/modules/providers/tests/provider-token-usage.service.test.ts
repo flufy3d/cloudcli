@@ -240,6 +240,16 @@ test('the recorded context window beats CONTEXT_WINDOW and the model heuristic',
   );
   assert.equal(summarizeClaudeTokenUsage(entries, { configured: '180000' }).total, 180_000);
   assert.equal(summarizeClaudeTokenUsage(entries, {}).total, 200_000);
+
+  // The model the app recorded for the session is the user's own selection, so
+  // it keeps the `[1m]` tag and reads as 1M before the session has ever run
+  // here — but it is still a heuristic, so an explicit CONTEXT_WINDOW wins.
+  assert.equal(summarizeClaudeTokenUsage(entries, { selectedModel: 'opus[1m]' }).total, 1_000_000);
+  assert.equal(summarizeClaudeTokenUsage(entries, { selectedModel: 'claude-opus-5' }).total, 200_000);
+  assert.equal(
+    summarizeClaudeTokenUsage(entries, { selectedModel: 'opus[1m]', configured: '180000' }).total,
+    180_000,
+  );
 });
 
 test('an unusable recorded window falls through instead of pinning a bogus total', () => {
