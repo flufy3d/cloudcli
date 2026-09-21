@@ -79,6 +79,18 @@ function replayOneTurn(server: FakeServer): void {
   notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
 }
 
+/** Waits for something the run produces asynchronously. */
+async function waitFor<T>(read: () => T | undefined): Promise<T> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const value = read();
+    if (value !== undefined) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error('the expected value never arrived');
+}
+
 function runtimeContext(resumed: boolean): ProviderRuntimeContext {
   return {
     resolveProviderSessionId: () => resumed ? THREAD_ID : null,
@@ -178,30 +190,136 @@ test('a failed turn surfaces the error and exits non-zero', async (t) => {
   assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
 });
 
-test('an approval nobody can answer is refused rather than left to block the turn', async (t) => {
-  let decision: unknown;
+test('an approval waits for the user and carries the command it is about', async (t) => {
+  let answer: Promise<unknown> | undefined;
   installFakeAppServer(t, (fake) => {
-    decision = fake.handlers.onRequest?.('item/commandExecution/requestApproval', {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    // A command approval is asked before the item is ever announced, and
+    // carries the command it wants to run (captured from a real request).
+    answer = Promise.resolve(fake.handlers.onRequest?.('item/commandExecution/requestApproval', {
       threadId: THREAD_ID,
       turnId: TURN_ID,
       itemId: 'exec-1',
       startedAtMs: 0,
       kind: 'command',
-    } as any);
-    fake.handlers.onNotification?.('turn/completed', {
+      reason: 'needs network access',
+      command: "/bin/zsh -lc 'rm -rf /etc'",
+      cwd: '/tmp',
+    } as any));
+    // The turn only ends once the approval has been answered.
+    void answer.then(() => notify('turn/completed', {
       threadId: THREAD_ID,
       turn: { id: TURN_ID, status: 'completed', error: null },
-    } as any);
+    }));
   });
   const messages: any[] = [];
 
-  await codexRuntime.run('hey there', {
+  const run = codexRuntime.run('hey there', {
     sessionId: 'app-session',
     cwd: process.cwd(),
   }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
 
-  assert.deepEqual(decision, { decision: 'decline' });
-  const note = messages.find((message) => message.kind === 'task_notification');
-  assert.ok(note, 'the refusal must be visible in the transcript');
-  assert.equal(note.id, 'exec-1_approval');
+  // The prompt reaches the client before anything answers it.
+  const prompt = await waitFor(() => messages.find((message) => message.kind === 'permission_request'));
+  assert.equal(prompt.toolName, 'Bash');
+  assert.deepEqual(JSON.parse(String(prompt.input)), { command: 'rm -rf /etc' });
+  assert.equal(prompt.context.reason, 'needs network access');
+  assert.equal(prompt.canInterrupt, true);
+
+  // It is listed as pending for the session until it is answered.
+  assert.equal(codexRuntime.permissions.listPending('app-session').length, 1);
+
+  codexRuntime.permissions.resolve(prompt.requestId, { allow: true });
+  await run;
+
+  assert.deepEqual(await answer, { decision: 'accept' });
+  assert.ok(messages.some((message) => message.kind === 'permission_resolved' && message.requestId === prompt.requestId));
+  assert.equal(codexRuntime.permissions.listPending('app-session').length, 0);
+});
+
+test('remembering an approval grants it for the whole session', async (t) => {
+  let answer: Promise<unknown> | undefined;
+  installFakeAppServer(t, (fake) => {
+    answer = Promise.resolve(fake.handlers.onRequest?.('item/fileChange/requestApproval', {
+      threadId: THREAD_ID, turnId: TURN_ID, itemId: 'exec-2', startedAtMs: 0,
+    } as any));
+    void answer.then(() => fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null },
+    } as any));
+  });
+  const messages: any[] = [];
+
+  const run = codexRuntime.run('hey there', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const prompt = await waitFor(() => messages.find((message) => message.kind === 'permission_request'));
+  codexRuntime.permissions.resolve(prompt.requestId, { allow: true, rememberEntry: 'codex:fileChange' });
+  await run;
+
+  assert.deepEqual(await answer, { decision: 'acceptForSession' });
+});
+
+test('a denied approval is declined, and one nobody answers is retracted', async (t) => {
+  let denied: Promise<unknown> | undefined;
+  installFakeAppServer(t, (fake) => {
+    denied = Promise.resolve(fake.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      threadId: THREAD_ID, turnId: TURN_ID, itemId: 'exec-3', startedAtMs: 0, kind: 'command',
+    } as any));
+    void denied.then(() => fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null },
+    } as any));
+  });
+  const messages: any[] = [];
+
+  const run = codexRuntime.run('hey there', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const prompt = await waitFor(() => messages.find((message) => message.kind === 'permission_request'));
+  codexRuntime.permissions.resolve(prompt.requestId, { allow: false });
+  await run;
+  assert.deepEqual(await denied, { decision: 'decline' });
+
+  // A run that ends with a prompt still open must retract it, or the card
+  // hangs in the transcript forever.
+  let orphan: Promise<unknown> | undefined;
+  const second: any[] = [];
+  installFakeAppServer(t, (fake) => {
+    orphan = Promise.resolve(fake.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      threadId: THREAD_ID, turnId: TURN_ID, itemId: 'exec-4', startedAtMs: 0, kind: 'command',
+    } as any));
+    fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null },
+    } as any);
+  });
+
+  await codexRuntime.run('hey there', {
+    sessionId: 'app-session-2',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => second.push(message) }, runtimeContext(true));
+
+  assert.ok(second.some((message) => message.kind === 'permission_cancelled'));
+  assert.deepEqual(await orphan, { decision: 'decline' });
+  assert.equal(codexRuntime.permissions.listPending('app-session-2').length, 0);
+});
+
+test('a request that is not an approval is reported as unimplemented', async (t) => {
+  let answer: unknown = 'unset';
+  installFakeAppServer(t, (fake) => {
+    answer = fake.handlers.onRequest?.('mcpServer/elicitation/request', { threadId: THREAD_ID } as any);
+    fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null },
+    } as any);
+  });
+
+  await codexRuntime.run('hey there', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+
+  assert.equal(await answer, undefined);
 });

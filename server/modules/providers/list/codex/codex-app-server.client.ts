@@ -82,12 +82,13 @@ export type CodexAppServerHandlers = {
   onNotification?: (method: string, params: AnyRecord) => void;
   /**
    * Every server-to-client *request*. Returning a value answers it; returning
-   * `undefined` rejects it as unsupported.
+   * `undefined` rejects it as unsupported. A promise is awaited, which is what
+   * lets an approval wait on a human.
    *
    * Answering is not optional: an approval request nobody replies to leaves
    * the turn blocked on it forever.
    */
-  onRequest?: (method: string, params: AnyRecord) => unknown;
+  onRequest?: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
   /** Called once when the child dies, with whatever explains it. */
   onExit?: (reason: string) => void;
 };
@@ -140,17 +141,30 @@ export async function openCodexAppServer(
       const params = (message.params ?? {}) as AnyRecord;
       if (typeof message.id === 'number') {
         // A server-to-client request. It must be answered or whatever asked
-        // for it waits forever.
-        const result = handlers.onRequest?.(message.method, params);
-        if (result === undefined) {
-          write({
-            jsonrpc: '2.0',
-            id: message.id,
-            error: { code: -32601, message: `cloudcli does not implement "${message.method}".` },
-          });
-        } else {
-          write({ jsonrpc: '2.0', id: message.id, result });
-        }
+        // for it waits forever — including an approval, which resolves only
+        // once a human answers it.
+        const requestId = message.id;
+        const unsupported = () => write({
+          jsonrpc: '2.0',
+          id: requestId,
+          error: { code: -32601, message: `cloudcli does not implement "${message.method}".` },
+        });
+        void (async () => {
+          try {
+            const result = await handlers.onRequest?.(message.method as string, params);
+            if (result === undefined) {
+              unsupported();
+              return;
+            }
+            write({ jsonrpc: '2.0', id: requestId, result });
+          } catch (error) {
+            write({
+              jsonrpc: '2.0',
+              id: requestId,
+              error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+            });
+          }
+        })();
         return;
       }
       handlers.onNotification?.(message.method, params);

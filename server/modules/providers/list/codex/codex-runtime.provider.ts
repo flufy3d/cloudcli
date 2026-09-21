@@ -22,6 +22,8 @@
  * - codexRuntime.abort(sessionId) — cancel an active session
  */
 
+import { randomUUID } from 'node:crypto';
+
 import {
   codexAppServer,
   codexAppServerTransport,
@@ -30,6 +32,7 @@ import {
 import {
   codexThreadItemToRows,
   readCodexAppServerItem,
+  readCodexCommandLine,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import {
@@ -40,7 +43,12 @@ import {
   createNormalizedMessage,
   resolveModelEffort,
 } from '@/shared/index.js';
-import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
+import type {
+  AnyRecord,
+  ProviderPermissionDecision,
+  ProviderRuntimeContext,
+  ProviderRuntimeWriter,
+} from '@/shared/index.js';
 import { readObjectRecord } from '@/shared/utils.js';
 
 type ActiveCodexSession = {
@@ -54,6 +62,29 @@ type ActiveCodexSession = {
 
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
 
+/**
+ * One approval Codex is blocked on, waiting for a human.
+ *
+ * `app-server` asks for sandbox escalations as JSON-RPC *requests*, and the
+ * turn stops until one is answered. The answer comes back over a different
+ * connection entirely — the chat gateway's `chat.permission-response` — so the
+ * two are joined here by the request id the `permission_request` frame
+ * carried. Keyed module-wide because `permissions.resolve` is called from
+ * outside any run.
+ */
+type PendingCodexApproval = {
+  /** Answers the JSON-RPC request Codex is waiting on. */
+  settle: (decision: ProviderPermissionDecision | null) => void;
+  /** App session id, for `listPending`. */
+  sessionId: string | null;
+  toolName: string;
+  toolId: string;
+  input: unknown;
+  receivedAt: Date;
+};
+
+const pendingCodexApprovals = new Map<string, PendingCodexApproval>();
+
 /** Default context window reported when the server has not said otherwise. */
 const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
 
@@ -61,8 +92,14 @@ const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
  * Maps a permission mode onto the two knobs `thread/start` takes.
  *
  * Unchanged from the `codex exec` mapping this replaced, so a mode decides
- * exactly what it decided before. What an approval request means is the one
- * difference and it is handled at the request itself.
+ * exactly what it decided before — except that `on-request` now means what it
+ * says: the escalation reaches the user's approval card instead of dying in a
+ * transport with nobody to ask.
+ *
+ * Who reviews an approval is deliberately not set here: Codex's own
+ * `approvals_reviewer` config decides whether a request is auto-reviewed
+ * before it ever reaches a client, and overriding that would quietly undo a
+ * setting the user made.
  */
 function mapPermissionModeToCodexOptions(permissionMode: string): { sandbox: string; approvalPolicy: string } {
   switch (permissionMode) {
@@ -78,6 +115,53 @@ function mapPermissionModeToCodexOptions(permissionMode: string): { sandbox: str
   }
 }
 
+/**
+ * The server-to-client requests that are an approval the user can answer.
+ *
+ * Anything else app-server may ask for (MCP elicitations, tool-side user
+ * input) is answered as unimplemented rather than guessed at.
+ */
+const CODEX_APPROVAL_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+]);
+
+/**
+ * Builds the reply one approval request expects.
+ *
+ * The command and file-change requests share a four-value decision; the
+ * permission request instead answers with the profile it is granted, so
+ * refusing it means granting nothing.
+ *
+ * A null decision is a request nobody answered — a timeout, or the run ending
+ * underneath it — and is refused, never approved.
+ */
+function toCodexApprovalResponse(
+  method: string,
+  params: AnyRecord,
+  decision: ProviderPermissionDecision | null,
+): AnyRecord {
+  if (method === 'item/permissions/requestApproval') {
+    const requested = readObjectRecord(params.permissions) ?? {};
+    return decision?.allow
+      ? {
+        permissions: {
+          ...(requested.network ? { network: requested.network } : {}),
+          ...(requested.fileSystem ? { fileSystem: requested.fileSystem } : {}),
+        },
+        scope: decision.rememberEntry ? 'session' : 'turn',
+      }
+      : { permissions: {}, scope: 'turn' };
+  }
+
+  if (!decision?.allow) {
+    return { decision: 'decline' };
+  }
+  // "Remember this" is a session-scoped approval on Codex's side.
+  return { decision: decision.rememberEntry ? 'acceptForSession' : 'accept' };
+}
+
 /** Turns the shared input items into the `UserInput` shape app-server accepts. */
 function toAppServerInput(items: Array<AnyRecord>): AnyRecord[] {
   return items.map((item) => {
@@ -86,6 +170,10 @@ function toAppServerInput(items: Array<AnyRecord>): AnyRecord[] {
     }
     return { type: 'text', text: String(item.text ?? ''), text_elements: [] };
   });
+}
+
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 /** Reads the context budget out of a `thread/tokenUsage/updated` notification. */
@@ -183,12 +271,24 @@ async function queryCodex(
    */
   const streamedText = new Map<string, string>();
 
+  /**
+   * The tool row each item produced, by item id.
+   *
+   * An approval request names only the item it is about, so this is what lets
+   * the prompt say *which* command or edit is waiting — Codex announces the
+   * item before it asks.
+   */
+  const approvalSubjects = new Map<string, { toolName: string; input: unknown }>();
+
   const emitItem = (rawItem: unknown, timestamp: string): void => {
     const item = readCodexAppServerItem(rawItem);
     if (!item) {
       return;
     }
     for (const row of codexThreadItemToRows(item, timestamp)) {
+      if (row.type === 'tool_use' && !approvalSubjects.has(item.id)) {
+        approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
+      }
       for (const message of context.normalizeMessage(row, capturedSessionId || sessionId || null)) {
         sendMessage(ws, message);
       }
@@ -207,6 +307,94 @@ async function queryCodex(
     }
   };
 
+  /** Approvals this run opened, so the run's end can retract them. */
+  const openApprovalIds = new Set<string>();
+
+  /**
+   * Puts one approval in front of the user and waits for the answer.
+   *
+   * Codex is blocked on the JSON-RPC request until this resolves, so the wait
+   * is unbounded on purpose: a prompt that times out on its own would deny an
+   * action the user was still reading.
+   */
+  const requestApproval = (method: string, params: AnyRecord): Promise<ProviderPermissionDecision | null> => {
+    const itemId = readNonEmptyString(params.itemId) ?? randomUUID();
+    const requestId = randomUUID();
+    // A command approval is asked *before* the item is announced and carries
+    // the command itself; everything else is asked about an item the user has
+    // already seen announced, so the card is rebuilt from that row.
+    const command = readNonEmptyString(params.command);
+    const subject = command
+      ? { toolName: 'Bash', input: JSON.stringify({ command: readCodexCommandLine(command) }) }
+      : approvalSubjects.get(itemId);
+    const reason = readNonEmptyString(params.reason);
+
+    return new Promise<ProviderPermissionDecision | null>((resolve) => {
+      let settled = false;
+      const settleOnce = (decision: ProviderPermissionDecision | null) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        pendingCodexApprovals.delete(requestId);
+        openApprovalIds.delete(requestId);
+        resolve(decision);
+      };
+
+      pendingCodexApprovals.set(requestId, {
+        settle: settleOnce,
+        sessionId: appSessionId || capturedSessionId || null,
+        toolName: subject?.toolName ?? 'Codex',
+        toolId: itemId,
+        input: subject?.input,
+        receivedAt: new Date(),
+      });
+      openApprovalIds.add(requestId);
+
+      sendMessage(ws, createNormalizedMessage({
+        kind: 'permission_request',
+        requestId,
+        toolName: subject?.toolName ?? 'Codex',
+        toolId: itemId,
+        input: subject?.input,
+        context: {
+          // What Codex is asking for beyond running the tool: network access,
+          // a write outside the workspace, and so on.
+          reason: reason ?? (method === 'item/fileChange/requestApproval'
+            ? 'Codex wants to write outside its sandbox.'
+            : 'Codex wants to step outside its sandbox.'),
+        },
+        canInterrupt: true,
+        sessionId: capturedSessionId || sessionId || null,
+        provider: 'codex',
+      }));
+    }).then((decision) => {
+      // Every attached tab drops the prompt, including one that reconnects
+      // mid-run and replays the request frame.
+      sendMessage(ws, createNormalizedMessage({
+        kind: 'permission_resolved',
+        requestId,
+        sessionId: capturedSessionId || sessionId || null,
+        provider: 'codex',
+      }));
+      return decision;
+    });
+  };
+
+  /** Retracts anything still waiting, so a finished run leaves no live prompt. */
+  const cancelOpenApprovals = (reason: string): void => {
+    for (const requestId of [...openApprovalIds]) {
+      sendMessage(ws, createNormalizedMessage({
+        kind: 'permission_cancelled',
+        requestId,
+        reason,
+        sessionId: capturedSessionId || sessionId || null,
+        provider: 'codex',
+      }));
+      pendingCodexApprovals.get(requestId)?.settle(null);
+    }
+  };
+
   try {
     connection = await codexAppServerTransport.open({
       onExit: (reason) => {
@@ -215,27 +403,12 @@ async function queryCodex(
         }
         settle();
       },
-      onRequest: (method, params) => {
-        // Nothing in the app can answer an approval, so one is refused rather
-        // than left to block the turn forever. Codex's own auto-reviewer
-        // settles the common cases before they ever reach a client.
-        if (method.endsWith('/requestApproval')) {
-          const itemId = typeof params.itemId === 'string' ? params.itemId : null;
-          if (itemId) {
-            // Named after the item it refused, so the note is one row rather
-            // than a new one per retry.
-            sendMessage(ws, createNormalizedMessage({
-              id: `${itemId}_approval`,
-              kind: 'task_notification',
-              summary: 'Codex asked to step outside its sandbox. CloudCLI has no approval prompt, so the request was refused.',
-              status: 'info',
-              sessionId: capturedSessionId || sessionId || null,
-              provider: 'codex',
-            }));
-          }
-          return { decision: 'decline' };
+      onRequest: async (method, params) => {
+        if (!CODEX_APPROVAL_METHODS.has(method)) {
+          return undefined;
         }
-        return undefined;
+        const decision = await requestApproval(method, params);
+        return toCodexApprovalResponse(method, params, decision);
       },
       onNotification: (method, params) => {
         const session = currentSession();
@@ -471,6 +644,7 @@ async function queryCodex(
     }
 
   } finally {
+    cancelOpenApprovals('The run ended before this was answered.');
     connection?.close();
     const session = currentSession();
     if (session) {
@@ -508,10 +682,43 @@ function abortCodexSession(sessionId: string) {
   return true;
 }
 
-/** Used by the providers module's CodexProvider to run and abort turns. */
+/**
+ * Used by the providers module's CodexProvider to run and abort turns, and to
+ * answer the approvals a run is blocked on.
+ *
+ * Declaring `permissions` is also what turns `supportsPermissionRequests` on
+ * for Codex in the capability catalog.
+ */
 export const codexRuntime = {
   run: queryCodex,
   abort: abortCodexSession,
+  permissions: {
+    /**
+     * Answers one approval. The gateway fans a decision out to every
+     * provider, so an id this runtime never issued is simply not ours.
+     */
+    resolve(requestId: string, decision: ProviderPermissionDecision): void {
+      pendingCodexApprovals.get(requestId)?.settle(decision);
+    },
+
+    /** The approvals this provider is waiting on for one session. */
+    listPending(sessionId: string): unknown[] {
+      const pending: unknown[] = [];
+      for (const [requestId, approval] of pendingCodexApprovals.entries()) {
+        if (approval.sessionId === sessionId) {
+          pending.push({
+            requestId,
+            toolName: approval.toolName,
+            toolId: approval.toolId,
+            input: approval.input,
+            receivedAt: approval.receivedAt,
+            provider: 'codex',
+          });
+        }
+      }
+      return pending;
+    },
+  },
 };
 
 /** Kept so `thread/fork` stays reachable through this module's usual import site. */
