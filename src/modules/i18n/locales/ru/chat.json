@@ -102,6 +102,7 @@
     "attachFiles": "Прикрепить файлы",
     "attachImages": "Прикрепить изображения",
     "send": "Отправить",
+    "sending": "Отправка…",
     "stop": "Остановить",
     "hintText": {
       "ctrlEnter": "Ctrl+Enter для отправки • Shift+Enter для новой строки • Tab для смены режима • / для команд",

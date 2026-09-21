@@ -111,6 +111,7 @@
     "attachFiles": "파일 첨부",
     "attachImages": "이미지 첨부",
     "send": "전송",
+    "sending": "전송 중…",
     "stop": "중지",
     "hintText": {
       "ctrlEnter": "Ctrl+Enter로 전송 • Shift+Enter로 줄바꿈 • Tab으로 모드 변경 • /로 슬래시 명령어",

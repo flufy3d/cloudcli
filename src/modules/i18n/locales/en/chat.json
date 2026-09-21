@@ -125,6 +125,7 @@
     "attachFiles": "Attach files",
     "attachImages": "Attach images",
     "send": "Send",
+    "sending": "Sending…",
     "stop": "Stop",
     "hintText": {
       "ctrlEnter": "Ctrl+Enter to send • Shift+Enter for new line • Tab to change modes • / for slash commands",

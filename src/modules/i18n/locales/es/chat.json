@@ -111,6 +111,7 @@
     "attachFiles": "Adjuntar archivos",
     "attachImages": "Adjuntar imágenes",
     "send": "Enviar",
+    "sending": "Enviando…",
     "stop": "Detener",
     "hintText": {
       "ctrlEnter": "Ctrl+Enter para enviar • Shift+Enter para nueva línea • Tab para cambiar de modo • / para comandos",

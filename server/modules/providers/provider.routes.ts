@@ -726,6 +726,10 @@ router.get(
  * a brand-new chat. The frontend must call this before the first `chat.send`
  * so the session id in the URL, the store, and the websocket all agree from
  * the very first message — there is no client-visible session-id handoff.
+ *
+ * `initialMessage` is only a title source, so the client sends a short prefix
+ * rather than the whole message; `clientRequestId` makes a repeated request
+ * resolve to the session the first one allocated instead of opening another.
  */
 router.post(
   '/sessions',
@@ -734,7 +738,12 @@ router.post(
     const provider = parseProvider(body.provider);
     const projectPath = typeof body.projectPath === 'string' ? body.projectPath : '';
     const initialMessage = typeof body.initialMessage === 'string' ? body.initialMessage : '';
-    const result = sessionsService.createAppSession(provider, projectPath, initialMessage);
+    // Stamped by the composer once per submit attempt: repeats of the same
+    // attempt must resolve to the session the first one allocated.
+    const clientRequestId = typeof body.clientRequestId === 'string' ? body.clientRequestId : null;
+    const result = sessionsService.createAppSession(provider, projectPath, initialMessage, {
+      clientRequestId,
+    });
     res.status(201).json(createApiSuccessResponse(result));
   }),
 );

@@ -102,6 +102,7 @@
     "attachFiles": "Dateien anhängen",
     "attachImages": "Bilder anhängen",
     "send": "Senden",
+    "sending": "Wird gesendet…",
     "stop": "Stoppen",
     "hintText": {
       "ctrlEnter": "Strg+Enter zum Senden • Shift+Enter für neue Zeile • Tab zum Moduswechsel • / für Slash-Befehle",

@@ -102,6 +102,7 @@
     "attachFiles": "Dosya ekle",
     "attachImages": "Resim ekle",
     "send": "Gönder",
+    "sending": "Gönderiliyor…",
     "stop": "Durdur",
     "hintText": {
       "ctrlEnter": "Göndermek için Ctrl+Enter • Yeni satır için Shift+Enter • Mod değiştirmek için Tab • Slash komutları için /",

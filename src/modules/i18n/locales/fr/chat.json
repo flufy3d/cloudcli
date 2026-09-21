@@ -103,6 +103,7 @@
     "attachFiles": "Joindre des fichiers",
     "attachImages": "Joindre des images",
     "send": "Envoyer",
+    "sending": "Envoi…",
     "stop": "Arrêter",
     "hintText": {
       "ctrlEnter": "Ctrl+Entrée pour envoyer • Maj+Entrée pour nouvelle ligne • Tab pour changer de mode • / pour les commandes slash",

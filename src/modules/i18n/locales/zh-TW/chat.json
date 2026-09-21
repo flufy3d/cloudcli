@@ -109,6 +109,7 @@
     "attachFiles": "附加檔案",
     "attachImages": "附加圖片",
     "send": "傳送",
+    "sending": "傳送中…",
     "stop": "停止",
     "hintText": {
       "ctrlEnter": "Ctrl+Enter 傳送 • Shift+Enter 換行 • Tab 切換模式 • / 斜線指令",

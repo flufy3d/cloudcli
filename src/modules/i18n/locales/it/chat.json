@@ -102,6 +102,7 @@
     "attachFiles": "Allega file",
     "attachImages": "Allega immagini",
     "send": "Invia",
+    "sending": "Invio…",
     "stop": "Ferma",
     "hintText": {
       "ctrlEnter": "Ctrl+Invio per inviare • Shift+Invio per nuova riga • Tab per cambiare modalità • / per comandi",
