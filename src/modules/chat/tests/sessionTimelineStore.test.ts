@@ -1384,3 +1384,67 @@ test('repeated identical prompts each keep exactly one row', async () => {
   );
   assert.equal(prompts.length, 2, 'two real sends must not collapse into one');
 });
+
+/**
+ * The reported failure, end to end.
+ *
+ * The user sends a prompt, then switches away and back (or the search jump
+ * or load-all path runs), which reloads the whole window. That page already
+ * contains the engine's copy of the prompt, because the engine persisted it
+ * the moment it arrived. The send-time stamp used to be rewritten to the end
+ * of that page on every wholesale load, which put the prompt's own copy
+ * *before* the first row it was allowed to pair with — so it never paired,
+ * and the prompt stayed on screen beside its persisted copy until the page
+ * was reloaded. A second refresh could not fix it either: the stamp was
+ * rewritten to the new end each time.
+ */
+test('a full reload that already holds the prompt still retires it', async () => {
+  const page = {
+    messages: [
+      msg(1, { id: 'srv-old-user', content: 'earlier question' }),
+      msg(2, { id: 'srv-old-reply', content: 'earlier answer', role: 'assistant' }),
+    ],
+    total: 2,
+    hasMore: false,
+  };
+  const pageWithPrompt = {
+    messages: [
+      ...page.messages,
+      msg(3, { id: 'srv-prompt', content: 'fix it' }),
+      msg(4, { id: 'srv-reply', content: 'fixing', role: 'assistant' }),
+    ],
+    total: 4,
+    hasMore: false,
+  };
+  const fetchPage = scriptedFetcher([
+    { params: { limit: 20, offset: 0 }, page },
+    { params: { limit: 20, offset: 0 }, page: pageWithPrompt },
+    { params: { limit: 20, offset: 0 }, page: pageWithPrompt },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  store.appendRealtime(SESSION_ID, msg(5, { id: 'local_fix', content: 'fix it' }));
+
+  // Switching to another tab and back reloads the whole window, and by then
+  // the engine has written the prompt.
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
+  const prompts = store.getMessages(SESSION_ID).filter(
+    (row) => row.kind === 'text' && row.role === 'user' && row.content === 'fix it',
+  );
+  assert.deepEqual(
+    prompts.map((row) => row.id),
+    ['srv-prompt'],
+    'the prompt must render once, as its persisted copy',
+  );
+
+  // And it stays retired across further reloads.
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  assert.equal(
+    store.getMessages(SESSION_ID).filter(
+      (row) => row.kind === 'text' && row.role === 'user' && row.content === 'fix it',
+    ).length,
+    1,
+  );
+});

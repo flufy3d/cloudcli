@@ -25,6 +25,24 @@ export const ZCODE_CANCELLED_NOTICE = '回复已中断';
 export const ZCODE_CANCELLED_NOTICE_KEY = 'taskNotices.replyInterrupted';
 
 /**
+ * The cross-transport identity of one ZCode assistant text row.
+ *
+ * ZCode names a persisted row `(message_id, part_id)` but its live stream
+ * only ever mentions the message: text arrives as `text_delta` events under
+ * the message id and no row id is ever sent, so the two paths cannot be
+ * joined on `id`. The message id is the one thing both sides do carry, so it
+ * becomes the row key and the client reconciles the streamed body against
+ * the persisted one through it.
+ *
+ * Consumers: this normalizer (live deltas) and `zcode-sessions.provider.ts`
+ * (persisted rows). Both must derive the key the same way or the streamed
+ * reply renders beside its persisted copy.
+ */
+export function buildZCodeTextRowKey(messageId: string): string {
+  return `zcode-message:${messageId}`;
+}
+
+/**
  * Whether an engine error record denotes a cancelled model request rather
  * than a real failure. Matches the engine's own cancellation predicates —
  * `turn_cancelled`/`model_request_cancelled`/`ABORT_ERR` codes, a
@@ -377,6 +395,7 @@ export class ZCodeLiveEventNormalizer {
         kind: 'stream_delta',
         role: 'assistant',
         content,
+        providerRowKey: buildZCodeTextRowKey(baseId),
       })];
     }
 

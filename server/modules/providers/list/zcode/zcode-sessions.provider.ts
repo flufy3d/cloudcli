@@ -27,7 +27,7 @@ import {
 import { getGlobalImageAssetsDir } from '@/shared/image-attachments.js';
 
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
-import { isZCodeCancelledEngineError, readZCodeTokenUsedCount, ZCodeLiveEventNormalizer, ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from './zcode-live-event-normalizer.js';
+import { buildZCodeTextRowKey, isZCodeCancelledEngineError, readZCodeTokenUsedCount, ZCodeLiveEventNormalizer, ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from './zcode-live-event-normalizer.js';
 
 const PROVIDER = 'zcode';
 
@@ -516,6 +516,11 @@ export class ZCodeSessionsProvider implements IProviderSessions {
             kind: 'text',
             role: messageRole === 'user' ? 'user' : 'assistant',
             content,
+            // The live stream never names this row — it sends deltas under
+            // the message id — so the message id is the only identity the
+            // two paths share. Without it the streamed reply and this row
+            // are two rows nothing but their text could relate.
+            ...(messageRole === 'user' ? {} : { providerRowKey: buildZCodeTextRowKey(row.message_id) }),
           }));
           textRowIndexByMessageId.set(row.message_id, normalized.length - 1);
         }

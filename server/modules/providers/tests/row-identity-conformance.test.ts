@@ -207,3 +207,25 @@ test('antigravity names one tool call the same way on both paths', () => {
     'the live row id is derived from the call identity both paths compute',
   );
 });
+
+/**
+ * ZCode names a persisted row `(message_id, part_id)` but its live stream
+ * only mentions the message: assistant text arrives as `text_delta` events
+ * and no row id is ever sent, so `id` cannot join the two paths. The message
+ * id is what both sides carry, and it is published as the row key so the
+ * client reconciles the streamed reply with the persisted one by identity
+ * rather than by comparing the text of the two.
+ */
+test('zcode publishes one row key for a reply on both paths', () => {
+  const messageId = 'msg_muaj6bc0_a3536698';
+  const live = zcode.normalizeMessage({
+    type: 'model_streaming',
+    id: messageId,
+    sessionId: SESSION_ID,
+    payload: { kind: 'text_delta', delta: 'the answer' },
+  }, SESSION_ID);
+
+  assert.equal(live.length, 1);
+  assert.equal(live[0].kind, 'stream_delta');
+  assert.equal(live[0].providerRowKey, `zcode-message:${messageId}`);
+});
