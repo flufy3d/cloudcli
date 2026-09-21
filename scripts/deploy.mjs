@@ -289,28 +289,40 @@ try {
 pkgDir = path.join(RUNTIME_DIR, 'node_modules', APP_NAME);
 console.log(`[deploy] 已切换固定运行目录：${pkgDir}`);
 
-// ── 4. 切换 pm2 服务（原地重启，绝不 delete） ──
+// ── 4. 切换 pm2 服务 ────────────────────────────────────────
 //
-// 从 cloudcli 自己的会话里跑部署时，这个脚本是被部署服务的子孙进程。
-// `pm2 delete` 连着进程树一起杀，脚本在第二条命令（start）之前就没了，
-// 服务再也起不来 —— 部署把自己锁死。`pm2 restart` 是一条命令，由 pm2 守护
-// 进程执行，脚本死了也照样把服务拉回来，进程条目自始至终存在。
-//
-// 带上 ecosystem 路径与 --update-env，重启时重读配置与环境变量，
-// 这正是当初选择 delete + start 想要的效果。
+// PM2 的 restart/startOrRestart 对已存在进程只合并环境变量，不更新 pm_exec_path
+// 和 pm_cwd。首次从旧 pnpm 全局目录迁移时必须重建一次进程条目；固定路径生效后
+// 的后续部署只做原地 restart。部署必须从服务外的普通终端运行，见文件头说明。
 const restartArgs = ['restart', ECOSYSTEM, '--only', APP_NAME, '--update-env'];
 
 function getRegisteredApp() {
   const jlist = capture('pm2', ['jlist']);
   if (jlist === null) throw new Error('无法读取 pm2 进程列表');
-  return JSON.parse(jlist).find((app) => app.name === APP_NAME) ?? null;
+  const matches = JSON.parse(jlist).filter((app) => app.name === APP_NAME);
+  if (matches.length > 1) throw new Error(`pm2 存在 ${matches.length} 个同名 cloudcli 进程，拒绝自动切换`);
+  return matches[0] ?? null;
 }
 
 function startOrRestartConfiguredApp() {
   const registered = getRegisteredApp();
-  runChecked('pm2', registered
-    ? restartArgs
-    : ['start', ECOSYSTEM, '--only', APP_NAME]);
+  if (!registered) {
+    runChecked('pm2', ['start', ECOSYSTEM, '--only', APP_NAME]);
+    return;
+  }
+
+  const alreadyUsesFixedRuntime = (
+    registered.pm2_env?.pm_exec_path === expectedServerEntry
+    && registered.pm2_env?.pm_cwd === expectedRuntimePath
+  );
+  if (alreadyUsesFixedRuntime) {
+    runChecked('pm2', restartArgs);
+    return;
+  }
+
+  console.log(`[deploy] PM2 仍登记旧入口，重建进程条目：${registered.pm2_env?.pm_exec_path ?? '未知路径'}`);
+  runChecked('pm2', ['delete', String(registered.pm_id)]);
+  runChecked('pm2', ['start', ECOSYSTEM, '--only', APP_NAME]);
 }
 
 function verifyPm2RuntimePath() {
@@ -341,9 +353,9 @@ async function waitUntilReady() {
 try {
   startOrRestartConfiguredApp();
   verifyPm2RuntimePath();
-  // 固定目录迁移会改变进程入口和 cwd；持久化后 pm2 resurrect 才不会恢复旧路径。
-  runChecked('pm2', ['save']);
   if (!await waitUntilReady()) throw new Error(`60 秒内 ${PORT} 端口未就绪`);
+  // 只持久化验证通过的进程；pm2 resurrect 不会恢复旧路径或未通过健康检查的新版本。
+  runChecked('pm2', ['save']);
 } catch (error) {
   const deployError = error instanceof Error ? error.message : String(error);
   console.error(`\n[deploy] ! 新版本启动失败，正在恢复上一版本：${deployError}`);
@@ -354,8 +366,8 @@ try {
     }
     startOrRestartConfiguredApp();
     verifyPm2RuntimePath();
-    runChecked('pm2', ['save']);
     if (!await waitUntilReady()) throw new Error(`回滚后 ${PORT} 端口仍未就绪`);
+    runChecked('pm2', ['save']);
   } catch (rollbackError) {
     fail(`新版本启动失败且自动回滚失败：${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
   }
