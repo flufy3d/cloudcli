@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
-import { CodexSessionsProvider, extractCodexUserImages } from '@/modules/providers/list/codex/codex-sessions.provider.js';
+import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
+import { codexThreadItemToRows, readCodexRolloutItem } from '@/modules/providers/list/codex/codex-thread-items.js';
 import { CursorSessionsProvider } from '@/modules/providers/list/cursor/cursor-sessions.provider.js';
 import { appendFilesInputTag, appendImagesInputTag } from '@/shared/image-attachments.js';
 
@@ -96,34 +97,48 @@ test('claude history: file reference blocks restore non-image attachments', () =
 
 // ---------------------------------------------------------------- Codex
 
-test('codex history: user_message payload images become path attachments', () => {
-  // Real rollout shape: local_image input items land in `local_images`,
-  // while `images` stays an empty array.
+/** The images one `UserMessage` item carries, as the transcript row records them. */
+const codexPromptImages = (item: unknown) => {
+  const parsed = readCodexRolloutItem(item);
+  assert.ok(parsed);
+  return codexThreadItemToRows(parsed, '2026-01-01T00:00:00.000Z')[0]?.images;
+};
+
+test('codex history: local_image content parts become path attachments', () => {
+  // Captured from a real rollout: an attached screenshot rides the prompt as
+  // a `local_image` content part.
   assert.deepEqual(
-    extractCodexUserImages({
-      type: 'user_message',
-      message: 'can u see attached image?',
-      images: [],
-      local_images: ['C:\\proj\\.cloudcli\\assets\\a.png'],
+    codexPromptImages({
+      type: 'UserMessage',
+      id: '01a0a182-00f5-7451-9616-9cbd8599cc80',
+      content: [
+        { type: 'local_image', path: 'C:\\proj\\.cloudcli\\assets\\a.png' },
+        { type: 'text', text: 'can u see attached image?', text_elements: [] },
+      ],
     }),
     [{ path: 'C:/proj/.cloudcli/assets/a.png' }],
   );
-  assert.deepEqual(
-    extractCodexUserImages({ type: 'user_message', message: 'hi', images: ['/proj/b.jpg'] }),
-    [{ path: '/proj/b.jpg' }],
+  assert.equal(
+    codexPromptImages({
+      type: 'UserMessage',
+      id: 'u-plain',
+      content: [{ type: 'text', text: 'hi', text_elements: [] }],
+    }),
+    undefined,
   );
-  assert.equal(extractCodexUserImages({ type: 'user_message', message: 'hi' }), undefined);
-  assert.equal(extractCodexUserImages({ type: 'user_message', message: 'hi', images: [], local_images: [] }), undefined);
 });
 
 test('codex history: base64 data URLs pass through as inline data attachments', () => {
   const dataUrl = 'data:image/png;base64,QUJD';
   assert.deepEqual(
-    extractCodexUserImages({
-      type: 'user_message',
-      message: 'look',
-      images: [dataUrl],
-      local_images: ['C:\\proj\\a.png'],
+    codexPromptImages({
+      type: 'UserMessage',
+      id: 'u-data',
+      content: [
+        { type: 'local_image', path: 'C:\\proj\\a.png' },
+        { type: 'image', url: dataUrl },
+        { type: 'text', text: 'look', text_elements: [] },
+      ],
     }),
     [{ path: 'C:/proj/a.png' }, { data: dataUrl }],
   );

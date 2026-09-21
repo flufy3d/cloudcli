@@ -6,14 +6,20 @@ import readline from 'node:readline';
 
 import { sessionsDb } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
-import { parseFilesInputTag, toImageAttachments } from '@/shared/image-attachments.js';
+import {
+  codexThreadItemToRows,
+  humanizeCodexToolName,
+  readCodexItemText,
+  readCodexProposedPlan,
+  readCodexRolloutItem,
+} from '@/modules/providers/list/codex/codex-thread-items.js';
+import { parseFilesInputTag } from '@/shared/image-attachments.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import { prepareTranscriptMessages } from '@/shared/message-unification.js';
 import type {
   AnyRecord,
   FetchHistoryOptions,
   FetchHistoryResult,
-    MemoryCitation,
     NormalizedMessage,
     ProviderSessionUsageInput,
     ProviderTokenUsageResult,
@@ -62,34 +68,19 @@ function readNonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-function isVisibleCodexUserMessage(payload: AnyRecord | null | undefined): boolean {
-  if (!payload || payload.type !== 'user_message') {
-    return false;
-  }
-
-  if (payload.kind && payload.kind !== 'plain') {
-    return false;
-  }
-
-  return typeof payload.message === 'string' && payload.message.trim().length > 0;
-}
-
 /**
  * Follows which turn a Codex rollout is inside as its rows stream past.
  *
- * Codex writes no per-row id — every line is `{timestamp, type, payload}` and
- * the `user_message` event that carries a prompt has no identity of its own —
- * so a turn id is the only durable address a user message has. Turns are
- * bracketed by rows that do carry `turn_id`: `task_started` opens one,
- * `turn_context` restates it, `task_complete` closes it, and the prompt is
- * written between them. That id is also exactly what `thread/fork` cuts at,
- * which is what makes "edit this message" and "fork from here" addressable
- * for Codex at all.
+ * A turn id is the address an edit cuts at: `thread/fork` takes a
+ * `lastTurnId`, and that is what makes "edit this message" and "fork from
+ * here" possible for Codex at all. Turns are bracketed by rows that carry
+ * `turn_id` — `task_started` opens one, `turn_context` restates it,
+ * `task_complete` closes it — and the prompt is written between them.
  *
- * `thread_rolled_back` retires the last N turns in place: the rows stay in the
- * file, but the turns are no longer part of the thread and the fork endpoint
- * refuses to cut at one. They are tracked here so a retired turn is never
- * offered as an anchor, rather than discovered when the fork fails.
+ * `thread_rolled_back` retires the last N turns in place: the rows stay in
+ * the file, but the turns are no longer part of the thread and the fork
+ * endpoint refuses to cut at one. They are tracked here so a retired turn is
+ * never offered as an anchor, rather than discovered when the fork fails.
  */
 function createCodexTurnTracker() {
   /** Turn ids still part of the conversation, oldest first. */
@@ -164,725 +155,6 @@ async function readCodexLiveTurnIds(filePath: string): Promise<string[]> {
   return turns.getLiveTurnIds();
 }
 
-/**
- * Reads the image attachments Codex records on `user_message` events.
- * Turns sent with `local_image` input items land in `local_images` as file
- * paths (verified against real rollout JSONL); the `images` array can carry
- * base64 data URLs, which are passed through as inline `data` attachments so
- * the UI can preview them without a file lookup.
- *
- * Exported for tests.
- */
-export function extractCodexUserImages(
-  payload: AnyRecord | null | undefined,
-): Array<{ path?: string; data?: string }> | undefined {
-  if (!payload) {
-    return undefined;
-  }
-
-  const candidates = [
-    ...(Array.isArray(payload.local_images) ? payload.local_images : []),
-    ...(Array.isArray(payload.images) ? payload.images : []),
-  ];
-
-  const attachments: Array<{ path?: string; data?: string }> = [];
-  for (const entry of candidates) {
-    if (typeof entry !== 'string' || !entry.trim()) {
-      continue;
-    }
-    if (entry.startsWith('data:')) {
-      attachments.push({ data: entry });
-    } else {
-      attachments.push(...toImageAttachments([entry]));
-    }
-  }
-
-  return attachments.length > 0 ? attachments : undefined;
-}
-
-function extractCodexTextContent(content: unknown): string {
-  if (!Array.isArray(content)) {
-    return typeof content === 'string' ? content : '';
-  }
-
-  return content
-    .map((item) => {
-      if (!item || typeof item !== 'object') {
-        return '';
-      }
-
-      const record = item as AnyRecord;
-      if (
-        (record.type === 'input_text' || record.type === 'output_text' || record.type === 'text')
-        && typeof record.text === 'string'
-      ) {
-        return record.text;
-      }
-
-      return '';
-    })
-    .filter(Boolean)
-    .join('\n');
-}
-
-/**
- * The command a live `command_execution` item ran, as the persisted transcript
- * spells it.
- *
- * Codex reports the shell invocation — `["/bin/zsh", "-lc", "<cmd>"]` — while
- * the rollout records the `cmd` argument the script passed. Storing the
- * invocation verbatim leaves the two transports describing one call
- * differently, which is enough to stop the client pairing them and render the
- * card twice. A plain string is already the command and passes through.
- */
-function readCodexCommandLine(value: unknown): string {
-  // Two serializations reach this: the SDK reports a string
-  // (`/bin/zsh -lc ls`), the rollout's own event format an array
-  // (`["/bin/zsh", "-lc", "ls"]`). Both wrap the command in a shell
-  // invocation, and the transcript records only what was inside it, so the
-  // wrapper comes off either way — otherwise the live card and the persisted
-  // one describe the same call differently and both render.
-  if (Array.isArray(value)) {
-    const parts = value.filter((part): part is string => typeof part === 'string');
-    const shellFlagIndex = parts.findIndex((part) => part === '-lc' || part === '-c');
-    return shellFlagIndex >= 0 && shellFlagIndex + 1 < parts.length
-      ? parts.slice(shellFlagIndex + 1).join(' ')
-      : parts.join(' ');
-  }
-
-  if (typeof value !== 'string') {
-    return '';
-  }
-
-  // `<shell> -lc <command>`: everything after the flag is the command, which
-  // may itself contain quotes and spaces, so the split is on the flag alone.
-  const wrapped = value.match(/^\S*(?:sh|bash|zsh)\s+-l?c\s+([\s\S]+)$/);
-  if (!wrapped) {
-    return value;
-  }
-  const command = wrapped[1].trim();
-  // The shell payload is usually quoted as one argument; unwrap a balanced
-  // pair rather than stripping quotes that belong to the command itself.
-  const quoted = command.match(/^(['"])([\s\S]*)\1$/);
-  return quoted ? quoted[2] : command;
-}
-
-/**
- * Reads the markdown out of Codex's `<proposed_plan>` envelope.
- *
- * Codex delivers a plan as a wrapped assistant message while Claude delivers
- * one as an `ExitPlanMode` call. Recognizing the envelope here lets both end up
- * on the same plan card instead of one provider showing a card and the other
- * showing prose with a stray tag in it. The closing tag is optional because a
- * streamed plan exposes the opening tag first.
- *
- * Exported for tests.
- */
-export function readCodexProposedPlan(text: string): string | null {
-  const openingTag = /^\s*<proposed_plan>[ \t]*(?:\r?\n)?/i;
-  if (!openingTag.test(text)) {
-    return null;
-  }
-
-  const body = text
-    .replace(openingTag, '')
-    .replace(/(?:\r?\n)?[ \t]*<\/proposed_plan>\s*$/i, '')
-    .trim();
-
-  return body || null;
-}
-
-/**
- * The block Codex appends to a reply that leaned on its memory files. It is
- * always the last thing in the message and is meant for programmatic parsing,
- * so it reads as raw XML when left in the prose.
- */
-const CODEX_MEMORY_CITATION_BLOCK = /<oai-mem-citation>([\s\S]*?)<\/oai-mem-citation>\s*$/i;
-
-/**
- * Lifts Codex's memory citations out of an assistant reply.
- *
- * The block names the memory files and line ranges the answer drew on, which is
- * worth showing — but as a footnote under the reply, not as markup inside it.
- * The trailing `<rollout_ids>` list is dropped: those are handles to earlier
- * rollouts that the transcript view has no way to open.
- *
- * Exported for tests.
- */
-export function readCodexMemoryCitations(text: string): { text: string; memoryCitations?: MemoryCitation[] } {
-  const block = CODEX_MEMORY_CITATION_BLOCK.exec(text);
-  if (!block) {
-    return { text };
-  }
-
-  const entries = /<citation_entries>([\s\S]*?)<\/citation_entries>/i.exec(block[1])?.[1] ?? '';
-  const memoryCitations: MemoryCitation[] = [];
-  for (const line of entries.split('\n')) {
-    const entry = line.trim();
-    if (!entry) {
-      continue;
-    }
-
-    const noteMarker = entry.indexOf('|note=');
-    const source = (noteMarker === -1 ? entry : entry.slice(0, noteMarker)).trim();
-    if (!source) {
-      continue;
-    }
-
-    const note = noteMarker === -1
-      ? ''
-      : entry.slice(noteMarker + '|note='.length).trim().replace(/^\[/, '').replace(/\]$/, '').trim();
-    memoryCitations.push(note ? { source, note } : { source });
-  }
-
-  const prose = text.slice(0, block.index).trimEnd();
-  return memoryCitations.length > 0 ? { text: prose, memoryCitations } : { text: prose };
-}
-
-function extractCodexToolOutput(output: unknown): string {
-  if (typeof output === 'string') {
-    return output;
-  }
-
-  if (!Array.isArray(output)) {
-    return output == null ? '' : JSON.stringify(output);
-  }
-
-  return output
-    .map((item) => {
-      const record = readObjectRecord(item);
-      return typeof record?.text === 'string' ? record.text : '';
-    })
-    .filter(Boolean)
-    .join('');
-}
-
-// ─── Codex "code mode" exec scripts ─────────────────────────────────────────
-// Newer Codex builds (and every Sol-family model) stop calling shell/patch
-// tools directly. Instead they emit one `exec` custom tool call whose input is
-// a small JavaScript program that awaits `tools.<name>({...})`. Persisting that
-// program verbatim is what makes the transcript read as raw machinery, so it is
-// parsed back into the operations it performs.
-
-type CodexExecOperation =
-  | { kind: 'shell'; command: string; justification?: string }
-  | { kind: 'stdin'; chars: string }
-  | { kind: 'patch'; patch: string }
-  | { kind: 'search'; queries: string[] }
-  | { kind: 'plan'; todos: CodexPlanTodo[] };
-
-/** One step of a checklist, in the shape the shared todo renderer consumes. */
-type CodexPlanTodo = { content: string; status: string };
-
-/**
- * Decodes one JavaScript string literal (single, double or backtick quoted).
- *
- * Template literals with `${}` interpolation are returned with the expression
- * text intact — the transcript has no bindings to evaluate, and showing the
- * raw template is still far more readable than the surrounding program.
- */
-function decodeJavaScriptStringLiteral(literal: string): string {
-  if (literal.startsWith('"')) {
-    try {
-      return JSON.parse(literal) as string;
-    } catch {
-      return literal.slice(1, -1);
-    }
-  }
-
-  return literal
-    .slice(1, -1)
-    .replace(/\\n/g, '\n')
-    .replace(/\\r/g, '\r')
-    .replace(/\\t/g, '\t')
-    .replace(/\\([\\'`])/g, '$1');
-}
-
-/**
- * Returns the source of the argument list of the call that opens at
- * `openParenIndex`, skipping over parens that appear inside string literals.
- *
- * A plain regex cannot be used here: shell commands routinely embed `(`/`)`
- * and quotes, so the argument object has to be found by balancing.
- */
-function readCallArguments(source: string, openParenIndex: number): string | null {
-  let depth = 0;
-  let quote: string | null = null;
-
-  for (let index = openParenIndex; index < source.length; index += 1) {
-    const character = source[index];
-
-    if (quote) {
-      if (character === '\\') {
-        index += 1;
-        continue;
-      }
-      if (character === quote) {
-        quote = null;
-      }
-      continue;
-    }
-
-    if (character === '"' || character === "'" || character === '`') {
-      quote = character;
-      continue;
-    }
-
-    if (character === '(') {
-      depth += 1;
-      continue;
-    }
-
-    if (character === ')') {
-      depth -= 1;
-      if (depth === 0) {
-        return source.slice(openParenIndex + 1, index);
-      }
-    }
-  }
-
-  return null;
-}
-
-/** Reads `key: "value"` / `"key": "value"` out of an object-literal source. */
-function readStringProperty(objectSource: string, key: string): string | undefined {
-  const pattern = new RegExp(
-    `(?:["']${key}["']|\\b${key})\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\`(?:\\\\.|[^\`\\\\])*\`)`,
-    's',
-  );
-  const match = pattern.exec(objectSource);
-  return match ? decodeJavaScriptStringLiteral(match[1]) : undefined;
-}
-
-/** Reads every `q: "..."` entry out of a `web__run` search-query array. */
-function readSearchQueries(objectSource: string): string[] {
-  const pattern = /(?:["']q["']|\bq)\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/gs;
-  return Array.from(objectSource.matchAll(pattern), (match) => decodeJavaScriptStringLiteral(match[1]));
-}
-
-/**
- * Finds the patch body an `apply_patch` call is given.
- *
- * The program almost always assigns it to a local first
- * (`const patch = "*** Begin Patch..."; tools.apply_patch(patch)`), so the
- * argument itself is usually an identifier. Scanning the whole script for the
- * literal that carries the patch header covers both forms.
- */
-function readPatchLiteral(source: string): string | undefined {
-  const pattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/gs;
-  for (const match of source.matchAll(pattern)) {
-    const decoded = decodeJavaScriptStringLiteral(match[1]);
-    if (decoded.includes('*** Begin Patch')) {
-      return decoded;
-    }
-  }
-  return undefined;
-}
-
-/**
- * Reads the steps of an `update_plan` call made from an exec script.
- *
- * The script writes its argument as a JavaScript object literal with unquoted
- * keys, so it is not JSON — each `{step, status}` entry is matched directly.
- */
-function readPlanSteps(objectSource: string): CodexPlanTodo[] {
-  const todos: CodexPlanTodo[] = [];
-  for (const entry of objectSource.matchAll(/\{([^{}]*)\}/g)) {
-    const content = readStringProperty(entry[1], 'step') ?? readStringProperty(entry[1], 'content');
-    if (content) {
-      todos.push({ content, status: readStringProperty(entry[1], 'status') ?? 'pending' });
-    }
-  }
-
-  return todos;
-}
-
-/**
- * Recovers commands a script keeps in a local array and maps over, which is how
- * Codex batches several shell calls:
- *   `const cmds = ["a", "b"]; await Promise.all(cmds.map(command => tools.shell_command({ command })))`
- * The call site then passes `{ command }` shorthand, so there is no literal to
- * read at the call itself.
- */
-function readMappedCommandCandidates(source: string): string[] {
-  const commands: string[] = [];
-  const arrayPattern = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\[([\s\S]*?)\]\s*;/g;
-  const stringPattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/gs;
-
-  for (const arrayMatch of source.matchAll(arrayPattern)) {
-    if (!new RegExp(`\\b${arrayMatch[1]}\\.map\\s*\\(`).test(source)) {
-      continue;
-    }
-    for (const stringMatch of arrayMatch[2].matchAll(stringPattern)) {
-      commands.push(decodeJavaScriptStringLiteral(stringMatch[1]));
-    }
-  }
-
-  return commands;
-}
-
-/**
- * Turns one Codex `exec` script into the operations it performs, in source
- * order. An empty result means the script did nothing recognizable and the
- * caller should fall back to showing it as code.
- *
- * Exported for tests.
- */
-export function parseCodexExecScript(input: unknown): CodexExecOperation[] {
-  const source = typeof input === 'string' ? input : String(input ?? '');
-  if (!source.includes('tools.')) {
-    return [];
-  }
-
-  const operations: CodexExecOperation[] = [];
-  const callPattern = /tools\.([A-Za-z_0-9]+)\s*\(/g;
-  /** Filled in lazily, and only once, for shorthand-argument shell calls. */
-  let mappedCommands: string[] | null = null;
-
-  for (const match of source.matchAll(callPattern)) {
-    const toolName = match[1];
-    const openParenIndex = match.index + match[0].length - 1;
-    const argumentSource = readCallArguments(source, openParenIndex) ?? '';
-
-    switch (toolName) {
-      case 'shell_command':
-      case 'exec_command': {
-        const command = readStringProperty(argumentSource, 'command')
-          ?? readStringProperty(argumentSource, 'cmd');
-        if (command) {
-          operations.push({
-            kind: 'shell',
-            command,
-            justification: readStringProperty(argumentSource, 'justification'),
-          });
-          break;
-        }
-
-        if (mappedCommands === null) {
-          mappedCommands = readMappedCommandCandidates(source);
-          for (const mappedCommand of mappedCommands) {
-            operations.push({ kind: 'shell', command: mappedCommand });
-          }
-        }
-        break;
-      }
-      case 'write_stdin': {
-        operations.push({ kind: 'stdin', chars: readStringProperty(argumentSource, 'chars') ?? '' });
-        break;
-      }
-      case 'apply_patch': {
-        const patch = readPatchLiteral(argumentSource) ?? readPatchLiteral(source);
-        if (patch) {
-          operations.push({ kind: 'patch', patch });
-        }
-        break;
-      }
-      case 'web__run':
-      case 'web_search': {
-        const queries = readSearchQueries(argumentSource);
-        if (queries.length > 0) {
-          operations.push({ kind: 'search', queries });
-        }
-        break;
-      }
-      case 'update_plan': {
-        const todos = readPlanSteps(argumentSource);
-        if (todos.length > 0) {
-          operations.push({ kind: 'plan', todos });
-        }
-        break;
-      }
-      default:
-        break;
-    }
-  }
-
-  return operations;
-}
-
-// ─── Codex shell output ─────────────────────────────────────────────────────
-
-type CodexShellOutput = {
-  output: string;
-  /** Set when the command has exited; `undefined` while it is still running. */
-  exitCode?: number;
-  /** Present while the command runs in the background under this cell id. */
-  runningCellId?: string;
-  truncated: boolean;
-};
-
-/**
- * Strips the two nested envelopes Codex wraps shell output in.
- *
- * The outer one reports on the sandbox *script* (`Script completed`, its wall
- * time, and `Output:`); the inner one reports on the *command* (`Exit code`,
- * its own wall time, an optional line count). Neither is useful in a chat
- * transcript, but the exit code decides whether the row is shown as failed, so
- * it is lifted out before the text is discarded.
- *
- * Exported for tests.
- */
-export function cleanCodexShellOutput(rawOutput: string): CodexShellOutput {
-  let output = rawOutput;
-  let exitCode: number | undefined;
-  let runningCellId: string | undefined;
-  let truncated = false;
-
-  const runningMatch = /^Script running with cell ID\s+(\S+)[^\n]*\n?/i.exec(output);
-  if (runningMatch) {
-    runningCellId = runningMatch[1];
-    output = output.slice(runningMatch[0].length);
-  } else {
-    output = output.replace(/^Script (?:completed|failed)[^\n]*\n?/i, '');
-  }
-
-  output = output.replace(/^Wall time[^\n]*\n?/i, '');
-  output = output.replace(/^Output:\s*\n?/i, '');
-  output = output.replace(/^Script error:\s*\n?/i, '');
-
-  const truncationMatch = /^Warning: truncated output[^\n]*\n(?:Total output lines:[^\n]*\n)?\n?/i.exec(output);
-  if (truncationMatch) {
-    truncated = true;
-    output = output.slice(truncationMatch[0].length);
-    output = output.replace(/^Script error:\s*\n?/i, '');
-  }
-
-  const exitCodeMatch = /^Exit code:\s*(-?\d+)[^\n]*\n?/i.exec(output);
-  if (exitCodeMatch) {
-    exitCode = Number.parseInt(exitCodeMatch[1], 10);
-    output = output.slice(exitCodeMatch[0].length);
-    output = output.replace(/^Wall time:[^\n]*\n?/i, '');
-    output = output.replace(/^Total output lines:[^\n]*\n?/i, '');
-    output = output.replace(/^Output:\s*\n?/i, '');
-  }
-
-  return { output, exitCode, runningCellId, truncated };
-}
-
-/**
- * `write_stdin` answers with a JSON envelope rather than plain text. Only its
- * `output` and `exit_code` matter to a reader.
- */
-function readCodexStdinOutput(rawOutput: string): CodexShellOutput | null {
-  const trimmed = rawOutput.trim();
-  const jsonStart = trimmed.indexOf('{');
-  if (jsonStart === -1) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(trimmed.slice(jsonStart)) as AnyRecord;
-    if (typeof parsed.output !== 'string') {
-      return null;
-    }
-    return {
-      output: parsed.output,
-      exitCode: typeof parsed.exit_code === 'number' ? parsed.exit_code : undefined,
-      truncated: false,
-    };
-  } catch {
-    return null;
-  }
-}
-
-// ─── Unified patches ────────────────────────────────────────────────────────
-
-type CodexFileChange = {
-  filePath: string;
-  /** `add` and `delete` are rendered as a whole-file write/removal. */
-  changeType: 'add' | 'update' | 'delete';
-  oldText: string;
-  newText: string;
-};
-
-/**
- * Rebuilds the before/after text of one unified diff.
- *
- * Only the hunks are available — never the whole file — so the reconstruction
- * keeps context lines in both sides and drops hunk headers. Feeding that pair
- * to the frontend's line differ reproduces exactly the additions, removals and
- * surrounding context the patch described, which is what Claude's `Edit` rows
- * already show.
- *
- * Exported for tests.
- */
-export function unifiedDiffToTexts(unifiedDiff: string): { oldText: string; newText: string } {
-  const oldLines: string[] = [];
-  const newLines: string[] = [];
-
-  for (const line of unifiedDiff.split('\n')) {
-    if (line.startsWith('@@') || line.startsWith('\\ No newline')) {
-      continue;
-    }
-    if (line.startsWith('+')) {
-      newLines.push(line.slice(1));
-      continue;
-    }
-    if (line.startsWith('-')) {
-      oldLines.push(line.slice(1));
-      continue;
-    }
-    const contextLine = line.startsWith(' ') ? line.slice(1) : line;
-    oldLines.push(contextLine);
-    newLines.push(contextLine);
-  }
-
-  // A unified diff ends with a newline, which would otherwise reconstruct as a
-  // phantom trailing blank line on both sides.
-  if (oldLines[oldLines.length - 1] === '' && newLines[newLines.length - 1] === '') {
-    oldLines.pop();
-    newLines.pop();
-  }
-
-  return { oldText: oldLines.join('\n'), newText: newLines.join('\n') };
-}
-
-/**
- * Splits a `*** Begin Patch` body into one change per file.
- *
- * Exported for tests.
- */
-export function parseCodexPatch(patch: string): CodexFileChange[] {
-  const changes: CodexFileChange[] = [];
-  const lines = patch.split('\n');
-  let current: { filePath: string; changeType: CodexFileChange['changeType']; body: string[] } | null = null;
-
-  const flush = () => {
-    if (!current) {
-      return;
-    }
-    const { oldText, newText } = unifiedDiffToTexts(current.body.join('\n'));
-    changes.push({
-      filePath: current.filePath,
-      changeType: current.changeType,
-      oldText: current.changeType === 'add' ? '' : oldText,
-      newText: current.changeType === 'delete' ? '' : newText,
-    });
-    current = null;
-  };
-
-  for (const line of lines) {
-    const fileHeader = /^\*\*\* (Add|Update|Delete) File:\s*(.+)$/.exec(line);
-    if (fileHeader) {
-      flush();
-      const changeType = fileHeader[1].toLowerCase() as CodexFileChange['changeType'];
-      current = { filePath: fileHeader[2].trim(), changeType, body: [] };
-      continue;
-    }
-
-    if (line.startsWith('*** ')) {
-      // `*** Begin Patch`, `*** End Patch`, `*** Move to:` — never diff content.
-      continue;
-    }
-
-    current?.body.push(line);
-  }
-
-  flush();
-  return changes;
-}
-
-/** Converts a `patch_apply_end` change map into the same per-file shape. */
-function readPatchApplyChanges(changes: unknown): CodexFileChange[] {
-  const record = readObjectRecord(changes);
-  if (!record) {
-    return [];
-  }
-
-  const parsed: CodexFileChange[] = [];
-  for (const [filePath, rawChange] of Object.entries(record)) {
-    const change = readObjectRecord(rawChange);
-    if (!change) {
-      continue;
-    }
-    const changeType = change.type === 'add' || change.type === 'delete' ? change.type : 'update';
-    const { oldText, newText } = unifiedDiffToTexts(
-      typeof change.unified_diff === 'string' ? change.unified_diff : '',
-    );
-    parsed.push({
-      filePath,
-      changeType,
-      oldText: changeType === 'add' ? '' : oldText,
-      newText: changeType === 'delete' ? '' : newText,
-    });
-  }
-
-  return parsed;
-}
-
-/** Maps a file change onto the tool the frontend already renders diffs for. */
-function fileChangeToToolMessage(change: CodexFileChange, timestamp: string, toolCallId: string): AnyRecord {
-  const toolName = change.changeType === 'add' ? 'Write' : 'Edit';
-  return {
-    type: 'tool_use',
-    timestamp,
-    toolName,
-    toolInput: JSON.stringify({
-      file_path: change.filePath,
-      old_string: change.oldText,
-      new_string: change.newText,
-      ...(change.changeType === 'delete' ? { deleted: true } : {}),
-    }),
-    toolCallId,
-  };
-}
-
-/** Reads the `file_path` back out of a rendered file-change row. */
-function readRowFilePath(row: AnyRecord): string {
-  try {
-    return String((JSON.parse(String(row.toolInput ?? '{}')) as AnyRecord).file_path ?? '');
-  } catch {
-    return '';
-  }
-}
-
-/**
- * Rewrites the rows reconstructed from a patch call's input with the
- * authoritative diffs Codex reports once the patch has been applied.
- *
- * Rows are matched by path, never by position: `patch_apply_end` reports the
- * touched files in map order, which does not follow the order they appeared in
- * the patch body. Rows whose file the report does not mention are dropped
- * rather than left behind claiming an edit that never happened.
- */
-function rewritePatchRows(
-  rows: AnyRecord[],
-  changes: CodexFileChange[],
-  callId: string,
-  messages: AnyRecord[],
-): void {
-  const rowsByPath = new Map<string, AnyRecord>();
-  for (const row of rows) {
-    rowsByPath.set(readRowFilePath(row), row);
-  }
-
-  const keptRows: AnyRecord[] = [];
-  for (const [index, change] of changes.entries()) {
-    const replacement = fileChangeToToolMessage(change, String(rows[0]?.timestamp ?? ''), `${callId}#${index}`);
-    const existing = rowsByPath.get(change.filePath);
-    if (existing) {
-      existing.toolName = replacement.toolName;
-      existing.toolInput = replacement.toolInput;
-      keptRows.push(existing);
-      rowsByPath.delete(change.filePath);
-      continue;
-    }
-
-    replacement.timestamp = rows[0]?.timestamp ?? replacement.timestamp;
-    keptRows.push(replacement);
-    messages.push(replacement);
-  }
-
-  for (const surplus of rowsByPath.values()) {
-    const position = messages.indexOf(surplus);
-    if (position !== -1) {
-      messages.splice(position, 1);
-    }
-  }
-
-  rows.splice(0, rows.length, ...keptRows);
-}
-
 // ─── Subagents ──────────────────────────────────────────────────────────────
 
 type CodexSubagentRecord = {
@@ -898,7 +170,7 @@ function parseCodexSubagentMessage(payload: AnyRecord): {
   messageType: string;
   result: string;
 } | null {
-  const text = extractCodexTextContent(payload.content);
+  const text = readCodexItemText(payload.content);
   const header = /Message Type:\s*([^\r\n]+)[\s\S]*?Sender:\s*([^\r\n]+)[\s\S]*?Payload:\s*\r?\n([\s\S]*)/i.exec(text);
   const author = readNonEmptyString(payload.author) || header?.[2]?.trim();
   if (!author) {
@@ -984,13 +256,15 @@ type CodexSubagentTranscript = {
 /**
  * Flattens a spawned agent's own rollout into the shared activity timeline.
  *
- * The subagent's transcript is the same format as the parent's, so its shell
- * and patch calls go through the same translation and end up rendered by the
- * same components as the main thread's.
+ * A subagent's rollout is the same format as the parent's, so it is read the
+ * same way: through the assembled `item_completed` stream and the one row
+ * renderer. The rows are then folded into the panel's activity shape, which
+ * pairs each tool call with its result.
  */
 async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubagentTranscript> {
   const activity: SubagentActivity[] = [];
   const transcript: CodexSubagentTranscript = { activity };
+  /** Tool activities still waiting for the result row that settles them. */
   const pendingResults = new Map<string, SubagentActivity>();
 
   let fileStream;
@@ -1001,7 +275,6 @@ async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubag
   }
 
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
 
   for await (const line of rl) {
     if (!line.trim()) {
@@ -1033,198 +306,50 @@ async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubag
       continue;
     }
 
-    if (entry.type !== 'response_item') {
+    if (entry.type !== 'event_msg' || payload.type !== 'item_completed') {
+      continue;
+    }
+
+    const item = readCodexRolloutItem(payload.item);
+    // The agent's own prompt is the task it was given, which the parent's
+    // `Task` card already states; its lifecycle events belong to the parent.
+    if (!item || item.kind === 'user_message' || item.kind === 'subagent_activity') {
       continue;
     }
 
     const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
-
-    if (payload.type === 'message' && payload.role === 'assistant') {
-      const content = extractCodexTextContent(payload.content).trim();
-      if (content) {
-        activity.push({ kind: 'text', content, timestamp });
-      }
-      continue;
-    }
-
-    if (payload.type === 'reasoning') {
-      const summary = Array.isArray(payload.summary)
-        ? payload.summary.map((item: AnyRecord) => item?.text).filter(Boolean).join('\n')
-        : '';
-      if (summary.trim()) {
-        activity.push({ kind: 'thinking', content: summary, timestamp });
-      }
-      continue;
-    }
-
-    if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
-      const callId = readNonEmptyString(payload.call_id) ?? generateMessageId('codex-subagent-call');
-      for (const child of translateCodexToolCall(payload, callId)) {
-        const record: SubagentActivity = { ...child, timestamp };
-        activity.push(record);
-        pendingResults.set(callId, record);
-      }
-      continue;
-    }
-
-    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
-      const callId = readNonEmptyString(payload.call_id);
-      const target = callId ? pendingResults.get(callId) : undefined;
-      if (!target) {
+    for (const row of codexThreadItemToRows(item, timestamp ?? '')) {
+      if (row.type === 'assistant' || row.type === 'thinking') {
+        const content = String(row.message?.content ?? '').trim();
+        if (content) {
+          activity.push({ kind: row.type === 'thinking' ? 'thinking' : 'text', content, timestamp });
+        }
         continue;
       }
-      const cleaned = cleanCodexShellOutput(extractCodexToolOutput(payload.output));
-      target.toolResult = {
-        content: cleaned.output,
-        isError: cleaned.exitCode !== undefined && cleaned.exitCode !== 0,
-      };
+
+      if (row.type === 'tool_use') {
+        const record: SubagentActivity = {
+          kind: 'tool',
+          timestamp,
+          toolId: String(row.toolCallId ?? ''),
+          toolName: String(row.toolName ?? 'tool'),
+          toolInput: row.toolInput,
+        };
+        activity.push(record);
+        pendingResults.set(record.toolId as string, record);
+        continue;
+      }
+
+      if (row.type === 'tool_result') {
+        const target = pendingResults.get(String(row.toolCallId ?? ''));
+        if (target) {
+          target.toolResult = { content: String(row.output ?? ''), isError: Boolean(row.isError) };
+        }
+      }
     }
   }
 
   return transcript;
-}
-
-/**
- * Translates one persisted Codex tool call into the canonical tool rows the
- * transcript renders. Most calls produce exactly one row; a patch produces one
- * per file it touched.
- *
- * Shared by the main thread and by subagent transcripts so a subagent's shell
- * command looks identical to the parent's.
- */
-function translateCodexToolCall(payload: AnyRecord, callId: string): SubagentActivity[] {
-  const name = readNonEmptyString(payload.name) ?? 'tool';
-  const rawInput = payload.type === 'custom_tool_call' ? payload.input : payload.arguments;
-
-  if (name === 'exec') {
-    const operations = parseCodexExecScript(rawInput);
-    const rows: SubagentActivity[] = [];
-    for (const operation of operations) {
-      if (operation.kind === 'shell') {
-        rows.push({
-          kind: 'tool',
-          toolId: callId,
-          toolName: 'Bash',
-          toolInput: { command: operation.command, description: operation.justification },
-        });
-      } else if (operation.kind === 'patch') {
-        for (const change of parseCodexPatch(operation.patch)) {
-          rows.push({
-            kind: 'tool',
-            toolId: callId,
-            toolName: change.changeType === 'add' ? 'Write' : 'Edit',
-            toolInput: {
-              file_path: change.filePath,
-              old_string: change.oldText,
-              new_string: change.newText,
-            },
-          });
-        }
-      } else if (operation.kind === 'search') {
-        rows.push({
-          kind: 'tool',
-          toolId: callId,
-          toolName: 'WebSearch',
-          toolInput: { query: operation.queries.join(' | ') },
-        });
-      }
-    }
-    if (rows.length > 0) {
-      return rows;
-    }
-  }
-
-  if (name === 'shell_command' || name === 'exec_command') {
-    let command = '';
-    try {
-      const args = JSON.parse(String(rawInput || '{}')) as AnyRecord;
-      command = String(args.command ?? args.cmd ?? '');
-    } catch {
-      command = String(rawInput ?? '');
-    }
-    return [{ kind: 'tool', toolId: callId, toolName: 'Bash', toolInput: { command } }];
-  }
-
-  if (name === 'apply_patch') {
-    return parseCodexPatch(String(rawInput ?? '')).map((change) => ({
-      kind: 'tool' as const,
-      toolId: callId,
-      toolName: change.changeType === 'add' ? 'Write' : 'Edit',
-      toolInput: {
-        file_path: change.filePath,
-        old_string: change.oldText,
-        new_string: change.newText,
-      },
-    }));
-  }
-
-  if (name === 'update_plan') {
-    return [{ kind: 'tool', toolId: callId, toolName: 'TodoWrite', toolInput: readCodexPlanInput(rawInput) }];
-  }
-
-  return [{ kind: 'tool', toolId: callId, toolName: humanizeCodexToolName(name), toolInput: rawInput }];
-}
-
-/**
- * Converts Codex's `update_plan` steps into the todo shape Claude's
- * `TodoWrite` already uses, so one renderer covers both providers.
- */
-function readCodexPlanInput(rawArguments: unknown): AnyRecord {
-  try {
-    const parsed = JSON.parse(String(rawArguments || '{}')) as AnyRecord;
-    const steps = Array.isArray(parsed.plan) ? parsed.plan : [];
-    return {
-      todos: steps.map((step: AnyRecord) => ({
-        content: typeof step?.step === 'string' ? step.step : String(step?.content ?? ''),
-        status: typeof step?.status === 'string' ? step.status : 'pending',
-      })),
-    };
-  } catch {
-    return { todos: [] };
-  }
-}
-
-function humanizeCodexToolName(toolName: string): string {
-  return toolName
-    .replace(/__/g, ' ')
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
-const CODEX_COLLABORATION_CONTROL_TOOLS = new Set([
-  'followup_task',
-  'interrupt_agent',
-  'list_agents',
-  'send_message',
-  'wait_agent',
-]);
-
-/**
- * Extracts a display name for the agent(s) a live `collab_tool_call` targets.
- * The SDK's receiver list carries either plain strings, or records keyed by
- * `agent_nickname` / `nickname` / `agent_path` depending on the Codex version,
- * so read the first usable one and fall back to the last path segment.
- */
-function readCodexCollabAgentLabel(receivers: unknown): string {
-  const lastSegment = (value: string): string => value.split('/').filter(Boolean).pop() ?? value;
-  const list = Array.isArray(receivers) ? receivers : [];
-  for (const entry of list) {
-    if (typeof entry === 'string' && entry.trim()) {
-      return lastSegment(entry.trim());
-    }
-    const record = readObjectRecord(entry);
-    const nickname = record
-      ? readNonEmptyString(record.agent_nickname) ?? readNonEmptyString(record.nickname)
-      : null;
-    if (nickname) {
-      return lastSegment(nickname);
-    }
-    const agentPath = record ? readNonEmptyString(record.agent_path) : null;
-    if (agentPath) {
-      return lastSegment(agentPath);
-    }
-  }
-  return 'agent';
 }
 
 // ─── Transcript reader ──────────────────────────────────────────────────────
@@ -1315,6 +440,19 @@ function readCodexTokenUsage(fileContent: string): ProviderTokenUsageResult {
 /**
  * Reads one Codex rollout file and produces the compact per-message records
  * `normalizeHistoryEntry` turns into `NormalizedMessage`s.
+ *
+ * Only the rollout's assembled view is read — the `event_msg` →
+ * `item_completed` entries — never the raw `response_item` records beside
+ * them. Both describe the same work, but only the items carry the id Codex
+ * also puts on the live `app-server` notification, and the live run reads
+ * those through the same `codexThreadItemToRows`. A row therefore has one
+ * identity and one shape no matter which side produced it, which is what
+ * stops a reply rendering once live and once again from history.
+ *
+ * Two records are read outside the item stream because nothing in it carries
+ * them: `token_count` (the context budget) and a spawned agent's
+ * `agent_message`, whose FINAL_ANSWER never becomes an item and is folded
+ * into the result of the `Task` row that started the agent.
  */
 async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryResult> {
   const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
@@ -1327,128 +465,52 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
   const messages: AnyRecord[] = [];
   let tokenUsage: AnyRecord | null = null;
 
-  /** Call ids whose orchestration wrapper must never reach the transcript. */
-  const ignoredToolCallIds = new Set<string>();
-  /** Exec calls that own a shell row, so their output can be routed back. */
-  const shellCallMessages = new Map<string, AnyRecord>();
-  /**
-   * Rows split out of one exec script beside the row that kept the call id.
-   * The call reports a single outcome for the whole script, so they inherit it
-   * rather than claiming a success nobody verified.
-   */
-  const splitShellFollowers = new Map<string, string[]>();
-  /**
-   * File rows produced by each patch call, so the authoritative
-   * `patch_apply_end` diffs can replace what was reconstructed from the call
-   * input, and so every row gets exactly one result.
-   */
-  const patchGroups = new Map<string, {
-    callId: string;
-    rows: AnyRecord[];
-    timestamp: string;
-    success?: boolean;
-    failure?: string;
-  }>();
-  /** Patch call awaiting its out-of-band `patch_apply_end` report. */
-  let pendingPatchCallId: string | null = null;
-  const execCallByCellId = new Map<string, string>();
-  const waitCallToExecCall = new Map<string, string>();
-  const pendingExecOutput = new Map<string, string>();
-  const completedExecCalls = new Set<string>();
-  /** Newest still-running exec call, for `write_stdin` polls that carry no cell id. */
-  let runningExecCallId: string | null = null;
-
-  const subagentsByCallId = new Map<string, CodexSubagentRecord>();
-  const subagentsByPath = new Map<string, CodexSubagentRecord>();
-
-  /**
-   * Records what one spawned-agent lifecycle event says about its agent.
-   *
-   * Codex has reported these under two shapes — a top-level
-   * `sub_agent_activity` payload, and a `SubAgentActivity` item inside
-   * `item_completed` — so both are routed here rather than each growing its
-   * own copy of the bookkeeping. `agent_thread_id` is the important part: it
-   * names the sibling rollout holding the agent's own transcript.
-   */
-  const applySubagentActivity = (activity: {
-    eventId?: string;
-    kind?: string;
-    agentPath?: string;
-    agentThreadId?: string;
-  }): void => {
-    const byCallId = activity.eventId ? subagentsByCallId.get(activity.eventId) : undefined;
-    const byPath = activity.agentPath ? subagentsByPath.get(activity.agentPath) : undefined;
-    const byThread = activity.agentThreadId
-      ? [...subagentsByCallId.values()].find((record) => record.agentThreadId === activity.agentThreadId)
-      : undefined;
-    const subagent = byCallId ?? byPath ?? byThread;
-    if (!subagent) {
-      return;
-    }
-
-    subagent.agentThreadId = activity.agentThreadId ?? subagent.agentThreadId;
-    if (activity.agentPath) {
-      subagent.agentPath = activity.agentPath;
-      subagentsByPath.set(activity.agentPath, subagent);
-    }
-  };
   const turns = createCodexTurnTracker();
   /** Turns whose prompt already carries the anchor, so only the first does. */
   const anchoredTurnIds = new Set<string>();
 
+  /**
+   * Every spawned agent's `Task` row, indexed by each handle it can later be
+   * addressed by: the lifecycle event's own id, the agent's path, and the
+   * thread id its transcript lives under.
+   */
+  const subagentsByCallId = new Map<string, CodexSubagentRecord>();
+  const subagentsByPath = new Map<string, CodexSubagentRecord>();
+  const subagentsByThread = new Map<string, CodexSubagentRecord>();
+
+  const indexSubagent = (record: CodexSubagentRecord): void => {
+    subagentsByCallId.set(record.toolCallId, record);
+    if (record.agentPath) {
+      subagentsByPath.set(record.agentPath, record);
+    }
+    if (record.agentThreadId) {
+      subagentsByThread.set(record.agentThreadId, record);
+    }
+  };
+
+  /** Settles a `Task` row; without a result the card renders as running forever. */
+  const closeSubagent = (
+    record: CodexSubagentRecord,
+    timestamp: string,
+    output: string,
+    isError: boolean,
+  ): void => {
+    if (record.isComplete) {
+      return;
+    }
+    record.isComplete = true;
+    messages.push({
+      uuid: `${record.toolCallId}_result`,
+      type: 'tool_result',
+      timestamp,
+      toolCallId: record.toolCallId,
+      output,
+      isError,
+    });
+  };
+
   const fileStream = fsSync.createReadStream(sessionFilePath);
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-  /** Emits a tool_result row unless the call already produced one. */
-  const pushToolResult = (callId: string, timestamp: string, output: string, isError: boolean) => {
-    if (completedExecCalls.has(callId)) {
-      return;
-    }
-    completedExecCalls.add(callId);
-    messages.push({ type: 'tool_result', timestamp, toolCallId: callId, output, isError });
-
-    // A script's other commands share the call's single outcome. The output
-    // itself belongs to the row the call addresses, so theirs says where to
-    // find it instead of repeating it.
-    for (const followerId of splitShellFollowers.get(callId) ?? []) {
-      messages.push({
-        type: 'tool_result',
-        timestamp,
-        toolCallId: followerId,
-        output: isError
-          ? 'This command ran as part of a script that failed; the output is on the first command of the script.'
-          : 'Output is on the first command of the script.',
-        isError,
-      });
-    }
-    splitShellFollowers.delete(callId);
-  };
-
-  /**
-   * Gives every row the identity of the rollout entry it came from.
-   *
-   * Rows are pushed from dozens of branches that each end in `continue`, so
-   * the stamping happens one entry late (and once more after the loop) rather
-   * than at every push site. Without it the rows a history read produces get
-   * a fresh random id each time, and the client has nothing to match the live
-   * copy of the same row against — which is how one reply renders twice.
-   *
-   * The rollout's own `id` is preferred; `ordinal` is the append-only
-   * position the file itself records and is just as reproducible.
-   */
-  let pendingRowIdentity: { key: string; from: number } | null = null;
-  const stampPendingRowIdentity = (): void => {
-    if (!pendingRowIdentity) {
-      return;
-    }
-    const { key, from } = pendingRowIdentity;
-    for (let index = from; index < messages.length; index++) {
-      if (!messages[index].uuid) {
-        messages[index].uuid = index === from ? key : `${key}_${index - from}`;
-      }
-    }
-    pendingRowIdentity = null;
-  };
 
   for await (const line of rl) {
     if (!line.trim()) {
@@ -1467,595 +529,129 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       continue;
     }
     const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : new Date().toISOString();
-    // Before the type-specific branches: a turn is opened and closed by rows
-    // that produce no transcript entry of their own, and each of those
-    // branches ends in a `continue`.
+
+    // A turn is opened and closed by rows that produce no transcript entry of
+    // their own, so the tracker sees every row before the branches below.
     turns.observe(entry.type, payload);
 
-    stampPendingRowIdentity();
-    pendingRowIdentity = {
-      key: readNonEmptyString(payload.id as string | undefined)
-        ?? (typeof entry.ordinal === 'number' ? `ord_${entry.ordinal}` : `line_${messages.length}`),
-      from: messages.length,
-    };
-
-    // ── event_msg ──────────────────────────────────────────────────────────
-    if (entry.type === 'event_msg') {
-      if (payload.type === 'token_count' && payload.info) {
-        const info = payload.info as AnyRecord;
-        if (info.total_token_usage) {
-          const usage = info.total_token_usage as AnyRecord;
-          tokenUsage = { used: usage.total_tokens || 0, total: info.model_context_window || 200000 };
-        }
-        continue;
-      }
-
-      if (payload.type === 'sub_agent_activity' && payload.kind === 'started') {
-        applySubagentActivity({
-          eventId: readNonEmptyString(payload.event_id),
-          kind: 'started',
-          agentPath: readNonEmptyString(payload.agent_path),
-          agentThreadId: readNonEmptyString(payload.agent_thread_id),
-        });
-        continue;
-      }
-
-      if (payload.type === 'sub_agent_activity' && payload.kind === 'interrupted') {
-        // An interrupted agent never sends the FINAL_ANSWER that closes its
-        // Task row, so the card would render as running forever. Close it here
-        // with the same non-error note the live path emits for the item.
-        const agentPath = readNonEmptyString(payload.agent_path);
-        const agentThreadId = readNonEmptyString(payload.agent_thread_id);
-        const subagent = (agentPath ? subagentsByPath.get(agentPath) : undefined)
-          ?? (agentThreadId
-            ? [...subagentsByCallId.values()].find((record) => record.agentThreadId === agentThreadId)
-            : undefined);
-        if (subagent && !subagent.isComplete) {
-          messages.push({
-            type: 'tool_result',
-            timestamp,
-            toolCallId: subagent.toolCallId,
-            output: 'Subagent was interrupted before returning a final answer.',
-            isError: false,
-          });
-          subagent.isComplete = true;
-        }
-        continue;
-      }
-
-      // Codex reports patch results out of band. They carry the real unified
-      // diffs, so they replace whatever was reconstructed from the call input.
-      // Codex reports the applied patch out of band, and it is the only place
-      // the real unified diffs appear. It always arrives before the call's own
-      // output, so the rows reconstructed from the call input are rewritten
-      // here rather than duplicated.
-      if (payload.type === 'patch_apply_end') {
-        const callId = readNonEmptyString(payload.call_id);
-        if (!callId) {
-          continue;
-        }
-        const changes = readPatchApplyChanges(payload.changes);
-        // A patch applied from inside an `exec` script is reported under a
-        // synthetic id that does not match the script's call id, so fall back
-        // to the patch call that is still in flight.
-        const group = patchGroups.get(callId)
-          ?? (pendingPatchCallId ? patchGroups.get(pendingPatchCallId) : undefined);
-        if (group) {
-          rewritePatchRows(group.rows, changes, group.callId, messages);
-          group.success = payload.success !== false;
-          group.failure = String(payload.stderr || payload.stdout || '');
-          pendingPatchCallId = null;
-        } else if (changes.length > 0) {
-          // A resumed thread can replay the result of a patch whose call is
-          // not in this file; the rows still belong in the transcript.
-          const rows = changes.map((change, index) =>
-            fileChangeToToolMessage(change, timestamp, `${callId}#${index}`));
-          rows.forEach((row) => messages.push(row));
-          patchGroups.set(callId, {
-            callId,
-            rows,
-            timestamp,
-            success: payload.success !== false,
-            failure: String(payload.stderr || payload.stdout || ''),
-          });
-        }
-        continue;
-      }
-
-      if (payload.type === 'turn_aborted') {
-        messages.push({
-          type: 'status_note',
-          timestamp,
-          content: payload.reason === 'interrupted' ? 'Turn interrupted' : `Turn aborted (${String(payload.reason ?? 'unknown')})`,
-        });
-        continue;
-      }
-
-      if (payload.type === 'context_compacted') {
-        messages.push({ type: 'status_note', timestamp, content: 'Context compacted' });
-        continue;
-      }
-
-      // Codex >=0.153 stopped writing `user_message` events; the typed prompt
-      // arrives as an `item_completed` whose item is a `UserMessage`. Only real
-      // prompts get one — injected context (AGENTS.md, plugin lists) rides
-      // unnamed `response_item` user messages, which stay unparsed — so the
-      // leak guard the old `kind` check provided holds by construction.
-      if (payload.type === 'item_completed') {
-        const completedItem = readObjectRecord(payload.item);
-        // Current Codex reports spawned-agent lifecycle here rather than as a
-        // top-level `sub_agent_activity` payload. The thread id it carries is
-        // the only way to find the agent's own rollout, so a card whose id
-        // never arrives renders with an empty timeline.
-        if (completedItem && completedItem.type === 'SubAgentActivity') {
-          applySubagentActivity({
-            eventId: readNonEmptyString(completedItem.id),
-            kind: readNonEmptyString(completedItem.kind),
-            agentPath: readNonEmptyString(completedItem.agent_path),
-            agentThreadId: readNonEmptyString(completedItem.agent_thread_id),
-          });
-          continue;
-        }
-        if (completedItem && completedItem.type === 'UserMessage') {
-          const content = extractCodexTextContent(completedItem.content);
-          if (content.trim()) {
-            // Same anchor discipline as the legacy branch below: only the
-            // first prompt of a turn anchors it, so a per-turn cut never
-            // takes a follow-up queued prompt with it.
-            const turnId = turns.getCurrentTurnId();
-            const isFirstPromptOfTurn = Boolean(turnId) && !anchoredTurnIds.has(turnId as string);
-            if (isFirstPromptOfTurn) {
-              anchoredTurnIds.add(turnId as string);
-            }
-            messages.push({
-              type: 'user',
-              timestamp,
-              message: { role: 'user', content },
-              images: extractCodexUserImages(completedItem),
-              ...(isFirstPromptOfTurn ? { turnId } : {}),
-            });
+    if (entry.type === 'response_item') {
+      // A spawned agent reports back as an `agent_message` addressed from its
+      // path. The FINAL_ANSWER is the only part of a sub-agent's work that
+      // never becomes an item, so it is read here and nowhere else.
+      if (payload.type === 'agent_message') {
+        const message = parseCodexSubagentMessage(payload);
+        if (message?.messageType === 'FINAL_ANSWER' && message.result) {
+          const record = subagentsByPath.get(message.author);
+          if (record) {
+            closeSubagent(record, timestamp, message.result, false);
           }
         }
-        continue;
-      }
-
-      if (isVisibleCodexUserMessage(payload)) {
-        // Only the first prompt of a turn is anchored. A turn can hold more
-        // than one — a follow-up queued while the turn was running is written
-        // into it — and the cut is per turn, so anchoring the second would
-        // quietly take the first with it when the user edited only the second.
-        const turnId = turns.getCurrentTurnId();
-        const isFirstPromptOfTurn = Boolean(turnId) && !anchoredTurnIds.has(turnId as string);
-        if (isFirstPromptOfTurn) {
-          anchoredTurnIds.add(turnId as string);
-        }
-        messages.push({
-          type: 'user',
-          timestamp,
-          message: { role: 'user', content: payload.message },
-          images: extractCodexUserImages(payload),
-          ...(isFirstPromptOfTurn ? { turnId } : {}),
-        });
       }
       continue;
     }
 
-    if (entry.type !== 'response_item') {
+    if (entry.type !== 'event_msg') {
       continue;
     }
 
-    // ── response_item ──────────────────────────────────────────────────────
-    if (payload.type === 'message' && payload.role === 'assistant') {
-      const cited = readCodexMemoryCitations(extractCodexTextContent(payload.content));
-      const textContent = cited.text;
-      if (!textContent.trim()) {
-        continue;
+    if (payload.type === 'token_count' && payload.info) {
+      const info = payload.info as AnyRecord;
+      if (info.total_token_usage) {
+        const usage = info.total_token_usage as AnyRecord;
+        tokenUsage = { used: usage.total_tokens || 0, total: info.model_context_window || 200000 };
       }
+      continue;
+    }
 
-      const proposedPlan = readCodexProposedPlan(textContent);
-      if (proposedPlan) {
-        const planCallId = readNonEmptyString(payload.id) ?? generateMessageId('codex-plan');
-        messages.push({
-          type: 'tool_use',
-          timestamp,
-          toolName: 'ExitPlanMode',
-          toolInput: JSON.stringify({ plan: proposedPlan }),
-          toolCallId: planCallId,
-          memoryCitations: cited.memoryCitations,
-        });
-        messages.push({ type: 'tool_result', timestamp, toolCallId: planCallId, output: '' });
-        continue;
-      }
-
+    if (payload.type === 'turn_aborted') {
       messages.push({
-        type: 'assistant',
+        // No item is written for an abort, so the row is named after the
+        // append-only position the file itself records: reproducible across
+        // reads, which is all a history-only row needs.
+        uuid: typeof entry.ordinal === 'number' ? `ord_${entry.ordinal}` : `line_${messages.length}`,
+        type: 'status_note',
         timestamp,
-        message: { role: 'assistant', content: textContent },
-        memoryCitations: cited.memoryCitations,
+        content: payload.reason === 'interrupted'
+          ? 'Turn interrupted'
+          : `Turn aborted (${String(payload.reason ?? 'unknown')})`,
       });
       continue;
     }
 
-    if (payload.type === 'reasoning') {
-      const summaryText = Array.isArray(payload.summary)
-        ? payload.summary.map((item: AnyRecord) => item?.text).filter(Boolean).join('\n')
-        : '';
-      if (summaryText.trim()) {
-        messages.push({
-          type: 'thinking',
-          timestamp,
-          message: { role: 'assistant', content: summaryText },
-        });
-      }
+    if (payload.type !== 'item_completed') {
       continue;
     }
 
-    if (payload.type === 'web_search_call') {
-      const action = readObjectRecord(payload.action);
-      const query = readNonEmptyString(action?.query as string | undefined);
-      if (query) {
-        const callId = readNonEmptyString(payload.id) ?? generateMessageId('codex-search');
-        messages.push({
-          type: 'tool_use',
-          timestamp,
-          toolName: 'WebSearch',
-          toolInput: JSON.stringify({ query }),
-          toolCallId: callId,
-        });
-      }
+    const item = readCodexRolloutItem(payload.item);
+    if (!item) {
       continue;
     }
 
-    if (payload.type === 'agent_message') {
-      const agentMessage = parseCodexSubagentMessage(payload);
-      if (!agentMessage || agentMessage.messageType !== 'FINAL_ANSWER' || !agentMessage.result) {
-        continue;
-      }
+    if (item.kind === 'subagent_activity') {
+      const existing = (item.agentThreadId ? subagentsByThread.get(item.agentThreadId) : undefined)
+        ?? (item.agentPath ? subagentsByPath.get(item.agentPath) : undefined)
+        ?? subagentsByCallId.get(item.id);
 
-      let subagent = subagentsByPath.get(agentMessage.author);
-      if (!subagent) {
-        // A resumed thread can replay an answer whose spawn call is not in this
-        // file. Synthesize the container so the answer still has a home.
-        const fallbackCallId = readNonEmptyString(payload.id) ?? generateMessageId('codex-subagent');
-        const taskName = agentMessage.author.split('/').filter(Boolean).pop() || 'agent';
+      if (item.activity === 'started' && !existing) {
+        // The spawn itself reaches the item stream only as this lifecycle
+        // event, so the `Task` row is built from it and keeps its id.
+        const label = item.agentPath?.split('/').filter(Boolean).pop() ?? 'agent';
         const taskMessage: AnyRecord = {
-          uuid: fallbackCallId,
+          uuid: item.id,
           type: 'tool_use',
           timestamp,
           toolName: 'Task',
-          toolInput: JSON.stringify({ description: humanizeCodexToolName(taskName) }),
-          toolCallId: fallbackCallId,
+          toolInput: JSON.stringify({ description: humanizeCodexToolName(label) }),
+          toolCallId: item.id,
         };
         messages.push(taskMessage);
-        subagent = { toolCallId: fallbackCallId, message: taskMessage, agentPath: agentMessage.author, isComplete: false };
-        subagentsByCallId.set(fallbackCallId, subagent);
-        subagentsByPath.set(agentMessage.author, subagent);
+        indexSubagent({
+          toolCallId: item.id,
+          message: taskMessage,
+          agentPath: item.agentPath,
+          agentThreadId: item.agentThreadId,
+          isComplete: false,
+        });
+        continue;
       }
 
-      if (!subagent.isComplete) {
-        messages.push({
-          type: 'tool_result',
-          timestamp,
-          toolCallId: subagent.toolCallId,
-          output: agentMessage.result,
-        });
-        subagent.isComplete = true;
+      if (!existing) {
+        continue;
+      }
+      // Later events fill in the handles the first one did not carry.
+      existing.agentPath = existing.agentPath ?? item.agentPath;
+      existing.agentThreadId = existing.agentThreadId ?? item.agentThreadId;
+      indexSubagent(existing);
+
+      if (item.activity === 'interrupted') {
+        closeSubagent(existing, timestamp, 'Subagent was interrupted before returning a final answer.', false);
       }
       continue;
     }
 
-    if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
-      const callId = readNonEmptyString(payload.call_id) ?? generateMessageId('codex-call');
-      const name = readNonEmptyString(payload.name) ?? 'tool';
-      const rawInput = payload.type === 'custom_tool_call' ? payload.input : payload.arguments;
+    const rows = codexThreadItemToRows(item, timestamp);
 
-      if (name === 'spawn_agent') {
-        let taskName = 'agent';
-        let prompt: string | undefined;
-        try {
-          const args = JSON.parse(String(rawInput || '{}')) as AnyRecord;
-          taskName = readNonEmptyString(args.task_name) || taskName;
-          // `message` is an encrypted transport blob on collaboration spawns —
-          // only surface it when it is readable prompt text.
-          const message = readNonEmptyString(args.message);
-          prompt = message && !/^gAAAAA/.test(message) ? message : undefined;
-        } catch {
-          // The activity event still supplies the canonical agent path.
-        }
-
-        const taskMessage: AnyRecord = {
-          uuid: callId,
-          type: 'tool_use',
-          timestamp,
-          toolName: 'Task',
-          // No `subagent_type`: Codex has no agent presets, and naming the
-          // provider there would render as "Codex / Codex" in the transcript.
-          toolInput: JSON.stringify({
-            description: humanizeCodexToolName(taskName),
-            ...(prompt ? { prompt } : {}),
-          }),
-          toolCallId: callId,
-        };
-        messages.push(taskMessage);
-        subagentsByCallId.set(callId, { toolCallId: callId, message: taskMessage, isComplete: false });
-        ignoredToolCallIds.add(callId);
-        continue;
+    if (item.kind === 'user_message') {
+      // Only the first prompt of a turn is anchored. A turn can hold more than
+      // one — a follow-up queued while the turn was running is written into it
+      // — and the edit cut is per turn, so anchoring the second would quietly
+      // take the first with it.
+      const turnId = turns.getCurrentTurnId();
+      if (turnId && !anchoredTurnIds.has(turnId) && rows.length > 0) {
+        anchoredTurnIds.add(turnId);
+        rows[0].turnId = turnId;
       }
-
-      if (name === 'wait') {
-        try {
-          const args = JSON.parse(String(rawInput || '{}')) as AnyRecord;
-          const execCallId = execCallByCellId.get(String(args.cell_id || ''));
-          if (execCallId) {
-            waitCallToExecCall.set(callId, execCallId);
-          }
-        } catch {
-          // Suppress the orchestration wait even when its payload is malformed.
-        }
-        ignoredToolCallIds.add(callId);
-        continue;
-      }
-
-      if (CODEX_COLLABORATION_CONTROL_TOOLS.has(name)) {
-        ignoredToolCallIds.add(callId);
-        continue;
-      }
-
-      if (name === 'update_plan') {
-        messages.push({
-          type: 'tool_use',
-          timestamp,
-          toolName: 'TodoWrite',
-          toolInput: JSON.stringify(readCodexPlanInput(rawInput)),
-          toolCallId: callId,
-        });
-        continue;
-      }
-
-      if (name === 'exec') {
-        const operations = parseCodexExecScript(rawInput);
-        const shellCommands = operations.filter((operation) => operation.kind === 'shell');
-        const stdinWrites = operations.filter((operation) => operation.kind === 'stdin');
-        const patches = operations.filter((operation) => operation.kind === 'patch');
-        const searches = operations.filter((operation) => operation.kind === 'search');
-        const plans = operations.filter((operation) => operation.kind === 'plan');
-
-        // A bare stdin poll continues whatever command is still running; it is
-        // a continuation, not an action of its own.
-        if (operations.length > 0 && shellCommands.length === 0 && stdinWrites.length > 0) {
-          ignoredToolCallIds.add(callId);
-          if (runningExecCallId) {
-            waitCallToExecCall.set(callId, runningExecCallId);
-          }
-          continue;
-        }
-
-        if (operations.length === 0) {
-          // An unrecognized wrapper is shown as-is rather than mislabelled as a
-          // shell command, so a new Codex tool degrades to a readable code
-          // block instead of a wrong one.
-          const fallbackMessage: AnyRecord = {
-            type: 'tool_use',
-            timestamp,
-            toolName: 'exec',
-            toolInput: rawInput,
-            toolCallId: callId,
-          };
-          messages.push(fallbackMessage);
-          continue;
-        }
-
-        // The call has exactly one output, so whichever row represents the work
-        // it did keeps the call id and receives that output. Extra rows get
-        // suffixed ids and are resolved by their own bookkeeping.
-        let outputOwnerAssigned = false;
-        const nextRowId = () => {
-          if (!outputOwnerAssigned) {
-            outputOwnerAssigned = true;
-            return callId;
-          }
-          return `${callId}~${messages.length}`;
-        };
-
-        // One row per command, matching both the live stream (which emits a
-        // `command_execution` item each) and this adapter's own subagent path.
-        // Joining them produced a card whose text matched nothing live, so the
-        // two transports rendered the call twice over.
-        shellCommands.forEach((operation, index) => {
-          const shellMessage: AnyRecord = {
-            type: 'tool_use',
-            timestamp,
-            toolName: 'Bash',
-            toolInput: JSON.stringify({
-              command: operation.command,
-              description: operation.justification,
-            }),
-            toolCallId: nextRowId(),
-          };
-          messages.push(shellMessage);
-          if (index === 0) {
-            // The call has exactly one output and it lands on the row that
-            // kept the call id.
-            shellCallMessages.set(callId, shellMessage);
-          } else {
-            // The rest cannot be handed that output, but they must still be
-            // settled — a tool row with no result renders as running forever,
-            // and the call has long finished. They are settled when the real
-            // result arrives, so they can carry its outcome: reporting an
-            // unqualified success on a command that actually failed is worse
-            // than the duplicate card this split exists to prevent.
-            const followers = splitShellFollowers.get(callId) ?? [];
-            followers.push(String(shellMessage.toolCallId));
-            splitShellFollowers.set(callId, followers);
-          }
-        });
-
-        for (const search of searches) {
-          messages.push({
-            type: 'tool_use',
-            timestamp,
-            toolName: 'WebSearch',
-            toolInput: JSON.stringify({ query: search.queries.join(' | ') }),
-            toolCallId: nextRowId(),
-          });
-        }
-
-        for (const plan of plans) {
-          // The script's own result covers whatever else it did, so the plan
-          // row is closed here — without one it would read as still running.
-          const planCallId = nextRowId();
-          messages.push({
-            type: 'tool_use',
-            timestamp,
-            toolName: 'TodoWrite',
-            toolInput: JSON.stringify({ todos: plan.todos }),
-            toolCallId: planCallId,
-          });
-          messages.push({ type: 'tool_result', timestamp, toolCallId: planCallId, output: '' });
-        }
-
-        if (patches.length > 0) {
-          const changes = patches.flatMap((patch) => parseCodexPatch(patch.patch));
-          const rows = changes.map((change, index) =>
-            fileChangeToToolMessage(change, timestamp, index === 0 ? nextRowId() : `${callId}#${index}`));
-          rows.forEach((row) => messages.push(row));
-          patchGroups.set(callId, { callId, rows, timestamp });
-          pendingPatchCallId = callId;
-        }
-
-        if (!outputOwnerAssigned) {
-          // Every recognized operation produced no row (an empty patch, say).
-          // Nothing owns the output, so drop it rather than leaving it loose.
-          ignoredToolCallIds.add(callId);
-        }
-        continue;
-      }
-
-      if (name === 'apply_patch') {
-        const rows = parseCodexPatch(String(rawInput ?? ''))
-          .map((change, index) => fileChangeToToolMessage(change, timestamp, `${callId}#${index}`));
-        rows.forEach((row) => messages.push(row));
-        patchGroups.set(callId, { callId, rows, timestamp });
-        pendingPatchCallId = callId;
-        // The call's own output is a bare `{}`; the per-file rows carry the result.
-        ignoredToolCallIds.add(callId);
-        continue;
-      }
-
-      if (name === 'shell_command' || name === 'exec_command') {
-        let command = '';
-        try {
-          const args = JSON.parse(String(rawInput || '{}')) as AnyRecord;
-          command = String(args.command ?? args.cmd ?? '');
-        } catch {
-          command = String(rawInput ?? '');
-        }
-        const shellMessage: AnyRecord = {
-          type: 'tool_use',
-          timestamp,
-          toolName: 'Bash',
-          toolInput: JSON.stringify({ command }),
-          toolCallId: callId,
-        };
-        messages.push(shellMessage);
-        shellCallMessages.set(callId, shellMessage);
-        continue;
-      }
-
-      messages.push({
-        type: 'tool_use',
-        timestamp,
-        toolName: name,
-        toolInput: rawInput,
-        toolCallId: callId,
-      });
-      continue;
     }
 
-    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
-      const callId = readNonEmptyString(payload.call_id) ?? '';
-      const rawOutput = extractCodexToolOutput(payload.output);
-
-      // A wait / stdin poll delivers the tail of an earlier command's output.
-      const continuedCallId = waitCallToExecCall.get(callId);
-      if (continuedCallId) {
-        const cleaned = readCodexStdinOutput(rawOutput) ?? cleanCodexShellOutput(rawOutput);
-        const accumulated = `${pendingExecOutput.get(continuedCallId) || ''}${cleaned.output}`;
-        pendingExecOutput.set(continuedCallId, accumulated);
-        if (!cleaned.runningCellId) {
-          if (runningExecCallId === continuedCallId) {
-            runningExecCallId = null;
-          }
-          pushToolResult(
-            continuedCallId,
-            timestamp,
-            accumulated,
-            cleaned.exitCode !== undefined && cleaned.exitCode !== 0,
-          );
-        }
-        continue;
-      }
-
-      const subagent = subagentsByCallId.get(callId);
-      if (subagent) {
-        try {
-          const taskPath = readNonEmptyString((JSON.parse(rawOutput) as AnyRecord).task_name);
-          if (taskPath) {
-            subagent.agentPath = taskPath;
-            subagentsByPath.set(taskPath, subagent);
-          }
-        } catch {
-          // The sub_agent_activity event normally supplies the path.
-        }
-        continue;
-      }
-
-      if (ignoredToolCallIds.has(callId)) {
-        continue;
-      }
-
-      if (shellCallMessages.has(callId)) {
-        const cleaned = cleanCodexShellOutput(rawOutput);
-        if (cleaned.runningCellId) {
-          execCallByCellId.set(cleaned.runningCellId, callId);
-          pendingExecOutput.set(callId, cleaned.output);
-          runningExecCallId = callId;
-          continue;
-        }
-        const accumulated = `${pendingExecOutput.get(callId) || ''}${cleaned.output}`;
-        pushToolResult(
-          callId,
-          timestamp,
-          accumulated,
-          cleaned.exitCode !== undefined && cleaned.exitCode !== 0,
-        );
-        continue;
-      }
-
-      pushToolResult(callId, timestamp, rawOutput, false);
-    }
-  }
-
-  // The last entry's rows have no following iteration to stamp them.
-  stampPendingRowIdentity();
-
-  // Every file row needs a result or the UI shows it as still running. The
-  // patch outcome is known only after `patch_apply_end` (which may never
-  // arrive), so results are emitted once the whole file has been read.
-  for (const group of patchGroups.values()) {
-    const failed = group.success === false;
-    for (const row of group.rows) {
-      messages.push({
-        // Named after the call it settles: these rows are produced after the
-        // file has been read, so the per-entry stamping cannot reach them.
-        uuid: `${row.toolCallId}_result`,
-        type: 'tool_result',
-        timestamp: group.timestamp,
-        toolCallId: row.toolCallId,
-        output: failed ? (group.failure || 'Patch failed') : '',
-        isError: failed,
+    if (item.kind === 'collab_spawn' && rows.length > 0) {
+      indexSubagent({
+        toolCallId: item.id,
+        message: rows[0],
+        isComplete: rows.length > 1,
       });
     }
+
+    messages.push(...rows);
   }
 
   await attachCodexSubagentTranscripts(sessionFilePath, subagentsByCallId);
@@ -2265,9 +861,9 @@ export class CodexSessionsProvider implements IProviderSessions {
         content: parsedFiles.text,
         images: rawImages,
         files,
-        // The enclosing turn, when the reader could name one. `baseId` is not
-        // usable for this: Codex rows carry no id, so it is synthesized per
-        // read and would address a different message every time.
+        // The enclosing turn, when the reader could name one. The row's own
+        // id addresses the message; the turn is what an edit cuts at, and
+        // only the reader knows which prompt opened one.
         transcriptAnchorId: readNonEmptyString(raw.turnId),
       })];
     }
@@ -2284,10 +880,9 @@ export class CodexSessionsProvider implements IProviderSessions {
       if (!content.trim()) {
         return [];
       }
-      // Same unification the live and session-reader paths apply: a proposed
-      // plan is a plan card, not an assistant paragraph that happens to open
-      // with a tag. Leaving it to the client is what put a provider-specific
-      // branch in a renderer shared by every provider.
+      // A proposed plan is a plan card, not an assistant paragraph that
+      // happens to open with a tag. Leaving it to the client is what put a
+      // provider-specific branch in a renderer shared by every provider.
       const proposedPlan = readCodexProposedPlan(content);
       if (proposedPlan) {
         return [createNormalizedMessage({
@@ -2311,13 +906,6 @@ export class CodexSessionsProvider implements IProviderSessions {
         role: 'assistant',
         content,
         memoryCitations: raw.memoryCitations,
-        // Deliberately unkeyed. The two transports do not share a row
-        // identity: the SDK stream numbers items per turn (`item_0`,
-        // `item_1`), while the rollout records the model's own response id
-        // (`msg_…`). Keying each side with its own value is worse than having
-        // no key at all — reconciliation takes the identity branch, finds no
-        // match, calls the rows distinct, and renders the reply twice with no
-        // fallback. Codex assistant text reconciles causally instead.
       })];
     }
 
@@ -2331,6 +919,9 @@ export class CodexSessionsProvider implements IProviderSessions {
         toolName: raw.toolName || 'Unknown',
         toolInput: raw.toolInput,
         toolId: raw.toolCallId || baseId,
+        // A live row arrives while the call is still running; the client
+        // renders the spinner off this and the completed row replaces it.
+        status: raw.status,
         subagentTools: raw.subagentTools,
         subagent: raw.subagent,
         memoryCitations: raw.memoryCitations,
@@ -2354,7 +945,12 @@ export class CodexSessionsProvider implements IProviderSessions {
   }
 
   /**
-   * Normalizes either a Codex history entry or a transformed live SDK event.
+   * Normalizes one Codex transcript row.
+   *
+   * Live frames and history rows arrive in the same vocabulary — both sides
+   * build their rows with `codexThreadItemToRows` — so there is one branch
+   * here, not one per transport. That is the property that keeps a row's
+   * identity and shape the same whether it came off the wire or off disk.
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
     const raw = readObjectRecord(rawMessage);
@@ -2362,251 +958,8 @@ export class CodexSessionsProvider implements IProviderSessions {
       return [];
     }
 
-    if (raw.message?.role) {
-      return this.normalizeHistoryEntry(raw, sessionId);
-    }
-
     const ts = raw.timestamp || new Date().toISOString();
     const baseId = raw.uuid || generateMessageId('codex');
-
-    if (raw.type === 'item') {
-      // Live items carry a stable SDK id, so an in-progress row and its later
-      // completion collapse onto the same transcript entry instead of stacking.
-      const itemId = readNonEmptyString(raw.itemId as string | undefined) ?? baseId;
-
-      switch (raw.itemType) {
-        case 'agent_message': {
-          const cited = readCodexMemoryCitations(String(raw.message?.content || ''));
-          const text = cited.text;
-          const proposedPlan = readCodexProposedPlan(text);
-          if (proposedPlan) {
-            // Same unification as history: a proposed plan is a plan card, not
-            // an assistant paragraph that happens to start with a tag.
-            return [createNormalizedMessage({
-              id: itemId,
-              sessionId,
-              timestamp: ts,
-              provider: PROVIDER,
-              kind: 'tool_use',
-              toolName: 'ExitPlanMode',
-              toolInput: { plan: proposedPlan },
-              toolId: itemId,
-              memoryCitations: cited.memoryCitations,
-            })];
-          }
-          return [createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'text',
-            role: 'assistant',
-            content: text,
-            memoryCitations: cited.memoryCitations,
-          })];
-        }
-        case 'reasoning':
-          return [createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'thinking',
-            content: raw.message?.content || '',
-          })];
-        case 'command_execution': {
-          const toolUse = createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_use',
-            toolName: 'Bash',
-            toolInput: { command: readCodexCommandLine(raw.command) },
-            toolId: itemId,
-            status: raw.status,
-          });
-          const partialOutput = typeof raw.output === 'string' ? raw.output : '';
-          if (raw.status === 'in_progress' && !partialOutput) {
-            return [toolUse];
-          }
-          // The SDK reports a command's output on the item itself; the UI reads
-          // tool output from a paired result, so one is emitted here. Emitting
-          // it while the command is still running is what lets its output
-          // stream into the row instead of appearing only at the end.
-          return [toolUse, createNormalizedMessage({
-            id: `${itemId}_result`,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_result',
-            toolId: itemId,
-            content: partialOutput,
-            isError: raw.status === 'failed' || (typeof raw.exitCode === 'number' && raw.exitCode !== 0),
-          })];
-        }
-        case 'file_change': {
-          // One row per file so each change gets the same diff view as an Edit.
-          const changes = Array.isArray(raw.changes) ? raw.changes : [];
-          const rows: NormalizedMessage[] = [];
-          for (const [index, change] of changes.entries()) {
-            const toolCallId = `${itemId}_${index}`;
-            rows.push(createNormalizedMessage({
-              id: toolCallId,
-              sessionId,
-              timestamp: ts,
-              provider: PROVIDER,
-              kind: 'tool_use',
-              toolName: change?.kind === 'add' ? 'Write' : 'Edit',
-              toolInput: { file_path: change?.path, old_string: '', new_string: '' },
-              toolId: toolCallId,
-              status: raw.status,
-            }));
-            if (raw.status !== 'in_progress') {
-              rows.push(createNormalizedMessage({
-                id: `${toolCallId}_result`,
-                sessionId,
-                timestamp: ts,
-                provider: PROVIDER,
-                kind: 'tool_result',
-                toolId: toolCallId,
-                content: raw.status === 'failed' ? 'Failed to apply file changes' : 'File changes applied',
-                isError: raw.status === 'failed',
-              }));
-            }
-          }
-          return rows;
-        }
-        case 'mcp_tool_call': {
-          const toolName = raw.server ? `mcp__${String(raw.server)}__${String(raw.tool ?? 'tool')}` : String(raw.tool || 'MCP');
-          const toolUse = createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_use',
-            toolName,
-            toolInput: raw.arguments,
-            toolId: itemId,
-            status: raw.status,
-          });
-          if (raw.status === 'in_progress') {
-            return [toolUse];
-          }
-          return [toolUse, createNormalizedMessage({
-            id: `${itemId}_result`,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_result',
-            toolId: itemId,
-            content: raw.error
-              ? String((raw.error as AnyRecord)?.message ?? raw.error)
-              : JSON.stringify(raw.result ?? ''),
-            isError: Boolean(raw.error) || raw.status === 'failed',
-          })];
-        }
-        case 'web_search':
-          return [createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_use',
-            toolName: 'WebSearch',
-            toolInput: { query: raw.query },
-            toolId: itemId,
-          })];
-        case 'collab_tool_call': {
-          // Codex >=0.144 routes every multi-agent call (spawn_agent, wait,
-          // send_message, interrupt_agent, ...) through one item type. Only
-          // spawns are work the user recognizes; the pure-orchestration calls
-          // are suppressed here exactly as the history reader suppresses them
-          // (see CODEX_COLLABORATION_CONTROL_TOOLS), so a live turn and its
-          // later reload render identically.
-          if (readNonEmptyString(raw.tool) !== 'spawn_agent') {
-            return [];
-          }
-          const label = readCodexCollabAgentLabel(raw.receiverAgents);
-          // Same rule as the history reader: on collaboration spawns the
-          // `prompt` can be an encrypted transport blob — only surface readable
-          // text.
-          const spawnPrompt = readNonEmptyString(raw.prompt);
-          const toolUse = createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_use',
-            toolName: 'Task',
-            toolInput: JSON.stringify({
-              description: humanizeCodexToolName(label),
-              ...(spawnPrompt && !/^gAAAAA/.test(spawnPrompt) ? { prompt: spawnPrompt } : {}),
-            }),
-            toolId: itemId,
-            status: raw.status,
-          });
-          // A spawn item stays open until the sub-agent finishes. Without the
-          // paired result row the front-end would render the card as running
-          // forever, so completion and failure close it out explicitly.
-          if (raw.status === 'in_progress') {
-            return [toolUse];
-          }
-          // Public lifecycle: in_progress | completed | failed | interrupted.
-          const outcome = raw.status === 'failed'
-            ? 'failed'
-            : raw.status === 'interrupted' ? 'was interrupted' : 'finished';
-          return [toolUse, createNormalizedMessage({
-            id: `${itemId}_result`,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_result',
-            toolId: itemId,
-            content: `Subagent ${humanizeCodexToolName(label)} ${outcome}`,
-            isError: raw.status === 'failed',
-          })];
-        }
-        case 'todo_list':
-          // Codex's live plan uses `{text, completed}`; Claude's TodoWrite uses
-          // `{content, status}`. Normalizing here means one renderer, not two.
-          return [createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_use',
-            toolName: 'TodoWrite',
-            toolInput: {
-              todos: (Array.isArray(raw.items) ? raw.items : []).map((item: AnyRecord) => ({
-                content: String(item?.text ?? ''),
-                status: item?.completed ? 'completed' : 'pending',
-              })),
-            },
-            toolId: itemId,
-          })];
-        case 'error':
-          return [createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'error',
-            content: raw.message?.content || 'Unknown error',
-          })];
-        default:
-          return [createNormalizedMessage({
-            id: itemId,
-            sessionId,
-            timestamp: ts,
-            provider: PROVIDER,
-            kind: 'tool_use',
-            toolName: raw.itemType || 'Unknown',
-            toolInput: raw.item || raw,
-            toolId: itemId,
-          })];
-      }
-    }
 
     if (raw.type === 'turn_complete') {
       return [createNormalizedMessage({
@@ -2628,7 +981,7 @@ export class CodexSessionsProvider implements IProviderSessions {
       })];
     }
 
-    return [];
+    return this.normalizeHistoryEntry(raw, sessionId);
   }
 
   /**

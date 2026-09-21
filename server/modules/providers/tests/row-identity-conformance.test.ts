@@ -26,11 +26,58 @@ import test from 'node:test';
 import { AntigravitySessionsProvider } from '@/modules/providers/list/antigravity/antigravity-sessions.provider.js';
 import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
 import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
+import {
+  codexThreadItemToRows,
+  readCodexAppServerItem,
+  readCodexRolloutItem,
+} from '@/modules/providers/list/codex/codex-thread-items.js';
 import { ZCodeSessionsProvider } from '@/modules/providers/list/zcode/zcode-sessions.provider.js';
 import { enforceNormalizedMessageContract } from '@/shared/normalized-message-contract.js';
 import type { NormalizedMessage } from '@/shared/types.js';
 
 const SESSION_ID = 'session-under-test';
+const CODEX_TIMESTAMP = '2026-01-01T00:00:00.000Z';
+
+// Captured from one `codex app-server` turn and the rollout it wrote.
+const CODEX_LIVE_AGENT_MESSAGE = {
+  type: 'agentMessage',
+  id: 'msg_02c8dbf5b38a0554016ab15ce008f487d08eeca161bae5821c',
+  text: '完成。',
+  phase: 'final_answer',
+};
+const CODEX_PERSISTED_AGENT_MESSAGE = {
+  type: 'AgentMessage',
+  id: 'msg_02c8dbf5b38a0554016ab15ce008f487d08eeca161bae5821c',
+  content: [{ type: 'Text', text: '完成。' }],
+  phase: 'final_answer',
+};
+const CODEX_LIVE_COMMAND = {
+  type: 'commandExecution',
+  id: 'exec-894d4147-e8aa-4799-8578-6cc60ce7bbd0',
+  command: "/bin/zsh -lc 'echo hello'",
+  cwd: '/tmp/cxprobe/ws2',
+  status: 'completed',
+  aggregatedOutput: 'hello\n',
+  exitCode: 0,
+};
+const CODEX_PERSISTED_COMMAND = {
+  type: 'CommandExecution',
+  id: 'exec-894d4147-e8aa-4799-8578-6cc60ce7bbd0',
+  command: ['/bin/zsh', '-lc', 'echo hello'],
+  cwd: 'file:///tmp/cxprobe/ws2',
+  status: 'completed',
+  stdout: 'hello\n',
+  aggregated_output: 'hello\n',
+  exit_code: 0,
+};
+
+/** The transcript rows one captured item produces, in emit order. */
+function codexRows(item: ReturnType<typeof readCodexRolloutItem>) {
+  if (!item) {
+    throw new Error('a captured Codex item was not recognized by its reader');
+  }
+  return codexThreadItemToRows(item, CODEX_TIMESTAMP);
+}
 
 type EngineCase = {
   provider: string;
@@ -81,24 +128,27 @@ const ENGINE_CASES: readonly EngineCase[] = [
   {
     provider: 'codex',
     normalize: (raw) => codex.normalizeMessage(raw, SESSION_ID),
+    // Both sides are produced by the real readers from records captured off a
+    // live `codex app-server` session and the rollout that same turn wrote.
+    // Hand-written fixtures are what let this guard pass while the product
+    // rendered every reply twice: the invented "live" frame carried a `msg_…`
+    // id, and no Codex transport has ever emitted one there.
     records: [
       {
-        label: 'live item',
-        raw: {
-          type: 'item',
-          itemId: 'msg_02f5777c2a733b17016ab0759323dc87d0922628f30ead41fd',
-          itemType: 'agent_message',
-          text: 'hello',
-          timestamp: '2026-01-01T00:00:00.000Z',
-        },
+        label: 'live assistant text',
+        raw: codexRows(readCodexAppServerItem(CODEX_LIVE_AGENT_MESSAGE))[0],
       },
       {
-        label: 'history assistant text',
-        raw: {
-          uuid: 'msg_02f5777c2a733b17016ab0759323dc87d0922628f30ead41fd',
-          timestamp: '2026-01-01T00:00:00.000Z',
-          message: { role: 'assistant', content: 'hello' },
-        },
+        label: 'persisted assistant text',
+        raw: codexRows(readCodexRolloutItem(CODEX_PERSISTED_AGENT_MESSAGE))[0],
+      },
+      {
+        label: 'live shell call',
+        raw: codexRows(readCodexAppServerItem(CODEX_LIVE_COMMAND))[0],
+      },
+      {
+        label: 'persisted shell call',
+        raw: codexRows(readCodexRolloutItem(CODEX_PERSISTED_COMMAND))[0],
       },
     ],
   },
@@ -228,4 +278,30 @@ test('zcode publishes one row key for a reply on both paths', () => {
   assert.equal(live.length, 1);
   assert.equal(live[0].kind, 'stream_delta');
   assert.equal(live[0].providerRowKey, `zcode-message:${messageId}`);
+});
+
+/**
+ * Codex reports one item twice: live over `app-server`, and again in the
+ * rollout a history read parses. Both carry Codex's own item id, and both are
+ * read into rows by the same renderer, so the ids must match exactly — that
+ * agreement is the only thing standing between the user and two copies of
+ * every reply.
+ */
+test('codex names one item the same way live and from history', () => {
+  const pairs = [
+    ['assistant text', CODEX_LIVE_AGENT_MESSAGE, CODEX_PERSISTED_AGENT_MESSAGE],
+    ['shell call', CODEX_LIVE_COMMAND, CODEX_PERSISTED_COMMAND],
+  ] as const;
+
+  for (const [label, liveItem, persistedItem] of pairs) {
+    const live = codexRows(readCodexAppServerItem(liveItem))
+      .flatMap((row) => codex.normalizeMessage(row, SESSION_ID))
+      .map((message) => message.id);
+    const persisted = codexRows(readCodexRolloutItem(persistedItem))
+      .flatMap((row) => codex.normalizeMessage(row, SESSION_ID))
+      .map((message) => message.id);
+
+    assert.ok(live.length > 0, `${label}: the live item produced no rows`);
+    assert.deepEqual(persisted, live, `${label}: the two transports name the same row differently`);
+  }
 });

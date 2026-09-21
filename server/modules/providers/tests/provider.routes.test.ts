@@ -91,9 +91,12 @@ test('conversation search streams title matches before transcript results', asyn
       type: 'event_msg',
       timestamp: '2026-08-12T09:00:00.000Z',
       payload: {
-        type: 'user_message',
-        kind: 'plain',
-        message: 'Release planning also appears in this conversation.',
+        type: 'item_completed',
+        item: {
+          type: 'UserMessage',
+          id: 'item-u1',
+          content: [{ type: 'text', text: 'Release planning also appears in this conversation.' }],
+        },
       },
     })}\n`);
     sessionsDb.createSession(

@@ -47,7 +47,7 @@
 - `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
 - `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类。
-- 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，专用于 `thread/fork` 这类 SDK 表达不了的操作）。
+- 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，以及这些请求产生的 item 通知流）。
 - zcode 附件通道：上传描述符在 runtime 内映射为 `session/send` 的原生 `attachments` 项（`{kind, filename, mimeType, sizeBytes, localPath}`，localPath 必须绝对；引擎静默丢弃无法映射的形状），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
 - zcode 发送链路（引擎 0.16.9）：每 turn 的模型选择随 `session/send` 下发（`modelSelection` + `modelExecution`，均 optional——本地 `cli/config.json` 配置不完整时降级省略，由引擎默认模型执行，不阻断发送）；引擎所需的 personal provider registry 由服务端从 `cli/config.json` 物化为 `~/.zcode/cli/cloudcli-provider-config.json` 并随 spawn env 注入，环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留）一律剥离，注入以 cloudcli 的解析为权威。
 - 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession`）。
@@ -173,11 +173,9 @@ CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在�
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
 外加乐观回显的簿记字段 `replacesAnchorId`。
 
-**工具卡同样要两路描述一致。** Codex 的实时与历史 `toolId` 来自两个 id 空间
-（SDK item id ／ rollout `call_id`），精确匹配结构性地不可能，只能靠「工具名 + 完整入参」指纹。
-因此入参必须逐字相同：命令文本统一成 shell 包装里的那条命令（`readCodexCommandLine`），
-多命令脚本在历史侧**按命令拆行**，与实时每条命令一个 item 的粒度对齐，
-也与本适配器子代理路径的既有做法一致。
+**工具卡同样要两路描述一致。** 描述一致的正解是两路读同一份记录，而不是把两份不同的记录
+对齐到同一个指纹上——codex 现在两路都读 ThreadItem，`toolId` 与入参因此天然相同
+（命令文本仍统一成 shell 包装里的那条命令，因为两种序列化一个给数组、一个给字符串）。
 
 **历史只能包含转录行。** `complete`、`stream_delta`、`stream_end`、`session_created`
 描述的是"一次运行正在进行"，历史里没有运行，也就不该出现这些 kind。
@@ -185,11 +183,10 @@ zcode 曾为每个持久化 step 产出一条 `complete`——真实会话里占
 一行都渲染不出来，却照样计入分页、计入每一次遍历转录的扫描、计入客户端发送时记录的行数。
 `history-kind-standard.test.ts` 对四家逐一把关。
 
-**子代理的线程 id 也是适配器的责任。** Codex 用 `agent_thread_id` 指向子代理自己的同级 rollout；
-该 id 曾只从 `sub_agent_activity` 顶层事件读取，而当前版本把它放在 `item_completed` 的
-`SubAgentActivity` 项里，于是 id 永远拿不到、子代理卡片一律空时间线。
-两种形状现在都路由到同一个处理函数（`applySubagentActivity`）——
-引擎换事件形状是常态，认一种就等于埋一颗定时炸弹。
+**子代理的线程 id 也是适配器的责任。** Codex 用 `agent_thread_id` 指向子代理自己的同级 rollout，
+该 id 来自 `SubAgentActivity` 项；spawn 本身也只以这个项出现在 item 流里，
+所以 `Task` 行就以它的 item id 命名，`completed` / `interrupted` 再用同一个 id 收尾。
+子代理自己的 rollout 用与主线程完全相同的读法（item 流 + 同一个行渲染器）铺进折叠面板。
 
 **跨路行身份是适配器的责任，不是前端的猜测活。** 一条持久化的行存在两份——
 运行中的实时帧，和之后历史读回的那一行。前端把两份显示成一行的唯一诚实依据是**同一个 `id`**；
@@ -210,10 +207,18 @@ id 必须字节相同。** 这条有两道闸门守着：
 | 引擎 | 行身份 | 依据 |
 | --- | --- | --- |
 | claude | 落盘 `uuid` | 实时 SDK 消息与落盘行的 `uuid` 同值，两路归一化出的 id 逐行相同 |
-| codex | rollout 的 `payload.id`（`msg_…`/`rs_…`/`ctc_…`），缺失时用 append-only 的 `ordinal` | 实时 `item_completed` 的 item id 与 rollout 里同一条 `response_item.id` 相同 |
+| codex | ThreadItem 的 `id`（`msg_…`/`rs_…`/`exec-<uuid>`/`call_…`），一项多行时后缀 `_<n>` / `_result` | 两路读的是同一个 ThreadItem：app-server 实时推 `item/started`+`item/completed`，rollout 把同一项写进 `event_msg`→`item_completed`，id 逐字相同 |
 | antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id |
 | zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
 | cursor / opencode | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
+
+**引擎同时提供「原始记录」和「组装好的记录」时，两路都读组装的那一份。** codex 的 rollout 里
+既有 Responses API 的原始条目（`response_item`：`custom_tool_call` 及其输出、`function_call`、
+`message`），也有引擎自己组装好的 ThreadItem（`event_msg` → `item_completed`）；app-server
+实时推送的正是后者。读原始条目意味着自己重建一遍引擎已经做过的事——把 exec 脚本反解成命令、
+把补丁反解成逐文件 diff、把输出回填到调用上——而重建出来的东西带的是原始条目的 id，
+和实时那份对不上，于是每条回复渲染两遍。读组装记录则两路同源：一个词汇表
+（`codex-thread-items.ts`）、一个行渲染器、一套 id。
 
 引擎确实什么都没给时**不要伪造**：随机值会让对账从"知道自己不知道"变成"自信地答错"。
 正确做法是让推导落在引擎记录的确定性属性上（文件内序号、step 号、数据库主键都算），
@@ -225,13 +230,9 @@ id 必须字节相同。** 这条有两道闸门守着：
 `providerRowKey` 只在行 id 本身无法跨路相等、但 provider 能从两路原生数据复建出同一身份时使用；
 它不承担展示 id、WebSocket `seq`、排序 `sequence` 或编辑锚点的职责。
 
-Codex 的两路在 `normalizeHistoryEntry` 汇合——实时 `agent_message` 带 `message.role`，
-在 `normalizeMessage` 开头就被转到这里，所以 key 在汇合点统一取，
-而不是在看似对应的实时分支里各取一次。
-
 **`providerRowKey` 的边界**：前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
 
-**工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（codex/antigravity 现状——三命名空间无桥、锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。
+**工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（antigravity 现状——锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。
 
 **Antigravity 转录读取**：`antigravity-transcript.provider.ts` 是 compact `transcript.jsonl` 与 `transcript_full.jsonl` 的唯一读取入口。它按原生 `step_index` 以 full 覆盖同一步、保留 compact 尚未被 full 追上的尾部，并跳过损坏 JSONL 尾行；历史正文同时带明确的完整度事实。历史专属 thinking 不进入可见时间线，因为它没有可与实时流对应的稳定身份。
 
