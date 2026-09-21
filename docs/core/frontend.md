@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.3.3 / 2026-09-18
+> 基准：2.4.8 / 2026-09-21
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -82,12 +82,13 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 ## 性能守则（硬约束，都是踩过坑的）
 
 1. **行身份稳定**：时间线 store 的两条不变量（字节等价行复用实例；更新只有原地 upsert / 保身份全量替换两种）。`React.memo`、WeakMap 转换缓存（`useChatMessages.ts`）、DOM 锚定全部依赖它。
-2. **滚动**：滚动机制归 `useChatScrollController`（组合 `useContinuousScrollAnchor` 的钉底 ResizeObserver、顶部链式加载、初始贴底、发送/刷新后的确定性回底、搜索跳转 reveal）——别在组件里另起 `setTimeout` 贴底或直接摸 scrollTop。**禁止给消息行加 `content-visibility: auto`**（估高↔真高翻转 + 锚定补偿会自持振荡，已实锤移除）；滚动窗口/补偿公式收在 `src/modules/chat/utils/chatScrollMath.ts`，行为契约测试绑定真身（`src/modules/chat/tests/chatScrollStability.test.ts`），两个 perf harness（`scripts/perf/chat-scroll-*.mjs`）是行为闸门。
-3. **懒挂载**：`transcript/LazyMessageRow.tsx` + 共享 IntersectionObserver（`useLazyRowObserver.ts`，1200px 边距）——视口附近才挂真实内容，占位行与实测高度常驻。
+2. **滚动与虚拟化**：转录由 virtua 的 `Virtualizer` 虚拟化，视口逻辑归 `useTranscriptViewport`（贴底、距顶两屏预取旧页、按下标跳转）。**滚动位置的正确性来自布局，不来自补偿**：virtua 测量每一行并据此改写滚动偏移，所以业务代码不得自行做高度差补偿、rAF 稳定循环或 `setTimeout` 贴底，也不要直接摸 `scrollTop`——要移动视口就用 `scrollToIndex`。前插旧页的那一次提交必须带 `shift`，否则会被当成追加。**禁止给消息行加 `content-visibility: auto`**：行自己改高度会把虚拟化没造成的高度变化喂给浏览器的启发式，与测量打架（已实锤移除，`transcriptRowCss.test.ts` 守着）。
+3. **行下标是唯一寻址方式**：虚拟列表按下标定位，所以「哪些行会被渲染」只能有一个来源。分组（`groupConsecutiveTools`）在状态层完成，行数、搜索命中下标、贴底目标全部取自同一个 `transcriptItems`；不要再引入第二层可见窗口切片。
 4. **高亮**：`src/shared/syntaxHighlighter.ts` 用 PrismLight + 显式语言注册表（`codeHighlightLanguages.ts`），不要换回全量 Prism。
 5. **流式**：流式行必须经 `StreamingMarkdown`（前缀/尾块两段 `MarkdownBody`，前缀 memo 命中）+ store 的 100ms tick，别在每 delta 上重解析全文。
 6. **WS 帧**：任何新功能不得在帧回调里直接 setState；进 store，靠 notify 批量提交。
-7. **Git 变更面板按需取 diff**：`useGitPanelController` 只负责 `fetch` 单个文件的 diff，status 刷新时只清掉已不在变更列表里的缓存；`ChangesView` 在某行展开时才请求，`FileChangeItem` 折叠时**不挂载** `GitDiffViewer`。几百个变更文件若一次性预取并常驻 DOM（每行 diff 一个节点），移动端浏览器会被内存打死。
+7. **滚动的验收只看行，不看 `scrollTop`**：`scripts/perf/chat-scroll-up-stability.mjs` 断言屏幕上的行走了多远（`visualProgress`）、有没有逆向漂移（`visualBacktrack`）。虚拟化会主动改写 `scrollTop` 来让行不动，因此基于 `scrollTop` 的断言两头不准——既放过了旧实现的卡顿，又会把新实现的正常补偿报成故障。
+8. **Git 变更面板按需取 diff**：`useGitPanelController` 只负责 `fetch` 单个文件的 diff，status 刷新时只清掉已不在变更列表里的缓存；`ChangesView` 在某行展开时才请求，`FileChangeItem` 折叠时**不挂载** `GitDiffViewer`。几百个变更文件若一次性预取并常驻 DOM（每行 diff 一个节点），移动端浏览器会被内存打死。
 
 ## i18n
 

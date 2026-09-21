@@ -105,25 +105,17 @@ function ChatInterface({
     setCurrentSessionId,
     isLoadingSessionMessages,
     isLoadingMoreMessages,
-    hasMoreMessages,
-    totalMessages,
     isUserScrolledUp,
     tokenBudget,
     setTokenBudget,
-    visibleMessageCount,
-    visibleMessages,
-    loadEarlierMessages,
-    loadAllMessages,
-    allMessagesLoaded,
-    isLoadingAllMessages,
-    loadAllJustFinished,
-    showLoadAllOverlay,
+    transcriptItems,
+    highlightedItemIndex,
     createDiff,
-    scrollContainerRef,
-    scrollContentRef,
-    stickToBottomSettled,
-    scrollToBottomAndReset,
-    notifyPaneMounted,
+    scrollRef,
+    virtualizerRef,
+    shiftOnPrepend,
+    handleScroll,
+    stickToBottom,
     requestLatestMessages,
   } = useChatSessionState({
     isActive,
@@ -138,6 +130,7 @@ function ChatInterface({
     resetStreamingState,
     statusCheckSentAtRef,
     sessionStore,
+    showThinking: Boolean(showThinking),
   });
 
   // Brand-new conversation: the composer allocated a stable session id via
@@ -227,7 +220,7 @@ function ChatInterface({
     onInputFocusChange,
     onFileOpen,
     onShowSettings,
-    stickToBottomAfterSend: stickToBottomSettled,
+    stickToBottomAfterSend: stickToBottom,
     addMessage,
     setPendingPermissionRequests,
     resolvePermissionModeForProvider,
@@ -418,9 +411,12 @@ function ChatInterface({
           )
         ) : (
         <ChatMessagesPane
-          scrollContainerRef={scrollContainerRef}
-          scrollContentRef={scrollContentRef}
-          onPaneMounted={notifyPaneMounted}
+          scrollRef={scrollRef}
+          virtualizerRef={virtualizerRef}
+          onScroll={handleScroll}
+          shiftOnPrepend={shiftOnPrepend}
+          transcriptItems={transcriptItems}
+          highlightedItemIndex={highlightedItemIndex}
           isProcessing={isProcessing}
           hasActivityIndicator={hasActivityIndicator}
           chatMessages={chatMessages}
@@ -429,17 +425,6 @@ function ChatInterface({
           onEditMessage={supportsMessageEditing && !isProcessing ? beginEditMessage : undefined}
           onForkFromMessage={supportsSessionForking ? handleForkFromMessage : undefined}
           isLoadingMoreMessages={isLoadingMoreMessages}
-          hasMoreMessages={hasMoreMessages}
-          totalMessages={totalMessages}
-          sessionMessagesCount={chatMessages.length}
-          visibleMessageCount={visibleMessageCount}
-          visibleMessages={visibleMessages}
-          loadEarlierMessages={loadEarlierMessages}
-          loadAllMessages={loadAllMessages}
-          allMessagesLoaded={allMessagesLoaded}
-          isLoadingAllMessages={isLoadingAllMessages}
-          loadAllJustFinished={loadAllJustFinished}
-          showLoadAllOverlay={showLoadAllOverlay}
           createDiff={createDiff}
           onFileOpen={onFileOpen}
           showRawParameters={showRawParameters}
@@ -453,7 +438,7 @@ function ChatInterface({
             <div className="pointer-events-none absolute -top-11 left-0 right-0 z-20 flex justify-center">
               <button
                 type="button"
-                onClick={scrollToBottomAndReset}
+                onClick={stickToBottom}
                 aria-label={t('input.scrollToBottom', { defaultValue: 'Scroll to bottom' })}
                 className="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full border border-border/50 bg-card text-muted-foreground shadow-sm transition-all duration-200 hover:bg-accent hover:text-foreground"
                 title={t('input.scrollToBottom', { defaultValue: 'Scroll to bottom' })}

@@ -140,13 +140,6 @@
       "sessionMessages": "Sitzungsnachrichten werden geladen..."
     },
     "messages": {
-      "showingOf": "{{shown}} von {{total}} Nachrichten werden angezeigt",
-      "scrollToLoad": "Nach oben scrollen, um mehr zu laden",
-      "showingLast": "Letzte {{count}} Nachrichten werden angezeigt ({{total}} gesamt)",
-      "loadEarlier": "Frühere Nachrichten laden",
-      "loadAll": "Alle Nachrichten laden",
-      "loadingAll": "Alle Nachrichten werden geladen...",
-      "allLoaded": "Alle Nachrichten geladen",
       "perfWarning": "Alle Nachrichten geladen – Scrollen kann langsamer sein. Klick auf 'Nach unten scrollen', um die Leistung wiederherzustellen."
     }
   },

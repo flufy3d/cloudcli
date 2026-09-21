@@ -140,13 +140,6 @@
       "sessionMessages": "Oturum mesajları yükleniyor..."
     },
     "messages": {
-      "showingOf": "{{total}} mesajdan {{shown}} tanesi gösteriliyor",
-      "scrollToLoad": "Daha fazlasını yüklemek için yukarı kaydır",
-      "showingLast": "Son {{count}} mesaj gösteriliyor ({{total}} toplam)",
-      "loadEarlier": "Önceki mesajları yükle",
-      "loadAll": "Tüm mesajları yükle",
-      "loadingAll": "Tüm mesajlar yükleniyor...",
-      "allLoaded": "Tüm mesajlar yüklendi",
       "perfWarning": "Tüm mesajlar yüklendi — kaydırma yavaşlayabilir. Performansı geri getirmek için \"En alta git\"e tıkla."
     }
   },

@@ -1,30 +1,32 @@
 import { useTranslation } from 'react-i18next';
-import { memo, useCallback, useEffect, useMemo } from 'react';
+import { memo, useCallback, useMemo } from 'react';
 import type { RefObject } from 'react';
+import { Virtualizer } from 'virtua';
+import type { VirtualizerHandle } from 'virtua';
 
-import type { ChatMessage } from '@/shared/types';
-import type { Project, ProjectSession, LLMProvider } from '@/shared/types';
+import type { ChatMessage, Project, ProjectSession, LLMProvider } from '@/shared/types';
 import { getIntrinsicMessageKey } from '@/modules/chat/utils/messageKeys';
-import { groupConsecutiveTools, isToolGroupItem } from '@/modules/chat/utils/toolGrouping';
+import { isToolGroupItem } from '@/modules/chat/utils/toolGrouping';
 import type { MessageListItem } from '@/modules/chat/utils/toolGrouping';
-
 import MessageComponent from '@/modules/chat/transcript/MessageComponent';
 import ToolGroupContainer from '@/modules/chat/transcript/ToolGroupContainer';
-import LoadAllMessagesOverlay from '@/modules/chat/transcript/LoadAllMessagesOverlay';
 import ChatExportMenu from '@/modules/chat/transcript/ChatExportMenu';
-import LazyMessageRow from '@/modules/chat/transcript/LazyMessageRow';
-import { useLazyRowObserver } from '@/modules/chat/hooks/useLazyRowObserver';
 
 type ChatMessagesPaneProps = {
-  scrollContainerRef: RefObject<HTMLDivElement>;
-  /** The inner content wrapper whose growth the scroll anchor observes. */
-  scrollContentRef: RefObject<HTMLDivElement>;
-  /** Reports mount/unmount so the scroll anchor can (re)attach listeners. */
-  onPaneMounted: () => void;
+  /** The scroll container, owned by `useTranscriptViewport`. */
+  scrollRef: RefObject<HTMLDivElement>;
+  /** virtua's handle, owned by `useTranscriptViewport`. */
+  virtualizerRef: RefObject<VirtualizerHandle>;
+  onScroll: (offset: number) => void;
+  /** True for the commit that prepends older history. */
+  shiftOnPrepend: boolean;
+  /** The grouped transcript rows, already windowed by the session state. */
+  transcriptItems: MessageListItem[];
   /** True while the viewed session has an active provider run in flight. */
   isProcessing?: boolean;
   /** True while ChatComposer's floating activity/stop tab is rendered above the input. */
   hasActivityIndicator?: boolean;
+  /** The full transcript, for the export menu. */
   chatMessages: ChatMessage[];
   selectedSession: ProjectSession | null;
   provider: LLMProvider;
@@ -33,17 +35,8 @@ type ChatMessagesPaneProps = {
   /** Present when the provider supports forking the session from a message. */
   onForkFromMessage?: (message: ChatMessage) => void;
   isLoadingMoreMessages: boolean;
-  hasMoreMessages: boolean;
-  totalMessages: number;
-  sessionMessagesCount: number;
-  visibleMessageCount: number;
-  visibleMessages: ChatMessage[];
-  loadEarlierMessages: () => void;
-  loadAllMessages: () => void;
-  allMessagesLoaded: boolean;
-  isLoadingAllMessages: boolean;
-  loadAllJustFinished: boolean;
-  showLoadAllOverlay: boolean;
+  /** Row a search jump landed on, flashed to orient the reader. */
+  highlightedItemIndex: number | null;
   createDiff: any;
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   showRawParameters?: boolean;
@@ -80,10 +73,24 @@ function isTurnFinalAssistantRow(items: MessageListItem[], index: number): boole
   return true;
 }
 
+/**
+ * The transcript. Rows are virtualized by virtua against the scroll container
+ * owned by `useTranscriptViewport`: only rows near the viewport are in the
+ * DOM, and virtua measures each one as it mounts, correcting the scroll offset
+ * so the content the reader is looking at never moves.
+ *
+ * Row spacing lives on each row (`pt-*`) rather than on the container, so
+ * nothing sits between the scroll container's top edge and the first row —
+ * a container padding or a flow-level header would offset virtua's whole
+ * index-to-offset mapping. The export menu is therefore a zero-height sticky
+ * layer, not a flow element.
+ */
 function ChatMessagesPane({
-  scrollContainerRef,
-  scrollContentRef,
-  onPaneMounted,
+  scrollRef,
+  virtualizerRef,
+  onScroll,
+  shiftOnPrepend,
+  transcriptItems,
   isProcessing = false,
   hasActivityIndicator = false,
   chatMessages,
@@ -92,17 +99,7 @@ function ChatMessagesPane({
   onEditMessage,
   onForkFromMessage,
   isLoadingMoreMessages,
-  hasMoreMessages,
-  totalMessages,
-  sessionMessagesCount,
-  visibleMessageCount,
-  visibleMessages,
-  loadEarlierMessages,
-  loadAllMessages,
-  allMessagesLoaded,
-  isLoadingAllMessages,
-  loadAllJustFinished,
-  showLoadAllOverlay,
+  highlightedItemIndex,
   createDiff,
   onFileOpen,
   showRawParameters,
@@ -110,28 +107,16 @@ function ChatMessagesPane({
   selectedProject,
 }: ChatMessagesPaneProps) {
   const { t } = useTranslation('chat');
-  const lazyRows = useLazyRowObserver(scrollContainerRef);
 
-  useEffect(() => {
-    onPaneMounted();
-    return () => onPaneMounted();
-  }, [onPaneMounted]);
-
-  const groupedVisibleMessages = useMemo(
-    () => groupConsecutiveTools(visibleMessages, Boolean(showThinking)),
-    [visibleMessages, showThinking],
-  );
-
-  // Stable, deterministic keys for the messages rendered this pass.
+  // Stable, deterministic keys for the rows rendered this pass.
   //
-  // `normalizedToChatMessages` rebuilds fresh ChatMessage objects on every store
-  // update, so caching keys by object identity (or via a cross-render allocation
-  // Set) minted a brand-new key for the *same* logical message on each prepend —
-  // remounting the whole list, which disconnects the scroll-restore anchor and
-  // reflows heights, jumping the viewport to the bottom. Deriving keys purely
-  // from this render's ordered messages (intrinsic key, disambiguated by
-  // occurrence index on collision) yields the same key for the same message
-  // order, so React preserves existing DOM nodes and component state on prepend.
+  // `normalizedToChatMessages` rebuilds fresh ChatMessage objects on every
+  // store update, so caching keys by object identity minted a brand-new key
+  // for the *same* logical message on each prepend, remounting rows and
+  // throwing away their measured heights. Deriving keys purely from this
+  // render's ordered rows (intrinsic key, disambiguated by occurrence index on
+  // collision) yields the same key for the same row order, so React preserves
+  // the DOM nodes and virtua keeps its measurements.
   const messageKeyMap = useMemo(() => {
     const keys = new WeakMap<ChatMessage, string>();
     const occurrences = new Map<string, number>();
@@ -141,7 +126,7 @@ function ChatMessagesPane({
       occurrences.set(intrinsicKey, seen + 1);
       keys.set(message, seen === 0 ? intrinsicKey : `${intrinsicKey}__${seen}`);
     };
-    for (const item of groupedVisibleMessages) {
+    for (const item of transcriptItems) {
       if (isToolGroupItem(item)) {
         item.messages.forEach(assign);
       } else {
@@ -149,7 +134,7 @@ function ChatMessagesPane({
       }
     }
     return keys;
-  }, [groupedVisibleMessages]);
+  }, [transcriptItems]);
 
   const getMessageKey = useCallback(
     (message: ChatMessage) =>
@@ -157,162 +142,135 @@ function ChatMessagesPane({
     [messageKeyMap],
   );
 
+  // The row preceding each item, which MessageComponent uses for grouping
+  // decisions, and the turn anchor it belongs to. Precomputed per commit
+  // because virtua renders rows out of order and by index, so a row cannot
+  // learn its predecessor from the render loop the way a full map could.
+  const rowContext = useMemo(() => {
+    const previousMessages: (ChatMessage | null)[] = [];
+    const turnAnchors: (ChatMessage | null)[] = [];
+    let previous: ChatMessage | null = null;
+    let currentTurnAnchor: ChatMessage | null = null;
+
+    for (const item of transcriptItems) {
+      previousMessages.push(previous);
+      if (isToolGroupItem(item)) {
+        turnAnchors.push(currentTurnAnchor);
+        previous = item.messages[item.messages.length - 1] || previous;
+        continue;
+      }
+      if (item.type === 'user' && item.transcriptAnchorId) {
+        currentTurnAnchor = item;
+      }
+      turnAnchors.push(currentTurnAnchor);
+      previous = item;
+    }
+
+    return { previousMessages, turnAnchors };
+  }, [transcriptItems]);
+
+  const renderRow = useCallback((item: MessageListItem, index: number) => {
+    const rowKey = isToolGroupItem(item)
+      ? `tool-group-${getMessageKey(item.messages[0])}`
+      : getMessageKey(item);
+    const highlightClass = index === highlightedItemIndex ? ' search-highlight-flash' : '';
+
+    return (
+      <div
+        key={rowKey}
+        data-anchor-id={rowKey}
+        className={`pt-3 sm:pt-4${highlightClass}`}
+      >
+        {isToolGroupItem(item) ? (
+          <ToolGroupContainer
+            group={item}
+            prevMessage={rowContext.previousMessages[index]}
+            createDiff={createDiff}
+            getMessageKey={getMessageKey}
+            onFileOpen={onFileOpen}
+            showRawParameters={showRawParameters}
+            showThinking={showThinking}
+            selectedProject={selectedProject}
+            provider={provider}
+          />
+        ) : (
+          <MessageComponent
+            message={item}
+            prevMessage={rowContext.previousMessages[index]}
+            turnAnchorMessage={rowContext.turnAnchors[index]}
+            isTurnFinalAssistant={isTurnFinalAssistantRow(transcriptItems, index)}
+            createDiff={createDiff}
+            onFileOpen={onFileOpen}
+            showRawParameters={showRawParameters}
+            showThinking={showThinking}
+            isThinkingStreaming={
+              isProcessing && index === transcriptItems.length - 1 && Boolean(item.isThinking)
+            }
+            selectedProject={selectedProject}
+            provider={provider}
+            onEditMessage={onEditMessage}
+            onForkFromMessage={onForkFromMessage}
+          />
+        )}
+      </div>
+    );
+  }, [
+    createDiff,
+    getMessageKey,
+    highlightedItemIndex,
+    isProcessing,
+    onEditMessage,
+    onFileOpen,
+    onForkFromMessage,
+    provider,
+    rowContext,
+    selectedProject,
+    showRawParameters,
+    showThinking,
+    transcriptItems,
+  ]);
+
   return (
     <div
-      ref={scrollContainerRef}
-      className={`chat-messages-pane relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden pt-3 sm:pt-4 ${
+      ref={scrollRef}
+      className={`chat-messages-pane relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden ${
         hasActivityIndicator ? 'pb-12 sm:pb-14' : 'pb-3 sm:pb-4'
       }`}
     >
-      {chatMessages.length > 0 && (
-        <div className="pointer-events-none sticky right-4 top-3 z-10 mb-2 flex justify-end sm:px-4">
-          <div className="pointer-events-auto">
-            <ChatExportMenu
-              messages={chatMessages}
-              sessionTitle={selectedSession?.title}
-              provider={selectedSession?.provider || provider}
-              createDiff={createDiff}
-            />
+      {/* Zero-height so it adds no offset ahead of the virtualized rows. */}
+      <div className="pointer-events-none sticky top-3 z-10 flex h-0 justify-end pr-4 sm:pr-4">
+        <div className="pointer-events-auto">
+          <ChatExportMenu
+            messages={chatMessages}
+            sessionTitle={selectedSession?.title}
+            provider={selectedSession?.provider || provider}
+            createDiff={createDiff}
+          />
+        </div>
+      </div>
+
+      {/* Older-history spinner floats over the top edge, for the same reason. */}
+      {isLoadingMoreMessages && (
+        <div className="pointer-events-none sticky top-0 z-10 flex h-0 justify-center">
+          <div className="mt-2 flex items-center space-x-2 rounded-full bg-background/90 px-3 py-1 shadow-sm">
+            <div className="h-3 w-3 animate-spin rounded-full border-b-2 border-gray-400" />
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              {t('session.loading.olderMessages')}
+            </p>
           </div>
         </div>
       )}
-      <div ref={scrollContentRef} className="mx-auto w-full max-w-[54.25rem] space-y-3 px-4 sm:space-y-4">
-          {/* Loading indicator for older messages (hide when load-all is active) */}
-          {isLoadingMoreMessages && !isLoadingAllMessages && !allMessagesLoaded && (
-            <div className="py-3 text-center text-gray-500 dark:text-gray-400">
-              <div className="flex items-center justify-center space-x-2">
-                <div className="h-4 w-4 animate-spin rounded-full border-b-2 border-gray-400" />
-                <p className="text-sm">{t('session.loading.olderMessages')}</p>
-              </div>
-            </div>
-          )}
 
-          {/* Indicator showing there are more messages to load (hide when all loaded) */}
-          {hasMoreMessages && !isLoadingMoreMessages && !allMessagesLoaded && (
-            <div className="border-b border-gray-200 py-2 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">
-              {totalMessages > 0 && (
-                <span>
-                  {t('session.messages.showingOf', { shown: sessionMessagesCount, total: totalMessages })}{' '}
-                  <span className="text-xs">{t('session.messages.scrollToLoad')}</span>
-                </span>
-              )}
-            </div>
-          )}
-
-          <LoadAllMessagesOverlay
-            showLoadAllOverlay={showLoadAllOverlay}
-            isLoadingAllMessages={isLoadingAllMessages}
-            loadAllJustFinished={loadAllJustFinished}
-            totalMessages={totalMessages}
-            onLoadAllMessages={loadAllMessages}
-          />
-
-          {/* Legacy message count indicator (for non-paginated view) */}
-          {!hasMoreMessages && chatMessages.length > visibleMessageCount && (
-            <div className="border-b border-gray-200 py-2 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">
-              {t('session.messages.showingLast', { count: visibleMessageCount, total: chatMessages.length })} |
-              <button className="ml-1 text-blue-600 underline hover:text-blue-700" onClick={loadEarlierMessages}>
-                {t('session.messages.loadEarlier')}
-              </button>
-              {' | '}
-              <button
-                className="text-blue-600 underline hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
-                onClick={loadAllMessages}
-              >
-                {t('session.messages.loadAll')}
-              </button>
-            </div>
-          )}
-
-          {(() => {
-            let prevMessage: ChatMessage | null = null;
-            let currentTurnAnchor: ChatMessage | null = null;
-            const totalCount = groupedVisibleMessages.length;
-            const enableLazy = totalCount > 25;
-            const activeTailCount = 15;
-
-            return groupedVisibleMessages.map((item, index) => {
-              const isNearTail = index >= totalCount - activeTailCount;
-
-              if (isToolGroupItem(item)) {
-                const groupPrevMessage = prevMessage;
-                prevMessage = item.messages[item.messages.length - 1] || prevMessage;
-
-                const rowContent = (
-                  <div key={`tool-group-${getMessageKey(item.messages[0])}`} data-anchor-id={`tool-group-${getMessageKey(item.messages[0])}`}>
-                    <ToolGroupContainer
-                      group={item}
-                      prevMessage={groupPrevMessage}
-                      createDiff={createDiff}
-                      getMessageKey={getMessageKey}
-                      onFileOpen={onFileOpen}
-                      showRawParameters={showRawParameters}
-                      showThinking={showThinking}
-                      selectedProject={selectedProject}
-                      provider={provider}
-                    />
-                  </div>
-                );
-
-                if (!enableLazy) {
-                  return rowContent;
-                }
-
-                return (
-                  <LazyMessageRow
-                    key={`lazy-tool-group-${getMessageKey(item.messages[0])}`}
-                    lazyRows={lazyRows}
-                    timestamp={item.messages[0]?.timestamp}
-                    initiallyNearViewport={isNearTail}
-                  >
-                    {rowContent}
-                  </LazyMessageRow>
-                );
-              }
-
-              if (item.type === 'user' && item.transcriptAnchorId) {
-                currentTurnAnchor = item;
-              }
-
-              const messagePrevMessage = prevMessage;
-              prevMessage = item;
-
-              const rowContent = (
-                <div key={getMessageKey(item)} data-anchor-id={getMessageKey(item)}>
-                  <MessageComponent
-                    message={item}
-                    prevMessage={messagePrevMessage}
-                    turnAnchorMessage={currentTurnAnchor}
-                    isTurnFinalAssistant={isTurnFinalAssistantRow(groupedVisibleMessages, index)}
-                    createDiff={createDiff}
-                    onFileOpen={onFileOpen}
-                    showRawParameters={showRawParameters}
-                    showThinking={showThinking}
-                    isThinkingStreaming={isProcessing && index === totalCount - 1 && Boolean(item.isThinking)}
-                    selectedProject={selectedProject}
-                    provider={provider}
-                    onEditMessage={onEditMessage}
-                    onForkFromMessage={onForkFromMessage}
-                  />
-                </div>
-              );
-
-              if (!enableLazy) {
-                return rowContent;
-              }
-
-              return (
-                <LazyMessageRow
-                  key={`lazy-${getMessageKey(item)}`}
-                  lazyRows={lazyRows}
-                  timestamp={item.timestamp}
-                  initiallyNearViewport={isNearTail}
-                >
-                  {rowContent}
-                </LazyMessageRow>
-              );
-            });
-          })()}
+      <div className="mx-auto w-full max-w-[54.25rem] px-4">
+        <Virtualizer
+          ref={virtualizerRef}
+          scrollRef={scrollRef}
+          shift={shiftOnPrepend}
+          onScroll={onScroll}
+          data={transcriptItems}
+        >
+          {renderRow}
+        </Virtualizer>
       </div>
     </div>
   );

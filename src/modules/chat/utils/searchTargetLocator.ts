@@ -1,14 +1,20 @@
 import type { ChatMessage } from '@/shared/types';
+import { isToolGroupItem } from '@/modules/chat/utils/toolGrouping';
+import type { MessageListItem } from '@/modules/chat/utils/toolGrouping';
 
 /**
- * Locates the message a sidebar search result points at, against the loaded
+ * Locates the row a sidebar search result points at, against the loaded
  * transcript rather than the rendered DOM.
  *
  * The jump used to render the entire transcript and then scan `.chat-message`
  * textContent for the snippet, retrying fifteen times before giving up
- * silently. Resolving the index from the data first means the caller can size
- * the render window so the target is guaranteed to be on screen, and a miss is
- * knowable instead of being papered over by the nearest-timestamp fallback.
+ * silently. Resolving the index from the data means the caller can hand it
+ * straight to the virtualizer, and a miss is knowable instead of being papered
+ * over by the nearest-timestamp fallback.
+ *
+ * The index is into the *grouped* rows the transcript actually renders, not
+ * into the flat message list: grouping folds consecutive tool calls into one
+ * row and drops hidden ones, so the two index spaces do not line up.
  */
 
 /** Shorter fragments match too many messages to identify one. */
@@ -47,20 +53,26 @@ function normalizeSearchSnippet(snippet: string): string {
     .trim();
 }
 
+/** Every message a rendered row covers — a tool group carries several. */
+function getRowMessages(item: MessageListItem): ChatMessage[] {
+  return isToolGroupItem(item) ? item.messages : [item];
+}
+
 /**
- * Returns the index of the best match, or -1 when the target is not in the
- * loaded transcript. The snippet is authoritative; the timestamp only breaks a
- * tie when no snippet matched, mirroring what the previous DOM scan did.
+ * Returns the index of the best-matching rendered row, or -1 when the target
+ * is not in the loaded transcript. The snippet is authoritative; the timestamp
+ * only breaks a tie when no snippet matched, mirroring what the previous DOM
+ * scan did.
  */
 export function findSearchTargetIndex(
-  messages: ChatMessage[],
+  items: MessageListItem[],
   target: SearchTarget,
 ): number {
   if (target.snippet) {
     const phrase = normalizeSearchSnippet(target.snippet);
     if (phrase.length >= MIN_SNIPPET_LENGTH) {
-      const matchIndex = messages.findIndex((message) =>
-        getSearchableText(message).includes(phrase),
+      const matchIndex = items.findIndex((item) =>
+        getRowMessages(item).some((message) => getSearchableText(message).includes(phrase)),
       );
       if (matchIndex >= 0) {
         return matchIndex;
@@ -74,16 +86,18 @@ export function findSearchTargetIndex(
       let closestIndex = -1;
       let closestDistance = Infinity;
 
-      for (const [index, message] of messages.entries()) {
-        const messageTime = new Date(message.timestamp).getTime();
-        if (!Number.isFinite(messageTime)) {
-          continue;
-        }
+      for (const [index, item] of items.entries()) {
+        for (const message of getRowMessages(item)) {
+          const messageTime = new Date(message.timestamp).getTime();
+          if (!Number.isFinite(messageTime)) {
+            continue;
+          }
 
-        const distance = Math.abs(messageTime - targetTime);
-        if (distance < closestDistance) {
-          closestDistance = distance;
-          closestIndex = index;
+          const distance = Math.abs(messageTime - targetTime);
+          if (distance < closestDistance) {
+            closestDistance = distance;
+            closestIndex = index;
+          }
         }
       }
 
@@ -94,17 +108,3 @@ export function findSearchTargetIndex(
   return -1;
 }
 
-/**
- * How many trailing messages must be rendered for `targetIndex` to be on screen.
- *
- * `visibleMessages` is a tail slice, so covering an old hit means rendering
- * everything after it. Exported for the caller and pinned by tests because an
- * off-by-one here scrolls to the wrong row or to nothing at all.
- */
-export function resolveSearchWindowSize(
-  messageCount: number,
-  targetIndex: number,
-  trailingContext: number,
-): number {
-  return messageCount - targetIndex + trailingContext;
-}

@@ -10,13 +10,28 @@
  *   3. sample scrollTop/scrollHeight every animation frame + observe DOM
  *      mutations inside the scroll content (placeholder swaps)
  *
- * Assertions (red = the user's symptom):
- *   A. netProgress   — after N wheel-ups the viewport must have moved up by
- *                      at least 50% of the intended distance.
- *   B. downwardYank  — scrollTop must not move DOWN between user inputs
- *                      (each sample gap without a wheel event).
- *   C. geometryChurn — scrollHeight must not change more than a few times
- *                      while the user is parked mid-history (no input).
+ * Assertions (red = the user's symptom). All of them are measured on the ROWS,
+ * not on scrollTop:
+ *   A. visualProgress  — over a burst of wheel-ups the content must actually
+ *                        travel at least half the distance the wheel asked for.
+ *   B. visualBacktrack — content must not travel against the scroll direction.
+ *   C. geometryChurn   — scrollHeight must not change while the user is parked
+ *                        mid-history with no input at all.
+ *
+ * Why not scrollTop. Earlier revisions asserted on scrollTop deltas, and they
+ * were useless twice over. They passed on the implementation users were
+ * calling unusable, and they fail on the one that replaced it: a virtualizer
+ * rewrites scrollTop on purpose, to keep measured rows from moving when an
+ * estimated height turns out wrong. A scrollTop "jump" there is the list
+ * holding still, which is the opposite of the defect. Only the rows say what
+ * the reader saw.
+ *
+ * Known blind spot: the frames where the old implementation jumped hardest are
+ * also the frames where it replaced every row in the DOM, leaving no row in
+ * common between two samples to measure against. Those frames are skipped, so
+ * visualBacktrack under-reports exactly where things are worst; visualProgress
+ * is the number that catches it, because swallowed scrolling shows up as
+ * distance never travelled.
  *
  * Exit 0 = green, 1 = red, 2 = harness error.
  */
@@ -194,23 +209,41 @@ try {
       window.__burst.mutations += m.reduce((s, x) => s + x.addedNodes.length + x.removedNodes.length, 0);
     });
     mo.observe(c.querySelector('div[class*="max-w"]') ?? c, { childList: true, subtree: true });
+    // Where each on-screen row sits relative to the viewport. Two consecutive
+    // frames sharing a row is what makes a visual jump measurable.
+    window.__rowTops = () => {
+      const base = c.getBoundingClientRect().top;
+      const tops = {};
+      for (const row of c.querySelectorAll('[data-anchor-id]')) {
+        const r = row.getBoundingClientRect();
+        if (r.bottom < base || r.top > base + c.clientHeight) continue;
+        tops[row.getAttribute('data-anchor-id')] = r.top - base;
+      }
+      return tops;
+    };
     const tick = () => {
-      window.__burst.samples.push({ t: performance.now(), scrollTop: c.scrollTop, scrollHeight: c.scrollHeight });
+      window.__burst.samples.push({
+        t: performance.now(), scrollTop: c.scrollTop, scrollHeight: c.scrollHeight,
+        rowTops: window.__rowTops(),
+      });
       requestAnimationFrame(tick);
     };
-    window.__burst.samples.push({ t: performance.now(), scrollTop: c.scrollTop, scrollHeight: c.scrollHeight });
+    window.__burst.samples.push({
+      t: performance.now(), scrollTop: c.scrollTop, scrollHeight: c.scrollHeight,
+      rowTops: window.__rowTops(),
+    });
     requestAnimationFrame(tick);
-    window.__burst.fallback = setInterval(() => {
-      window.__burst.samples.push({ t: performance.now(), scrollTop: c.scrollTop, scrollHeight: c.scrollHeight });
-    }, 32);
   })()`);
   await sleep(400);
 
   const center = await cdp.evaluate(`(() => { const r = window.__pane().getBoundingClientRect(); return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) }; })()`);
-  const N_WHEELS = 30;
-  const WHEEL_GAP_MS = 60;
+  // Fast flicks into never-rendered history: the symptom needs rows whose
+  // height was never measured, arriving faster than any settle timer.
+  const N_WHEELS = 40;
+  const WHEEL_DELTA_PX = 600;
+  const WHEEL_GAP_MS = 16;
   for (let i = 0; i < N_WHEELS; i++) {
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: center.x, y: center.y, deltaX: 0, deltaY: -120 });
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: center.x, y: center.y, deltaX: 0, deltaY: -WHEEL_DELTA_PX });
     await cdp.evaluate(`window.__burst.wheels.push(performance.now())`);
     await sleep(WHEEL_GAP_MS);
   }
@@ -227,7 +260,7 @@ try {
 
   // analysis: classify every significant viewport movement
   const first = burst.samples[0], last = burst.samples[burst.samples.length - 1];
-  const intendedPx = N_WHEELS * 120;
+  const intendedPx = N_WHEELS * WHEEL_DELTA_PX;
   const netUp = first.scrollTop - last.scrollTop;
 
   const jumps = [];
@@ -249,18 +282,69 @@ try {
   const yankWithHeightChange = yankDown.filter((j) => j.dHeight !== 0).length;
   const heightChanges = new Set(burst.samples.map((s) => s.scrollHeight)).size - 1;
 
+  /**
+   * What the eye actually saw, accumulated over the whole flick.
+   *
+   * Every frame, the median on-screen row moves by some amount; summing those
+   * gives the distance the content really travelled, independent of scrollTop.
+   * That matters because the other three assertions all read scrollTop, which
+   * a virtualizer legitimately rewrites in order to hold content still — they
+   * cannot tell "the list corrected itself" from "the list threw the reader
+   * somewhere else".
+   *
+   * Two numbers come out of it:
+   *   visualProgress  — content travelled in the direction the wheel asked for
+   *   visualBacktrack — content travelled the OTHER way, which the user never
+   *                     asked for; this is the "it keeps bouncing" symptom.
+   *
+   * Per-frame drift is deliberately not asserted: at a 16ms flick rate a wheel
+   * and its effect routinely land in different frames, so single frames are
+   * noise and only the totals are meaningful.
+   */
+  let visualProgress = 0;
+  let visualBacktrack = 0;
+  const backtrackFrames = [];
+  for (let i = 1; i < burst.samples.length; i++) {
+    const prev = burst.samples[i - 1], cur = burst.samples[i];
+    if (!prev.rowTops || !cur.rowTops) continue;
+    // Clamped at the top: there is nowhere left to go, so neither number applies.
+    if (cur.scrollTop <= 1 || prev.scrollTop <= 1) continue;
+
+    const moves = [];
+    for (const [anchorId, top] of Object.entries(cur.rowTops)) {
+      const before = prev.rowTops[anchorId];
+      if (before !== undefined) moves.push(top - before);
+    }
+    if (!moves.length) continue;
+    moves.sort((a, b) => a - b);
+    // Scrolling up by X moves every row DOWN the viewport by X.
+    const moved = moves[Math.floor(moves.length / 2)];
+
+    if (moved > 0) {
+      visualProgress += moved;
+    } else if (moved < 0) {
+      visualBacktrack += -moved;
+      if (-moved > 24) {
+        backtrackFrames.push({ t: Math.round(cur.t - burst.samples[0].t), movedPx: Math.round(moved) });
+      }
+    }
+  }
+  visualProgress = Math.round(visualProgress);
+  visualBacktrack = Math.round(visualBacktrack);
+  const requestedPx = N_WHEELS * WHEEL_DELTA_PX;
+
   const verdict = {
-    netProgress: {
-      pass: netUp >= intendedPx * 0.5,
-      detail: `net upward progress ${netUp}px after ${N_WHEELS} wheels (intended ${intendedPx}px, expect >= ${intendedPx * 0.5})`,
-    },
-    downwardYank: {
-      pass: downwardDrift <= 50,
-      detail: `viewport moved DOWN without input by ${Math.round(downwardDrift)}px across ${yankDown.length} jumps; ${yankAtBottom} landed exactly at bottom, ${yankWithHeightChange} coincided with height change (expect <= 50px)`,
-    },
     geometryChurn: {
       pass: parkChurn <= 2,
       detail: `scrollHeight changed ${parkChurn}x while parked 2s no-input; ${heightChanges} distinct heights during burst; ${burst.mutations} row DOM mutations`,
+    },
+    visualProgress: {
+      pass: visualProgress >= requestedPx * 0.5,
+      detail: `on-screen rows travelled ${visualProgress}px of the ${requestedPx}px the wheel asked for (expect >= ${requestedPx * 0.5})`,
+    },
+    visualBacktrack: {
+      pass: visualBacktrack <= 200,
+      detail: `content travelled ${visualBacktrack}px AGAINST the scroll direction across ${backtrackFrames.length} frames worse than 24px (expect <= 200px)`,
     },
   };
 
@@ -275,6 +359,10 @@ try {
     parkChurn,
     burstHeightChanges: heightChanges,
     burstMutations: burst.mutations,
+    visualProgress,
+    visualBacktrack,
+    requestedPx,
+    backtrackFrames: backtrackFrames.slice(0, 40),
     jumps: jumps.slice(0, 40),
     wsFrameCount: wsFrames.length,
     wsFrames: wsFrames.slice(-6),
