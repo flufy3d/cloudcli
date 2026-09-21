@@ -218,7 +218,9 @@ test('a streaming row anchors its timestamp at segment start and finalizes in pl
 
   const finalized = store.getMessages(SESSION_ID).find((row) => row.content === 'Hello');
   assert.ok(finalized);
-  assert.match(finalized!.id, /^text_/);
+  // A streamed segment with no engine row yet is held under a placeholder id;
+  // the engine's own row takes its place when it arrives.
+  assert.match(finalized!.id, /^__streamed_/);
   assert.equal(finalized!.timestamp, anchoredTimestamp);
   assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, realtimeCountBefore,
     'finalization replaces the streaming row in place');
@@ -311,7 +313,7 @@ test('a keyed Antigravity stream survives an empty first refresh and is pruned w
   await store.refreshLatestFromServer(SESSION_ID);
   let matchingRows = store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent);
   assert.equal(matchingRows.length, 1);
-  assert.match(matchingRows[0].id, /^text_/);
+  assert.match(matchingRows[0].id, /^__streamed_/);
   assert.equal(matchingRows[0].providerRowKey, providerRowKey);
 
   await store.refreshLatestFromServer(SESSION_ID);
@@ -783,19 +785,19 @@ test('optimistic user, thinking, and same-turn assistant echoes are absorbed int
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
-
   const at = (n: number) => new Date(BASE_TIME + n * 1000).toISOString();
   // Sent before this page existed, which is the only order reality produces:
-  // a prompt is not on disk until it has been sent. The stamp is what the
-  // store records at send time.
+  // a prompt is not on disk until it has been sent. The store records the
+  // transcript's last row at that moment — here, nothing at all.
   store.appendRealtime(SESSION_ID,
     msg(1, {
       id: 'local_user_echo',
       content: 'what is the answer?',
       timestamp: at(1),
-      replacesAfterRowCount: 0,
     }));
+
+  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+
   store.appendRealtime(SESSION_ID, {
     id: 'rt_thinking_echo',
     sessionId: SESSION_ID,
@@ -804,8 +806,11 @@ test('optimistic user, thinking, and same-turn assistant echoes are absorbed int
     timestamp: at(2),
     provider: 'claude',
   } as NormalizedMessage);
+  // The live reply arrives under the engine's own id — the same id the
+  // persisted row carries — so recognising it as the same row is a lookup,
+  // not a comparison of what it says.
   store.appendRealtime(SESSION_ID, {
-    id: 'text_streamed_echo',
+    id: 'm4',
     sessionId: SESSION_ID,
     kind: 'text',
     role: 'assistant',
@@ -840,10 +845,12 @@ test('a live provider echo merges into its optimistic user row before history re
   }));
   emit(store, providerEcho);
 
+  // The echo takes the stand-in's place, so the prompt carries the engine's
+  // own identity — and its edit/fork anchor — before any refresh.
   let userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
   assert.deepEqual(
     userRows.map((row) => ({ id: row.id, transcriptAnchorId: row.transcriptAnchorId })),
-    [{ id: 'local_prompt', transcriptAnchorId: 'claude-user-uuid' }],
+    [{ id: 'claude-user-uuid', transcriptAnchorId: 'claude-user-uuid' }],
   );
 
   await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
@@ -1262,15 +1269,21 @@ test('an older page prepended after sending does not strand the optimistic promp
     provider: 'claude', kind: 'text', role: 'user', content: 'continue',
   });
   assert.equal(
-    store.getSessionSlot(SESSION_ID)?.realtimeMessages.find((row) => row.id === 'local_repeat')?.replacesAfterRowCount,
-    1,
+    store.getSessionSlot(SESSION_ID)?.pendingPrompts.get('local_repeat')?.afterRowId,
+    'srv-new',
+    'the prompt anchors on the row the transcript ended with when it was sent',
   );
 
   await store.fetchMore(SESSION_ID, { limit: 20 });
 
-  const stamp = store.getSessionSlot(SESSION_ID)
-    ?.realtimeMessages.find((row) => row.id === 'local_repeat')?.replacesAfterRowCount;
-  assert.equal(stamp, 2, 'the stamp must shift by the number of rows prepended');
+  // The anchor is an id, so prepending an older page above it changes
+  // nothing. The row-count stamp this replaced had to be rewritten on every
+  // such page, and a wholesale refresh left it pointing past the prompt's own
+  // copy — after which the prompt could never retire at all.
+  assert.equal(
+    store.getSessionSlot(SESSION_ID)?.pendingPrompts.get('local_repeat')?.afterRowId,
+    'srv-new',
+  );
 
   const userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
   assert.equal(userRows.length, 2, 'the sent prompt must not be retired by the older identical one');
@@ -1324,9 +1337,8 @@ test('returning to a tool-heavy tail does not resurrect retired user echoes', as
 /**
  * A user row can reach the live stream without ever having been an optimistic
  * prompt: a second tab (or phone) sent it, or the engine echoed it back on a
- * resume. Retirement keys off the `local_` prefix, so such a row was retained
- * forever and rendered beside its own persisted copy — the prompt appeared
- * twice, and a reload did not clear it.
+ * resume. It arrives under the engine's own id, the same id the transcript
+ * will hold, so the refresh recognises it without looking at what it says.
  */
 test('a user row that never was an optimistic prompt is pruned once the transcript holds it', async () => {
   const store = new SessionTimelineStore({
@@ -1340,7 +1352,7 @@ test('a user row that never was an optimistic prompt is pruned once the transcri
     }),
   });
 
-  store.appendRealtime(SESSION_ID, msg(1, { id: 'live_user', content: 'ship it' }));
+  store.appendRealtime(SESSION_ID, msg(1, { id: 'srv_user', content: 'ship it' }));
   await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
 
   const prompts = store.getMessages(SESSION_ID).filter(
@@ -1349,8 +1361,8 @@ test('a user row that never was an optimistic prompt is pruned once the transcri
   assert.equal(prompts.length, 1, 'the prompt must not render as both a live copy and a persisted one');
 });
 
-/** Two genuinely distinct sends of the same text must both survive: the claim
- * is one-to-one, so the second live row keeps its own persisted counterpart. */
+/** Two genuinely distinct sends of the same text must both survive: they are
+ * two engine rows with two ids, and nothing collapses rows by content. */
 test('repeated identical prompts each keep exactly one row', async () => {
   const store = new SessionTimelineStore({
     fetchPage: async () => ({
@@ -1363,8 +1375,8 @@ test('repeated identical prompts each keep exactly one row', async () => {
     }),
   });
 
-  store.appendRealtime(SESSION_ID, msg(1, { id: 'live_a', content: 'again' }));
-  store.appendRealtime(SESSION_ID, msg(3, { id: 'live_b', content: 'again' }));
+  store.appendRealtime(SESSION_ID, msg(1, { id: 'srv_a', content: 'again' }));
+  store.appendRealtime(SESSION_ID, msg(3, { id: 'srv_b', content: 'again' }));
   await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
 
   const prompts = store.getMessages(SESSION_ID).filter(

@@ -1,202 +1,117 @@
 import type { NormalizedMessage } from '@/shared/types';
 
-
-type UserTurnFingerprint = {
-  text: string;
-  imageCount: number;
-  fileCount: number;
+/**
+ * What the transcript looked like when a prompt was sent.
+ *
+ * The client writes the user's prompt into the timeline immediately, before
+ * the engine has persisted anything, so that row exists only here. Retiring
+ * it later needs one question answered: which persisted user row is its copy?
+ *
+ * `afterRowId` is the id of the last persisted row at send time. Every row
+ * that appears after it is newer than the prompt, so the first user row past
+ * that point is the prompt's persisted copy. An id survives what an index
+ * does not — pages prepended above it, the whole array replaced by a refresh —
+ * which is exactly where the previous row-count stamp silently stopped
+ * matching and left the prompt rendered twice for the rest of the session.
+ *
+ * `null` means nothing was loaded yet, so any user row qualifies.
+ */
+export type PendingPrompt = {
+  afterRowId: string | null;
 };
 
-function userTurnFingerprint(message: NormalizedMessage): UserTurnFingerprint | null {
-  if (message.kind !== 'text' || message.role !== 'user') return null;
-
-  const text = (message.content || '').trim();
-  const imageCount = Array.isArray(message.images) ? message.images.length : 0;
-  const fileCount = Array.isArray(message.files) ? message.files.length : 0;
-  if (!text && imageCount === 0 && fileCount === 0) return null;
-
-  return { text, imageCount, fileCount };
+/** Whether a row is a client-side optimistic prompt awaiting its copy. */
+export function isOptimisticPromptRow(message: NormalizedMessage): boolean {
+  return message.id.startsWith('local_') && message.kind === 'text' && message.role === 'user';
 }
 
-function userTurnFingerprintsMatch(
-  local: UserTurnFingerprint,
-  server: UserTurnFingerprint,
-): boolean {
-  return (
-    local.text === server.text
-    && local.imageCount === server.imageCount
-    && local.fileCount === server.fileCount
-  );
+function isPersistedUserRow(message: NormalizedMessage): boolean {
+  return message.kind === 'text' && message.role === 'user';
 }
 
 /**
- * Used by the session timeline store to fold a provider's live user-message
- * echo into the optimistic row that already represents the same send.
+ * The outcome of pairing optimistic prompts against the transcript.
  *
- * The local id and timestamp stay in place until persisted history arrives:
- * they are the causal marker that later keeps this turn's live reply below its
- * server-backed prompt. Provider-owned fields such as `transcriptAnchorId`
- * are adopted immediately so edit and fork controls can use the real anchor.
+ * `retiredAnchors` is every pairing: it decides which prompt stops being
+ * rendered, where a permissive answer is the right one — an unpaired prompt
+ * shows next to its own persisted copy, the duplicate this all exists to
+ * stop.
+ *
+ * `provenAnchors` is the subset whose prompt had a real anchor, so the
+ * pairing is a fact rather than the best available reading. Only those may be
+ * used to prove which persisted turn a live row belongs to: a prompt sent
+ * before any history was loaded can be paired with the newest turn for
+ * display and still be the wrong turn to fingerprint a tool call against.
  */
-export function mergeProviderUserEchoIntoOptimisticRow(
-  realtimeMessages: NormalizedMessage[],
-  providerEcho: NormalizedMessage,
-): NormalizedMessage[] | null {
-  if (providerEcho.id.startsWith('local_')) {
-    return null;
-  }
-
-  const providerFingerprint = userTurnFingerprint(providerEcho);
-  if (!providerFingerprint) {
-    return null;
-  }
-
-  for (let index = realtimeMessages.length - 1; index >= 0; index -= 1) {
-    const candidate = realtimeMessages[index];
-    if (!candidate.id.startsWith('local_')) {
-      continue;
-    }
-
-    const localFingerprint = userTurnFingerprint(candidate);
-    if (!localFingerprint || !userTurnFingerprintsMatch(localFingerprint, providerFingerprint)) {
-      continue;
-    }
-
-    const merged = {
-      ...providerEcho,
-      id: candidate.id,
-      timestamp: candidate.timestamp,
-      replacesAnchorId: candidate.replacesAnchorId,
-      replacesAfterRowCount: candidate.replacesAfterRowCount,
-    };
-    const next = [...realtimeMessages];
-    next[index] = merged;
-    return next;
-  }
-
-  return null;
-}
-
-/**
- * Claims the persisted copy of a user row that never was an optimistic prompt,
- * so the live copy can be dropped instead of rendering beside it.
- *
- * Optimistic `local_*` rows are excluded on purpose: they anchor their turn
- * until the merge stage hides them, and retiring one here would destroy the
- * only record of where that turn begins. A row without the prefix carries no
- * anchor duty — it reached the stream because a second tab sent it or the
- * engine echoed it back — so an unclaimed transcript row with the same
- * fingerprint is that row, not a coincidence.
- *
- * Claims are one-to-one: sending the same text twice pairs each live row with
- * its own persisted turn rather than letting one row retire both.
- */
-export function claimServerUserEcho(
-  liveMessage: NormalizedMessage,
-  serverMessages: NormalizedMessage[],
-  claimedServerIds: Set<string>,
-): boolean {
-  if (liveMessage.id.startsWith('local_')) {
-    return false;
-  }
-
-  const liveFingerprint = userTurnFingerprint(liveMessage);
-  if (!liveFingerprint) {
-    return false;
-  }
-
-  for (const serverMessage of serverMessages) {
-    if (claimedServerIds.has(serverMessage.id)) {
-      continue;
-    }
-    const serverFingerprint = userTurnFingerprint(serverMessage);
-    if (!serverFingerprint || !userTurnFingerprintsMatch(liveFingerprint, serverFingerprint)) {
-      continue;
-    }
-    claimedServerIds.add(serverMessage.id);
-    return true;
-  }
-
-  return false;
-}
-
-function findServerEchoForLocalUser(
-  localMessage: NormalizedMessage,
-  serverMessages: NormalizedMessage[],
-  claimedServerIds: Set<string>,
-): NormalizedMessage | null {
-  const localFingerprint = userTurnFingerprint(localMessage);
-  if (!localFingerprint) {
-    return null;
-  }
-
-  // Only a row that appeared after this prompt was sent can be its persisted
-  // copy. `replacesAfterRowCount` records how much transcript was on screen at
-  // that moment, which settles it without comparing two machines' clocks — the
-  // engine stamps its copy, the browser stamps this one, and a difference
-  // between them is not evidence of anything.
-  const firstEligibleIndex = localMessage.replacesAfterRowCount ?? 0;
-
-  for (let index = firstEligibleIndex; index < serverMessages.length; index++) {
-    const serverMessage = serverMessages[index];
-    if (claimedServerIds.has(serverMessage.id)) {
-      continue;
-    }
-
-    const serverFingerprint = userTurnFingerprint(serverMessage);
-    if (!serverFingerprint || !userTurnFingerprintsMatch(localFingerprint, serverFingerprint)) {
-      continue;
-    }
-
-    // The earliest eligible match wins: repeated sends of the same prompt pair
-    // in order, so the nth echo retires against the nth persisted turn.
-    return serverMessage;
-  }
-
-  return null;
-}
-
-/**
- * The result of retiring optimistic user rows against the persisted transcript.
- *
- * `retiredAnchors` is the pairing the filter had to compute anyway: which
- * persisted turn took over from which optimistic row. It is what lets the
- * merge keep a live reply below the user turn that caused it after the
- * optimistic row is gone, so it is returned rather than discarded.
- */
-export type OptimisticUserEchoReconciliation = {
-  messages: NormalizedMessage[];
+export type OptimisticPromptReconciliation = {
   retiredAnchors: Map<string, string>;
+  provenAnchors: Map<string, string>;
 };
 
 /**
- * Retires local optimistic user rows once a corresponding persisted turn is
- * available, reporting which persisted row claimed each one. Matches are
- * one-to-one so repeated sends cannot claim one row.
+ * Pairs each optimistic prompt with the persisted user row that replaced it.
+ *
+ * Pairing is positional and one-to-one: the nth prompt still waiting takes
+ * the nth qualifying user row. Nothing here reads message text, timestamps or
+ * array lengths — sending the same words twice pairs each send with its own
+ * turn because the second send's anchor sits after the first send's copy.
+ *
+ * `runEnded` is the escape hatch for the one case an anchor cannot answer: a
+ * transcript rewritten under the prompt (a fork, a truncation) can drop the
+ * anchor row out of the window entirely. Rather than keep an unmatched prompt
+ * on screen forever — the failure this whole mechanism exists to prevent —
+ * a finished run lets the prompt pair with any user row it has not claimed.
  */
-export function reconcileOptimisticUserEchoes(
+export function reconcileOptimisticPrompts(
   serverMessages: NormalizedMessage[],
   realtimeMessages: NormalizedMessage[],
-): OptimisticUserEchoReconciliation {
-  const claimedServerIds = new Set<string>();
+  pendingPrompts: ReadonlyMap<string, PendingPrompt>,
+  runEnded: boolean,
+): OptimisticPromptReconciliation {
   const retiredAnchors = new Map<string, string>();
+  const provenAnchors = new Map<string, string>();
+  if (serverMessages.length === 0) {
+    return { retiredAnchors, provenAnchors };
+  }
 
-  const messages = realtimeMessages.filter((message) => {
-    if (!message.id.startsWith('local_')) {
-      return true;
+  const claimedServerIds = new Set<string>();
+
+  for (const message of realtimeMessages) {
+    if (!isOptimisticPromptRow(message)) {
+      continue;
     }
 
-    const serverEcho = findServerEchoForLocalUser(message, serverMessages, claimedServerIds);
-    if (!serverEcho) {
-      return true;
+    const anchorRowId = pendingPrompts.get(message.id)?.afterRowId ?? null;
+    let firstEligibleIndex = 0;
+    // A prompt sent with nothing loaded has no anchor to be right about. Its
+    // pairing is the best available reading until the run ends — by then the
+    // transcript certainly holds this turn, so the newest unclaimed user row
+    // is it.
+    let anchored = runEnded;
+    if (anchorRowId !== null) {
+      const anchorIndex = serverMessages.findIndex((candidate) => candidate.id === anchorRowId);
+      if (anchorIndex < 0 && !runEnded) {
+        continue;
+      }
+      anchored = anchorIndex >= 0;
+      firstEligibleIndex = anchorIndex + 1;
     }
 
-    claimedServerIds.add(serverEcho.id);
-    retiredAnchors.set(message.id, serverEcho.id);
-    return false;
-  });
+    for (let index = firstEligibleIndex; index < serverMessages.length; index++) {
+      const candidate = serverMessages[index];
+      if (claimedServerIds.has(candidate.id) || !isPersistedUserRow(candidate)) {
+        continue;
+      }
+      claimedServerIds.add(candidate.id);
+      retiredAnchors.set(message.id, candidate.id);
+      if (anchored) {
+        provenAnchors.set(message.id, candidate.id);
+      }
+      break;
+    }
+  }
 
-  return { messages, retiredAnchors };
+  return { retiredAnchors, provenAnchors };
 }
 
 /**

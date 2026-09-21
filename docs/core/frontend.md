@@ -47,7 +47,7 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 前端在协议之上的本地扩展写在 `src/shared/types.ts`，必须显式列出：
 
 - `TimelineMessageKind` = 协议的 `MessageKind` + `interactive_prompt`。后者由 composer 本地合成，引擎永不产出；把它挡在 `MessageKind` 之外，就不会有人误以为某家引擎该发这个 kind。
-- `NormalizedMessage` = 协议消息换上 `TimelineMessageKind`，再加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。这两个字段从不上线，只活在「发出去」与「持久化回合顶替掉它」之间。
+- `NormalizedMessage` = 协议消息换上 `TimelineMessageKind`，再加乐观回显的簿记字段 `replacesAnchorId`。它从不上线，只活在「发出去」与「持久化回合顶替掉它」之间；发送时刻的转录位置记在 store slot 的 `pendingPrompts` 里，不挂在消息上。
 
 新增一个跨端字段时改协议文件，**不要**在前端这边补声明——那正是漂移的来路。
 账号配额的形状（`ProviderQuotaData` 等）同样出自协议（`shared/protocol/quota.ts`），

@@ -3,7 +3,7 @@
   "prompt": "用 ls 列出当前目录，然后只回答文件名",
   "live": [
     {
-      "id": "item_0",
+      "id": "exec-765e1675-9820-4afc-ae92-8bdc7554a3b3",
       "sessionId": "f1",
       "timestamp": "2026-09-18T10:55:11.097Z",
       "provider": "codex",
@@ -12,32 +12,40 @@
       "toolInput": {
         "command": "ls"
       },
-      "toolId": "item_0",
+      "toolId": "exec-765e1675-9820-4afc-ae92-8bdc7554a3b3",
       "status": "completed"
     },
     {
-      "id": "item_0_result",
+      "id": "exec-765e1675-9820-4afc-ae92-8bdc7554a3b3_result",
       "sessionId": "f1",
       "timestamp": "2026-09-18T10:55:11.097Z",
       "provider": "codex",
       "kind": "tool_result",
-      "toolId": "item_0",
+      "toolId": "exec-765e1675-9820-4afc-ae92-8bdc7554a3b3",
       "content": "y.txt\n",
       "isError": false
     },
     {
-      "id": "codex_fff1884e-54b7-45ed-b30b-264d0db73526",
+      "id": "msg_02f5777c2a733b17016ab0759323dc87d0922628f30ead41fd",
       "sessionId": "f1",
       "timestamp": "2026-09-18T10:55:11.097Z",
       "provider": "codex",
       "kind": "text",
       "role": "assistant",
       "content": "y.txt"
+    },
+    {
+      "id": "vol_complete_codex-turn",
+      "sessionId": "f1",
+      "timestamp": "2026-09-18T10:55:11.097Z",
+      "provider": "codex",
+      "kind": "complete",
+      "success": true
     }
   ],
   "history": [
     {
-      "id": "codex_cb7bc032-6533-4e73-a3da-4f15726b4238",
+      "id": "01a0c14b-3acd-7853-80e3-c1a539f065cd",
       "sessionId": "f1",
       "timestamp": "2026-09-18T10:53:26.862Z",
       "provider": "codex",
@@ -47,21 +55,21 @@
       "transcriptAnchorId": "01a0b426-4bca-70f0-8b03-c150356257fe"
     },
     {
-      "id": "codex_185d6605-a1ce-468f-bb3a-f06ce813fff7",
+      "id": "ctc_02f5777c2a733b17016ab07595ad3887d08f8c15eb4706d656",
       "sessionId": "f1",
       "timestamp": "2026-09-18T10:53:30.630Z",
       "provider": "codex",
       "kind": "tool_use",
       "toolName": "Bash",
       "toolInput": "{\"command\":\"ls\"}",
-      "toolId": "call_wDZOSrPBHPPHiNfa8rYyPWUw",
+      "toolId": "call_8wXWzRSldd0f9838uFdjQmdX",
       "toolResult": {
         "content": "y.txt\n",
         "isError": false
       }
     },
     {
-      "id": "codex_bf760799-d8c9-41c8-b5a0-8ffb5206e4af",
+      "id": "msg_02f5777c2a733b17016ab0759323dc87d0922628f30ead41fd",
       "sessionId": "f1",
       "timestamp": "2026-09-18T10:53:34.063Z",
       "provider": "codex",

@@ -3,13 +3,36 @@ import assert from 'node:assert/strict';
 import { test } from 'vitest';
 
 import type { NormalizedMessage } from '@/shared/types';
-import { reconcileOptimisticUserEchoes, upsertToolUseRow } from '@/modules/chat/utils/sessionMessageReconciliation';
+import {
+  reconcileOptimisticPrompts,
+  upsertToolUseRow,
+} from '@/modules/chat/utils/sessionMessageReconciliation';
+import type { PendingPrompt } from '@/modules/chat/utils/sessionMessageReconciliation';
 
-/** These cases assert which rows survive; the pairing has its own coverage. */
-const retireOptimisticUserEchoes = (
-  serverMessages: Parameters<typeof reconcileOptimisticUserEchoes>[0],
-  realtimeMessages: Parameters<typeof reconcileOptimisticUserEchoes>[1],
-) => reconcileOptimisticUserEchoes(serverMessages, realtimeMessages).messages;
+/**
+ * Which optimistic prompts survive a reconciliation.
+ *
+ * Nothing here compares message text: a prompt is paired with the first
+ * persisted user row that appeared after the transcript position recorded at
+ * send time. Pairing on what the prompt says is what used to make two
+ * identical prompts fight over one persisted turn.
+ */
+const survivingPrompts = (
+  serverMessages: NormalizedMessage[],
+  realtimeMessages: NormalizedMessage[],
+  pendingPrompts: Map<string, PendingPrompt>,
+  runEnded = false,
+): string[] => {
+  const { retiredAnchors } = reconcileOptimisticPrompts(
+    serverMessages,
+    realtimeMessages,
+    pendingPrompts,
+    runEnded,
+  );
+  return realtimeMessages
+    .filter((message) => !retiredAnchors.has(message.id))
+    .map((message) => message.id);
+};
 
 const createUserMessage = (
   id: string,
@@ -26,84 +49,118 @@ const createUserMessage = (
   ...overrides,
 });
 
-test('replaces an optimistic image-only turn with its persisted Claude copy', () => {
-  const local = createUserMessage('local_image', '2026-07-28T20:30:21.000Z', {
-    images: [{ path: 'C:/Users/test/.cloudcli/assets/upload.png', name: 'image.png' }],
-  });
-  const persisted = createUserMessage('claude_image', '2026-07-28T20:30:26.000Z', {
-    images: [{ data: 'data:image/png;base64,AAAA' }],
-  });
+test('an optimistic prompt retires against the user row that followed its anchor', () => {
+  const local = createUserMessage('local_1', '2026-07-28T20:30:21.000Z', { content: 'hello' });
+  const persisted = createUserMessage('claude_text', '2026-07-28T20:30:26.000Z', { content: 'hello' });
 
-  assert.deepEqual(retireOptimisticUserEchoes([persisted], [local]), []);
-});
-
-test('does not collapse an attachment-only turn into a server row without attachments', () => {
-  const local = createUserMessage('local_image', '2026-07-28T20:30:21.000Z', {
-    images: [{ path: 'C:/Users/test/.cloudcli/assets/upload.png' }],
-  });
-  const persisted = createUserMessage('claude_empty', '2026-07-28T20:30:22.000Z');
-
-  assert.deepEqual(retireOptimisticUserEchoes([persisted], [local]), [local]);
-});
-
-test('matches optimistic attachment turns to persisted turns one-to-one', () => {
-  const firstLocal = createUserMessage('local_first', '2026-07-28T20:30:21.000Z', {
-    images: [{ path: 'C:/Users/test/.cloudcli/assets/first.png' }],
-  });
-  const secondLocal = createUserMessage('local_second', '2026-07-28T20:30:25.000Z', {
-    images: [{ path: 'C:/Users/test/.cloudcli/assets/second.png' }],
-  });
-  const firstPersisted = createUserMessage('claude_first', '2026-07-28T20:30:22.000Z', {
-    images: [{ data: 'data:image/png;base64,AAAA' }],
-  });
-
-  const remainingRealtime = retireOptimisticUserEchoes(
-    [firstPersisted],
-    [firstLocal, secondLocal],
+  assert.deepEqual(
+    survivingPrompts([persisted], [local], new Map([['local_1', { afterRowId: null }]])),
+    [],
   );
-
-  assert.deepEqual(remainingRealtime.map((message) => message.id), ['local_second']);
 });
 
-test('keeps the existing optimistic text reconciliation behavior', () => {
-  const local = createUserMessage('local_text', '2026-07-28T20:30:21.000Z', {
-    content: 'hello',
+/**
+ * The persisted copy is stamped by the engine and the optimistic row by the
+ * browser, on two machines whose clocks need not agree. Retirement therefore
+ * never consults either one: an engine running a minute behind used to have
+ * its row rejected as "too old", leaving the user looking at their own
+ * message twice for the rest of the session.
+ */
+test('retirement survives an engine clock that runs behind the browser', () => {
+  const local = createUserMessage('local_1', '2026-01-01T00:01:00.000Z', {
+    provider: 'antigravity',
+    content: 'answer in two words',
   });
-  const persisted = createUserMessage('claude_text', '2026-07-28T20:30:26.000Z', {
-    content: 'hello',
+  const persisted = createUserMessage('srv-1', '2026-01-01T00:00:00.000Z', {
+    provider: 'antigravity',
+    content: 'answer in two words',
   });
 
-  assert.deepEqual(retireOptimisticUserEchoes([persisted], [local]), []);
+  assert.deepEqual(
+    survivingPrompts([persisted], [local], new Map([['local_1', { afterRowId: null }]])),
+    [],
+  );
 });
 
-test('a replacement echo survives a kept turn that repeats its text', () => {
-  // The exact shape a rewind that branches produces: the turn that survived
-  // the cut is re-stamped to the moment of the copy, one second before the
-  // replacement was typed, and happens to say the same thing the user just
-  // corrected their message to.
-  const userRow = (id: string, content: string, timestamp: string) => ({
-    id,
-    kind: 'text',
-    role: 'user',
-    provider: 'codex',
-    sessionId: 's1',
-    content,
-    timestamp,
-  }) as NormalizedMessage;
+test('a prompt is not retired by a user row that predates it', () => {
+  const older = createUserMessage('srv-old', '2026-01-01T00:00:00.000Z', { content: 'continue' });
+  const filler = createUserMessage('srv-filler', '2026-01-01T00:00:01.000Z', {
+    role: 'assistant',
+    content: 'ok',
+  });
+  const local = createUserMessage('local_2', '2026-01-01T00:01:00.000Z', { content: 'continue' });
 
-  const kept = [userRow('kept', 'continue', '2026-01-01T00:00:21.000Z')];
-  const echo = {
-    ...userRow('local_1', 'continue', '2026-01-01T00:00:20.000Z'),
-    replacesAnchorId: 'turn-b',
-    replacesAfterRowCount: kept.length,
-  } as NormalizedMessage;
+  // Sent when `srv-filler` was the transcript's last row, so neither row
+  // above it can be this prompt's copy — not even the one that says the same
+  // thing.
+  assert.deepEqual(
+    survivingPrompts([older, filler], [local], new Map([['local_2', { afterRowId: 'srv-filler' }]])),
+    ['local_2'],
+  );
+});
 
-  assert.deepEqual(retireOptimisticUserEchoes(kept, [echo]), [echo]);
+/**
+ * The anchor is an id, not a position, because the array it points into is
+ * routinely rewritten: an older page is prepended above it, or a refresh
+ * replaces the window wholesale. A row-count stamp silently stopped matching
+ * after either of those, and the prompt then stayed on screen next to its own
+ * persisted copy for the rest of the session — the duplicate this mechanism
+ * exists to prevent.
+ */
+test('an anchor still pairs after older history is prepended above it', () => {
+  const anchor = createUserMessage('srv-anchor', '2026-01-01T00:00:10.000Z', {
+    role: 'assistant',
+    content: 'previous reply',
+  });
+  const local = createUserMessage('local_3', '2026-01-01T00:00:20.000Z', { content: 'next' });
+  const persisted = createUserMessage('srv-new', '2026-01-01T00:00:21.000Z', { content: 'next' });
 
-  // Once the provider has written the replacement, it is a row the cut did not
-  // keep, so it retires the echo.
-  const persisted = [...kept, userRow('persisted', 'continue', '2026-01-01T00:00:25.000Z')];
-  assert.deepEqual(retireOptimisticUserEchoes(persisted, [echo]), []);
+  const olderPage = Array.from({ length: 40 }, (_, index) =>
+    createUserMessage(`srv-old-${index}`, '2026-01-01T00:00:00.000Z', { content: 'next' }));
+
+  assert.deepEqual(
+    survivingPrompts(
+      [...olderPage, anchor, persisted],
+      [local],
+      new Map([['local_3', { afterRowId: 'srv-anchor' }]]),
+    ),
+    [],
+    'the pairing follows the anchor row, not its index',
+  );
+});
+
+test('two prompts waiting at once pair with their own turns, in order', () => {
+  const first = createUserMessage('local_first', '2026-07-28T20:30:21.000Z', { content: 'same text' });
+  const second = createUserMessage('local_second', '2026-07-28T20:30:25.000Z', { content: 'same text' });
+  const firstPersisted = createUserMessage('srv-first', '2026-07-28T20:30:22.000Z', { content: 'same text' });
+
+  assert.deepEqual(
+    survivingPrompts(
+      [firstPersisted],
+      [first, second],
+      new Map([
+        ['local_first', { afterRowId: null }],
+        ['local_second', { afterRowId: null }],
+      ]),
+    ),
+    ['local_second'],
+    'one persisted turn retires one prompt, never both',
+  );
+});
+
+/**
+ * A fork or an edit can rewrite the transcript under a prompt and take its
+ * anchor row with it. Waiting for an anchor that will never come back is how
+ * a duplicate becomes permanent, so the end of the run is the deadline: after
+ * it, the prompt pairs with whatever user row is available.
+ */
+test('a vanished anchor blocks pairing only until the run ends', () => {
+  const local = createUserMessage('local_4', '2026-01-01T00:01:00.000Z', { content: 'go' });
+  const persisted = createUserMessage('srv-1', '2026-01-01T00:01:01.000Z', { content: 'go' });
+  const pending = new Map([['local_4', { afterRowId: 'srv-gone' }]]);
+
+  assert.deepEqual(survivingPrompts([persisted], [local], pending), ['local_4']);
+  assert.deepEqual(survivingPrompts([persisted], [local], pending, true), []);
 });
 
 test('upsertToolUseRow: a blank re-announce frame never blanks a populated card', () => {
@@ -131,69 +188,4 @@ test('upsertToolUseRow: a blank re-announce frame never blanks a populated card'
   // A fresh toolId appends as before.
   const appended = upsertToolUseRow(updated, toolRow('row_4', 'call_2', {}));
   assert.equal(appended.length, 2);
-});
-
-/**
- * Retiring the optimistic echo must not depend on the two clocks agreeing.
- *
- * The persisted copy of a prompt is stamped by the engine, the optimistic row
- * by the browser. The match used to require the persisted row to land inside a
- * window around the local timestamp, so an engine running more than ten
- * seconds behind had its row rejected as "too old" — the optimistic echo
- * survived and the user saw their own message twice.
- *
- * `replacesAfterRowCount` already records how much transcript existed when the
- * row was sent, which answers the same question causally: only a row that
- * appeared afterwards can be this prompt's persisted copy.
- */
-test('an optimistic prompt retires against its persisted copy despite clock skew', () => {
-  const local: NormalizedMessage = {
-    id: 'local_1',
-    sessionId: 'sess-1',
-    timestamp: '2026-01-01T00:01:00.000Z',
-    provider: 'antigravity',
-    kind: 'text',
-    role: 'user',
-    content: 'answer in two words',
-    replacesAfterRowCount: 0,
-  };
-  // The engine stamped its copy a full minute earlier than the browser did.
-  const persisted: NormalizedMessage = {
-    id: 'srv-1',
-    sessionId: 'sess-1',
-    timestamp: '2026-01-01T00:00:00.000Z',
-    provider: 'antigravity',
-    kind: 'text',
-    role: 'user',
-    content: 'answer in two words',
-  };
-
-  assert.deepEqual(retireOptimisticUserEchoes([persisted], [local]), []);
-});
-
-test('an optimistic prompt is not retired by transcript that predates it', () => {
-  const local: NormalizedMessage = {
-    id: 'local_2',
-    sessionId: 'sess-1',
-    timestamp: '2026-01-01T00:01:00.000Z',
-    provider: 'antigravity',
-    kind: 'text',
-    role: 'user',
-    content: 'continue',
-    // Two rows were already on screen when this was sent, so neither of them
-    // can be its persisted copy.
-    replacesAfterRowCount: 2,
-  };
-  const older: NormalizedMessage = {
-    id: 'srv-old',
-    sessionId: 'sess-1',
-    timestamp: '2026-01-01T00:00:00.000Z',
-    provider: 'antigravity',
-    kind: 'text',
-    role: 'user',
-    content: 'continue',
-  };
-  const filler: NormalizedMessage = { ...older, id: 'srv-filler', role: 'assistant', content: 'ok' };
-
-  assert.deepEqual(retireOptimisticUserEchoes([older, filler], [local]), [local]);
 });

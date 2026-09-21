@@ -154,7 +154,7 @@ test('a content frame finalizes the buffered text segment before entering the st
   const textRow = rowsAfterTool.find((row) => row.kind === 'text' && row.content === 'Hello there');
   const toolRow = rowsAfterTool.find((row) => row.kind === 'tool_use');
   assert.ok(textRow, 'the buffered text must finalize as its own row when a content frame arrives');
-  assert.match(textRow!.id, /^text_/, 'the finalized row must carry the text_ id prefix');
+  assert.match(textRow!.id, /^__streamed_/, 'streamed text with no engine row yet is held under a placeholder id');
   assert.ok(toolRow, 'the tool frame must enter the store');
   assert.ok(
     rowsAfterTool.indexOf(textRow!) < rowsAfterTool.indexOf(toolRow!),
@@ -248,9 +248,13 @@ test('a paged-away user turn still dedupes the reply against its persisted copy'
   // mid-stream" bug: a long agent turn pushed the current user row past the
   // 20-row tail page, so the return refresh lands a server view whose only
   // user rows belong to OLDER turns, while the raw local user echo survives
-  // (the server row it could reconcile with was never fetched). In that shape
-  // the echo matcher misses, the pruned streaming row revives from the stale
-  // delta buffer, and the revived bubble renders next to its transcript copy.
+  // (the server row it could reconcile with was never fetched).
+  //
+  // The replay the server sends on reconnect is every frame the run emitted,
+  // which includes each segment's `stream_end` and the engine's own row for
+  // it. Those rows carry the ids the transcript also carries, so recognising
+  // them is a lookup — the reply is not matched by comparing its text to the
+  // persisted copy, which is what used to fail here.
   const now = Date.now();
   const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
   const transcriptPage = {
@@ -292,18 +296,32 @@ test('a paged-away user turn still dedupes the reply against its persisted copy'
     await timeline.sessionStore.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
   });
 
-  // Replayed deltas for the missed segment arrive on top of the stale buffer,
-  // then the replayed stream_end flushes and finalizes whatever accumulated.
+  // The replay: the first segment closes and the engine names its row, then
+  // the second segment arrives the same way.
+  timeline.emit({ kind: 'stream_end', sessionId: SESSION_ID } as unknown as ServerEvent);
+  timeline.emit({
+    kind: 'text',
+    id: 'm4',
+    sessionId: SESSION_ID,
+    role: 'assistant',
+    content: 'Segment one.',
+    timestamp: at(30),
+  } as unknown as ServerEvent);
   timeline.emit({ kind: 'stream_delta', sessionId: SESSION_ID, content: 'Segment two.' } as unknown as ServerEvent);
   await tickThrottle();
   timeline.emit({ kind: 'stream_end', sessionId: SESSION_ID } as unknown as ServerEvent);
+  timeline.emit({
+    kind: 'text',
+    id: 'm6',
+    sessionId: SESSION_ID,
+    role: 'assistant',
+    content: 'Segment two.',
+    timestamp: at(20),
+  } as unknown as ServerEvent);
 
   const renderedTexts = () => timeline.sessionStore.getMessages(SESSION_ID)
     .filter((row) => row.kind === 'text' && row.role === 'assistant')
     .map((row) => row.content ?? '');
-  // The turn's own user row is beyond the tail page, but a live row cannot
-  // belong to a turn older than the newest one on disk — and that turn already
-  // carries this segment.
   assert.equal(
     renderedTexts().filter((content) => content.includes('Segment one.')).length,
     1,

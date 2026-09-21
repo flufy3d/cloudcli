@@ -33,6 +33,14 @@
       "kind": "text",
       "role": "assistant",
       "content": "a.txt"
+    },
+    {
+      "id": "vol_complete_claude-turn",
+      "sessionId": "f1",
+      "timestamp": "2026-09-20T12:09:49.153Z",
+      "provider": "claude",
+      "kind": "complete",
+      "success": true
     }
   ],
   "history": [

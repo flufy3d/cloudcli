@@ -157,7 +157,7 @@ CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在�
 
 各端在协议之上的本地扩展必须显式写出、不得混入协议本身。今天只有前端有：
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
-外加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。
+外加乐观回显的簿记字段 `replacesAnchorId`。
 
 **工具卡同样要两路描述一致。** Codex 的实时与历史 `toolId` 来自两个 id 空间
 （SDK item id ／ rollout `call_id`），精确匹配结构性地不可能，只能靠「工具名 + 完整入参」指纹。
