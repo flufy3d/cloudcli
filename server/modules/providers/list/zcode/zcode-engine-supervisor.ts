@@ -124,6 +124,7 @@ export class EngineSupervisor {
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
+        windowsHide: true,
       })),
       now: dependencies.now ?? Date.now,
     };

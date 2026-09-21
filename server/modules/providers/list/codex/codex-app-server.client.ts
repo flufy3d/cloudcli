@@ -102,6 +102,7 @@ async function withAppServer<T>(
   const child = spawn(process.execPath, [launcher, 'app-server'], {
     env: process.env,
     stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
   });
 
   // The server logs sandbox and skill warnings to stderr on every start. They

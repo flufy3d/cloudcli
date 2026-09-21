@@ -69,7 +69,7 @@ function killProcessTree(child) {
 
   if (process.platform === 'win32' && child.pid) {
     try {
-      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
       return;
     } catch {
       // Fall through to the plain kill.
@@ -657,6 +657,7 @@ async function compactOpenCodeSession(options = {}, ws, context) {
     cwd: workingDir,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
+    windowsHide: true,
   });
 
   let stderrTail = '';
