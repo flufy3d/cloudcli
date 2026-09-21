@@ -85,6 +85,20 @@ type PendingCodexApproval = {
 
 const pendingCodexApprovals = new Map<string, PendingCodexApproval>();
 
+/**
+ * Item types whose in-flight state is worth showing before they finish.
+ *
+ * These are the ones a user waits on — a shell command, an MCP call, a patch
+ * being applied, a spawned agent. Everything else either starts empty (text,
+ * reasoning) or is already complete when announced.
+ */
+const PROGRESSIVE_CODEX_ITEM_TYPES = new Set([
+  'commandExecution',
+  'fileChange',
+  'mcpToolCall',
+  'collabAgentToolCall',
+]);
+
 /** Default context window reported when the server has not said otherwise. */
 const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
 
@@ -265,13 +279,6 @@ async function queryCodex(
   const settle = () => settleTurn?.();
 
   /**
-   * Text that has streamed but whose item has not completed yet, per item id.
-   * The completed item carries the whole text, so these are only the bridge
-   * between the two.
-   */
-  const streamedText = new Map<string, string>();
-
-  /**
    * The tool row each item produced, by item id.
    *
    * An approval request names only the item it is about, so this is what lets
@@ -289,18 +296,6 @@ async function queryCodex(
       if (row.type === 'tool_use' && !approvalSubjects.has(item.id)) {
         approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
       }
-      for (const message of context.normalizeMessage(row, capturedSessionId || sessionId || null)) {
-        sendMessage(ws, message);
-      }
-    }
-  };
-
-  /** Emits the partial form of a text-bearing item as it streams. */
-  const emitStreamedText = (itemId: string, kind: 'agent_message' | 'reasoning', delta: string): void => {
-    const text = (streamedText.get(itemId) ?? '') + delta;
-    streamedText.set(itemId, text);
-    const rows = codexThreadItemToRows({ kind, id: itemId, text }, new Date().toISOString());
-    for (const row of rows) {
       for (const message of context.normalizeMessage(row, capturedSessionId || sessionId || null)) {
         sendMessage(ws, message);
       }
@@ -427,23 +422,36 @@ async function queryCodex(
             return;
           }
 
-          case 'item/started':
+          case 'item/started': {
+            // Only work the user waits on is worth showing before it
+            // finishes. Text and reasoning items start empty — their content
+            // arrives as deltas — and a user message announced twice would be
+            // appended twice, because a transcript row is appended on arrival
+            // and only reconciled against *history* by id.
+            const startedType = readObjectRecord(params.item)?.type;
+            if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
+              emitItem(params.item, new Date().toISOString());
+            }
+            return;
+          }
+
           case 'item/completed':
             emitItem(params.item, new Date().toISOString());
             return;
 
           case 'item/agentMessage/delta': {
-            const itemId = typeof params.itemId === 'string' ? params.itemId : null;
-            if (itemId && typeof params.delta === 'string') {
-              emitStreamedText(itemId, 'agent_message', params.delta);
-            }
-            return;
-          }
-
-          case 'item/reasoning/summaryTextDelta': {
-            const itemId = typeof params.itemId === 'string' ? params.itemId : null;
-            if (itemId && typeof params.delta === 'string') {
-              emitStreamedText(itemId, 'reasoning', params.delta);
+            // Streamed prose has its own protocol frame: the client grows one
+            // placeholder from the fragments and the completed item's row
+            // then takes its place. Re-sending the whole text as a `text` row
+            // per delta instead appends one row per fragment.
+            if (typeof params.delta === 'string' && params.delta) {
+              sendMessage(ws, createNormalizedMessage({
+                kind: 'stream_delta',
+                role: 'assistant',
+                content: params.delta,
+                sessionId: capturedSessionId || sessionId || null,
+                provider: 'codex',
+              }));
             }
             return;
           }

@@ -234,6 +234,48 @@ test('a streaming row anchors its timestamp at segment start and finalizes in pl
   assert.equal(nextSegment!.content, 'Next');
 });
 
+test('a realtime row an engine names twice stays one row', async () => {
+  const store = new SessionTimelineStore();
+
+  // An engine that reports a reply while it is written sends the same row id
+  // more than once. The id is derived from the engine's own record, so the
+  // second frame is the first grown — not a second message. Codex shipped a
+  // build that sent one frame per streamed fragment, and the transcript kept
+  // every partial as its own bubble.
+  emit(store, {
+    kind: 'text', role: 'assistant', id: 'msg_1', sessionId: SESSION_ID,
+    provider: 'claude', timestamp: new Date(BASE_TIME).toISOString(), content: 'par',
+  });
+  emit(store, {
+    kind: 'text', role: 'assistant', id: 'msg_1', sessionId: SESSION_ID,
+    provider: 'claude', timestamp: new Date(BASE_TIME + 5000).toISOString(), content: 'partial answer',
+  });
+
+  const rows = store.getSessionSlot(SESSION_ID)!.realtimeMessages;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].content, 'partial answer');
+  // Kept where it first landed, so a later frame cannot reorder it past the
+  // tools that ran after it.
+  assert.equal(rows[0].timestamp, new Date(BASE_TIME).toISOString());
+});
+
+test('rows minted per frame are never collapsed onto each other', async () => {
+  const store = new SessionTimelineStore();
+
+  // A `vol_` id promises nothing across frames, so two of them are two rows
+  // even though neither is a stable identity.
+  emit(store, {
+    kind: 'error', id: 'vol_error_1', sessionId: SESSION_ID,
+    provider: 'claude', timestamp: new Date(BASE_TIME).toISOString(), content: 'first',
+  });
+  emit(store, {
+    kind: 'error', id: 'vol_error_2', sessionId: SESSION_ID,
+    provider: 'claude', timestamp: new Date(BASE_TIME + 1000).toISOString(), content: 'second',
+  });
+
+  assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 2);
+});
+
 test('a persisted Antigravity row replaces its keyed stream even after a newer user turn exists', async () => {
   const streamedContent = 'A concrete implementation plan with enough text to identify the persisted row.';
   const providerRowKey = 'assistant-step:2';

@@ -1349,7 +1349,8 @@ export class SessionTimelineStore {
       slot.runEnded = false;
     }
 
-    let updated = this.adoptEngineRow(slot, message)
+    let updated = this.replaceRealtimeRowById(slot, message)
+      ?? this.adoptEngineRow(slot, message)
       ?? [...slot.realtimeMessages, message];
     if (updated.length > MAX_REALTIME_MESSAGES) {
       updated = updated.slice(-MAX_REALTIME_MESSAGES);
@@ -1357,6 +1358,37 @@ export class SessionTimelineStore {
     slot.realtimeMessages = updated;
     recomputeMergedIfNeeded(slot);
     this.notify(sessionId);
+  }
+
+  /**
+   * Replaces a realtime row an engine has already named, or returns null when
+   * this row is new.
+   *
+   * A transcript row's id is derived from the engine's own record, so two
+   * frames carrying one id are one row — the second is the first grown or
+   * corrected. Realtime frames were previously only reconciled against
+   * *history* by id and appended against each other, so an engine that
+   * reported one reply as it was written put every partial in the transcript
+   * as its own message. Ids minted per frame (`vol_…`) are excluded: they
+   * promise nothing across frames.
+   *
+   * The original timestamp is kept, because it is where the row belongs
+   * relative to the tools around it — a later frame must not reorder it.
+   */
+  private replaceRealtimeRowById(
+    slot: SessionSlot,
+    message: NormalizedMessage,
+  ): NormalizedMessage[] | null {
+    if (isVolatileMessageId(message.id)) {
+      return null;
+    }
+    const index = slot.realtimeMessages.findIndex((row) => row.id === message.id);
+    if (index < 0) {
+      return null;
+    }
+    const next = [...slot.realtimeMessages];
+    next[index] = { ...message, timestamp: slot.realtimeMessages[index].timestamp };
+    return next;
   }
 
   /**

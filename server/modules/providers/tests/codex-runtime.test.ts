@@ -148,8 +148,8 @@ test('the live reply carries the item id the rollout will record', async (t) => 
   assert.equal(reply.uuid, 'msg_02c8dbf5b38a0554016ab15ce008f487d08eeca161bae5821c');
 });
 
-test('assistant text streams before its item completes, under one id', async (t) => {
-  const server = installFakeAppServer(t, (fake) => {
+test('streamed prose rides stream_delta and lands as exactly one row', async (t) => {
+  installFakeAppServer(t, (fake) => {
     const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
     notify('item/started', { item: { type: 'agentMessage', id: 'msg_stream', text: '' } });
@@ -165,11 +165,52 @@ test('assistant text streams before its item completes, under one id', async (t)
     cwd: process.cwd(),
   }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
 
+  // The fragments are stream frames, which the client grows into one
+  // placeholder. Sending them as text rows instead appends one message per
+  // fragment — which is exactly what shipped and had to be undone.
+  assert.deepEqual(
+    messages.filter((message) => message.kind === 'stream_delta').map((message) => message.content),
+    ['par', 'tial'],
+  );
   const replies = messages.filter((message) => message.type === 'assistant');
-  assert.deepEqual(replies.map((row) => row.message.content), ['par', 'partial', 'partial answer']);
-  // One row, updated three times — the id is what makes that true.
-  assert.deepEqual([...new Set(replies.map((row) => row.uuid))], ['msg_stream']);
-  assert.ok(server.calls.some((call) => call.method === 'turn/start'));
+  assert.equal(replies.length, 1, 'a streamed reply must produce exactly one transcript row');
+  assert.equal(replies[0].uuid, 'msg_stream');
+  assert.equal(replies[0].message.content, 'partial answer');
+});
+
+test('an item that starts empty is not announced before it has content', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    // A prompt echo announced on both start and completion would be appended
+    // twice; only the completion is forwarded.
+    const userMessage = {
+      type: 'userMessage',
+      id: '01a0c4d2-b0a4-7991-85e5-931b865e6ed0',
+      content: [{ type: 'text', text: 'hey there', text_elements: [] }],
+    };
+    notify('item/started', { item: userMessage });
+    notify('item/completed', { item: userMessage });
+    // A shell command is worth showing while it runs, so both are forwarded
+    // and the client merges them on the shared tool id.
+    const command = { type: 'commandExecution', id: 'exec-1', command: "/bin/zsh -lc 'ls'" };
+    notify('item/started', { item: { ...command, status: 'inProgress' } });
+    notify('item/completed', { item: { ...command, status: 'completed', aggregatedOutput: 'a.txt\n', exitCode: 0 } });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  const messages: any[] = [];
+
+  await codexRuntime.run('hey there', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  assert.equal(messages.filter((message) => message.type === 'user').length, 1);
+  assert.equal(messages.filter((message) => message.type === 'tool_use').length, 2);
+  assert.deepEqual(
+    [...new Set(messages.filter((message) => message.type === 'tool_use').map((row) => row.toolCallId))],
+    ['exec-1'],
+  );
 });
 
 test('a failed turn surfaces the error and exits non-zero', async (t) => {
