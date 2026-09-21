@@ -62,6 +62,8 @@
 
 **claude 的上下文窗口为什么必须持久化**：转录里每条 assistant 记的是*解析后*的模型 id（`claude-opus-5`），永远不会出现 `claude-opus-5[1m]` 这种窗口变体标记，所以任何"读转录猜窗口"的启发式都分不出 1M 会话和 200k 会话。真值只有 SDK 在 query 存活期间知道（`getContextUsage()` 的 `rawMaxTokens`，其 `maxTokens` 与之同值，`percentage` 就是 `round(used/total*100)`）。因此 runtime 在每回合结束拿到该值后写进 `sessions.context_window`（`services/claude-context-window.ts`，键是 app session id，找不到行就静默跳过，下一回合再写），三条发布 token budget 的路径——`/token-usage`、每一页历史、回合中的每个 assistant 帧——都先读它再落到 `CONTEXT_WINDOW` 和启发式。这条优先级里 SDK 真值排在 `CONTEXT_WINDOW` **之前**，否则实时帧（从不读 env）和重开会话后的读数又会互相矛盾。历史页不额外带 `percentage`：它等价于前端已有的 `used/total`，存下来只会在转录继续前进后变成陈旧值。还没在本应用跑过的会话退而看 `sessions.model`：那是用户在模型选择器里选的变体（`opus[1m]`），比转录里被解析掉的 id 多一个 `[1m]` 标签，所以配置成 1M 的会话重开即显 1M、不必先跑一轮。
 
+历史页走 `sessionHistoryCache`，而缓存项的有效性原本只看转录文件的 path+mtime+size——因为结果曾经完全由文件推导。窗口持久化打破了这个前提（`tokenUsage.total` 多依赖了一个 DB 列，而该列是回合结束后异步写的），所以 `session.context_window` 也进了缓存判据：否则回合后的首次历史读取可能赶在写入之前，把一个回退默认值的 `total` 凝固在缓存里，往后每次翻页都把 badge 打回旧窗口，和实时帧来回跳。
+
 `/token-usage` 与历史页共用 `summarizeClaudeTokenUsage` 这一个读取器（同样跳过 sidechain 与全零的 `<synthetic>` 行），两者只在取行范围上不同：历史页按 `sessionId` 过滤转录行，端点读整份文件。
 
 ## 交互式权限与提问（opencode）

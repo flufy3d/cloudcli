@@ -492,6 +492,9 @@ export const sessionsService = {
     const fullHistory = await sessionHistoryCache.getFullHistory({
       sessionId,
       transcriptPath,
+      // `tokenUsage.total` is resolved against this, and it is written after
+      // the turn the page was read for, so it has to invalidate the entry.
+      contextWindow: session.context_window ?? null,
       loadFull: () => providerSessions.fetchHistory(sessionId, {
         limit: null,
         offset: 0,
