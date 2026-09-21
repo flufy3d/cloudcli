@@ -207,11 +207,19 @@ export function useChatRealtimeHandlers({
         }
 
         case 'status': {
-          if (directive.text === 'token_budget' && directive.tokenBudget) {
-            // A just-compacted session reports `compacted: true` with `used: 0`;
-            // those numbers describe the context the user discarded, so the
-            // badge falls back to the summary's size (see `toTokenBudget`).
-            setTokenBudget(toTokenBudget(directive.tokenBudget));
+          if (directive.text === 'token_budget') {
+            // The badge measures the conversation on screen, and every
+            // session's frames arrive on the same socket, so a budget frame
+            // is only the viewed session's business: without this check two
+            // live runs traded the badge back and forth, and a brand-new
+            // session inherited an occupancy it had never spent.
+            const viewedSessionId = activeViewSessionIdRef.current;
+            if (directive.tokenBudget && viewedSessionId && directive.sessionId === viewedSessionId) {
+              // A just-compacted session reports `compacted: true` with `used: 0`;
+              // those numbers describe the context the user discarded, so the
+              // badge falls back to the summary's size (see `toTokenBudget`).
+              setTokenBudget(toTokenBudget(directive.tokenBudget));
+            }
           } else if (directive.text && directive.sessionId) {
             onSessionProcessing?.(directive.sessionId, {
               statusText: directive.text,
