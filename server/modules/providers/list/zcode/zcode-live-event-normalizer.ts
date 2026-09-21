@@ -322,7 +322,7 @@ export class ZCodeLiveEventNormalizer {
     const stateKey = sessionId ?? '';
 
     if (kind === 'reasoning_start') {
-      this.openReasoningBlock(stateKey);
+      this.openReasoningBlock(stateKey, baseId);
       return [];
     }
 
@@ -332,7 +332,7 @@ export class ZCodeLiveEventNormalizer {
         return [];
       }
       return [createNormalizedMessage({
-        id: this.openReasoningBlock(stateKey),
+        id: this.openReasoningBlock(stateKey, baseId),
         sessionId,
         timestamp,
         provider: PROVIDER,
@@ -414,12 +414,21 @@ export class ZCodeLiveEventNormalizer {
     return [];
   }
 
-  private openReasoningBlock(stateKey: string): string {
+  /**
+   * The id every delta of one reasoning segment is emitted under.
+   *
+   * Derived from the engine's own id for the event that opened the segment,
+   * so a history read of the same segment lands on the same id and the client
+   * does not render the streamed block beside the persisted one. The cache
+   * keeps the later deltas on the opening event's id even when the engine
+   * numbers each delta separately.
+   */
+  private openReasoningBlock(stateKey: string, baseId: string): string {
     const existing = this.reasoningBlockIds.get(stateKey);
     if (existing) {
       return existing;
     }
-    const id = generateMessageId('zcode_reasoning');
+    const id = `${baseId}_reasoning`;
     this.reasoningBlockIds.set(stateKey, id);
     return id;
   }

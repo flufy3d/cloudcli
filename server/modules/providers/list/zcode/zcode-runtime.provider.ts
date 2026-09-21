@@ -756,7 +756,9 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
                 continue;
               }
               writer.send(createNormalizedMessage({
-                id: generateMessageId('zcode'),
+                // Derived from the engine event this notice reports, so a
+                // replayed run re-announces the same row instead of a new one.
+                id: `${message.id}_cancelled_notice`,
                 sessionId: handle.sessionId,
                 provider: 'zcode',
                 kind: 'task_notification',

@@ -19,7 +19,8 @@ import { fileURLToPath } from 'node:url';
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
-import type { MessageInputForKind } from '../../shared/protocol/messageKinds.js';
+import type { MessageInputForKind, VolatileMessageId } from '../../shared/protocol/messageKinds.js';
+import { VOLATILE_MESSAGE_ID_PREFIX } from '../../shared/protocol/messageKinds.js';
 
 import { parseFrontMatter } from './frontmatter.js';
 import type {
@@ -348,10 +349,15 @@ export function validatePathSecurity(targetPath: string, rootPath: string): void
 // ---------------------------
 //----------------- NORMALIZED PROVIDER MESSAGE UTILITIES ------------
 /**
- * Generates a stable unique id for normalized provider messages.
+ * Generates a throwaway id for a frame that exists only while a run is live.
+ *
+ * The result is branded and prefixed so it cannot be used as a transcript
+ * row's id: those have to be derived from the engine's own record, or the
+ * same persisted row comes back under a new id on every history read and the
+ * client has nothing to match the live copy against.
  */
-export function generateMessageId(prefix = 'msg'): string {
-  return `${prefix}_${randomUUID()}`;
+export function generateMessageId(prefix = 'msg'): VolatileMessageId {
+  return `${VOLATILE_MESSAGE_ID_PREFIX}${prefix}_${randomUUID()}` as VolatileMessageId;
 }
 
 /**

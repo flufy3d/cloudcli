@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { enforceNormalizedMessageContract } from '@/shared/normalized-message-contract.js';
+import { generateMessageId } from '@/shared/utils.js';
 
 test('a conforming message passes through untouched', () => {
   const payload = {
@@ -72,4 +73,60 @@ test('a payload missing its envelope is rejected with the reason', () => {
   const noProvider = enforceNormalizedMessageContract({ kind: 'text', content: 'x' });
   assert.equal(noProvider.ok, false);
   assert.ok(!noProvider.ok && noProvider.reason.includes('provider'));
+});
+
+/**
+ * A transcript row exists twice — as a live frame and as the persisted row a
+ * later history read returns — so its id has to come from the engine's own
+ * record. An id invented at emit time makes the same row arrive under a new
+ * id every time, which is what forced the client to guess at which live row
+ * and which persisted row were the same message.
+ *
+ * The compiler already refuses a generated id on a transcript row, but two
+ * runtimes are `.js` and several history paths read their rows out of `any`,
+ * so the gate reports it here as well.
+ */
+test('a generated id on a transcript row is reported as a contract violation', () => {
+  const result = enforceNormalizedMessageContract({
+    id: generateMessageId('text'),
+    sessionId: 'sess-1',
+    timestamp: '2026-01-01T00:00:00.000Z',
+    provider: 'codex',
+    kind: 'text',
+    role: 'assistant',
+    content: 'hello',
+  });
+
+  assert.ok(result.ok, 'the row still reaches the client: a dropped reply is worse than a duplicate');
+  assert.equal(result.contractViolations.length, 1);
+  assert.match(result.contractViolations[0], /id/);
+});
+
+test('a generated id is fine on a frame that only exists while the run does', () => {
+  for (const kind of ['stream_delta', 'complete', 'status', 'session_created']) {
+    const result = enforceNormalizedMessageContract({
+      id: generateMessageId(kind),
+      sessionId: 'sess-1',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      provider: 'zcode',
+      kind,
+    });
+    assert.ok(result.ok);
+    assert.deepEqual(result.contractViolations, [], `${kind} may carry a generated id`);
+  }
+});
+
+test('an engine-derived id on a transcript row passes clean', () => {
+  const result = enforceNormalizedMessageContract({
+    id: 'c841b977-a3e4-49ec-8d8c-f074975abe00',
+    sessionId: 'sess-1',
+    timestamp: '2026-01-01T00:00:00.000Z',
+    provider: 'claude',
+    kind: 'text',
+    role: 'user',
+    content: 'hi',
+  });
+
+  assert.ok(result.ok);
+  assert.deepEqual(result.contractViolations, []);
 });

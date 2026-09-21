@@ -81,6 +81,12 @@ flowchart LR
 
 因此剪枝阶段**必须保留乐观用户行**：它是回合边界的唯一记录，隐藏它是合并阶段的职责。两个锚点都不适用的行才退回时间戳排列。
 
+**行身份是协议保证的，不是前端推断出来的。** 转录行（`text`/`thinking`/`tool_use`/
+`tool_result`/`task_notification`）的 `id` 由引擎自己的记录推导，同一条记录在实时路与历史路、
+读多少遍都字节相同（契约与逐引擎依据见 [providers.md](./providers.md)）。因此两路合并的判重
+基准是 **id 相等**；下面那些按回合、按指纹、按到达顺序的裁决只是 id 还没有全面覆盖时的回退，
+覆盖到哪里就删到哪里。
+
 **判重同样按 `身份 > 因果 > 挂钟` 取。** 判定一条实时 assistant 行是否已被持久化（`isAssistantTextEchoedInSameTurnOnServer`），先定它属于哪个回合：
 
 1. `providerRowKey` 身份对账（见 [providers.md](./providers.md) 的行身份表）；

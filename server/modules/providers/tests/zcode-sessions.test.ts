@@ -157,18 +157,20 @@ test('normalizeMessage maps reasoning deltas to thinking', () => {
 test('consecutive reasoning deltas of one thinking segment share one stable id', () => {
   const provider = new ZCodeSessionsProvider();
   const first = provider.normalizeMessage(
-    { type: 'model_streaming', payload: { kind: 'reasoning_delta', delta: 'Let me start' } },
+    { type: 'model_streaming', id: 'zmsg_7', payload: { kind: 'reasoning_delta', delta: 'Let me start' } },
     'sess_1'
   );
+  // The engine numbers each delta separately; the segment keeps the id of the
+  // event that opened it so a history read of the same block matches.
   const second = provider.normalizeMessage(
-    { type: 'model_streaming', payload: { kind: 'reasoning_delta', delta: ' and check' } },
+    { type: 'model_streaming', id: 'zmsg_8', payload: { kind: 'reasoning_delta', delta: ' and check' } },
     'sess_1'
   );
 
   assert.equal(second.length, 1);
   assert.equal(second[0].kind, 'thinking');
   assert.equal(second[0].id, first[0].id);
-  assert.match(first[0].id, /^zcode_reasoning_/);
+  assert.equal(first[0].id, 'zmsg_7_reasoning');
 });
 
 test('reasoning boundary markers emit nothing but open and close the block', () => {

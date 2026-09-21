@@ -193,6 +193,9 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       let agentResponseSegmentOpen = false;
 
       const processKey = sessionId || capturedSessionId || `agy_${Date.now()}_${keylessRunCounter += 1}`;
+      // Numbers the interrupted-stream notices of this run so two of them
+      // cannot collide on one id.
+      let streamInterruptedNoticeCount = 0;
 
       /**
        * Builds the user-facing failure description for a non-zero or
@@ -460,7 +463,10 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
               // notice to a quiet transcript line instead of a hard error.
               streamInterruptedResult = true;
               writer.send(createNormalizedMessage({
-                id: generateMessageId(PROVIDER),
+                // One notice per interrupted result, named after the run that
+                // produced it: a replay re-announces the same row rather than
+                // stacking a second copy on top of the first.
+                id: `${processKey}_stream_interrupted_${streamInterruptedNoticeCount += 1}`,
                 kind: 'task_notification',
                 summary: STREAM_INTERRUPTED_SUMMARY,
                 summaryKey: STREAM_INTERRUPTED_SUMMARY_KEY,

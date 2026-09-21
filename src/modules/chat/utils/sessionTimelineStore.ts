@@ -39,6 +39,7 @@
  * through `applyServerEvent`, history through the fetch methods.
  */
 
+import { isVolatileMessageId } from '@shared/protocol/messageKinds';
 import { authenticatedFetch } from '@/shared/api';
 import type { LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
 import {
@@ -285,7 +286,7 @@ function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedM
           }
           if (targetIndex >= 0) {
             // Prefer persisted message over synthetic realtime message
-            if (out[targetIndex].id.startsWith('text_') && !m.id.startsWith('text_')) {
+            if (isVolatileMessageId(out[targetIndex].id) && !isVolatileMessageId(m.id)) {
               out[targetIndex] = m;
             }
           }

@@ -1241,3 +1241,72 @@ test('every command of a failed exec script reports the failure', async () => {
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+/**
+ * A rollout row must come back under the same id every time it is read, and
+ * that id must be the one the live SDK already used for the same item.
+ *
+ * Codex names its items (`msg_…`, `rs_…`, `ctc_…`) and the live
+ * `item_completed` event carries the same id, so the two paths can be joined
+ * directly. The history reader used to drop those ids and generate a fresh
+ * one per read, which left the client comparing reply text to work out
+ * whether the streamed row and the persisted row were the same reply.
+ */
+test('Codex history rows reuse the rollout item id on every read', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-row-identity-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-row-identity-1';
+    const lines = [
+      JSON.stringify({ type: 'session_meta', ordinal: 0, payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({ type: 'event_msg', ordinal: 1, payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      JSON.stringify({ type: 'turn_context', ordinal: 2, payload: { turn_id: 'turn-1' } }),
+      JSON.stringify({
+        type: 'event_msg',
+        ordinal: 3,
+        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'the prompt' }] } },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        ordinal: 4,
+        payload: { type: 'message', role: 'assistant', id: 'msg_rollout_1', content: [{ type: 'output_text', text: 'the answer' }] },
+      }),
+      JSON.stringify({ type: 'event_msg', ordinal: 5, payload: { type: 'task_complete', turn_id: 'turn-1' } }),
+    ];
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${lines.join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-row-identity-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-row-identity-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const provider = new CodexSessionsProvider();
+      const first = await provider.fetchHistory('app-row-identity-1');
+      const second = await provider.fetchHistory('app-row-identity-1');
+
+      assert.deepEqual(
+        second.messages.map((message) => message.id),
+        first.messages.map((message) => message.id),
+        'two reads of one rollout must name the same rows the same way',
+      );
+
+      const assistantRow = first.messages.find(
+        (message) => message.kind === 'text' && message.role === 'assistant',
+      );
+      assert.ok(assistantRow);
+      assert.equal(
+        assistantRow.id,
+        'msg_rollout_1',
+        'the persisted reply keeps the item id the live frame already used',
+      );
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
