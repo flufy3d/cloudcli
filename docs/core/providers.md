@@ -53,12 +53,16 @@
 
 | 引擎 | `used` 来源 | `total` 来源 | 备注 |
 | --- | --- | --- | --- |
-| claude | 最新一条主线程 assistant 的 `input + cache_read + cache_creation + output`；每回合结束再用 SDK `Query.getContextUsage({detail:'summary'})` 覆盖（带 `percentage`） | 同一次 SDK 调用的真实 autocompact 窗口；历史页按模型 id 含 `[1m]` 定 1M，否则 200k（`services/claude-usage.ts`） | SDK 会执行输入流里的 `/compact`，无需额外协议 |
+| claude | 最新一条主线程 assistant 的 `input + cache_read + cache_creation + output`；每回合结束再用 SDK `Query.getContextUsage({detail:'summary'})` 覆盖（带 `percentage`） | **会话维度持久化的 SDK 真值**（见下）＞`CONTEXT_WINDOW` ＞ 模型启发式（`[1m]` 定 1M，否则 200k），单一 resolver `resolveClaudeContextWindow`（`services/claude-usage.ts`） | SDK 会执行输入流里的 `/compact`，无需额外协议 |
 | codex | rollout `token_count.info.last_token_usage`（live 用 `turn.completed.usage`） | `model_context_window` | 旧的 `total_token_usage` 只作 `cumulative` |
 | opencode | 最新 assistant 消息的 `tokens.total` | `~/.cache/opencode/models.json` 的 `limit.context`（`list/opencode/opencode-context-usage.ts`，按 path+mtime+size 记忆化） | 会话列（`tokens_*`）是累计值，只作 `cumulative`；压缩摘要消息（`summary: true`）跳过 |
 | antigravity | live usageRecord 的 total | 1M（硬编码） | 同值持久化到 brain `token_usage.json` |
 | zcode | 最新 step 的 `tokens.total`；旧行没有该字段时取 `input + output + reasoning`（持久化 prompt 已含 cache read，不能再加） | 引擎目录的 `contextWindow`（`resolveZCodeModelContextWindow`；用户自加 provider 只有引擎目录里有），缺失时回退 `v2/config.json` 的 `limit.context` | 全转录求和只作 `cumulative`（`list/zcode/zcode-context-usage.ts`）；压缩摘要行（`summary` 对象）跳过 → `compacted` + `summaryBytes` |
 | cursor | 无 `getTokenUsage` 切面 | — | `supportsTokenUsage: false` |
+
+**claude 的上下文窗口为什么必须持久化**：转录里每条 assistant 记的是*解析后*的模型 id（`claude-opus-5`），永远不会出现 `claude-opus-5[1m]` 这种窗口变体标记，所以任何"读转录猜窗口"的启发式都分不出 1M 会话和 200k 会话。真值只有 SDK 在 query 存活期间知道（`getContextUsage()` 的 `rawMaxTokens`，其 `maxTokens` 与之同值，`percentage` 就是 `round(used/total*100)`）。因此 runtime 在每回合结束拿到该值后写进 `sessions.context_window`（`services/claude-context-window.ts`，键是 app session id，找不到行就静默跳过，下一回合再写），三条发布 token budget 的路径——`/token-usage`、每一页历史、回合中的每个 assistant 帧——都先读它再落到 `CONTEXT_WINDOW` 和启发式。这条优先级里 SDK 真值排在 `CONTEXT_WINDOW` **之前**，否则实时帧（从不读 env）和重开会话后的读数又会互相矛盾。历史页不额外带 `percentage`：它等价于前端已有的 `used/total`，存下来只会在转录继续前进后变成陈旧值。
+
+`/token-usage` 与历史页共用 `summarizeClaudeTokenUsage` 这一个读取器（同样跳过 sidechain 与全零的 `<synthetic>` 行），两者只在取行范围上不同：历史页按 `sessionId` 过滤转录行，端点读整份文件。
 
 ## 交互式权限与提问（opencode）
 

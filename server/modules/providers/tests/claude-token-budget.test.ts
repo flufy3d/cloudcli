@@ -102,3 +102,43 @@ test('the cumulative reader ignores anything that is not a result', () => {
     null,
   );
 });
+
+test('the recorded window drives the live frames, with the model heuristic as fallback', () => {
+  // The frames a run streams have to report the same window the reload path
+  // resolves, or the badge changes the moment the turn ends.
+  const assistantMessage = {
+    type: 'assistant',
+    message: {
+      model: 'claude-opus-5',
+      usage: { input_tokens: 10, cache_read_input_tokens: 40_000, output_tokens: 100 },
+    },
+  };
+
+  assert.equal(extractTokenBudget(assistantMessage, 1_000_000)?.total, 1_000_000);
+  assert.equal(extractTokenBudget(assistantMessage)?.total, 200_000);
+  assert.equal(
+    extractTokenBudget({
+      ...assistantMessage,
+      message: { ...assistantMessage.message, model: 'claude-opus-5[1m]' },
+    })?.total,
+    1_000_000,
+  );
+
+  assert.equal(
+    extractCumulativeTokenBudget(
+      { type: 'result', usage: { input_tokens: 18, output_tokens: 166 } },
+      1_000_000,
+    )?.total,
+    1_000_000,
+  );
+});
+
+test('no frame ever reports the legacy 160k window', () => {
+  const budget = extractTokenBudget({
+    type: 'assistant',
+    message: { usage: { input_tokens: 10, output_tokens: 2 } },
+  });
+
+  assert.ok(budget);
+  assert.notEqual(budget.total, 160_000);
+});

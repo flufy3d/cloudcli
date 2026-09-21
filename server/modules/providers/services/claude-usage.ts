@@ -4,10 +4,12 @@ import { readUsageNumber } from '@/shared/utils.js';
 /**
  * Latest context-window usage from a Claude transcript's already-parsed rows.
  *
- * Exported because the session-messages reader hands the same usage back on
- * every history page, the way the Codex and OpenCode readers do. Without that,
- * a Claude session's counter only moved when the session was reselected, and
- * the store's "this provider reports no usage" path overwrote it with zero.
+ * Consumers: the Claude sessions provider, for both the usage it hands back on
+ * every history page (the way the Codex and OpenCode readers do — without
+ * that, a Claude session's counter only moved when the session was reselected,
+ * and the store's "this provider reports no usage" path overwrote it with
+ * zero) and the `/token-usage` endpoint. One reader for both is deliberate:
+ * they used to be separate scans that disagreed about the same session.
  *
  * Reads the newest assistant turn only: `input_tokens + cache_read +
  * cache_creation` is that one request's whole prompt, i.e. what the context
@@ -16,7 +18,7 @@ import { readUsageNumber } from '@/shared/utils.js';
  */
 export function summarizeClaudeTokenUsage(
   entries: AnyRecord[],
-  configuredContextWindow: string | undefined = process.env.CONTEXT_WINDOW,
+  contextWindowSources: ClaudeContextWindowSources = {},
 ): ProviderTokenUsageResult {
   let inputTokens = 0;
   let outputTokens = 0;
@@ -69,7 +71,7 @@ export function summarizeClaudeTokenUsage(
 
   return {
     used: inputTokens + outputTokens,
-    total: resolveClaudeContextWindow(configuredContextWindow, observedModel),
+    total: resolveClaudeContextWindow(contextWindowSources, observedModel),
     inputTokens,
     outputTokens,
     cacheReadTokens,
@@ -80,17 +82,53 @@ export function summarizeClaudeTokenUsage(
 }
 
 /**
- * Resolves the context window a transcript's usage is measured against.
+ * Everything that can tell us how large a Claude session's context window is,
+ * in the order the resolver trusts them.
  *
- * `[1m]` model variants carry the 1M-context beta; every other current model
- * is 200k. The `CONTEXT_WINDOW` override stays authoritative when set, so a
- * deployment can pin an explicit window.
+ * Shared by the transcript readers and the live runtime frames so all three
+ * surfaces that publish a token budget — `/token-usage`, every history page,
+ * and the per-assistant frame during a run — can never disagree about the
+ * window the same session is measured against.
  */
-function resolveClaudeContextWindow(
-  configuredContextWindow: string | undefined,
+export type ClaudeContextWindowSources = {
+  /**
+   * Window the SDK reported for this exact session, persisted on the app row
+   * by `recordClaudeSessionContextWindow`. Authoritative when present.
+   */
+  recorded?: number | null;
+  /** Raw `CONTEXT_WINDOW` deployment override, unparsed. */
+  configured?: string | undefined;
+};
+
+/**
+ * Resolves the context window a session's usage is measured against.
+ *
+ * Consumers: `summarizeClaudeTokenUsage` above (the two transcript paths) and
+ * the Claude runtime provider, for the frames it streams during a run.
+ *
+ * Precedence, and why:
+ *
+ * 1. The window the SDK reported for this session. It is a measurement of the
+ *    run that actually happened, and it is the same number the live
+ *    `token_budget` frames carry, so preferring it is what keeps the reload
+ *    path and the realtime path in agreement.
+ * 2. `CONTEXT_WINDOW`. A deployment-wide guess, and the only thing available
+ *    for a session CloudCLI has never run.
+ * 3. The model id. `[1m]` variants carry the 1M-context beta; every other
+ *    current model is 200k. This only ever fires for transcripts written
+ *    outside CloudCLI, because a transcript records the resolved model id
+ *    (`claude-opus-5`) and never the variant tag.
+ */
+export function resolveClaudeContextWindow(
+  sources: ClaudeContextWindowSources,
   model: string | null,
 ): number {
-  const parsedContextWindow = Number.parseInt(configuredContextWindow ?? '', 10);
+  const recorded = sources.recorded;
+  if (typeof recorded === 'number' && Number.isFinite(recorded) && recorded > 0) {
+    return recorded;
+  }
+
+  const parsedContextWindow = Number.parseInt(sources.configured ?? '', 10);
   if (Number.isFinite(parsedContextWindow) && parsedContextWindow > 0) {
     return parsedContextWindow;
   }

@@ -203,6 +203,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- restores its exact runtime configuration instead of provider defaults.
     model TEXT,
     effort TEXT,
+    -- Context window this session actually runs against, in tokens, as the
+    -- provider engine itself reported it. NULL until an engine reports one,
+    -- which is the only way to know a window the transcript never records
+    -- (a Claude session on a 1M-context model writes the resolved model id,
+    -- never the 1M variant tag). Readers fall back to CONTEXT_WINDOW and then
+    -- to a per-provider default.
+    context_window INTEGER,
     -- The app session this one was branched from, NULL for sessions created
     -- normally. Informational only: a fork is a fully independent provider
     -- session, and deleting the source does not affect it.

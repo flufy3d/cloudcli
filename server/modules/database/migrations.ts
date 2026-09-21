@@ -459,6 +459,21 @@ const addSessionEffortColumn = (db: Database): void => {
   addColumnToTableIfNotExists(db, 'sessions', columnNames, 'effort', 'TEXT');
 };
 
+/**
+ * Adds the `context_window` column that records the window a session actually
+ * runs against, as the provider engine reported it.
+ *
+ * Existing rows stay NULL: the window is a measurement, not something that can
+ * be backfilled from the transcript, so readers keep falling back to
+ * `CONTEXT_WINDOW` and the per-provider default until an engine reports one.
+ */
+const addSessionContextWindowColumn = (db: Database): void => {
+  const sessionsTableInfo = getTableInfo(db, 'sessions');
+  const columnNames = sessionsTableInfo.map((column) => column.name);
+
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'context_window', 'INTEGER');
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -556,6 +571,7 @@ export const runMigrations = (db: Database) => {
     addProviderSessionIdMapping(db);
     addSessionModelColumn(db);
     addSessionEffortColumn(db);
+    addSessionContextWindowColumn(db);
     addForkedFromSessionIdColumn(db);
     ensureProjectsForSessionPaths(db);
     db.exec(SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL);

@@ -28,6 +28,11 @@ import {
   CLAUDE_PREDEFINED_MODELS,
   CLAUDE_ULTRACODE_EFFORT
 } from '@/modules/providers/list/claude/claude-models.provider.js';
+import {
+  readClaudeSessionContextWindow,
+  recordClaudeSessionContextWindow
+} from '@/modules/providers/services/claude-context-window.js';
+import { resolveClaudeContextWindow } from '@/modules/providers/services/claude-usage.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import {
   createNotificationEvent,
@@ -408,40 +413,27 @@ function readNumber(value) {
  */
 
 /**
- * Resolves the context window for one Claude model id.
- *
- * `[1m]` variants carry the 1M-context beta; every other current model is
- * 200k. `CONTEXT_WINDOW` stays authoritative when set, so a deployment can
- * pin an explicit window.
- * @param {string} [model] - Anthropic model id
- * @returns {number} Context window in tokens
- */
-function resolveClaudeContextWindow(model) {
-  const configured = parseInt(process.env.CONTEXT_WINDOW, 10);
-  if (Number.isFinite(configured) && configured > 0) {
-    return configured;
-  }
-
-  return typeof model === 'string' && model.includes('[1m]') ? 1000000 : 200000;
-}
-
-/**
  * Builds a context-window budget from an Anthropic-shaped usage payload.
  *
  * `input_tokens + cache_read + cache_creation` is one request's whole prompt,
  * which is exactly what the context window holds at that moment.
  * @param {Object} messageUsage - Anthropic usage payload
  * @param {string} [model] - The request's model id, for the window size
+ * @param {number|null} [recordedContextWindow] - Window the SDK reported for
+ *   this session on an earlier turn; wins over the model heuristic
  * @returns {TokenBudget} Token budget object
  */
-function buildTokenBudget(messageUsage, model) {
+function buildTokenBudget(messageUsage, model, recordedContextWindow = null) {
   const directInputTokens = readNumber(messageUsage.input_tokens ?? messageUsage.inputTokens);
   const cacheCreationTokens = readNumber(messageUsage.cache_creation_input_tokens ?? messageUsage.cacheCreationInputTokens ?? messageUsage.cacheCreationTokens);
   const cacheReadTokens = readNumber(messageUsage.cache_read_input_tokens ?? messageUsage.cacheReadInputTokens ?? messageUsage.cacheReadTokens);
   const cacheTokens = cacheCreationTokens + cacheReadTokens;
   const inputTokens = directInputTokens + cacheTokens;
   const outputTokens = readNumber(messageUsage.output_tokens ?? messageUsage.outputTokens);
-  const contextWindow = resolveClaudeContextWindow(model);
+  const contextWindow = resolveClaudeContextWindow(
+    { recorded: recordedContextWindow, configured: process.env.CONTEXT_WINDOW },
+    model ?? null
+  );
 
   return {
     used: inputTokens + outputTokens,
@@ -465,9 +457,11 @@ function buildTokenBudget(messageUsage, model) {
  * prompt its own request carried. The turn-ending `result` is deliberately not
  * a source here — see `extractCumulativeTokenBudget`.
  * @param {Object} sdkMessage - SDK stream message
+ * @param {number|null} [recordedContextWindow] - Window the SDK reported for
+ *   this session on an earlier turn
  * @returns {TokenBudget|null} Token budget object or null
  */
-function extractTokenBudget(sdkMessage) {
+function extractTokenBudget(sdkMessage, recordedContextWindow = null) {
   if (!sdkMessage || typeof sdkMessage !== 'object') {
     return null;
   }
@@ -492,7 +486,7 @@ function extractTokenBudget(sdkMessage) {
     return null;
   }
 
-  return buildTokenBudget(messageUsage, sdkMessage.message?.model);
+  return buildTokenBudget(messageUsage, sdkMessage.message?.model, recordedContextWindow);
 }
 
 /**
@@ -509,9 +503,11 @@ function extractTokenBudget(sdkMessage) {
  * message ever emits, so it stays available for the caller to use when a turn
  * produced no assistant budget at all.
  * @param {Object} sdkMessage - SDK stream message
+ * @param {number|null} [recordedContextWindow] - Window the SDK reported for
+ *   this session on an earlier turn
  * @returns {TokenBudget|null} Token budget object or null
  */
-function extractCumulativeTokenBudget(sdkMessage) {
+function extractCumulativeTokenBudget(sdkMessage, recordedContextWindow = null) {
   if (!sdkMessage || typeof sdkMessage !== 'object' || sdkMessage.type !== 'result') {
     return null;
   }
@@ -520,7 +516,7 @@ function extractCumulativeTokenBudget(sdkMessage) {
     const usageModelKey = sdkMessage.modelUsage && typeof sdkMessage.modelUsage === 'object'
       ? Object.keys(sdkMessage.modelUsage)[0]
       : undefined;
-    return buildTokenBudget(sdkMessage.usage, usageModelKey);
+    return buildTokenBudget(sdkMessage.usage, usageModelKey, recordedContextWindow);
   }
 
   if (!sdkMessage.modelUsage || typeof sdkMessage.modelUsage !== 'object') {
@@ -538,7 +534,10 @@ function extractCumulativeTokenBudget(sdkMessage) {
   const inputTokens = readNumber(modelData.cumulativeInputTokens ?? modelData.inputTokens);
   const outputTokens = readNumber(modelData.cumulativeOutputTokens ?? modelData.outputTokens);
   const totalUsed = inputTokens + outputTokens;
-  const contextWindow = resolveClaudeContextWindow(modelKey);
+  const contextWindow = resolveClaudeContextWindow(
+    { recorded: recordedContextWindow, configured: process.env.CONTEXT_WINDOW },
+    modelKey ?? null
+  );
 
   return {
     used: totalUsed,
@@ -790,6 +789,11 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Process-map key: the app session id when the caller supplied one, else
   // the provider-native id once captured (legacy/direct API callers).
   const sessionKey = () => sessionId || capturedSessionId || null;
+  // The window the SDK reported for this session on an earlier turn. Read up
+  // front so a resumed 1M session's very first frame already reports 1M
+  // instead of the 200k the transcript's model id implies; refreshed at the
+  // end of every turn from the SDK's own accounting.
+  let recordedContextWindow = readClaudeSessionContextWindow(sessionKey());
 
   const emitNotification = (event) => {
     notifyUserIfEnabled({
@@ -1053,8 +1057,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       // Extract and send token budget updates from assistant usage payloads,
       // falling back to the turn's cumulative bill only for SDK builds that
       // report no per-assistant usage at all.
-      const tokenBudgetData = extractTokenBudget(message)
-        || (assistantBudgetSent ? null : extractCumulativeTokenBudget(message));
+      const tokenBudgetData = extractTokenBudget(message, recordedContextWindow)
+        || (assistantBudgetSent ? null : extractCumulativeTokenBudget(message, recordedContextWindow));
       if (tokenBudgetData) {
         if (message.type === 'assistant') {
           assistantBudgetSent = true;
@@ -1108,6 +1112,11 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
               return;
             }
             const currentKey = sessionKey();
+            // The only place the session's real window is ever observable.
+            // Persist it before the abort check: a user who interrupts still
+            // ran on that window, and every later reader needs it.
+            recordedContextWindow = sdkBudget.total;
+            recordClaudeSessionContextWindow(currentKey, sdkBudget.total);
             if (currentKey && abortedSessionIds.has(currentKey)) {
               return;
             }
