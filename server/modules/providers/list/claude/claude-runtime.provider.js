@@ -853,6 +853,21 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // still owns the activeSessions entry (or was superseded by a newer run).
   let queryInstance = null;
 
+  // Reads the window this run is measured against off the live query and
+  // persists it, so a run that never reaches its `result` still leaves the
+  // session row knowing how large its context window is.
+  const captureContextWindow = createContextWindowCapture(
+    () => fetchSdkContextBudget(queryInstance),
+    (total) => {
+      windowSources.recorded = total;
+      recordClaudeSessionContextWindow(sessionKey(), total);
+    }
+  );
+  // The head of the stream is the first place worth probing; after that only
+  // assistant replies are, so a brand-new session does not spend both
+  // attempts before it has produced anything to measure.
+  let streamHeadSeen = false;
+
   try {
     const resolvedModel = await context.resolveResumeModel(sessionId, options.model);
     let effortModels = CLAUDE_PREDEFINED_MODELS;
@@ -1065,6 +1080,15 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         }
         ws.send(createNormalizedMessage({ kind: 'status', text: 'token_budget', tokenBudget: tokenBudgetData, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
       }
+
+      // A resumed session's prompt is already assembled at the head of the
+      // stream, so the window is readable before a single token comes back; a
+      // brand-new one has nothing to measure until its first assistant reply.
+      // Skipped once the row already knows its window.
+      if (!windowSources.recorded && (!streamHeadSeen || message.type === 'assistant')) {
+        void captureContextWindow();
+      }
+      streamHeadSeen = true;
 
       if (isTaskNotificationUserMessage(message)) {
         turnSawTaskNotification = true;
@@ -1421,6 +1445,58 @@ async function fetchSdkContextBudget(queryInstance) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Serialises one run's attempts to read the context window off its own query.
+ *
+ * The window is only observable while a query is live, and a run does not
+ * always reach its `result`: an interrupted turn, a crashed CLI, or the server
+ * restarting mid-turn all end the stream first. Recording only at the end of a
+ * clean turn therefore left those sessions' rows blank — and a session whose
+ * model is `default` carries no `[1m]` tag for the resolver to fall back on,
+ * so it read as 200k from then on, however large the window it ran against.
+ *
+ * Attempts are capped instead of made per message: each one costs a control
+ * request, and the only reason a live query answers with nothing is that the
+ * run has produced no response yet, which the second attempt covers.
+ * @param {() => Promise<TokenBudget|null>} readBudget - Reads the live window
+ * @param {(total: number) => void} onWindow - Receives the window, once
+ * @param {number} [maxAttempts] - Reads to spend before leaving it to the turn's end
+ * @returns {() => Promise<void>} Idempotent probe; safe to call per message
+ */
+export function createContextWindowCapture(readBudget, onWindow, maxAttempts = 2) {
+  let attempts = 0;
+  let inFlight = null;
+  let captured = false;
+
+  return () => {
+    if (inFlight) {
+      return inFlight;
+    }
+    if (captured || attempts >= maxAttempts) {
+      return Promise.resolve();
+    }
+
+    attempts += 1;
+    inFlight = Promise.resolve()
+      .then(readBudget)
+      .then((budget) => {
+        const total = readNumber(budget?.total);
+        if (total > 0) {
+          captured = true;
+          onWindow(total);
+        }
+      })
+      .catch(() => {
+        // A control request that failed says nothing about the window; the
+        // next attempt, or the turn's end, reads it again.
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+    return inFlight;
+  };
 }
 
 export const claudeRuntime = {
