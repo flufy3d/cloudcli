@@ -16,7 +16,8 @@ import {
   isFileUrl,
   markdownUrlTransform,
 } from '@/modules/chat/utils/fileLink';
-import { readExternalFileContent } from '@/shared/api';
+import { api, readApiJson, readExternalFileContent } from '@/shared/api';
+import { shouldProxyLocalHref } from '@/modules/chat/utils/localProxyLink';
 import { copyTextToClipboard } from '@/shared/utils';
 import { UnifiedImageViewer } from '@/shared/ui';
 import { usePaletteOps } from '@/modules/command-palette';
@@ -28,6 +29,36 @@ type MarkdownProps = {
   /** Render single newlines as hard line breaks (for user-typed messages). */
   breaks?: boolean;
 };
+
+// Opens a link to a service running on the server's machine through the local
+// proxy, so a browser on another machine can actually reach it.
+//
+// The blank window is opened synchronously by the click handler and passed in
+// here: opening it after awaiting the ticket would be blocked as a popup.
+async function openThroughLocalProxy(
+  href: string,
+  popup: Window | null,
+  failureMessage: string,
+): Promise<void> {
+  try {
+    const response = await api.localProxy.createTicket(href);
+    const { data } = await readApiJson<{ data: { proxyPath: string } }>(response);
+    const target = popup ?? window.open('', '_blank');
+    if (!target) {
+      throw new Error('The browser blocked the proxy window.');
+    }
+    // The proxied page is served from this origin; cutting the opener keeps it
+    // from reaching back into the chat window.
+    target.opener = null;
+    target.location.replace(data.proxyPath);
+  } catch (error) {
+    console.error('[LocalProxy] failed to open link', href, error);
+    if (popup && !popup.closed) {
+      popup.document.title = failureMessage;
+      popup.document.body.textContent = `${failureMessage}\n\n${href}`;
+    }
+  }
+}
 
 // Links to the wider web (or in-page anchors) keep normal browser navigation;
 // everything else is treated as a workspace file reference.
@@ -402,6 +433,7 @@ export const MarkdownBody = memo(function MarkdownBody({ children, breaks = fals
   );
   const rehypePlugins = useMemo(() => [rehypeKatex], []);
   const { openFileInEditor } = usePaletteOps();
+  const { t } = useTranslation('chat');
 
   const components = useMemo(
     () => ({
@@ -430,6 +462,22 @@ export const MarkdownBody = memo(function MarkdownBody({ children, breaks = fals
           );
         }
 
+        if (shouldProxyLocalHref(href, window.location.origin)) {
+          return (
+            <a
+              href={href}
+              className="text-blue-600 hover:underline dark:text-blue-400"
+              title={t('localProxy.linkHint')}
+              onClick={(event) => {
+                event.preventDefault();
+                void openThroughLocalProxy(href as string, window.open('', '_blank'), t('localProxy.failed'));
+              }}
+            >
+              {linkChildren}
+            </a>
+          );
+        }
+
         return (
           <a
             href={href}
@@ -442,7 +490,7 @@ export const MarkdownBody = memo(function MarkdownBody({ children, breaks = fals
         );
       },
     }),
-    [openFileInEditor],
+    [openFileInEditor, t],
   );
 
   return (

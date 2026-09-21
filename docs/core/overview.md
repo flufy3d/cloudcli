@@ -47,6 +47,7 @@ server/
     plugins/               插件注册表、插件子进程、WS 代理
     scheduled-messages/    定时消息（调度器 → 无附着 chat turn）
     browser-use/           浏览器自动化 service + 本地 MCP 桥接
+    local-proxy/           把服务器本机端口上的服务转发给远程浏览器（票据 + 会话 cookie）
     voice/  cli/  git/  file-tree/  worktrees/  projects/  settings/  system/  user/
                            其余领域模块（每个 = routes + services 的薄模块）
   shared/                  interfaces.ts（IProvider 契约）、types.ts（NormalizedMessage、
@@ -85,6 +86,8 @@ docs/
 - **可选 API key**：`validateApiKey` 作用于全部 `/api`；agent 模块另走 API key / 平台双模鉴权。
 - **上传白名单**：`chat.send` 的附件只放行 `~/.cloudcli/assets` 直接子文件，防止任意路径读。
 - **`file:` 链接白名单**：会话里引擎产出的本地文件链接走只读端点，目录白名单含各引擎数据根与系统临时目录（`server` 侧 fileLink 相关服务），防止越权读盘。
+- **本机服务代理**（`server/modules/local-proxy`）：聊天里出现的 `http://localhost:<port>/…` 只在服务器那台机器上可达，远程浏览器打不开。前端（`src/modules/chat/utils/localProxyLink.ts`）在"链接指向本机、而页面自身不是本机地址"时改走代理：先用 JWT 换一张 60 秒一次性票据，首个文档请求用票据换 `HttpOnly` 会话 cookie（`Path=/api/local-proxy`，8 小时）并 302 把票据从地址栏抹掉，之后页面的子资源靠该 cookie 放行——浏览器不会给它们带 Authorization 头。转发只允许 GET/HEAD，目标 host 固定 `127.0.0.1`，禁服务自身端口；请求侧丢掉 `cookie`/`authorization`，响应侧剥掉 `set-cookie`/CSP/HSTS 并把 `Location` 改写回代理前缀。页面里写死的根绝对路径资源由 `localProxyAbsolutePathFallback` 按 `Referer` 送回对应端口，该中间件必须排在静态资源处理之前。
+- **代理的固有代价**：任何已登录用户都能读到服务器本机任意端口的 GET 内容；被代理页面运行在 cloudcli 同源下，其脚本能访问本源的 `localStorage`。代理的对象是用户自己机器上的本地服务，以此为前提接受这两点。
 
 ## 构建与部署
 

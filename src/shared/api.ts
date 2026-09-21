@@ -545,6 +545,12 @@ export const api = {
     installRuntime: () => post('/api/browser-use/runtime/install'),
   },
 
+  localProxy: {
+    // Mints the single-use ticket that lets the browser open a service running
+    // on the server's machine through the cloudcli origin.
+    createTicket: (url: string) => post('/api/local-proxy/tickets', { url }),
+  },
+
   voice: {
     health: () => get('/api/voice/health'),
     transcribe: (formData: FormData, headers: Record<string, string> = {}) =>

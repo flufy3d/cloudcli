@@ -320,5 +320,9 @@
       "claude": "API Key、Bedrock、Vertex 登录没有 claude.ai 订阅限额",
       "codex": "API Key 登录通常不会提供 ChatGPT 账号的 5 小时和周限额"
     }
+  },
+  "localProxy": {
+    "linkHint": "这个地址只存在于服务器本机，CloudCLI 将通过本地代理打开。",
+    "failed": "CloudCLI 无法打开这个服务器本机地址。"
   }
 }

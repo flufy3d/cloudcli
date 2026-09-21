@@ -285,5 +285,9 @@
       "claude": "API-Schlüssel-, Bedrock- und Vertex-Anmeldungen haben keine Abo-Limits von Claude.ai",
       "codex": "API-Schlüssel-Anmeldungen liefern in der Regel keine 5-Stunden- oder Wochenlimits"
     }
+  },
+  "localProxy": {
+    "linkHint": "Diese Adresse existiert nur auf dem Server; CloudCLI öffnet sie über den lokalen Proxy.",
+    "failed": "CloudCLI konnte diese serverlokale Adresse nicht öffnen."
   }
 }

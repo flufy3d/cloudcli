@@ -285,5 +285,9 @@
       "claude": "API anahtarı, Bedrock ve Vertex girişlerinde claude.ai abonelik limitleri bulunmaz",
       "codex": "API Anahtarı ile girişler genellikle 5 saatlik veya haftalık limitleri bildirmez"
     }
+  },
+  "localProxy": {
+    "linkHint": "Bu adres yalnızca sunucuda bulunur; CloudCLI onu yerel proxy üzerinden açar.",
+    "failed": "CloudCLI bu sunucu yerel adresini açamadı."
   }
 }

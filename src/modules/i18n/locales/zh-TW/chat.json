@@ -328,5 +328,9 @@
       "claude": "API Key、Bedrock、Vertex 登入沒有 claude.ai 訂閱限額",
       "codex": "API Key 登入通常不會提供 5 小時和週限額"
     }
+  },
+  "localProxy": {
+    "linkHint": "這個位址只存在於伺服器本機，CloudCLI 將透過本機代理開啟。",
+    "failed": "CloudCLI 無法開啟這個伺服器本機位址。"
   }
 }

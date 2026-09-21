@@ -306,5 +306,9 @@
       "claude": "API 키, Bedrock, Vertex 로그인에는 claude.ai 구독 한도가 없습니다",
       "codex": "API 키 로그인은 일반적으로 5시간 또는 주간 한도를 제공하지 않습니다"
     }
+  },
+  "localProxy": {
+    "linkHint": "이 주소는 서버에만 존재하므로 CloudCLI가 로컬 프록시로 엽니다.",
+    "failed": "이 서버 로컬 주소를 열지 못했습니다."
   }
 }

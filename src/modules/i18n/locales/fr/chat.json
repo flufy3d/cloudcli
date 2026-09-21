@@ -287,5 +287,9 @@
       "claude": "Les connexions par clé API, Bedrock ou Vertex n'ont pas de limites d'abonnement claude.ai",
       "codex": "La connexion par clé API n'indique généralement pas de limite de 5 h ou hebdomadaire"
     }
+  },
+  "localProxy": {
+    "linkHint": "Cette adresse n'existe que sur le serveur ; CloudCLI l'ouvre via son proxy local.",
+    "failed": "CloudCLI n'a pas pu ouvrir cette adresse locale du serveur."
   }
 }
