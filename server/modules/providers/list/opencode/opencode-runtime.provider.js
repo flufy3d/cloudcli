@@ -54,6 +54,16 @@ const spawnFunction = crossSpawn;
 const activeRuns = new Map();
 
 /**
+ * Shortest gap between two mid-turn context-usage reads.
+ *
+ * OpenCode only reports usage when the whole run ends, so a long tool-heavy
+ * turn needs the runtime to publish it mid-turn (see `publishLiveTokenBudget`).
+ * Each read opens `opencode.db` and walks the session's message rows, so it
+ * must not run on every streamed message update.
+ */
+const LIVE_CONTEXT_MIN_INTERVAL_MS = 1_500;
+
+/**
  * Kills a spawned CLI process and everything it started.
  *
  * `cross-spawn` resolves `opencode` through the Windows `.cmd` shim, so the
@@ -212,6 +222,9 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     aborted: false,
     completeSent: false,
     terminalNotified: false,
+    /** Timestamp of the last mid-turn context read, and the occupancy it published. */
+    contextPublishedAt: 0,
+    publishedContextUsed: null,
     userMessageIds: new Set(),
     assistantMessageIds: new Set(),
     partTypes: new Map(),
@@ -261,6 +274,47 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       sessionId: run.providerSessionId || run.appSessionId || null,
       provider: 'opencode',
     }));
+  };
+
+  const sendTokenBudget = (tokenBudget) => {
+    ws.send(createNormalizedMessage({
+      kind: 'status',
+      text: 'token_budget',
+      tokenBudget,
+      sessionId: run.appSessionId || run.providerSessionId || runId,
+      provider: 'opencode',
+    }));
+  };
+
+  /**
+   * Publishes the session's context occupancy while the turn is still running.
+   *
+   * OpenCode only reports usage when the whole run ends, so without this the
+   * composer's context badge stayed frozen for the entire tool loop. Message
+   * updates arrive as each step closes and its usage is persisted, so each one
+   * re-reads opencode.db — rate-limited, and skipped when the occupancy has
+   * not moved since the last frame. The payload is what `/token-usage`
+   * returns, so the live badge and a reloaded transcript cannot disagree.
+   */
+  const publishLiveTokenBudget = () => {
+    if (run.aborted || run.completeSent || !run.providerSessionId) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - run.contextPublishedAt < LIVE_CONTEXT_MIN_INTERVAL_MS) {
+      return;
+    }
+    run.contextPublishedAt = now;
+
+    const tokenBudget = readOpenCodeTokenUsage(run.providerSessionId);
+    const used = Number(tokenBudget?.used ?? 0);
+    if (!tokenBudget || used <= 0 || used === run.publishedContextUsed) {
+      return;
+    }
+
+    run.publishedContextUsed = used;
+    sendTokenBudget(tokenBudget);
   };
 
   const registerProviderSession = (nextSessionId) => {
@@ -331,6 +385,9 @@ async function spawnOpenCode(command, options = {}, ws, context) {
 
     if (partType === 'step-finish') {
       emitNormalized({ type: 'step_finish', id: partId, sessionID: run.providerSessionId });
+      // A step closing is the earliest point its usage can be read back, so
+      // the composer's badge moves with the tool loop instead of at `complete`.
+      publishLiveTokenBudget();
       return;
     }
 
@@ -381,6 +438,9 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       run.userMessageIds.add(id);
     } else if (role === 'assistant') {
       run.assistantMessageIds.add(id);
+      // Each step's usage lands with its message update; refresh the badge
+      // without waiting for the whole run to finish.
+      publishLiveTokenBudget();
     }
   };
 
@@ -485,13 +545,7 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       run.completeSent = true;
       const tokenBudget = readOpenCodeTokenUsage(run.providerSessionId);
       if (tokenBudget) {
-        ws.send(createNormalizedMessage({
-          kind: 'status',
-          text: 'token_budget',
-          tokenBudget,
-          sessionId: run.appSessionId || run.providerSessionId || runId,
-          provider: 'opencode',
-        }));
+        sendTokenBudget(tokenBudget);
       }
 
       ws.send(createCompleteMessage({
