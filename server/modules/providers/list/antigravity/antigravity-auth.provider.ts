@@ -7,9 +7,9 @@
  * @module antigravity-auth.provider
  */
 
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 
+import { hasKeychainItem } from '@/modules/providers/shared/credentials/macos-keychain.js';
 import type { IProviderAuth } from '@/shared/interfaces.js';
 import type { ProviderAuthStatus, ProviderQuotaData } from '@/shared/types.js';
 import { extractEmailFromJwt } from '@/shared/utils.js';
@@ -127,23 +127,15 @@ function opaqueCredential(): AntigravityTokenInfo {
  * completed login, but later refreshes update only the keychain — and a
  * failed refresh can clear the file while the keychain copy stays valid — so
  * the file alone under-reports authenticated state and traps the UI in its
- * login prompt. `security` prints item attributes only (never the password
- * without `-w`), so this probe is read-only.
+ * login prompt.
  * `CLOUDCLI_ANTIGRAVITY_SKIP_KEYCHAIN=1` disables the probe for hermetic tests.
  */
 function hasKeychainCredentials(): boolean {
-  if (process.platform !== 'darwin' || process.env.CLOUDCLI_ANTIGRAVITY_SKIP_KEYCHAIN === '1') {
-    return false;
-  }
-  try {
-    execFileSync('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity'], {
-      stdio: ['ignore', 'ignore', 'ignore'],
-      timeout: 3000,
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  return hasKeychainItem({
+    service: 'gemini',
+    account: 'antigravity',
+    extraSkipEnvVars: ['CLOUDCLI_ANTIGRAVITY_SKIP_KEYCHAIN'],
+  });
 }
 
 /**
