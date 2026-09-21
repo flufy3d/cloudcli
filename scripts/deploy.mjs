@@ -4,10 +4,11 @@
 // 改代码、跑 dev 都不影响正在干活的线上服务。
 //
 // 用法：pnpm run deploy
-// 注意：本会话若由 cloudcli 服务托管，最后的进程切换会断开自身连接，
-// 应在服务之外的普通终端里执行。
+// 脚本会先把自己拉起成 detached 后台进程（日志 ~/.cloudcli/deploy.log），当前终端
+// 只跟读日志，所以终端关闭、或 pm2 切换把托管本会话的服务重启，都不会打断部署。
+// 在 cloudcli 托管的会话里执行时，切换那一刻自身连接仍会断，后续进度看日志。
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -22,7 +23,9 @@ const RUNTIME_DIR = path.join(CLOUDCLI_HOME, 'runtime');
 const NEXT_RUNTIME_DIR = path.join(CLOUDCLI_HOME, `runtime-next-${process.pid}`);
 const PREVIOUS_RUNTIME_DIR = path.join(CLOUDCLI_HOME, 'runtime-previous');
 const DEPLOY_LOCK = path.join(CLOUDCLI_HOME, 'deploy.lock');
+const DEPLOY_LOG = path.join(CLOUDCLI_HOME, 'deploy.log');
 let cutoverInProgress = false;
+let deployCompleted = false;
 
 function fail(msg) {
   console.error(`\n[deploy] ✗ ${msg}`);
@@ -104,10 +107,61 @@ function releaseDeployLock() {
   }
 }
 
+// ── 脱离宿主进程 ───────────────────────────────────────────
+// 部署中途要重启 pm2。如果这个脚本本身是被重启对象的子进程——在 cloudcli 托管的
+// 终端里执行就是这种情况——宿主一死脚本跟着死，可能停在切换之前，留下"构建过了
+// 但线上没更新"。所以先把自己重新拉起成 detached 进程（detached 等于 setsid，
+// 终端挂断的 SIGHUP 也到不了它），输出写进日志文件，当前终端只负责跟读：
+// 关掉终端、或者宿主服务被重启，部署都照样跑完。
+if (!process.env.CLOUDCLI_DEPLOY_DETACHED) {
+  fs.mkdirSync(CLOUDCLI_HOME, { recursive: true });
+  const args = process.argv.slice(2);
+  fs.writeFileSync(DEPLOY_LOG, `[deploy] ${new Date().toISOString()} 启动，参数：${args.join(' ') || '（无）'}\n`);
+
+  const logFd = fs.openSync(DEPLOY_LOG, 'a');
+  const worker = spawn(process.execPath, [import.meta.filename, ...args], {
+    cwd: REPO_ROOT,
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    env: { ...process.env, CLOUDCLI_DEPLOY_DETACHED: '1' },
+  });
+  worker.unref();
+  fs.closeSync(logFd);
+
+  console.log(`[deploy] 部署已在后台启动（PID ${worker.pid}），日志：${DEPLOY_LOG}`);
+  console.log('[deploy] 以下为实时日志。在这里按 Ctrl-C 只停止跟读，不会中断部署。');
+
+  const tail = spawn('tail', ['-n', '+2', '-f', DEPLOY_LOG], { stdio: ['ignore', 'inherit', 'inherit'] });
+  const exitCode = await new Promise((resolve) => {
+    worker.on('exit', (code, signal) => resolve(signal ? 1 : code ?? 1));
+    worker.on('error', () => resolve(1));
+  });
+  // 留一点时间让 tail 把最后几行吐完，再收掉它。
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  tail.kill('SIGTERM');
+  process.exit(exitCode);
+}
+
+// 清理被强杀的历史部署留下的暂存目录（正常退出会自己删）。
+for (const entry of fs.readdirSync(CLOUDCLI_HOME, { withFileTypes: true })) {
+  const orphanPid = /^runtime-next-(\d+)$/.exec(entry.name)?.[1];
+  if (entry.isDirectory() && orphanPid && !isProcessAlive(Number(orphanPid))) {
+    fs.rmSync(path.join(CLOUDCLI_HOME, entry.name), { recursive: true, force: true });
+    console.log(`[deploy] 已清理上次中断留下的暂存目录：${entry.name}`);
+  }
+}
+
 acquireDeployLock();
-process.on('exit', () => {
+process.on('exit', (code) => {
   fs.rmSync(NEXT_RUNTIME_DIR, { recursive: true, force: true });
   releaseDeployLock();
+  // 中断和失败都走这里：把"线上没变"说清楚，别让人以为构建成功就等于部署成功。
+  if (!deployCompleted) {
+    console.error(
+      `\n[deploy] ✗ 部署未完成（退出码 ${code}）。固定运行目录未切换，线上仍是本次部署前的版本。\n` +
+      '[deploy]   若版本号已自增并提交，该版本号作废，下次部署会在它之上继续自增。',
+    );
+  }
 });
 function handleTerminationSignal(signal) {
   if (cutoverInProgress) {
@@ -411,4 +465,5 @@ if (globalBinDir) {
 }
 
 cutoverInProgress = false;
+deployCompleted = true;
 console.log(`\n[deploy] ✓ 部署完成，访问 http://localhost:${PORT}`);
