@@ -73,6 +73,14 @@ export type ProviderCapabilities = {
    */
   supportsCompaction: boolean;
   /**
+   * Whether the engine has its own session-scoped scheduling layer (Claude's
+   * CronCreate/ScheduleWakeup, which CloudCLI keeps alive by holding the CLI
+   * process open). CloudCLI's scheduled jobs work for every provider; this
+   * flag only drives the hint shown when a job is bound to a session whose
+   * engine already schedules inside itself.
+   */
+  supportsNativeScheduling: boolean;
+  /**
    * Whether replacing an already-sent message also reverts the files the
    * agent changed, so the composer warns about it. Static per provider: a
    * transcript either has file side effects to undo (OpenCode's revert) or

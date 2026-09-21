@@ -16,6 +16,7 @@
 | `chat.send` 入口 | `server/modules/websocket/services/chat-websocket.service.ts` 的 `handleChatSend`：`resolveSendTarget`（会话行以 DB 为准，不信任客户端）→ `dispatchRun`（附件过滤只放行 `~/.cloudcli/assets` 直接子文件、记录 model/effort） |
 | `chat.compact` 入口 | 同一文件的 `handleChatCompact`：同样的 `resolveSendTarget` 与 run 登记，但执行走 runtime 可选切面 `IProviderRuntime.compact(options, writer, context)`（能力矩阵 `supportsCompaction` 不满足则 `protocol_error: COMPACTION_UNSUPPORTED`）。前端由 `/compact` 菜单项发出（composer 不落用户气泡），压缩完成后照样以 `complete` 结束 → 前端按既有 complete 路径刷新历史，压缩摘要随历史页回来。压缩刚结束时引擎还报不出新占用（见 [providers.md](./providers.md) 的 `compacted` 约定），前端收到后清空占用百分比（`ContextUsageBar`），`TokenUsageSummary` 改用 `summaryBytes` 显示压缩摘要的大小，等下一个回合的刷新再显示真实 K 数与百分比 |
 | 运行登记 | `chat-run-registry.service.ts`：`startRun` / `replayEvents` / `completeRunIfCurrent`；**run 属于服务端不属于 socket**——断线存活、多端同看、无观察者也能跑；完成后事件缓冲保留约 5 分钟供补发 |
+| 定时任务入口 | `scheduled-jobs` 模块的调度器到点调 `runDetachedChatTurn`（与一次性定时消息同一条无附着通道）：`reuse` 任务跑在绑定会话、`new` 任务先 `createAppSession` 再跑；会话忙时记 `skipped`，**永不打断**在跑回合（一次性消息的 interrupt 语义只属于用户手选的时刻） |
 | 统一分发 | `server/modules/providers/services/provider-runtime.service.ts` → `IProviderRuntime.run(command, options, writer, context)` |
 | 出站写入 | `chat-session-writer.service.ts`（`ChatSessionWriter`）：**先过线上契约闸门**（`server/shared/normalized-message-contract.ts`：信封坏了整条丢、协议未声明的字段剥掉并点名记录，见 [providers.md](./providers.md)），再吞掉 `session_created`、把 provider 原生 id 重映射为 app session id、给每事件打**单调 `seq`**、扇出给所有 watching socket |
 | 终态 | 每次运行**恰好一个 `complete`**（成功/失败/中止都是）；`error` 是信息性行，不终止 run |
@@ -112,5 +113,5 @@ assistant 文本的 live/history 对账优先使用 provider 给出的 `provider
 | 新增客户端 → 服务端帧 | `chat-websocket.service.ts` 的消息类型 switch；需要鉴权/限流语义时看 `resolveSendTarget` 的模式 |
 | 新增工具卡片渲染 | `src/modules/chat/tools/configs/toolConfigs.ts` 注册（配置驱动，**禁止散落条件分支**），复杂内容加 ContentRenderer；见 `src/modules/chat/tools/README.md`。工具别名/展示分类/命令提取统一在 `toolTaxonomy.ts`，别再拷贝名单 |
 | 新增权限相关能力 | 引擎 runtime 的 `permissions` 网关 → 矩阵自动推导 `supportsPermissionRequests` → 前端按矩阵渲染 |
-| 新增由能力矩阵驱动的 UI 差异 | 静态能力进 `provider-capabilities.catalog.ts`，前端只读矩阵、不写 provider 分支：`supportsCompaction` 决定 `/compact` 是否出现，`editRevertsFiles` 决定编辑横幅说"已修改的文件不会被还原"还是"会一并还原"（opencode 的 revert 会还原 snapshot 文件）。提问卡（`AskUserQuestionPanel`）文案与引擎无关，用 `chat:misc.*` 中性串 |
+| 新增由能力矩阵驱动的 UI 差异 | 静态能力进 `provider-capabilities.catalog.ts`，前端只读矩阵、不写 provider 分支：`supportsCompaction` 决定 `/compact` 是否出现，`editRevertsFiles` 决定编辑横幅说"已修改的文件不会被还原"还是"会一并还原"（opencode 的 revert 会还原 snapshot 文件），`supportsNativeScheduling` 决定定时任务表单是否提示"引擎自带会话内调度"。提问卡（`AskUserQuestionPanel`）文案与引擎无关，用 `chat:misc.*` 中性串 |
 | 改历史分页 | `src/modules/chat/utils/sessionMessagePagination.ts` + store 的序列化测试（`sessionTimelineSequences.test.ts`）必须跟着改 |

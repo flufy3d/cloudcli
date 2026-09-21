@@ -1,4 +1,4 @@
-import { MessageSquare, Terminal, Folder, GitBranch, ClipboardCheck, MonitorPlay, type LucideIcon } from 'lucide-react';
+import { MessageSquare, Terminal, Folder, GitBranch, ClipboardCheck, Clock, MonitorPlay, type LucideIcon } from 'lucide-react';
 import { Fragment } from 'react';
 import type { Dispatch, KeyboardEvent, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -60,6 +60,13 @@ const TASKS_TAB: BuiltInTab = {
   icon: ClipboardCheck,
 };
 
+const SCHEDULED_TAB: BuiltInTab = {
+  kind: 'builtin',
+  id: 'scheduled',
+  labelKey: 'tabs.scheduled',
+  icon: Clock,
+};
+
 /** Rendered by WorkspaceHeader to show the built-in workspace tabs plus any enabled plugin tabs. */
 export default function WorkspaceTabs({
   activeTab,
@@ -76,6 +83,7 @@ export default function WorkspaceTabs({
     ...(shouldShowShellTab ? [SHELL_TAB] : []),
     ...(shouldShowBrowserTab ? [BROWSER_TAB] : []),
     ...(shouldShowTasksTab ? [TASKS_TAB] : []),
+    SCHEDULED_TAB,
   ];
 
   const pluginTabs: PluginTab[] = plugins

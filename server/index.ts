@@ -51,6 +51,11 @@ import {
     initializeScheduledMessageDispatcher,
     scheduledMessagesRoutes,
 } from './modules/scheduled-messages/index.js';
+import {
+    closeScheduledJobDispatcher,
+    initializeScheduledJobDispatcher,
+    scheduledJobsRoutes,
+} from './modules/scheduled-jobs/index.js';
 import { assetsRoutes } from './modules/assets/index.js';
 import { fileTreeRoutes } from './modules/file-tree/index.js';
 import { worktreesRoutes } from './modules/worktrees/index.js';
@@ -211,6 +216,7 @@ app.use('/api/browser-use', authenticateToken, browserUseRoutes);
 // Unified provider MCP routes (protected)
 app.use('/api/providers', authenticateToken, providerRoutes);
 app.use('/api/scheduled-messages', authenticateToken, scheduledMessagesRoutes);
+app.use('/api/scheduled-jobs', authenticateToken, scheduledJobsRoutes);
 
 // Agent API Routes (uses API key authentication)
 app.use('/api/agent', agentRoutes);
@@ -398,6 +404,9 @@ async function startServer() {
             // Sends anything that came due while the server was not running,
             // then keeps polling.
             initializeScheduledMessageDispatcher(providerRuntimeService);
+            // Recurring jobs: fires their next occurrence, marks stale ones
+            // missed, and records every attempt in the run history.
+            initializeScheduledJobDispatcher(providerRuntimeService);
 
             // Start periodic auto-archive scheduler for historical sessions
             sessionsAutoArchiveService.startScheduler();
@@ -424,6 +433,11 @@ async function startServer() {
                 closeScheduledMessageDispatcher();
             } catch (err) {
                 console.error('[ScheduledMessages] Error closing dispatcher during shutdown:', getErrorMessage(err));
+            }
+            try {
+                closeScheduledJobDispatcher();
+            } catch (err) {
+                console.error('[ScheduledJobs] Error closing dispatcher during shutdown:', getErrorMessage(err));
             }
             try {
                 await browserUseService.stopAllSessions();

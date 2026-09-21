@@ -92,7 +92,7 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 
 ## i18n
 
-- 目录 `src/modules/i18n/`：11 种语言 × 7 个命名空间（auth/chat/codeEditor/common/settings/sidebar/tasks）= 77 个 JSON。
+- 目录 `src/modules/i18n/`：11 种语言 × 8 个命名空间（auth/chat/codeEditor/common/scheduled/settings/sidebar/tasks）；`scheduled` 目前只有 en / zh-CN / zh-TW 三份，其余语言整包回退英文（i18next fallback 按命名空间生效）。
 - 新增用户可见文案必须走 i18n key；**en / zh-CN / zh-TW 三份必须给全**，其余语言可暂缺（回退英文）——这是当前维护约定，翻译覆盖面以 `src/modules/i18n/locales/` 现状为准。
 
 ## PWA 与版本

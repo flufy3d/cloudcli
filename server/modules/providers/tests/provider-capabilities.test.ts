@@ -47,6 +47,9 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // The Agent SDK processes `/compact` from the held input stream, which is
     // exactly what the runtime's compact primitive feeds it.
     supportsCompaction: true,
+    // Claude's CronCreate/ScheduleWakeup schedule inside the running CLI
+    // process; CloudCLI holds that process open so the wake-ups can fire.
+    supportsNativeScheduling: true,
     editRevertsFiles: false,
     mcp: {
       scopes: ['user', 'local', 'project'],
@@ -68,6 +71,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsMessageEditing: false,
     supportsSessionForking: false,
     supportsCompaction: false,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
     mcp: {
       scopes: ['user', 'project'],
@@ -94,6 +98,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsSessionForking: true,
     // `thread/compact/start` on the same app-server transport the fork rides.
     supportsCompaction: true,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
     mcp: {
       scopes: ['user', 'project'],
@@ -124,6 +129,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsSessionForking: true,
     // `opencode run --command compact` runs the CLI's own compaction command.
     supportsCompaction: true,
+    supportsNativeScheduling: false,
     editRevertsFiles: true,
     mcp: {
       scopes: ['user', 'project'],
@@ -155,6 +161,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // background summarization turn), which is what puts `/compact` in the
     // composer menu for this provider.
     supportsCompaction: true,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
     mcp: {
       scopes: ['user', 'project'],
@@ -179,6 +186,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // model ("not a built-in slash command"), and the CLI has no compaction
     // subcommand or flag. Slash expansion only covers skills/custom commands.
     supportsCompaction: false,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
     mcp: {
       scopes: ['user', 'project'],

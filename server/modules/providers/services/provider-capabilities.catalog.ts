@@ -47,6 +47,14 @@ export type ProviderCatalogEntry = {
   /** Whether the provider runtime can accept model-level reasoning effort. */
   supportsEffort: boolean;
   /**
+   * Whether the engine schedules deferred work inside a session on its own
+   * (Claude's CronCreate/ScheduleWakeup). Informational: CloudCLI's scheduled
+   * jobs are offered for every provider, and this only decides whether the
+   * job form warns that the engine already has a session-scoped scheduler
+   * whose wake-ups a job's run would supersede.
+   */
+  supportsNativeScheduling: boolean;
+  /**
    * Whether replacing an already-sent message also reverts the files the
    * agent changed. Claude resumes a transcript partway and Codex forks one,
    * so neither touches files; OpenCode's `rewindSession` marks a server-side
@@ -64,6 +72,9 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    // Claude's CronCreate/ScheduleWakeup schedule work inside the running CLI
+    // process; CloudCLI holds that process open so the wake-ups can fire.
+    supportsNativeScheduling: true,
     editRevertsFiles: false,
   },
   cursor: {
@@ -74,6 +85,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: false,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
   },
   codex: {
@@ -84,6 +96,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
   },
   opencode: {
@@ -98,6 +111,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    supportsNativeScheduling: false,
     editRevertsFiles: true,
   },
   zcode: {
@@ -115,6 +129,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
   },
   antigravity: {
@@ -125,6 +140,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    supportsNativeScheduling: false,
     editRevertsFiles: false,
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;
