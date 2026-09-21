@@ -182,13 +182,6 @@
       "sessionMessages": "Cargando mensajes de la sesión..."
     },
     "messages": {
-      "showingOf": "Mostrando {{shown}} de {{total}} mensajes",
-      "scrollToLoad": "Desplázate hacia arriba para cargar más",
-      "showingLast": "Mostrando los últimos {{count}} mensajes ({{total}} en total)",
-      "loadEarlier": "Cargar mensajes anteriores",
-      "loadAll": "Cargar todos los mensajes",
-      "loadingAll": "Cargando todos los mensajes...",
-      "allLoaded": "Todos los mensajes cargados",
       "perfWarning": "Todos los mensajes cargados — el desplazamiento puede ser más lento. Haz clic en \"Ir al final\" para recuperar el rendimiento."
     }
   },
@@ -321,5 +314,9 @@
       "claude": "Los inicios de sesión con API key, Bedrock o Vertex no tienen límites de suscripción de claude.ai",
       "codex": "Los inicios de sesión con API Key no suelen indicar límites de 5 horas o semanales"
     }
+  },
+  "localProxy": {
+    "linkHint": "Esta dirección solo existe en el servidor; CloudCLI la abre mediante su proxy local.",
+    "failed": "CloudCLI no pudo abrir esta dirección local del servidor."
   }
 }

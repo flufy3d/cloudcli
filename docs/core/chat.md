@@ -1,6 +1,6 @@
 # 聊天链路（Chat Pipeline）
 
-> 基准：2.3.10 / 2026-09-20
+> 基准：2.4.8 / 2026-09-21
 > **核心文档**：改动 `server/modules/websocket/**` 或 `src/modules/chat/**` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -53,7 +53,7 @@ flowchart LR
 - **`src/modules/chat/utils/sessionTimelineStore.ts`**（`SessionTimelineStore`）：不 import React。每会话一个 slot（`serverMessages` / `realtimeMessages` / `merged` + 分页元数据 + 流式分段缓冲 + 重连 resume seq）。`applyServerEvent` 是时间线状态的唯一入口：内部路由表 `SERVER_EVENT_ROUTES` 一行定义一个 kind 的 flush 门/持久化/动作，并产出副作用指令。
 - **`src/modules/chat/hooks/useSessionStore.ts`**：React 适配器，每次应用挂载建一个 store，`notify` 触发重渲染——**非 React → React 的唯一提交边界**。
 - **渲染层对引擎无感**：`MessageComponent` 等共用渲染组件**不得**按引擎名分支。引擎的私有包装在各自适配器归一化掉（例如 Codex 的 `<proposed_plan>` 由适配器拆成与 Claude 一致的 `ExitPlanMode` 计划卡，实时/会话读取/持久化三条路都做），详见 [providers.md](./providers.md)。
-- **渲染层**：空态/加载态由 ChatInterface 直接渲染（无消息时 Pane 不挂载）；`ChatMessagesPane` 只承载 transcript（分组、懒挂载、指示器、导出菜单）。`ChatMessage` 是纯视图模型：`type` 为 `user|assistant|error` 三值联合，assistant 子形态靠 `isToolUse`/`isThinking` 等 is* 旗标区分，由 convertRow 每次从 NormalizedMessage 重建，不落盘（JSON 导出是唯一序列化面）。
+- **渲染层**：空态/加载态由 ChatInterface 直接渲染（无消息时 Pane 不挂载）；`ChatMessagesPane` 只承载 transcript——它把状态层给的 `transcriptItems` 交给 virtua 虚拟化渲染，自己不再决定显示哪些行。`ChatMessage` 是纯视图模型：`type` 为 `user|assistant|error` 三值联合，assistant 子形态靠 `isToolUse`/`isThinking` 等 is* 旗标区分，由 convertRow 每次从 NormalizedMessage 重建，不落盘（JSON 导出是唯一序列化面）。
 
 ### 两条硬不变量（store 与渲染器的契约，方法实现必须保持）
 
@@ -62,48 +62,54 @@ flowchart LR
 
 模块内的次级排序契约见 `sessionTimelineStore.ts` 头注释：内容帧先 flush 流式缓冲再落表（路由表的 flush 门）；服务端覆盖剪枝必须先于内容级短路；旧页拉取期间的偏移漂移要先做一次有界最新页校准；流式行时间戳锚定在分段开始且不刷新。
 
-**乐观用户行的回收也不看时钟。** 发送时 `appendRealtime` 用当时的服务端行数打上
-`replacesAfterRowCount`；回收时只有**在那之后出现**的服务端行才有资格认领它。
-这既让引擎时间戳落后于浏览器时不再把持久化副本判成"太旧"（表现为自己发的消息显示两遍），
-也防止更早的同文本提示词把新消息吃掉（表现为新消息消失）。编辑路径原本就设这个值，语义一致。
-认领关系记在 slot 的 `retiredOptimisticUserAnchors` 中，并跨历史分页窗口保留：乐观行继续充当
-尚未落盘实时回复的回合边界，但不再参与渲染。切换会话后的整页加载只重标仍待落盘的乐观行；
-已经被认领的行即使其服务端副本被工具密集的最新页挤出窗口，也不能重新出现。
+**判重只有一条依据：`id` 相等。** 转录行（`text`/`thinking`/`tool_use`/`tool_result`/
+`task_notification`）的 `id` 由引擎自己的记录推导，同一条记录在实时路与历史路、读多少遍都字节
+相同（契约与逐引擎依据见 [providers.md](./providers.md)）。于是"这条实时行是不是已经落盘"是一次
+集合查找：`serverIds.has(row.id)`。不比正文、不看时钟、不数下标、不重建回合。
 
-**没有 `local_` 前缀的用户实时行走另一条路：认领后直接剪掉。** 这类行来自他端标签页或引擎回显，
-不承担回合边界职责（边界由本端的乐观行记录），而回收只认乐观行前缀——于是它们曾被无条件保留，
-与自己的持久化副本并排渲染，且重开会话依旧在。剪枝阶段改为让它们在转录里一对一认领同指纹的用户行，
-认领到就退场。认领集合与工具卡的相互独立，并预先填入乐观行已认领的服务端行，
-避免一条持久化用户行被两边同时认领；一对一保证了连发两条相同文本时各自配对，不会被折叠成一条。
+前端只有三类行没有引擎 id，它们各自有**有界**的退场方式，绝不靠猜：
+
+| 行 | 为什么没有 id | 怎么退场 |
+| --- | --- | --- |
+| 乐观用户行 `local_*` | 发送时引擎还没写任何东西 | 与发送时刻之后出现的第一条持久化用户行配对 |
+| 流式占位行 `__streamed_*` | 增量是还不存在的那一行的碎片 | 引擎随后发来的正式行就地顶替；或按 `providerRowKey` 由更完整的持久化行接管 |
+| 合成结算行 `__finalized_*` | 本端为未收到结果的工具卡补的 | 随它结算的那张卡一起退场 |
+
+**乐观用户行按 id 锚点配对，不用行数、不用时钟、不看正文。** 发送时把当时转录的**最后一行 id**
+记进 slot 的 `pendingPrompts`；此后出现在该行之后的第一条持久化用户行就是它的副本，一对一认领。
+用 id 而不是行数，是因为这个数组会被整页刷新替换、被旧页前插——行数戳在这两种情况下会静默失配，
+而失配的结果是乐观行永远退不了休，与自己的持久化副本并排显示到会话结束。发送时转录为空则没有锚点：
+此时配对仍然进行（宁可乐观行早退，也不要重复），但这种配对**不算已证明**，不能用来给工具卡定位回合。
+锚点行被 fork/编辑改写而消失时，`complete` 是兜底期限——run 结束后允许与任意未认领的用户行配对，
+以保证重复不会变成永久。
+
+**引擎回显的用户行同样是"顶替"而非"并排"。** codex 会在实时流里回显用户消息，claude 不会
+（实测：SDK 的 query 输出只有 system/assistant/user(tool_result)/result，没有提示词回显）。
+回显行带引擎 id，到达时直接顶替尚未配对的乐观行，于是这条行从那一刻起就有了真身份和编辑/Fork 锚点。
 
 **两路合并的排序依据按 `源内顺序 > 因果锚点 > 时间戳` 取，时间戳永不单独裁决跨路先后。** 各路内部顺序本身就是权威的（服务端是转录序，实时是到达序），需要裁决的只有交错位置；而两路的时间戳来自不同机器（流式行由浏览器打戳，历史行由引擎落盘时打戳），拿它定跨路先后会让时钟偏斜直接变成乱序。因此每条实时行取两个因果下界中较晚的一个，有下界时时间戳不参与：
 
-- **回合锚点**——实时行属于其上方最近一条乐观用户行开启的回合。该乐观用户行被持久化副本顶替时（`reconcileOptimisticUserEchoes` 的一对一配对），顶替它的服务端行即成为这一回合所有实时行的下界。这条路径覆盖"服务端还没跟上"。
+- **回合锚点**——实时行属于其上方最近一条用户行开启的回合。该用户行的持久化副本（乐观行的配对结果，或引擎回显行自己的 id）即成为这一回合所有实时行的下界。这条路径覆盖"服务端还没跟上"。
 - **到达锚点**——实时行首次出现时服务端数组的末行，记在 slot 的 `realtimeArrivalAnchors` 上，只记一次不修正。当时已在转录里的行必然发生在它之前。这条路径覆盖"服务端早已有"（他端标签页、重连后补看的会话没有乐观行可锚）。
 
 因此剪枝阶段**必须保留乐观用户行**：它是回合边界的唯一记录，隐藏它是合并阶段的职责。两个锚点都不适用的行才退回时间戳排列。
 
-**判重同样按 `身份 > 因果 > 挂钟` 取。** 判定一条实时 assistant 行是否已被持久化（`isAssistantTextEchoedInSameTurnOnServer`），先定它属于哪个回合：
+**`providerRowKey` 处理"同一行、两边正文不一样长"。** 流式缓冲从 delta 到 `__streaming_`、再到定稿占位行全程保留该 key；key 变化以及有 key/无 key 的切换都会先闭合旧段，避免相邻 provider 行或普通 stdout 被拼成一条。历史刷新只在 provider、会话、key 唯一对应时裁决：完整历史接管；历史明确截断而实时完整时实时接管；两边都明确截断时保留较长正文。正文不参与身份判断。Antigravity 的纯 assistant 正文使用原生 `step_index` 派生 key。
 
-1. `providerRowKey` 身份对账（见 [providers.md](./providers.md) 的行身份表）；
-2. 行自带 `transcriptAnchorId` 时按锚点定位服务端回合；
-3. 否则按**到达顺序**取 `realtimeMessages` 中它上方最近的用户行——上方没有用户行（他端标签页、重连后补看）就归属**最新的持久化回合**，因为实时行不可能早于已经落盘的回合；
-4. 该回合的用户行已被分页移出 `serverMessages`、上述都定位不到时，归属**最新的持久化回合**——实时行不可能属于比已落盘回合更旧的回合。
+**工具卡：先 id，再原生 call id，最后才是 codex 专属的指纹兜底。** 引擎在两路用同一 id 命名的调用由上面的 id 判重直接解决；两路行 id 不同但原生 call id 相同的走 `toolIdentity.ts` 的精确匹配。codex 是唯一两者都没有的引擎——rollout 记 `ctc_…`/`call_…`，实时流 announce `exec-…`，两者之间除了命令文本没有任何关联字段（已从真实 rollout 核对）。因此保留"规范工具名 + 完整参数指纹"的一对一认领，但**只在已证明的同一回合内**生效：回合证明来自乐观行的已证明配对或非空 `transcriptAnchorId`，证明不了就两张卡都留着（宁可重复一张卡，不可吞掉用户真跑过的命令）。Edit/Write 的指纹包含修改内容；仅当实时 Edit/Write 的两侧 diff 都未到达、历史端有完整 diff 时，才按路径与顺序一对一认领。
 
-判重路径**已无任何挂钟裁决**。曾经第 3 步是挂钟：浏览器落后于引擎时，一条真回复会被判成旧回合的回声而消失，一条真回声又会被保留成重复——同一个时钟问题同时造成两种现象。
-
-assistant 文本的 live/history 对账优先使用 provider 给出的 `providerRowKey`。流式缓冲从 delta 到 `__streaming_`、再到定稿 `text_` 全程保留该 key；key 变化以及有 key/无 key 的切换都会先闭合旧段，避免相邻 provider 行或普通 stdout 被拼成一条。历史刷新只在 provider、会话、key 唯一对应时裁决：完整历史接管；历史明确截断而实时完整时实时接管；两边都明确截断时保留较长正文。正文不参与身份猜测，标点、金额、版本号和否定词保持原样。不同 key、同 key 多候选或无 key 且无法定位同一用户回合的行全部保留。Antigravity 的纯 assistant 正文使用原生 `step_index` 派生 key，`complete` 仍只是终态信号，正文由随后的历史刷新接管。
-
-工具卡的跨路去重按 `toolIdentity.ts` 匹配：精确 toolId，或同一用户回合内的“规范工具名 + 完整参数指纹”（claimed 一对一，按 realtime 顺序配对）。同一回合由相同用户消息 id 或相同的非空 `transcriptAnchorId` 证明，正文和时间不能单独证明回合。Edit/Write 的指纹包含修改内容，不允许只因目标路径相同吞掉跨回合的真实卡片；仅当实时 Edit/Write 的两侧 diff 都未到达、历史端有完整 diff 时，才在已证明的同一回合按路径与顺序一对一认领。`__finalized_` 合成结算行随其卡片退役。
+**已知缺口（不伪造，写在这里）**：zcode 的 thinking 行两路 id 不同（实时是开段事件的 `${id}_reasoning`，落盘是 `(message_id, part_id)`），目前仍靠 `sessionThinkingRows.ts` 的整段正文相等来判重。要彻底收口需要引擎在 reasoning 事件上带出 part id——它的 `tool_result` 事件已经带了 `resultPartId`，文本与推理事件没有对应字段。zcode 的 assistant **正文**不受此影响：两路都发布 `zcode-message:<message_id>` 作为 `providerRowKey`，走身份对账。
 
 ### 渲染性能优化
 
 - 思考块按稳定 id 归组 upsert（`src/modules/chat/utils/sessionThinkingRows.ts`）。
 - 流式文本由 `transcript/StreamingMarkdown.tsx` 渲染：按 `streamingMarkdown.ts` 切"已定稿前缀 + 待定尾块"两段 `MarkdownBody`，前缀字节稳定命中 memo，每 100ms tick 只重解析尾块。
-- 搜索跳转先按 `searchTargetLocator.ts` 在数据上解析命中下标（-1 即确定性放弃），再按 `resolveSearchWindowSize` 只渲染命中窗口（不再整转录渲染），DOM 定位走 `LazyMessageRow` 包装层常驻的时间戳锚。
-- 滚动机制归 `hooks/useChatScrollController`（组合锚定 hook）：初始贴底 rAF 循环、发送/刷新后的确定性回底（立即 + 双 rAF 重钉，取代盲延时）、搜索命中 reveal；组件别再自己 `setTimeout` 摸滚动，与分页耦合的意图（回底并重置窗口、窗口扩张）留在 session 状态。
+- **转录是虚拟列表**：`ChatMessagesPane` 用 virtua 的 `Virtualizer` 渲染，只有视口附近的行在 DOM 里；行高由 virtua 实测，估高与真高的差值由它改写滚动偏移吸收。这取代了原先「服务端分页 + `visibleMessageCount` 切片 + 懒挂载占位」三层各管一段、互相错拍的结构——现在「渲染哪些行」只有 `transcriptItems` 一个来源。
+- 视口行为归 `hooks/useTranscriptViewport`：贴底跟随、距顶两屏预取旧页、按下标跳转。它不做任何位置补偿——补偿是 virtua 的职责，业务层再补一次只会打架。前插旧页的那一次提交带 `shift`，请求发出时置位、请求结束且该次提交渲染后复位（只按行数复位会在空页时卡住，把下一次追加误当历史）。
+- 搜索跳转按 `searchTargetLocator.ts` 在**分组后的行**上解析命中下标（-1 即确定性放弃），再交给 `scrollToIndex` 居中；不再需要渲染窗口，也不再有 DOM 查找和多段定时器。分组会折叠工具行、丢弃隐藏行，所以消息下标与行下标不是一回事，定位必须在行空间做。
 - 工具卡片按 toolId upsert，服务端把引擎的流式参数增量累积成稳定快照再发。
-- 视口懒挂载与滚动锚定见 [frontend.md](./frontend.md) 的性能守则。
+- `transcript/Markdown.tsx` 的链接分三类：工作区文件路径在编辑器里打开；指向服务器本机端口（而页面自身不在那台机器上）的链接改走本机服务代理，机制与安全边界见 [overview.md](./overview.md#认证与安全边界)；其余按普通外链新标签打开。
+- 虚拟化与滚动的硬约束见 [frontend.md](./frontend.md) 的性能守则；端到端闸门是 `scripts/perf/chat-scroll-up-stability.mjs`，它断言屏幕上的行走了多远，而不是 `scrollTop` 变了多少。
 
 ## 扩展检查单
 

@@ -144,13 +144,82 @@ const _everyKindIsDescribed: KindWithoutFields extends never
   : ['kind without a field set', KindWithoutFields] = true;
 void _everyKindIsDescribed;
 
-/** The payload accepted when constructing a message of one specific kind. */
+/**
+ * Kinds that can appear in a stored transcript.
+ *
+ * These are the rows that exist twice — once as a live frame while the run is
+ * in flight, once as a persisted row a later history read returns. The client
+ * has to recognise the two as the same row, so their `id` must be derived
+ * from something the engine itself stores: same record, same id, every read,
+ * on both paths. Every other kind describes a run in flight and is never read
+ * back, so a throwaway id is fine there.
+ */
+export const TRANSCRIPT_ROW_KINDS = [
+  'text',
+  'thinking',
+  'tool_use',
+  'tool_result',
+  'task_notification',
+] as const satisfies readonly MessageKind[];
+
+/**
+ * `error` is deliberately absent. Most error frames are produced by the
+ * gateway or a runtime about a run in flight and are never read back, so
+ * there is no engine record to derive an id from. zcode is the one engine
+ * that persists error rows; its live and history paths derive the same id
+ * from the engine's own event id, which is what the join needs — the
+ * requirement just cannot be stated for the kind as a whole.
+ */
+
+/** A kind whose rows are persisted and therefore need a deterministic id. */
+export type TranscriptRowKind = typeof TRANSCRIPT_ROW_KINDS[number];
+
+/**
+ * The marker every randomly generated message id starts with.
+ *
+ * A random id is legitimate on a frame that exists only while a run is in
+ * flight, and never on a row a later history read has to match. Making the
+ * two kinds of id tell themselves apart is what lets the contract gate catch
+ * the mistake in the `.js` runtimes the compiler cannot inspect.
+ */
+export const VOLATILE_MESSAGE_ID_PREFIX = 'vol_';
+
+/**
+ * An id invented at emit time rather than derived from the engine's record.
+ *
+ * The brand exists to be rejected: `DeterministicRowId` below accepts any
+ * plain string but not this one, so passing a generated id as a transcript
+ * row's id stops compiling at the line that did it.
+ */
+export type VolatileMessageId = string & { readonly __volatile: unique symbol };
+
+/**
+ * An id a transcript row may carry: anything except a generated one.
+ *
+ * Plain strings — an engine uuid, a rollout ordinal, a database key — satisfy
+ * this. `VolatileMessageId` does not.
+ */
+export type DeterministicRowId = string & { __volatile?: undefined };
+
+/** Whether an id was invented at emit time. */
+export function isVolatileMessageId(id: string): boolean {
+  return id.startsWith(VOLATILE_MESSAGE_ID_PREFIX);
+}
+
+/**
+ * The payload accepted when constructing a message of one specific kind.
+ *
+ * `id` is mandatory for transcript rows and optional for everything else:
+ * omitting it there is what let adapters fall back to a random id, which made
+ * the same persisted row arrive under a new id on every history read and left
+ * the client with nothing to join the two sources on.
+ */
 export type MessageInputForKind<K extends MessageKind> =
   Omit<NormalizedMessageEnvelope, 'kind' | 'id' | 'sessionId' | 'timestamp'>
   & {
     kind: K;
-    id?: string | null;
     sessionId?: string | null;
     timestamp?: string | null;
   }
+  & (K extends TranscriptRowKind ? { id: DeterministicRowId } : { id?: string | null })
   & MessageFieldsByKind[K];

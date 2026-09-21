@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-// 本地部署：把当前仓库编译产物打包成独立副本全局安装，并切换 pm2 生产实例。
+// 本地部署：把当前仓库编译产物打包并安装到固定运行目录，再切换 pm2 生产实例。
 // 生产实例与开发目录彻底脱钩（见 ~/.pm2/ecosystem.config.cjs），
 // 改代码、跑 dev 都不影响正在干活的线上服务。
 //
 // 用法：pnpm run deploy
-// 注意：本会话若由 cloudcli 服务托管，最后的进程切换会断开自身连接，
-// 应在服务之外的普通终端里执行。
+// 脚本会先把自己拉起成 detached 后台进程（日志 ~/.cloudcli/deploy.log），当前终端
+// 只跟读日志，所以终端关闭、或 pm2 切换把托管本会话的服务重启，都不会打断部署。
+// 在 cloudcli 托管的会话里执行时，切换那一刻自身连接仍会断，后续进度看日志。
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -16,17 +18,30 @@ const APP_NAME = 'cloudcli';
 const PORT = 3030;
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
 const ECOSYSTEM = path.join(os.homedir(), '.pm2', 'ecosystem.config.cjs');
+const CLOUDCLI_HOME = path.join(os.homedir(), '.cloudcli');
+const RUNTIME_DIR = path.join(CLOUDCLI_HOME, 'runtime');
+const NEXT_RUNTIME_DIR = path.join(CLOUDCLI_HOME, `runtime-next-${process.pid}`);
+const PREVIOUS_RUNTIME_DIR = path.join(CLOUDCLI_HOME, 'runtime-previous');
+const DEPLOY_LOCK = path.join(CLOUDCLI_HOME, 'deploy.lock');
+const DEPLOY_LOG = path.join(CLOUDCLI_HOME, 'deploy.log');
+let cutoverInProgress = false;
+let deployCompleted = false;
 
 function fail(msg) {
   console.error(`\n[deploy] ✗ ${msg}`);
   process.exit(1);
 }
 
-// 显示输出的执行（build / pack / install 全程可见）
-function run(cmd, args, cwd = REPO_ROOT) {
+// 显示输出的执行（build / pack / install 全程可见）；切换后的步骤直接调用
+// runChecked，让上层有机会回滚，而不是在命令失败时立刻退出进程。
+function runChecked(cmd, args, cwd = REPO_ROOT) {
   console.log(`\n[deploy] $ cd ${cwd} && ${cmd} ${args.join(' ')}`);
+  execFileSync(cmd, args, { cwd, stdio: 'inherit' });
+}
+
+function run(cmd, args, cwd = REPO_ROOT) {
   try {
-    execFileSync(cmd, args, { cwd, stdio: 'inherit' });
+    runChecked(cmd, args, cwd);
   } catch {
     fail(`命令执行失败：${cmd} ${args.join(' ')}`);
   }
@@ -44,6 +59,121 @@ function capture(cmd, args) {
     return null;
   }
 }
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function acquireDeployLock() {
+  fs.mkdirSync(CLOUDCLI_HOME, { recursive: true });
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs.openSync(DEPLOY_LOCK, 'wx');
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + '\n');
+      fs.closeSync(fd);
+      return;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+
+      let ownerPid = null;
+      try {
+        ownerPid = JSON.parse(fs.readFileSync(DEPLOY_LOCK, 'utf8')).pid;
+      } catch {
+        fail(`部署锁内容无效，请确认没有部署进程后手工删除：${DEPLOY_LOCK}`);
+      }
+      if (isProcessAlive(ownerPid)) {
+        fail(`已有部署正在运行（PID ${ownerPid}），请等待它完成`);
+      }
+      fs.rmSync(DEPLOY_LOCK, { force: true });
+    }
+  }
+
+  fail(`无法取得部署锁：${DEPLOY_LOCK}`);
+}
+
+function releaseDeployLock() {
+  try {
+    const ownerPid = JSON.parse(fs.readFileSync(DEPLOY_LOCK, 'utf8')).pid;
+    if (ownerPid === process.pid) fs.rmSync(DEPLOY_LOCK, { force: true });
+  } catch {
+    // 锁已被清理或内容损坏时无需再处理。
+  }
+}
+
+// ── 脱离宿主进程 ───────────────────────────────────────────
+// 部署中途要重启 pm2。如果这个脚本本身是被重启对象的子进程——在 cloudcli 托管的
+// 终端里执行就是这种情况——宿主一死脚本跟着死，可能停在切换之前，留下"构建过了
+// 但线上没更新"。所以先把自己重新拉起成 detached 进程（detached 等于 setsid，
+// 终端挂断的 SIGHUP 也到不了它），输出写进日志文件，当前终端只负责跟读：
+// 关掉终端、或者宿主服务被重启，部署都照样跑完。
+if (!process.env.CLOUDCLI_DEPLOY_DETACHED) {
+  fs.mkdirSync(CLOUDCLI_HOME, { recursive: true });
+  const args = process.argv.slice(2);
+  fs.writeFileSync(DEPLOY_LOG, `[deploy] ${new Date().toISOString()} 启动，参数：${args.join(' ') || '（无）'}\n`);
+
+  const logFd = fs.openSync(DEPLOY_LOG, 'a');
+  const worker = spawn(process.execPath, [import.meta.filename, ...args], {
+    cwd: REPO_ROOT,
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    env: { ...process.env, CLOUDCLI_DEPLOY_DETACHED: '1' },
+  });
+  worker.unref();
+  fs.closeSync(logFd);
+
+  console.log(`[deploy] 部署已在后台启动（PID ${worker.pid}），日志：${DEPLOY_LOG}`);
+  console.log('[deploy] 以下为实时日志。在这里按 Ctrl-C 只停止跟读，不会中断部署。');
+
+  const tail = spawn('tail', ['-n', '+2', '-f', DEPLOY_LOG], { stdio: ['ignore', 'inherit', 'inherit'] });
+  const exitCode = await new Promise((resolve) => {
+    worker.on('exit', (code, signal) => resolve(signal ? 1 : code ?? 1));
+    worker.on('error', () => resolve(1));
+  });
+  // 留一点时间让 tail 把最后几行吐完，再收掉它。
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  tail.kill('SIGTERM');
+  process.exit(exitCode);
+}
+
+// 清理被强杀的历史部署留下的暂存目录（正常退出会自己删）。
+for (const entry of fs.readdirSync(CLOUDCLI_HOME, { withFileTypes: true })) {
+  const orphanPid = /^runtime-next-(\d+)$/.exec(entry.name)?.[1];
+  if (entry.isDirectory() && orphanPid && !isProcessAlive(Number(orphanPid))) {
+    fs.rmSync(path.join(CLOUDCLI_HOME, entry.name), { recursive: true, force: true });
+    console.log(`[deploy] 已清理上次中断留下的暂存目录：${entry.name}`);
+  }
+}
+
+acquireDeployLock();
+process.on('exit', (code) => {
+  fs.rmSync(NEXT_RUNTIME_DIR, { recursive: true, force: true });
+  releaseDeployLock();
+  // 中断和失败都走这里：把"线上没变"说清楚，别让人以为构建成功就等于部署成功。
+  if (!deployCompleted) {
+    console.error(
+      `\n[deploy] ✗ 部署未完成（退出码 ${code}）。固定运行目录未切换，线上仍是本次部署前的版本。\n` +
+      '[deploy]   若版本号已自增并提交，该版本号作废，下次部署会在它之上继续自增。',
+    );
+  }
+});
+function handleTerminationSignal(signal) {
+  if (cutoverInProgress) {
+    console.warn(`\n[deploy] ! 已收到 ${signal}，固定目录已切换；将继续验证，失败时自动回滚`);
+    return;
+  }
+  const exitCode = signal === 'SIGINT' ? 130 : signal === 'SIGHUP' ? 129 : 143;
+  process.exit(exitCode);
+}
+process.on('SIGINT', () => handleTerminationSignal('SIGINT'));
+process.on('SIGTERM', () => handleTerminationSignal('SIGTERM'));
+process.on('SIGHUP', () => handleTerminationSignal('SIGHUP'));
 
 // ── 0. 更新版本号（自增第三位 patch；--no-bump 沿用当前版本号） ──
 const pkgJsonPath = path.join(REPO_ROOT, 'package.json');
@@ -80,48 +210,12 @@ if (process.argv.includes('--no-bump')) {
 run('pnpm', ['build']);
 
 // ── 2. 打包（存放于稳定的 ~/.cloudcli/deploy 目录，避免随机临时目录被删导致后续 pnpm ENOENT） ───
-const deployDir = path.join(os.homedir(), '.cloudcli', 'deploy');
+const deployDir = path.join(CLOUDCLI_HOME, 'deploy');
 fs.mkdirSync(deployDir, { recursive: true });
 
-// pnpm v10 默认拦截依赖的安装脚本。实测唯一生效的白名单落点是**全局 package.json
-// 的 `pnpm.onlyBuiltDependencies`**：写在全局 rc（`only-built-dependencies=`）或全局
-// `pnpm-workspace.yaml` 里都不被读取，`pnpm approve-builds` 没有 `-y`，
-// `onlyBuiltDependenciesGlobally` 这个设置在 pnpm 10 里根本不存在。
-// 没有它，本包的 postinstall（scripts/fix-node-pty.js）和 better-sqlite3 的 install
-// 都会被静默跳过。
+// pnpm v10 默认拦截依赖的安装脚本。白名单写进这个独立运行目录的 package.json，
+// 不再修改共享的全局 pnpm 配置，也不会影响机器上的其他全局工具。
 const BUILD_ALLOWLIST = [APP_NAME, 'better-sqlite3'];
-
-// 同时清理全局 package.json 中可能残留的已失效的本地 file: 路径，防止 pnpm 校验旧依赖时抛 ENOENT
-try {
-  const globalDir = path.dirname(capture('pnpm', ['root', '-g']) || '');
-  const globalPkgJson = path.join(globalDir, 'package.json');
-  if (fs.existsSync(globalPkgJson)) {
-    const pkg = JSON.parse(fs.readFileSync(globalPkgJson, 'utf8'));
-    let modified = false;
-    if (pkg.dependencies?.[APP_NAME]?.startsWith('file:')) {
-      const oldPath = pkg.dependencies[APP_NAME].slice(5);
-      if (!fs.existsSync(oldPath)) {
-        delete pkg.dependencies[APP_NAME];
-        modified = true;
-      }
-    }
-
-    // 只增不删：这份名单是全局共享的，别的全局包可能也往里加过条目。
-    const current = Array.isArray(pkg.pnpm?.onlyBuiltDependencies) ? pkg.pnpm.onlyBuiltDependencies : [];
-    const missing = BUILD_ALLOWLIST.filter((name) => !current.includes(name));
-    if (missing.length) {
-      pkg.pnpm = { ...pkg.pnpm, onlyBuiltDependencies: [...current, ...missing].sort() };
-      modified = true;
-      console.log(`[deploy] 已把 ${missing.join('、')} 加入全局构建白名单（pnpm v10 默认拦安装脚本）`);
-    }
-
-    if (modified) {
-      fs.writeFileSync(globalPkgJson, JSON.stringify(pkg, null, 2) + '\n');
-    }
-  }
-} catch {
-  // 忽略全局配置清理异常
-}
 
 const packOut = capture('pnpm', ['pack', '--pack-destination', deployDir]);
 const packLine = packOut?.split('\n').map((l) => l.trim()).filter(Boolean).pop();
@@ -131,13 +225,21 @@ if (!packLine) {
 const tarball = path.isAbsolute(packLine) ? packLine : path.join(deployDir, path.basename(packLine));
 if (!fs.existsSync(tarball)) fail(`tarball 不存在：${tarball}`);
 
-// ── 3. 全局安装（独立静态副本，首次会编译原生依赖，较慢） ──
-run('pnpm', ['add', '-g', tarball]);
+// ── 3. 安装到独立暂存目录（首次会编译原生依赖，较慢） ──
+// node-linker=hoisted 让 cloudcli 本体成为普通目录，而不是指向 .pnpm 哈希目录的软链。
+// 先完整安装到 runtime-next；全部检查通过后才切换，安装失败不碰正在运行的版本。
+fs.rmSync(NEXT_RUNTIME_DIR, { recursive: true, force: true });
+fs.mkdirSync(NEXT_RUNTIME_DIR, { recursive: true });
+fs.writeFileSync(path.join(NEXT_RUNTIME_DIR, 'package.json'), JSON.stringify({
+  private: true,
+  dependencies: { [APP_NAME]: `file:${tarball}` },
+  pnpm: { onlyBuiltDependencies: BUILD_ALLOWLIST },
+}, null, 2) + '\n');
+run('pnpm', ['install', '--prod', '--config.node-linker=hoisted'], NEXT_RUNTIME_DIR);
 
-const globalRoot = capture('pnpm', ['root', '-g']);
-const pkgDir = path.join(globalRoot, APP_NAME);
+let pkgDir = path.join(NEXT_RUNTIME_DIR, 'node_modules', APP_NAME);
 const serverEntry = path.join(pkgDir, 'dist-server', 'server', 'index.js');
-if (!fs.existsSync(serverEntry)) fail(`全局安装后未找到服务入口：${serverEntry}`);
+if (!fs.existsSync(serverEntry)) fail(`安装后未找到服务入口：${serverEntry}`);
 
 // ── 3.5 原生依赖兜底 ───────────────────────────────────────
 // pnpm v10 起默认不执行依赖的构建脚本，better-sqlite3 的 install 脚本
@@ -150,7 +252,7 @@ const sqliteProbe = capture('node', [
   `const dir=fs.realpathSync(${JSON.stringify(pkgDir)});` +
   `console.log(fs.realpathSync(path.dirname(require.resolve('better-sqlite3/package.json',{paths:[dir]}))))`,
 ]);
-if (!sqliteProbe) fail('无法解析 better-sqlite3 安装位置（全局安装不完整？）');
+if (!sqliteProbe) fail('无法解析 better-sqlite3 安装位置（运行目录安装不完整？）');
 const sqliteBinary = path.join(sqliteProbe, 'build', 'Release', 'better_sqlite3.node');
 if (!fs.existsSync(sqliteBinary)) {
   console.log(`[deploy] better-sqlite3 缺原生二进制（pnpm v10 默认拦构建脚本），补跑 install 脚本…`);
@@ -161,12 +263,10 @@ if (!fs.existsSync(sqliteBinary)) {
 // ── 3.6 node-pty 执行权限兜底 ──────────────────────────────
 // 同样是 pnpm v10 拦构建脚本的后果：本包的 postinstall（scripts/fix-node-pty.js）
 // 负责给 node-pty 的 spawn-helper 补上执行位，缺了它开终端就 posix_spawnp failed。
-// 这里不调那个脚本 —— 它按相对路径找 node_modules，pnpm 的全局布局是软链到
-// .pnpm 虚拟目录的，靠不住 —— 直接从安装好的包解析 node-pty 的真实位置再补。
+// 这里仍直接从安装好的包解析 node-pty 的真实位置再补，避免依赖具体布局。
 //
-// 上面的全局构建白名单正常时这一步不会触发；保留它是因为那份名单是全局共享的，
-// 被别的工具改写过一次（条目被按字符拆碎）就会重新失效，而这里的后果是开终端直接
-// posix_spawnp failed。兜底比信号可靠。
+// 上面的构建白名单正常时这一步不会触发；仍保留兜底检查，避免安装脚本行为变化后
+// 开终端直接报 posix_spawnp failed。
 const ptyProbe = capture('node', [
   '-e',
   `const fs=require('fs'),path=require('path');` +
@@ -193,40 +293,177 @@ if (ptyProbe) {
   console.log('[deploy] 未解析到 node-pty，跳过 spawn-helper 权限检查');
 }
 
-// ── 4. 切换 pm2 服务（原地重启，绝不 delete） ──
-//
-// 从 cloudcli 自己的会话里跑部署时，这个脚本是被部署服务的子孙进程。
-// `pm2 delete` 连着进程树一起杀，脚本在第二条命令（start）之前就没了，
-// 服务再也起不来 —— 部署把自己锁死。`pm2 restart` 是一条命令，由 pm2 守护
-// 进程执行，脚本死了也照样把服务拉回来，进程条目自始至终存在。
-//
-// 带上 ecosystem 路径与 --update-env，重启时重读配置与环境变量，
-// 这正是当初选择 delete + start 想要的效果。
+// ── 3.7 受控切换固定运行目录 ───────────────────────────────
+// 部署锁保证同一时间只有一个切换者。每次 rename 在同一文件系统内是原子的；两次
+// rename 之间固定路径会短暂不存在，因此 PM2 只在整个目录切换完成后才会重启。
 if (!fs.existsSync(ECOSYSTEM)) fail(`pm2 配置不存在：${ECOSYSTEM}`);
-const jlist = capture('pm2', ['jlist']);
-const running = jlist ? JSON.parse(jlist).find((a) => a.name === APP_NAME) : null;
-if (running) {
-  run('pm2', ['restart', ECOSYSTEM, '--only', APP_NAME, '--update-env']);
-} else {
-  run('pm2', ['start', ECOSYSTEM, '--only', APP_NAME]);
-  // 进程条目是新建的，落盘一次，pm2 resurrect 才认得它。重启路径不改条目，
-  // 无需落盘 —— 也正好避免在脚本可能被重启打断时多做一步。
-  run('pm2', ['save']);
+const expectedRuntimePath = path.join(RUNTIME_DIR, 'node_modules', APP_NAME);
+const expectedServerEntry = path.join(expectedRuntimePath, 'dist-server', 'server', 'index.js');
+let configuredApp;
+try {
+  const requireFromDeploy = createRequire(import.meta.url);
+  const ecosystemConfig = requireFromDeploy(ECOSYSTEM);
+  configuredApp = ecosystemConfig?.apps?.find((app) => app?.name === APP_NAME);
+} catch (error) {
+  fail(`无法读取 pm2 配置：${error instanceof Error ? error.message : String(error)}`);
+}
+if (
+  configuredApp?.script !== expectedServerEntry
+  || configuredApp?.cwd !== expectedRuntimePath
+) {
+  fail(`pm2 的 cloudcli 配置必须指向固定运行目录：${expectedRuntimePath}`);
 }
 
-// ── 5. 健康检查 ────────────────────────────────────────────
-console.log(`\n[deploy] 等待 http://127.0.0.1:${PORT} 就绪…`);
-const deadline = Date.now() + 60_000;
-let ready = false;
-while (Date.now() < deadline) {
+function restorePreviousRuntime() {
+  if (!fs.existsSync(PREVIOUS_RUNTIME_DIR)) return false;
+
+  if (fs.existsSync(RUNTIME_DIR)) fs.renameSync(RUNTIME_DIR, NEXT_RUNTIME_DIR);
   try {
-    const res = await fetch(`http://127.0.0.1:${PORT}/`, { redirect: 'manual' });
-    if (res.status < 500) { ready = true; break; }
-  } catch {
-    // 进程还没起来，继续等
+    fs.renameSync(PREVIOUS_RUNTIME_DIR, RUNTIME_DIR);
+    return true;
+  } catch (error) {
+    if (!fs.existsSync(RUNTIME_DIR) && fs.existsSync(NEXT_RUNTIME_DIR)) {
+      fs.renameSync(NEXT_RUNTIME_DIR, RUNTIME_DIR);
+    }
+    throw error;
   }
-  execFileSync('sleep', ['2']);
 }
 
-if (!ready) fail(`60 秒内 ${PORT} 端口未就绪，检查日志：pm2 logs ${APP_NAME}`);
+try {
+  fs.rmSync(PREVIOUS_RUNTIME_DIR, { recursive: true, force: true });
+  if (fs.existsSync(RUNTIME_DIR)) fs.renameSync(RUNTIME_DIR, PREVIOUS_RUNTIME_DIR);
+  fs.renameSync(NEXT_RUNTIME_DIR, RUNTIME_DIR);
+  cutoverInProgress = true;
+} catch (error) {
+  if (!fs.existsSync(RUNTIME_DIR) && fs.existsSync(PREVIOUS_RUNTIME_DIR)) {
+    fs.renameSync(PREVIOUS_RUNTIME_DIR, RUNTIME_DIR);
+  }
+  fail(`切换固定运行目录失败：${error instanceof Error ? error.message : String(error)}`);
+}
+pkgDir = path.join(RUNTIME_DIR, 'node_modules', APP_NAME);
+console.log(`[deploy] 已切换固定运行目录：${pkgDir}`);
+
+// ── 4. 切换 pm2 服务 ────────────────────────────────────────
+//
+// PM2 的 restart/startOrRestart 对已存在进程只合并环境变量，不更新 pm_exec_path
+// 和 pm_cwd。首次从旧 pnpm 全局目录迁移时必须重建一次进程条目；固定路径生效后
+// 的后续部署只做原地 restart。部署必须从服务外的普通终端运行，见文件头说明。
+const restartArgs = ['restart', ECOSYSTEM, '--only', APP_NAME, '--update-env'];
+
+function getRegisteredApp() {
+  const jlist = capture('pm2', ['jlist']);
+  if (jlist === null) throw new Error('无法读取 pm2 进程列表');
+  const matches = JSON.parse(jlist).filter((app) => app.name === APP_NAME);
+  if (matches.length > 1) throw new Error(`pm2 存在 ${matches.length} 个同名 cloudcli 进程，拒绝自动切换`);
+  return matches[0] ?? null;
+}
+
+function startOrRestartConfiguredApp() {
+  const registered = getRegisteredApp();
+  if (!registered) {
+    runChecked('pm2', ['start', ECOSYSTEM, '--only', APP_NAME]);
+    return;
+  }
+
+  const alreadyUsesFixedRuntime = (
+    registered.pm2_env?.pm_exec_path === expectedServerEntry
+    && registered.pm2_env?.pm_cwd === expectedRuntimePath
+  );
+  if (alreadyUsesFixedRuntime) {
+    runChecked('pm2', restartArgs);
+    return;
+  }
+
+  console.log(`[deploy] PM2 仍登记旧入口，重建进程条目：${registered.pm2_env?.pm_exec_path ?? '未知路径'}`);
+  runChecked('pm2', ['delete', String(registered.pm_id)]);
+  runChecked('pm2', ['start', ECOSYSTEM, '--only', APP_NAME]);
+}
+
+function verifyPm2RuntimePath() {
+  const app = getRegisteredApp();
+  if (
+    app?.pm2_env?.pm_exec_path !== expectedServerEntry
+    || app?.pm2_env?.pm_cwd !== expectedRuntimePath
+  ) {
+    throw new Error('pm2 仍未使用固定运行目录');
+  }
+}
+
+async function waitUntilReady() {
+  console.log(`\n[deploy] 等待 http://127.0.0.1:${PORT} 就绪…`);
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${PORT}/`, { redirect: 'manual' });
+      if (res.status < 500) return true;
+    } catch {
+      // 进程还没起来，继续等
+    }
+    execFileSync('sleep', ['2']);
+  }
+  return false;
+}
+
+try {
+  startOrRestartConfiguredApp();
+  verifyPm2RuntimePath();
+  if (!await waitUntilReady()) throw new Error(`60 秒内 ${PORT} 端口未就绪`);
+  // 只持久化验证通过的进程；pm2 resurrect 不会恢复旧路径或未通过健康检查的新版本。
+  runChecked('pm2', ['save']);
+} catch (error) {
+  const deployError = error instanceof Error ? error.message : String(error);
+  console.error(`\n[deploy] ! 新版本启动失败，正在恢复上一版本：${deployError}`);
+
+  try {
+    if (!restorePreviousRuntime()) {
+      fail(`新版本启动失败，且没有可回滚的上一版本：${deployError}`);
+    }
+    startOrRestartConfiguredApp();
+    verifyPm2RuntimePath();
+    if (!await waitUntilReady()) throw new Error(`回滚后 ${PORT} 端口仍未就绪`);
+    runChecked('pm2', ['save']);
+  } catch (rollbackError) {
+    fail(`新版本启动失败且自动回滚失败：${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+  }
+
+  fail(`新版本启动失败，已恢复上一版本：${deployError}`);
+}
+
+// ── 5. 更新稳定 CLI 入口 ───────────────────────────────────
+// 旧部署用 pnpm 全局安装，生成的 shell shim 硬编码了 .pnpm 哈希路径。新入口直接
+// 指向固定 runtime；先准备临时软链，再 rename 覆盖，避免留下半写入的脚本。
+const globalBinDir = capture('pnpm', ['bin', '-g']);
+if (globalBinDir) {
+  const cliEntry = path.join(pkgDir, 'dist-server', 'server', 'modules', 'cli', 'cli.js');
+  const cliLink = path.join(globalBinDir, APP_NAME);
+  const nextCliLink = path.join(globalBinDir, `.${APP_NAME}-next-${process.pid}`);
+  try {
+    fs.rmSync(nextCliLink, { force: true });
+    fs.symlinkSync(cliEntry, nextCliLink);
+
+    const globalRoot = capture('pnpm', ['root', '-g']);
+    const globalManifest = globalRoot && path.join(path.dirname(globalRoot), 'package.json');
+    if (globalManifest && fs.existsSync(globalManifest)) {
+      const manifest = JSON.parse(fs.readFileSync(globalManifest, 'utf8'));
+      if (manifest.dependencies?.[APP_NAME]) {
+        try {
+          runChecked('pnpm', ['remove', '-g', APP_NAME]);
+        } catch (error) {
+          console.warn(`[deploy] ! 清理旧全局安装失败，将只覆盖 CLI 入口：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+
+    fs.renameSync(nextCliLink, cliLink);
+    console.log(`[deploy] CLI 固定入口：${cliLink} -> ${cliEntry}`);
+  } catch (error) {
+    fs.rmSync(nextCliLink, { force: true });
+    fail(`更新 cloudcli CLI 入口失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+} else {
+  fail('无法解析 pnpm 全局 bin 目录，未能更新 cloudcli CLI 入口');
+}
+
+cutoverInProgress = false;
+deployCompleted = true;
 console.log(`\n[deploy] ✓ 部署完成，访问 http://localhost:${PORT}`);

@@ -60,6 +60,7 @@ import {
 } from './modules/scheduled-jobs/index.js';
 import { assetsRoutes } from './modules/assets/index.js';
 import { fileTreeRoutes } from './modules/file-tree/index.js';
+import { createLocalProxyRouter, localProxyAbsolutePathFallback } from './modules/local-proxy/index.js';
 import { worktreesRoutes } from './modules/worktrees/index.js';
 import {
     browserUseMcpRoutes,
@@ -227,6 +228,14 @@ app.use('/api/scheduled-jobs-mcp', scheduledJobsMcpRoutes);
 app.use('/api/agent', agentRoutes);
 
 app.use('/api/voice', authenticateToken, voiceRoutes);
+
+// Loopback service proxy: ticket minting is JWT protected, the forwarded
+// requests authenticate with the proxy's own session cookie instead.
+app.use('/api/local-proxy', createLocalProxyRouter(authenticateToken));
+
+// Must precede the static handlers: a page served through the proxy asks for
+// its root-absolute assets on this origin, and they belong to the local service.
+app.use(localProxyAbsolutePathFallback);
 
 // Serve the branded index shell for the SPA root before static files so the
 // injected apple title is present when iOS adds the app to the home screen.

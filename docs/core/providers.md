@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.3.10 / 2026-09-20
+> 基准：2.4.3 / 2026-09-21
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -197,7 +197,7 @@ CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在�
 
 各端在协议之上的本地扩展必须显式写出、不得混入协议本身。今天只有前端有：
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
-外加乐观回显的簿记字段 `replacesAnchorId` / `replacesAfterRowCount`。
+外加乐观回显的簿记字段 `replacesAnchorId`。
 
 **工具卡同样要两路描述一致。** Codex 的实时与历史 `toolId` 来自两个 id 空间
 （SDK item id ／ rollout `call_id`），精确匹配结构性地不可能，只能靠「工具名 + 完整入参」指纹。
@@ -217,30 +217,45 @@ zcode 曾为每个持久化 step 产出一条 `complete`——真实会话里占
 两种形状现在都路由到同一个处理函数（`applySubagentActivity`）——
 引擎换事件形状是常态，认一种就等于埋一颗定时炸弹。
 
-**跨路行身份是适配器的责任，不是前端的猜测活。** 一条行在两路上无从对认时，
-前端只能退回按因果锚点定位回合、按文本相似度判重——重复回复正是这么来的。
-身份可以承载在 `providerRowKey` 上，也可以是两路本就相等的行 `id`；
-后者不必再设 key。六家引擎目前的实现情况：
+**跨路行身份是适配器的责任，不是前端的猜测活。** 一条持久化的行存在两份——
+运行中的实时帧，和之后历史读回的那一行。前端把两份显示成一行的唯一诚实依据是**同一个 `id`**；
+对认不上时它只能退回按文本相似度和数组下标猜，重复消息就是这么来的。
+
+因此协议规定：**`kind` 属于转录行的消息（`text` / `thinking` / `tool_use` / `tool_result` /
+`task_notification`），其 `id` 必须由引擎自己的记录推导——同一条记录，无论走哪一路、读多少遍，
+id 必须字节相同。** 这条有两道闸门守着：
+
+- 编译期：`shared/protocol/messageKinds.ts` 里 `generateMessageId()` 返回带品牌的
+  `VolatileMessageId`，无法赋给转录行的 `id`（类型为 `DeterministicRowId`），写错的那一行直接编译不过。
+- 运行期：两个 `.js` 运行时和若干从 `any` 读出的历史路径编译器看不到，由
+  `enforceNormalizedMessageContract` 兜底——转录行带 `vol_` 前缀的 id 会被点名记录（消息照发，
+  丢一条真回复比重复一条更糟）。
+
+各引擎的推导依据：
 
 | 引擎 | 行身份 | 依据 |
 | --- | --- | --- |
-| antigravity | 有（`providerRowKey`） | `assistant-step:<step_index>` |
-| claude | 有（承载在 `id`，不需要 key） | 实时 `SDKAssistantMessage.uuid` 与该行落盘后的 `uuid` 同值，且完整消息模式下一条消息一个内容块，与转录同粒度，故两路归一化出的行 `id` 逐行相同 |
-| codex | **无** | 两路各自编号：实时 SDK 按回合编 `item_<n>`，rollout 记模型响应 id `msg_…`，不在同一 id 空间 |
-| zcode | **无** | 落盘行身份是 `(message_id, part_id)`，而实时文本事件只带 `messageId`——一条 message 可以有多个 part，用 message 级 id 会是 1:N |
-| cursor / opencode | **未盘点** | 见 `docs/design/跨路行身份.md` |
+| claude | 落盘 `uuid` | 实时 SDK 消息与落盘行的 `uuid` 同值，两路归一化出的 id 逐行相同 |
+| codex | rollout 的 `payload.id`（`msg_…`/`rs_…`/`ctc_…`），缺失时用 append-only 的 `ordinal` | 实时 `item_completed` 的 item id 与 rollout 里同一条 `response_item.id` 相同 |
+| antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id |
+| zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
+| cursor / opencode | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
 
-没有行身份的引擎**不要伪造一个**。用序号、行号或本端生成值顶替，会让对账从"知道自己不知道"
-变成"自信地答错"；没有 key 时前端至少还会走 [chat.md](./chat.md) 里那套因果回退。
+引擎确实什么都没给时**不要伪造**：随机值会让对账从"知道自己不知道"变成"自信地答错"。
+正确做法是让推导落在引擎记录的确定性属性上（文件内序号、step 号、数据库主键都算），
+或者接受这一行无法跨路对认并在上表里写明。
 
-zcode 要具备行身份，需要**引擎侧**在文本流事件上带出 part id——它的 `tool_result`
-事件已经带了 `resultPartId`，文本事件没有对应字段。这是引擎的改动，不是适配器能补的。
+跨引擎一致性由 `server/modules/providers/tests/row-identity-conformance.test.ts` 守：
+同一条记录读两遍 id 必须相同，且任何转录行都不得带 `vol_` id。
+
+`providerRowKey` 只在行 id 本身无法跨路相等、但 provider 能从两路原生数据复建出同一身份时使用；
+它不承担展示 id、WebSocket `seq`、排序 `sequence` 或编辑锚点的职责。
 
 Codex 的两路在 `normalizeHistoryEntry` 汇合——实时 `agent_message` 带 `message.role`，
 在 `normalizeMessage` 开头就被转到这里，所以 key 在汇合点统一取，
 而不是在看似对应的实时分支里各取一次。
 
-**跨路文本身份要求**：`NormalizedMessage.providerRowKey` 是 provider 在同一会话内为一条最终可渲染行生成的稳定身份，只在 live 与历史两路都能从原生数据复建时设置；它不承担消息展示 id、WebSocket `seq`、provider 排序 `sequence` 或编辑锚点的职责。前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选或缺 key 且无法证明同一用户回合时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
+**`providerRowKey` 的边界**：前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
 
 **工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（codex/antigravity 现状——三命名空间无桥、锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。
 

@@ -39,6 +39,7 @@
  * through `applyServerEvent`, history through the fetch methods.
  */
 
+import { isVolatileMessageId } from '@shared/protocol/messageKinds';
 import { authenticatedFetch } from '@/shared/api';
 import type { LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
 import {
@@ -49,11 +50,11 @@ import {
   readFrameSessionId,
 } from '@shared/protocol/frameNarrowing';
 import {
-  claimServerUserEcho,
-  mergeProviderUserEchoIntoOptimisticRow,
-  reconcileOptimisticUserEchoes,
+  isOptimisticPromptRow,
+  reconcileOptimisticPrompts,
   upsertToolUseRow,
 } from '@/modules/chat/utils/sessionMessageReconciliation';
+import type { PendingPrompt } from '@/modules/chat/utils/sessionMessageReconciliation';
 import { isThinkingRowEchoOnServer, upsertThinkingRow } from '@/modules/chat/utils/sessionThinkingRows';
 import {
   claimExactServerToolCall,
@@ -73,8 +74,6 @@ import {
 import type { SessionMessagesRequestOptions } from '@/modules/chat/utils/sessionMessagePagination';
 import {
   compareMessagesChronologically,
-  isAssistantTextEchoedInSameTurnOnServer,
-  isAssistantTextMatch,
   readMessageTime,
   reconcileProviderRowText,
 } from '@/modules/chat/utils/sessionMessageTurnDedupe';
@@ -87,12 +86,34 @@ export type SessionSlot = {
   serverMessages: NormalizedMessage[];
   realtimeMessages: NormalizedMessage[];
   /**
-   * Remembers which persisted user row took over each optimistic `local_*`
-   * echo. The pairing outlives paginated server windows so a session reload
-   * cannot revive already-retired prompts when their server rows fall outside
-   * the latest page; the retained local row still anchors unfinished live work.
+   * What the transcript held when each optimistic prompt was sent, so the
+   * prompt can be paired with its persisted copy without consulting a clock,
+   * an array length or the prompt's own text. Entries are dropped with the
+   * row they describe.
+   */
+  pendingPrompts: Map<string, PendingPrompt>;
+  /**
+   * Remembers which persisted user row took over each optimistic prompt. The
+   * pairing outlives paginated server windows so a session reload cannot
+   * revive already-retired prompts when their server rows fall outside the
+   * latest page; the retained local row still anchors unfinished live work.
    */
   retiredOptimisticUserAnchors: Map<string, string>;
+  /**
+   * The placeholder row holding streamed text that no engine row has claimed
+   * yet, or `null`. Every engine follows a streamed segment with a real row
+   * carrying its own id; until that row arrives the placeholder is all the
+   * reply the transcript has.
+   */
+  streamingPlaceholderId: string | null;
+  /** Counts streamed segments so their placeholders get distinct ids. */
+  streamedSegmentCount: number;
+  /**
+   * Whether this session's run has finished. A finished run is the deadline
+   * for every placeholder: once the transcript has been refreshed after it,
+   * anything still unmatched is retired rather than left on screen forever.
+   */
+  runEnded: boolean;
   /**
    * For each realtime row, the id of the last server row that was already
    * present when the row first arrived — everything the transcript held by
@@ -131,7 +152,11 @@ function createEmptySlot(): SessionSlot {
   return {
     serverMessages: EMPTY,
     realtimeMessages: EMPTY,
+    pendingPrompts: new Map(),
     retiredOptimisticUserAnchors: new Map(),
+    streamingPlaceholderId: null,
+    streamedSegmentCount: 0,
+    runEnded: false,
     realtimeArrivalAnchors: new Map(),
     merged: EMPTY,
     _lastServerRef: EMPTY,
@@ -216,182 +241,132 @@ function enqueueHistoryMutation<T>(
 }
 
 /**
- * Collapses duplicate assistant replies and replaces live streaming bubbles
- * with persisted text. Turn-aware so identical assistant text within the same turn
- * is collapsed even when separated by tool_use or status events.
+ * The id of the row that holds a streamed segment's text until the engine's
+ * own row for that segment arrives.
+ *
+ * Streaming deltas carry no id of their own — they are fragments of a row
+ * that does not exist yet — so the text has to live somewhere addressable
+ * while it arrives. Every engine follows the segment with a real row that
+ * has an engine-derived id, and `adoptStreamedSegment` swaps it in; the
+ * placeholder is what the transcript shows in between.
  */
-function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedMessage[] {
-  const out: NormalizedMessage[] = [];
-  let currentTurnAssistantTexts = new Set<string>();
+function buildStreamedTextPlaceholderId(sessionId: string, segment: number): string {
+  return `__streamed_${sessionId}_${segment}`;
+}
 
-  for (const m of merged) {
-    if (m.kind === 'text' && m.role === 'user') {
-      currentTurnAssistantTexts = new Set<string>();
-      out.push(m);
-      continue;
-    }
-
-    if (m.kind === 'stream_delta') {
-      // Keyed rows reconcile only through the cross-transport identity path.
-      // Content-only collapse must not hide a key collision.
-      if (m.providerRowKey) {
-        out.push(m);
-        continue;
-      }
-      const prev = out[out.length - 1];
-      if (prev && prev.kind === 'text' && prev.role === 'assistant') {
-        const ps = (prev.content || '').trim();
-        const ms = (m.content || '').trim();
-        if (ps.length > 0 && isAssistantTextMatch(ps, ms)) {
-          continue;
-        }
-      }
-    }
-
-    if (m.kind === 'text' && m.role === 'assistant') {
-      // A providerRowKey makes this row ineligible for the legacy text map.
-      // The merge/prune phase already removed a unique, content-compatible
-      // live echo; anything left here is a distinct row or a collision that
-      // must remain visible rather than being silently discarded.
-      if (m.providerRowKey) {
-        out.push(m);
-        continue;
-      }
-      const text = (m.content || '').trim();
-      const compactKey = text.replace(/\s+/g, '');
-      if (compactKey.length > 0) {
-        // If immediately preceded by matching stream_delta, promote delta to final text
-        const lastIdx = out.length - 1;
-        if (lastIdx >= 0 && out[lastIdx].kind === 'stream_delta') {
-          const deltaText = (out[lastIdx].content || '').trim();
-          if (isAssistantTextMatch(deltaText, text)) {
-            out[lastIdx] = m;
-            currentTurnAssistantTexts.add(compactKey);
-            continue;
-          }
-        }
-
-        // Content-only reconciliation is restricted to the current user turn.
-        const isDuplicateInTurn = currentTurnAssistantTexts.has(compactKey);
-
-        if (isDuplicateInTurn) {
-          let targetIndex = -1;
-          for (let index = out.length - 1; index >= 0; index -= 1) {
-            const item = out[index];
-            if (item.kind === 'text' && item.role === 'assistant' && isAssistantTextMatch(item.content || '', text)) {
-              targetIndex = index;
-              break;
-            }
-          }
-          if (targetIndex >= 0) {
-            // Prefer persisted message over synthetic realtime message
-            if (out[targetIndex].id.startsWith('text_') && !m.id.startsWith('text_')) {
-              out[targetIndex] = m;
-            }
-          }
-          continue;
-        }
-
-        currentTurnAssistantTexts.add(compactKey);
-      }
-    }
-
-    out.push(m);
-  }
-  return out;
+/** Whether a row is streamed text still waiting for the engine's own row. */
+function isStreamedTextPlaceholder(message: NormalizedMessage): boolean {
+  return message.id.startsWith('__streamed_');
 }
 
 /**
- * After a server refresh, drop only the realtime rows the persisted transcript
- * already owns. Anything not yet on disk (common right after `complete`, while
- * JSONL indexing lags) stays in `realtimeMessages` so the chat pane never
- * flashes the empty "Continue your conversation" state.
+ * After a server refresh, drop the realtime rows the persisted transcript
+ * already owns.
+ *
+ * Every engine derives a transcript row's id from its own record, so a live
+ * row and its persisted copy arrive under the same id and this is a set
+ * membership test — no text comparison, no turn reconstruction, no array
+ * arithmetic. Rows not yet on disk (common right after `complete`, while
+ * indexing lags) stay, so the pane never flashes the empty state.
+ *
+ * Three kinds of row have no engine id to be matched on, and each has a
+ * bounded way out rather than an open-ended guess:
+ *
+ * - the optimistic prompt, retired against the persisted user row that
+ *   appeared after the transcript position recorded at send time;
+ * - the streamed-text placeholder, retired once the engine's own row for the
+ *   segment arrives or a persisted row reconciles with it by
+ *   `providerRowKey`;
+ * - the synthetic settle row, which leaves with the card it settles.
  */
 function pruneRealtimeSupersededByServer(
   serverMessages: NormalizedMessage[],
   realtimeMessages: NormalizedMessage[],
-  retiredOptimisticUserAnchors: Map<string, string>,
+  slot: Pick<SessionSlot, 'pendingPrompts' | 'retiredOptimisticUserAnchors' | 'runEnded'>,
 ): NormalizedMessage[] {
   if (realtimeMessages.length === 0) {
     return realtimeMessages;
   }
 
   const serverIds = new Set(serverMessages.map((message) => message.id));
-  // Optimistic user rows are deliberately kept here. They are what records
-  // which turn each live row belongs to, and the merge needs that boundary to
-  // anchor a live reply below its own user turn. Hiding them is the merge's
-  // job (`reconcileOptimisticUserEchoes`), not this prune's.
   const claimedServerRowIds = new Set<string>();
   const allServerTools = collectServerToolCalls(serverMessages);
 
-  // Which persisted turn a live row belongs to, answered causally.
-  //
-  // The optimistic user row above it names the turn, and
-  // `reconcileOptimisticUserEchoes` has already worked out which persisted row
-  // took that echo's place — so the pairing is used rather than re-derived.
-  // With no user row above it (a tab that did not send, a session resumed
-  // mid-run) the row belongs to the newest persisted turn, because a live row
-  // cannot precede a turn already on disk.
-  //
-  // Demanding that the live and persisted user rows share an id or a
-  // transcript anchor, as this once did, can never hold in the sending tab:
-  // the optimistic row's id is `local_*` and only history normalization
-  // produces anchors. The turn was therefore never provable, the index came
-  // back empty, and fingerprint pairing — the only thing that can match a
-  // provider whose two transports use different tool ids — was unreachable.
-  const { retiredAnchors } = reconcileOptimisticUserEchoes(serverMessages, realtimeMessages);
+  // Optimistic prompts are kept in `realtimeMessages` even once retired: they
+  // are what records where each turn begins, which the merge needs to place a
+  // live reply below its own prompt. Hiding them is the merge's job.
+  const { retiredAnchors, provenAnchors } = reconcileOptimisticPrompts(
+    serverMessages,
+    realtimeMessages,
+    slot.pendingPrompts,
+    slot.runEnded,
+  );
   for (const [localId, serverId] of retiredAnchors) {
-    retiredOptimisticUserAnchors.set(localId, serverId);
+    slot.retiredOptimisticUserAnchors.set(localId, serverId);
   }
 
-  // Persisted user rows an optimistic prompt already took over. Kept apart
-  // from the tool-card claims so the two never compete for one row, and
-  // seeded here so a provider echo cannot re-claim a turn already retired.
-  const claimedServerUserIds = new Set<string>(retiredAnchors.values());
-
-  const turnRangeFromStart = (start: number): NormalizedMessage[] => {
-    const end = serverMessages.findIndex(
-      (candidate, index) => index > start && candidate.kind === 'text' && candidate.role === 'user',
-    );
-    return serverMessages.slice(start, end < 0 ? undefined : end);
-  };
-
-  const serverTurnForRealtimeMessage = (message: NormalizedMessage): NormalizedMessage[] => {
+  /**
+   * The persisted rows of the turn a live row belongs to, or an empty list
+   * when that turn cannot be proven.
+   *
+   * The turn is named by the nearest user row above the live row, and the
+   * pairing computed above says which persisted row that prompt became.
+   * Proof comes from that pairing or from a transcript anchor — never from
+   * what the prompt says, which is how an identical prompt from an earlier
+   * turn used to be accepted as proof.
+   */
+  const serverTurnForRealtimeRow = (message: NormalizedMessage): NormalizedMessage[] => {
     const realtimeIndex = realtimeMessages.findIndex((candidate) => candidate.id === message.id);
     if (realtimeIndex < 0) return [];
-    let userMessage: NormalizedMessage | undefined;
+
+    let turnStart = -1;
+    let namedByLivePrompt = false;
     for (let index = realtimeIndex - 1; index >= 0; index -= 1) {
       const candidate = realtimeMessages[index];
-      if (candidate.kind === 'text' && candidate.role === 'user') {
-        userMessage = candidate;
-        break;
+      if (candidate.kind !== 'text' || candidate.role !== 'user') {
+        continue;
       }
+      namedByLivePrompt = true;
+      // Only a proven pairing may name the turn. A prompt paired on the
+      // permissive path — sent before any history was loaded — can point at
+      // an older turn that merely happens to be the newest one in the
+      // window, and fingerprinting against it would hide a real card.
+      const pairedServerId = provenAnchors.get(candidate.id)
+        ?? (candidate.id.startsWith('local_') ? null : candidate.id);
+      turnStart = pairedServerId === null
+        ? -1
+        : serverMessages.findIndex((row) => row.id === pairedServerId);
+      if (turnStart < 0 && candidate.transcriptAnchorId) {
+        turnStart = serverMessages.findIndex((row) => row.transcriptAnchorId === candidate.transcriptAnchorId);
+      }
+      break;
     }
 
-    if (!userMessage) {
-      for (let index = serverMessages.length - 1; index >= 0; index -= 1) {
-        const candidate = serverMessages[index];
-        if (candidate.kind === 'text' && candidate.role === 'user') {
-          return turnRangeFromStart(index);
-        }
-      }
+    // A live prompt that cannot be placed leaves the turn unproven; falling
+    // back to the newest persisted turn would be a guess about which turn
+    // this row belongs to, and a wrong one hides a card the user ran.
+    if (turnStart < 0 && namedByLivePrompt) {
       return [];
     }
 
-    const pairedServerId = retiredOptimisticUserAnchors.get(userMessage.id);
-    if (pairedServerId) {
-      const start = serverMessages.findIndex((candidate) => candidate.id === pairedServerId);
-      if (start >= 0) return turnRangeFromStart(start);
+    if (turnStart < 0) {
+      // No live prompt names this turn (a tab that did not send, a session
+      // resumed mid-run). A live row cannot precede a turn already on disk,
+      // so it belongs to the newest persisted one.
+      for (let index = serverMessages.length - 1; index >= 0; index -= 1) {
+        const candidate = serverMessages[index];
+        if (candidate.kind === 'text' && candidate.role === 'user') {
+          turnStart = index;
+          break;
+        }
+      }
     }
+    if (turnStart < 0) return [];
 
-    if (userMessage.transcriptAnchorId) {
-      const start = serverMessages.findIndex((candidate) => candidate.kind === 'text'
-        && candidate.role === 'user'
-        && candidate.transcriptAnchorId === userMessage!.transcriptAnchorId);
-      if (start >= 0) return turnRangeFromStart(start);
-    }
-
-    return [];
+    const turnEnd = serverMessages.findIndex(
+      (candidate, index) => index > turnStart && candidate.kind === 'text' && candidate.role === 'user',
+    );
+    return serverMessages.slice(turnStart, turnEnd < 0 ? undefined : turnEnd);
   };
 
   const retained = realtimeMessages.filter((message) => {
@@ -399,43 +374,38 @@ function pruneRealtimeSupersededByServer(
       return false;
     }
 
-    if (message.kind === 'stream_delta' || message.id === `__streaming_${message.sessionId}`) {
-      if (isAssistantTextEchoedInSameTurnOnServer(message, serverMessages, realtimeMessages)) {
-        return false;
-      }
+    if (isOptimisticPromptRow(message)) {
       return true;
     }
 
-    if (message.kind === 'thinking' && isThinkingRowEchoOnServer(message, serverMessages)) {
-      return false;
-    }
-
-    if (message.kind === 'text' && message.role === 'assistant') {
-      if (isAssistantTextEchoedInSameTurnOnServer(message, serverMessages, realtimeMessages)) {
-        return false;
-      }
-      return true;
-    }
-
-    if (message.kind === 'text' && message.role === 'user') {
-      // The optimistic row stays: it is this turn's only boundary marker, and
-      // hiding it is the merge stage's job. A row that never was optimistic
-      // has no such duty, so the transcript's own copy supersedes it.
-      if (message.id.startsWith('local_')) {
-        return true;
-      }
-      return !claimServerUserEcho(message, serverMessages, claimedServerUserIds);
+    if (isStreamedTextPlaceholder(message)) {
+      // Only a row that provably holds the same text may retire it: the
+      // engine's own row (handled by the id test above and by
+      // `adoptStreamedSegment`), or a persisted row the provider reconciles
+      // by key and that the provider says is the more complete of the two.
+      // Retiring it on a timer or at the end of the run would delete output
+      // that exists nowhere else — several engines print text they never
+      // persist.
+      return !(
+        message.providerRowKey
+        && reconcileProviderRowText(message, serverMessages).winner === 'server'
+      );
     }
 
     if (message.kind === 'tool_use' && message.toolId) {
-      // A divergent id may use the parameter fingerprint only after the
-      // preceding user turn identifies one unique persisted turn. When history
-      // is paged or clocks disagree we retain the card instead of letting an
-      // Edit/Write from another turn claim it by target path.
+      // An engine that names a call the same way on both transports is
+      // already handled by the id test above; this catches the ones whose row
+      // ids differ but whose native call id does not.
       if (claimExactServerToolCall(message, allServerTools, claimedServerRowIds)) {
         return false;
       }
-      const serverTools = collectServerToolCalls(serverTurnForRealtimeMessage(message));
+      // Codex has no shared identity for a tool call at all: the rollout
+      // records it as `ctc_…`/`call_…` while the live stream announces
+      // `exec-…`, and nothing links the two but the command itself. Matching
+      // by argument fingerprint is the only way to recognise the card, so it
+      // is confined to the one persisted turn the prompt pairing proves —
+      // never across turns, where an identical command is a real second call.
+      const serverTools = collectServerToolCalls(serverTurnForRealtimeRow(message));
       if (claimMatchingServerToolCall(message, serverTools, claimedServerRowIds)) {
         return false;
       }
@@ -485,12 +455,15 @@ function resolveRealtimeFloors(
   let turnFloor: number | null = null;
 
   for (const message of realtimeMessages) {
-    if (message.id.startsWith('local_')) {
-      const anchorServerId = retiredAnchors.get(message.id);
-      const anchorIndex = anchorServerId === undefined ? undefined : serverIndexById.get(anchorServerId);
-      // An optimistic row still awaiting its persisted copy ends the previous
-      // turn without opening a floored one: its own rows cannot be placed
-      // relative to a server row that does not exist yet.
+    if (message.kind === 'text' && message.role === 'user') {
+      // A live user row opens a turn. Its floor is the persisted copy of that
+      // prompt — the row an optimistic stand-in was retired against, or the
+      // engine's own row once the transcript holds it. A prompt with no
+      // persisted copy yet ends the previous turn without opening a floored
+      // one: its rows cannot be placed relative to a server row that does not
+      // exist.
+      const anchorServerId = retiredAnchors.get(message.id) ?? message.id;
+      const anchorIndex = serverIndexById.get(anchorServerId);
       turnFloor = anchorIndex === undefined ? null : anchorIndex;
       continue;
     }
@@ -560,22 +533,29 @@ function computeMerged(
   server: NormalizedMessage[],
   realtime: NormalizedMessage[],
   arrivalAnchors: Map<string, string>,
-  retiredOptimisticUserAnchors: Map<string, string>,
+  slot: Pick<SessionSlot, 'pendingPrompts' | 'retiredOptimisticUserAnchors' | 'runEnded'>,
 ): NormalizedMessage[] {
   if (realtime.length === 0) {
-    return dedupeAdjacentAssistantEchoes(server);
+    return server;
   }
 
   const serverIds = new Set(server.map((message) => message.id));
-  const reconciliation = reconcileOptimisticUserEchoes(server, realtime);
-  for (const [localId, serverId] of reconciliation.retiredAnchors) {
-    retiredOptimisticUserAnchors.set(localId, serverId);
+  const { retiredAnchors } = reconcileOptimisticPrompts(
+    server,
+    realtime,
+    slot.pendingPrompts,
+    slot.runEnded,
+  );
+  for (const [localId, serverId] of retiredAnchors) {
+    slot.retiredOptimisticUserAnchors.set(localId, serverId);
   }
-  const reconciledRealtime = reconciliation.messages.filter(
-    (message) => !retiredOptimisticUserAnchors.has(message.id),
+  // Retired prompts stay in `realtime` as turn boundaries; the merge is where
+  // they stop being rendered.
+  const reconciledRealtime = realtime.filter(
+    (message) => !slot.retiredOptimisticUserAnchors.has(message.id),
   );
   if (server.length === 0) {
-    return dedupeAdjacentAssistantEchoes(reconciledRealtime);
+    return reconciledRealtime;
   }
   const providerRowReconciliations = new Map<string, ReturnType<typeof reconcileProviderRowText>>();
   const reconcileRealtimeProviderRow = (message: NormalizedMessage) => {
@@ -602,6 +582,9 @@ function computeMerged(
     }),
   );
   const extra = reconciledRealtime.filter((message) => {
+    // The id is the join. Everything below covers only the rows that have no
+    // engine id yet: streamed text still waiting for its row, and the rows
+    // whose engines reconcile through `providerRowKey` instead.
     if (serverIds.has(message.id)) {
       return false;
     }
@@ -611,12 +594,8 @@ function computeMerged(
     if (
       (message.kind === 'text' && message.role === 'assistant')
       || message.kind === 'stream_delta'
-      || message.id === `__streaming_${message.sessionId}`
     ) {
-      if (
-        reconcileRealtimeProviderRow(message).winner === 'server'
-        || isAssistantTextEchoedInSameTurnOnServer(message, server, realtime)
-      ) {
+      if (reconcileRealtimeProviderRow(message).winner === 'server') {
         return false;
       }
     }
@@ -626,57 +605,22 @@ function computeMerged(
   const prunedServer = server.filter((message) => !serverRowsSupersededByRealtime.has(message.id));
 
   if (extra.length === 0) {
-    return dedupeAdjacentAssistantEchoes(prunedServer);
+    return prunedServer;
   }
 
   // Interleave the two sources without reordering either one. Placement
   // follows each live row's causal anchor where one exists; the clocks only
   // place rows no anchor covers.
-  return dedupeAdjacentAssistantEchoes(
-    stableMergeMessageSources(
+  return stableMergeMessageSources(
+    prunedServer,
+    extra,
+    resolveRealtimeFloors(
       prunedServer,
-      extra,
-      resolveRealtimeFloors(
-        prunedServer,
-        realtime,
-        retiredOptimisticUserAnchors,
-        arrivalAnchors,
-      ),
+      realtime,
+      slot.retiredOptimisticUserAnchors,
+      arrivalAnchors,
     ),
   );
-}
-
-/**
- * Keeps every pending optimistic prompt's send-time row count pointing at the
- * same place after the server array is rewritten.
- *
- * The stamp is an index into `serverMessages`, so prepending an older page
- * shifts it; a wholesale replacement invalidates it entirely, and the only
- * honest answer then is the new tail — a row that arrived before the refresh
- * cannot be the copy of a prompt sent after it. Left unadjusted, a repeated
- * prompt is retired by an identical one from an earlier turn and the message
- * the user just sent disappears.
- */
-function restampPendingPrompts(slot: SessionSlot, adjust: (stamp: number) => number): void {
-  let changed = false;
-  const next = slot.realtimeMessages.map((row) => {
-    if (
-      !row.id.startsWith('local_')
-      || row.replacesAfterRowCount === undefined
-      || slot.retiredOptimisticUserAnchors.has(row.id)
-    ) {
-      return row;
-    }
-    const restamped = adjust(row.replacesAfterRowCount);
-    if (restamped === row.replacesAfterRowCount) {
-      return row;
-    }
-    changed = true;
-    return { ...row, replacesAfterRowCount: restamped };
-  });
-  if (changed) {
-    slot.realtimeMessages = next;
-  }
 }
 
 /**
@@ -735,7 +679,7 @@ function recomputeMergedIfNeeded(slot: SessionSlot): boolean {
     slot.serverMessages,
     slot.realtimeMessages,
     slot.realtimeArrivalAnchors,
-    slot.retiredOptimisticUserAnchors,
+    slot,
   );
   return true;
 }
@@ -1030,6 +974,11 @@ export class SessionTimelineStore {
         // so a lost frame cannot leave a card running forever.
         if (sid) {
           this.finalizeRunningTools(sid);
+          // The run is the deadline for rows that never got an engine id. The
+          // refresh that follows this event is the last chance for a
+          // persisted copy to show up; after it, anything still unmatched is
+          // retired rather than left duplicating the transcript forever.
+          this.getSlot(sid).runEnded = true;
         }
         return {
           effect: 'complete',
@@ -1101,10 +1050,6 @@ export class SessionTimelineStore {
       try {
         const data = await this.fetchPage(sessionId, requestOptions);
         slot.serverMessages = data.messages;
-        // A wholesale replacement leaves no way to translate an old index, so
-        // a pending prompt can only be retired by something that arrives after
-        // this page.
-        restampPendingPrompts(slot, () => data.messages.length);
         slot.total = data.total;
         slot.hasMore = data.hasMore;
         slot.offset = (requestOptions.offset ?? 0) + data.messages.length;
@@ -1114,7 +1059,7 @@ export class SessionTimelineStore {
         slot.realtimeMessages = pruneRealtimeSupersededByServer(
           slot.serverMessages,
           slot.realtimeMessages,
-          slot.retiredOptimisticUserAnchors,
+          slot,
         );
         this.discardStreamBufferIfPruned(sessionId, realtimeBeforePrune, slot.realtimeMessages);
         recomputeMergedIfNeeded(slot);
@@ -1187,7 +1132,6 @@ export class SessionTimelineStore {
           slot.total = data.total;
           slot.offset = slot.serverMessages.length;
           prependedCount = olderMerge.prependedCount;
-          restampPendingPrompts(slot, (stamp) => stamp + olderMerge.prependedCount);
           if (data.tokenUsage !== undefined) {
             slot.tokenUsage = data.tokenUsage;
           }
@@ -1359,7 +1303,7 @@ export class SessionTimelineStore {
     const prunedRealtimeMessages = pruneRealtimeSupersededByServer(
       nextServerMessages,
       slot.realtimeMessages,
-      slot.retiredOptimisticUserAnchors,
+      slot,
     );
     if (
       nextServerMessages.length === previousServerMessages.length
@@ -1391,37 +1335,94 @@ export class SessionTimelineStore {
   appendRealtime(sessionId: string, msg: NormalizedMessage): void {
     // A frame with no id is not a renderable timeline row — gateway frames
     // such as `session_removed` carry only their own payload. Admitting one
-    // used to crash every later recompute in removeOptimisticUserEchoes.
+    // used to crash every later recompute of the merged view.
     if (typeof msg.id !== 'string' || msg.id.length === 0) {
       return;
     }
     const slot = this.getSlot(sessionId);
-    const withSession =
+    const message =
       msg.sessionId === sessionId
         ? msg
         : { ...msg, sessionId };
-    // An optimistic prompt records how much transcript existed when it was
-    // sent. Retiring it later then needs no clock: only a row that arrived
-    // afterwards can be its persisted copy, which also stops an identical
-    // prompt from an earlier turn claiming it and making the new message
-    // vanish. The edit path sets its own value and is left alone.
-    const normalizedMessage =
-      withSession.id.startsWith('local_')
-      && withSession.kind === 'text'
-      && withSession.role === 'user'
-      && withSession.replacesAfterRowCount === undefined
-        ? { ...withSession, replacesAfterRowCount: slot.serverMessages.length }
-        : withSession;
-    let updated = mergeProviderUserEchoIntoOptimisticRow(
-      slot.realtimeMessages,
-      normalizedMessage,
-    ) ?? [...slot.realtimeMessages, normalizedMessage];
+
+    // An optimistic prompt records the transcript's last row at send time.
+    // Everything persisted after that row is newer than the prompt, so the
+    // first user row past it is the prompt's own copy — settled without a
+    // clock, a row count, or a look at what the prompt says.
+    if (isOptimisticPromptRow(message) && !slot.pendingPrompts.has(message.id)) {
+      slot.pendingPrompts.set(message.id, {
+        afterRowId: slot.serverMessages.length > 0
+          ? slot.serverMessages[slot.serverMessages.length - 1].id
+          : null,
+      });
+      slot.runEnded = false;
+    }
+
+    let updated = this.adoptEngineRow(slot, message)
+      ?? [...slot.realtimeMessages, message];
     if (updated.length > MAX_REALTIME_MESSAGES) {
       updated = updated.slice(-MAX_REALTIME_MESSAGES);
     }
     slot.realtimeMessages = updated;
     recomputeMergedIfNeeded(slot);
     this.notify(sessionId);
+  }
+
+  /**
+   * Lets an arriving engine row take the place of the client-side stand-in it
+   * makes obsolete, or returns null when it replaces nothing.
+   *
+   * Two rows in the timeline are written by the client because the engine has
+   * not named them yet: the text of a segment still streaming, and the prompt
+   * the user just sent. Both are stand-ins for a row the engine will name.
+   * When that row arrives it is swapped in, keeping the stand-in's position
+   * and start time, so the transcript carries the engine's identity from then
+   * on. Without the swap the stand-in and the persisted copy are two rows
+   * that only a text comparison could relate — which is how a message came to
+   * be rendered twice.
+   */
+  private adoptEngineRow(
+    slot: SessionSlot,
+    message: NormalizedMessage,
+  ): NormalizedMessage[] | null {
+    if (message.kind !== 'text') {
+      return null;
+    }
+
+    if (message.role === 'assistant' && slot.streamingPlaceholderId !== null) {
+      const index = slot.realtimeMessages.findIndex(
+        (row) => row.id === slot.streamingPlaceholderId,
+      );
+      slot.streamingPlaceholderId = null;
+      if (index < 0) {
+        return null;
+      }
+      const next = [...slot.realtimeMessages];
+      // The placeholder's timestamp is when the segment started streaming,
+      // which is where the reply belongs relative to the tools that followed.
+      next[index] = { ...message, timestamp: slot.realtimeMessages[index].timestamp };
+      return next;
+    }
+
+    // Some engines echo the prompt back on the live stream (codex does, claude
+    // does not). The echo is the engine's own row for the send the optimistic
+    // prompt stands in for, so it takes that row's place rather than being
+    // appended beside it.
+    if (message.role === 'user' && !message.id.startsWith('local_')) {
+      const index = slot.realtimeMessages.findIndex(
+        (row) => isOptimisticPromptRow(row) && !slot.retiredOptimisticUserAnchors.has(row.id),
+      );
+      if (index < 0) {
+        return null;
+      }
+      const standIn = slot.realtimeMessages[index];
+      const next = [...slot.realtimeMessages];
+      next[index] = { ...message, timestamp: standIn.timestamp };
+      slot.pendingPrompts.delete(standIn.id);
+      return next;
+    }
+
+    return null;
   }
 
   /**
@@ -1502,10 +1503,10 @@ export class SessionTimelineStore {
   }
 
   /**
-   * Finalize streaming: convert the streaming message to a regular text
-   * message. The well-known streaming ID is replaced with a unique `text_`
-   * message ID (the prefix the adjacent-echo dedupe treats as "persisted
-   * wins"). A no-op when no streaming row exists.
+   * Closes the streamed segment: the accumulating `__streaming_` row becomes
+   * a placeholder assistant row that holds the text until the engine's own
+   * row for that segment arrives and takes its place. A no-op when no
+   * streaming row exists.
    */
   private finalizeStreaming(sessionId: string): void {
     const slot = this.slots.get(sessionId);
@@ -1514,13 +1515,16 @@ export class SessionTimelineStore {
     const idx = slot.realtimeMessages.findIndex(m => m.id === streamId);
     if (idx >= 0) {
       const stream = slot.realtimeMessages[idx];
+      slot.streamedSegmentCount += 1;
+      const placeholderId = buildStreamedTextPlaceholderId(sessionId, slot.streamedSegmentCount);
       slot.realtimeMessages = [...slot.realtimeMessages];
       slot.realtimeMessages[idx] = {
         ...stream,
-        id: `text_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        id: placeholderId,
         kind: 'text',
         role: 'assistant',
       };
+      slot.streamingPlaceholderId = placeholderId;
       recomputeMergedIfNeeded(slot);
       this.notify(sessionId);
     }
@@ -1700,9 +1704,9 @@ export class SessionTimelineStore {
   /**
    * Drops every persisted row from `anchorId` onwards after an edit replaced
    * an already-sent message, plus the live rows that belonged to the replaced
-   * turn. The optimistic replacement echo survives — it is stamped with the
-   * surviving row count so the transcript renderer can tell it apart from the
-   * turns it now sits after.
+   * turn. The optimistic replacement echo survives, re-anchored on the last
+   * surviving persisted row so it retires against its own copy and not one of
+   * the turns the edit removed.
    */
   private truncateAt(sessionId: string, anchorId: string): void {
     const slot = this.slots.get(sessionId);
@@ -1717,9 +1721,18 @@ export class SessionTimelineStore {
     const replacements = slot.realtimeMessages.filter(
       (message) => message.replacesAnchorId === anchorId,
     );
+    const survivingTail = slot.serverMessages[slot.serverMessages.length - 1];
+    slot.pendingPrompts.clear();
+    slot.retiredOptimisticUserAnchors.clear();
     slot.realtimeMessages = replacements.length > 0
-      ? [{ ...replacements[replacements.length - 1], replacesAfterRowCount: cutIndex }]
+      ? [replacements[replacements.length - 1]]
       : [];
+    // The replacement prompt is newer than everything the cut left behind, so
+    // it anchors on the surviving tail rather than the row it replaced.
+    const replacement = slot.realtimeMessages[0];
+    if (replacement && isOptimisticPromptRow(replacement)) {
+      slot.pendingPrompts.set(replacement.id, { afterRowId: survivingTail?.id ?? null });
+    }
     slot.total = slot.serverMessages.length;
     slot.offset = slot.serverMessages.length;
     recomputeMergedIfNeeded(slot);

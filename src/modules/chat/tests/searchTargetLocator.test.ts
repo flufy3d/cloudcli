@@ -2,10 +2,8 @@ import assert from 'node:assert/strict';
 
 import { test } from 'vitest';
 
-import {
-  findSearchTargetIndex,
-  resolveSearchWindowSize,
-} from '@/modules/chat/utils/searchTargetLocator';
+import { findSearchTargetIndex } from '@/modules/chat/utils/searchTargetLocator';
+import { groupConsecutiveTools } from '@/modules/chat/utils/toolGrouping';
 import type { ChatMessage } from '@/shared/types';
 
 /**
@@ -15,12 +13,11 @@ import type { ChatMessage } from '@/shared/types';
  * the highlight, telling the user they had been taken to their result when they
  * had not.
  *
- * Resolving the index from the message data first is what makes a miss
- * detectable — findSearchTargetIndex returns -1 and the jump declines rather
- * than pretending. The DOM step (useChatSessionState's findMessageRow) prefers
- * an exact timestamp match on the always-present LazyMessageRow wrapper and
- * falls back to the nearest row: a hit collapsed inside a tool group is
- * rendered under the group's own first timestamp.
+ * Resolving the index from the message data is what makes a miss detectable —
+ * findSearchTargetIndex returns -1 and the jump declines rather than
+ * pretending. The index it returns addresses the *grouped* rows the transcript
+ * renders, because that is the index space the virtualizer scrolls by; a hit
+ * collapsed inside a tool group resolves to the group's row.
  */
 
 const message = (content: string, timestamp: string): ChatMessage => ({
@@ -129,22 +126,41 @@ test('only the leading part of an over-long snippet has to match', () => {
   assert.equal(findSearchTargetIndex(messages, { snippet: `${head}DIFFERENT-TAIL` }), 0);
 });
 
-test('the search window covers the resolved target plus trailing context', () => {
-  // visibleMessages is a tail slice, so covering index N means rendering
-  // everything after it.
-  assert.equal(resolveSearchWindowSize(100, 99, 20), 21, 'newest message needs a small window');
-  assert.equal(resolveSearchWindowSize(100, 0, 20), 120, 'oldest message needs the whole list');
-  assert.equal(resolveSearchWindowSize(100, 50, 20), 70);
+test('a hit inside a collapsed tool group resolves to the group row', () => {
+  // Grouping folds a run of same-tool calls into one rendered row, so the hit's
+  // index in the flat message list is NOT the row the viewport must scroll to.
+  const messages: ChatMessage[] = [
+    message('intro text', '2024-01-01T10:00:00.000Z'),
+    ...Array.from({ length: 3 }, (_, i) => ({
+      type: 'assistant' as const,
+      content: '',
+      timestamp: `2024-01-01T10:0${i + 1}:00.000Z`,
+      isToolUse: true,
+      toolName: 'Bash',
+      toolInput: JSON.stringify({ command: i === 2 ? 'npm run migrate:database' : `echo ${i}` }),
+    })),
+    message('closing remarks about the migration', '2024-01-01T10:05:00.000Z'),
+  ];
+
+  const items = groupConsecutiveTools(messages, true);
+  assert.equal(items.length, 3, 'intro, one tool group, closing');
+  // The hit is the third message of the group, i.e. index 3 of the flat list.
+  assert.equal(findSearchTargetIndex(items, { snippet: 'npm run migrate:database' }), 1);
 });
 
-test('the window always includes the target itself', () => {
-  const messageCount = 40;
-  for (let targetIndex = 0; targetIndex < messageCount; targetIndex++) {
-    const windowSize = resolveSearchWindowSize(messageCount, targetIndex, 0);
-    const firstRenderedIndex = messageCount - windowSize;
-    assert.ok(
-      firstRenderedIndex <= targetIndex,
-      `target ${targetIndex} fell outside a window of ${windowSize}`,
-    );
-  }
+test('rows after a collapsed group keep their grouped index', () => {
+  const messages: ChatMessage[] = [
+    ...Array.from({ length: 4 }, (_, i) => ({
+      type: 'assistant' as const,
+      content: '',
+      timestamp: `2024-01-01T10:0${i}:00.000Z`,
+      isToolUse: true,
+      toolName: 'Read',
+      toolInput: JSON.stringify({ file_path: `/tmp/file-${i}` }),
+    })),
+    message('the deployment pipeline is now green', '2024-01-01T10:09:00.000Z'),
+  ];
+
+  const items = groupConsecutiveTools(messages, true);
+  assert.equal(findSearchTargetIndex(items, { snippet: 'deployment pipeline is now green' }), 1);
 });

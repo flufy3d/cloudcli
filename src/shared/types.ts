@@ -80,11 +80,6 @@ export type NormalizedMessage = Omit<WireNormalizedMessage, 'kind'> & {
    * this stamp from being dropped with the turns it replaces.
    */
   replacesAnchorId?: string;
-  /**
-   * How many rows the transcript held when the replaced turn was cut, so the
-   * echo can only be retired by a persisted row that did not exist back then.
-   */
-  replacesAfterRowCount?: number;
 };
 
 

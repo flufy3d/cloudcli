@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import {
   access,
   lstat,
@@ -19,7 +20,8 @@ import { fileURLToPath } from 'node:url';
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
-import type { MessageInputForKind } from '../../shared/protocol/messageKinds.js';
+import type { MessageInputForKind, VolatileMessageId } from '../../shared/protocol/messageKinds.js';
+import { VOLATILE_MESSAGE_ID_PREFIX } from '../../shared/protocol/messageKinds.js';
 
 import { parseFrontMatter } from './frontmatter.js';
 import type {
@@ -495,10 +497,15 @@ export function validatePathSecurity(targetPath: string, rootPath: string): void
 // ---------------------------
 //----------------- NORMALIZED PROVIDER MESSAGE UTILITIES ------------
 /**
- * Generates a stable unique id for normalized provider messages.
+ * Generates a throwaway id for a frame that exists only while a run is live.
+ *
+ * The result is branded and prefixed so it cannot be used as a transcript
+ * row's id: those have to be derived from the engine's own record, or the
+ * same persisted row comes back under a new id on every history read and the
+ * client has nothing to match the live copy against.
  */
-export function generateMessageId(prefix = 'msg'): string {
-  return `${prefix}_${randomUUID()}`;
+export function generateMessageId(prefix = 'msg'): VolatileMessageId {
+  return `${VOLATILE_MESSAGE_ID_PREFIX}${prefix}_${randomUUID()}` as VolatileMessageId;
 }
 
 /**
@@ -1591,4 +1598,75 @@ export function parseAntigravityWorkspacePath(workspaceUris: string | null): str
   }
 
   return null;
+}
+
+// ---------------------------
+//----------------- LOOPBACK HTTP FORWARDING UTILITIES ------------
+/**
+ * One inbound request restated as a call against a service listening on this
+ * machine's loopback interface.
+ *
+ * `path` must be an absolute path and already carry its query string; the
+ * forwarder does not rebuild it. `headers` fully replaces the caller's headers
+ * so no client credentials leak into a local service by accident. `body` is
+ * only written when present, which is why GET/HEAD callers simply omit it.
+ * `transformResponseHeaders` is the last chance to strip or rewrite upstream
+ * headers (`set-cookie`, `location`, CSP) before they reach the browser.
+ */
+export type LoopbackForwardRequest = {
+  port: number;
+  path: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+  transformResponseHeaders?: (
+    headers: http.IncomingHttpHeaders,
+    statusCode: number,
+  ) => http.OutgoingHttpHeaders;
+};
+
+/**
+ * Pipes a request to `127.0.0.1:<port>` and streams the upstream response
+ * straight back to the client without buffering it.
+ *
+ * Used by the plugins module (RPC calls into a plugin's own HTTP server) and by
+ * the local-proxy module (serving server-side dev servers to a remote browser).
+ * The target host is hardcoded to the loopback address: both callers exist to
+ * reach services on this machine, and pinning the host keeps request forgery
+ * confined to ports that are already local.
+ *
+ * `onError` receives connection failures; pass Express's `next` to route them
+ * into the error middleware, or handle them inline to send a custom status.
+ */
+export function forwardToLoopbackService(
+  request: LoopbackForwardRequest,
+  res: Response,
+  onError: (error: Error) => void,
+): void {
+  const upstreamRequest = http.request(
+    {
+      hostname: '127.0.0.1',
+      port: request.port,
+      path: request.path,
+      method: request.method,
+      headers: request.headers,
+    },
+    (upstreamResponse) => {
+      const statusCode = upstreamResponse.statusCode ?? 502;
+      const headers = request.transformResponseHeaders
+        ? request.transformResponseHeaders(upstreamResponse.headers, statusCode)
+        : upstreamResponse.headers;
+      res.writeHead(statusCode, headers);
+      upstreamResponse.pipe(res);
+    },
+  );
+
+  upstreamRequest.on('error', onError);
+
+  if (request.body !== undefined) {
+    upstreamRequest.setHeader('content-length', Buffer.byteLength(request.body));
+    upstreamRequest.write(request.body);
+  }
+
+  upstreamRequest.end();
 }

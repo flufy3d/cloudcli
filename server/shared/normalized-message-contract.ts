@@ -14,8 +14,11 @@
  * log so the adapter that invented it can be fixed.
  */
 
+import { isVolatileMessageId, TRANSCRIPT_ROW_KINDS } from '../../shared/protocol/messageKinds.js';
 import type { NormalizedMessage } from '@/shared/types.js';
 import { readObjectRecord } from '@/shared/utils.js';
+
+const TRANSCRIPT_ROW_KIND_SET: ReadonlySet<string> = new Set(TRANSCRIPT_ROW_KINDS);
 
 /**
  * Every field the wire contract declares.
@@ -91,8 +94,35 @@ const KNOWN_KEYS: ReadonlySet<string> = new Set(NORMALIZED_MESSAGE_KEYS);
 
 /** Result of checking one outbound payload against the contract. */
 export type NormalizedMessageContractResult =
-  | { ok: true; message: NormalizedMessage; strippedKeys: string[] }
+  | { ok: true; message: NormalizedMessage; strippedKeys: string[]; contractViolations: string[] }
   | { ok: false; reason: string };
+
+/**
+ * Faults that are worth naming but not worth dropping a message over.
+ *
+ * A transcript row whose id was invented at emit time is a real defect — the
+ * client cannot match it against the persisted copy, which is how the same
+ * message ends up rendered twice — but withholding the row would turn a
+ * duplicate into a missing reply. So it travels, and it is named.
+ */
+function collectContractViolations(record: Record<string, unknown>): string[] {
+  const violations: string[] = [];
+  const kind = String(record.kind);
+  const id = typeof record.id === 'string' ? record.id : '';
+
+  if (TRANSCRIPT_ROW_KIND_SET.has(kind)) {
+    if (!id) {
+      violations.push(`a ${kind} row carries no id; it must be derived from the engine's own record`);
+    } else if (isVolatileMessageId(id)) {
+      violations.push(
+        `a ${kind} row carries a generated id (${id}); a persisted row must reuse the engine's own `
+        + 'identifier so the live copy and the history copy match',
+      );
+    }
+  }
+
+  return violations;
+}
 
 /**
  * Checks one outbound payload and returns the message that may leave the
@@ -116,14 +146,15 @@ export function enforceNormalizedMessageContract(value: unknown): NormalizedMess
     return { ok: false, reason: `missing \`provider\` on a ${record.kind} message` };
   }
 
+  const contractViolations = collectContractViolations(record);
   const strippedKeys = Object.keys(record).filter((key) => !KNOWN_KEYS.has(key));
   if (strippedKeys.length === 0) {
-    return { ok: true, message: record as NormalizedMessage, strippedKeys };
+    return { ok: true, message: record as NormalizedMessage, strippedKeys, contractViolations };
   }
 
   const message = { ...record };
   for (const key of strippedKeys) {
     delete message[key];
   }
-  return { ok: true, message: message as NormalizedMessage, strippedKeys };
+  return { ok: true, message: message as NormalizedMessage, strippedKeys, contractViolations };
 }

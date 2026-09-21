@@ -167,13 +167,6 @@
       "sessionMessages": "正在加载会话消息..."
     },
     "messages": {
-      "showingOf": "显示 {{shown}} / {{total}} 条消息",
-      "scrollToLoad": "向上滚动以加载更多",
-      "showingLast": "显示最近 {{count}} 条消息（共 {{total}} 条）",
-      "loadEarlier": "加载更早的消息",
-      "loadAll": "加载全部消息",
-      "loadingAll": "正在加载全部消息...",
-      "allLoaded": "全部消息已加载",
       "perfWarning": "已加载全部消息 - 滚动可能变慢。点击「滚动到底部」恢复性能。"
     }
   },
@@ -333,5 +326,9 @@
       "claude": "API Key、Bedrock、Vertex 登录没有 claude.ai 订阅限额",
       "codex": "API Key 登录通常不会提供 ChatGPT 账号的 5 小时和周限额"
     }
+  },
+  "localProxy": {
+    "linkHint": "这个地址只存在于服务器本机，CloudCLI 将通过本地代理打开。",
+    "failed": "CloudCLI 无法打开这个服务器本机地址。"
   }
 }

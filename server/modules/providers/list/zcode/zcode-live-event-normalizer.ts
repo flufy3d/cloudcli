@@ -25,6 +25,24 @@ export const ZCODE_CANCELLED_NOTICE = '回复已中断';
 export const ZCODE_CANCELLED_NOTICE_KEY = 'taskNotices.replyInterrupted';
 
 /**
+ * The cross-transport identity of one ZCode assistant text row.
+ *
+ * ZCode names a persisted row `(message_id, part_id)` but its live stream
+ * only ever mentions the message: text arrives as `text_delta` events under
+ * the message id and no row id is ever sent, so the two paths cannot be
+ * joined on `id`. The message id is the one thing both sides do carry, so it
+ * becomes the row key and the client reconciles the streamed body against
+ * the persisted one through it.
+ *
+ * Consumers: this normalizer (live deltas) and `zcode-sessions.provider.ts`
+ * (persisted rows). Both must derive the key the same way or the streamed
+ * reply renders beside its persisted copy.
+ */
+export function buildZCodeTextRowKey(messageId: string): string {
+  return `zcode-message:${messageId}`;
+}
+
+/**
  * Whether an engine error record denotes a cancelled model request rather
  * than a real failure. Matches the engine's own cancellation predicates —
  * `turn_cancelled`/`model_request_cancelled`/`ABORT_ERR` codes, a
@@ -322,7 +340,7 @@ export class ZCodeLiveEventNormalizer {
     const stateKey = sessionId ?? '';
 
     if (kind === 'reasoning_start') {
-      this.openReasoningBlock(stateKey);
+      this.openReasoningBlock(stateKey, baseId);
       return [];
     }
 
@@ -332,7 +350,7 @@ export class ZCodeLiveEventNormalizer {
         return [];
       }
       return [createNormalizedMessage({
-        id: this.openReasoningBlock(stateKey),
+        id: this.openReasoningBlock(stateKey, baseId),
         sessionId,
         timestamp,
         provider: PROVIDER,
@@ -377,6 +395,7 @@ export class ZCodeLiveEventNormalizer {
         kind: 'stream_delta',
         role: 'assistant',
         content,
+        providerRowKey: buildZCodeTextRowKey(baseId),
       })];
     }
 
@@ -414,12 +433,21 @@ export class ZCodeLiveEventNormalizer {
     return [];
   }
 
-  private openReasoningBlock(stateKey: string): string {
+  /**
+   * The id every delta of one reasoning segment is emitted under.
+   *
+   * Derived from the engine's own id for the event that opened the segment,
+   * so a history read of the same segment lands on the same id and the client
+   * does not render the streamed block beside the persisted one. The cache
+   * keeps the later deltas on the opening event's id even when the engine
+   * numbers each delta separately.
+   */
+  private openReasoningBlock(stateKey: string, baseId: string): string {
     const existing = this.reasoningBlockIds.get(stateKey);
     if (existing) {
       return existing;
     }
-    const id = generateMessageId('zcode_reasoning');
+    const id = `${baseId}_reasoning`;
     this.reasoningBlockIds.set(stateKey, id);
     return id;
   }

@@ -12,14 +12,13 @@ import type { DiffCalculator } from '@/shared/types';
 import { createCachedDiffCalculator } from '@/modules/chat/utils/messageTransforms';
 
 import { normalizedToChatMessages } from '@/modules/chat/hooks/useChatMessages';
-import { useChatScrollController } from '@/modules/chat/hooks/useChatScrollController';
-import { expandVisibleCount, sliceVisibleMessages } from '@/modules/chat/utils/chatScrollMath';
-import { findSearchTargetIndex, resolveSearchWindowSize } from '@/modules/chat/utils/searchTargetLocator';
+import { useTranscriptViewport } from '@/modules/chat/hooks/useTranscriptViewport';
+import { groupConsecutiveTools } from '@/modules/chat/utils/toolGrouping';
 import { toTokenBudget } from '@/modules/chat/utils/contextUsage';
+import { findSearchTargetIndex } from '@/modules/chat/utils/searchTargetLocator';
 
-const INITIAL_VISIBLE_MESSAGES = 100;
-/** Rows rendered below a search-jump hit; the hit opens the tail slice. */
-const SEARCH_JUMP_TRAILING_CONTEXT = 30;
+/** How long a search hit stays flashed after the jump lands. */
+const SEARCH_HIGHLIGHT_DURATION_MS = 4000;
 
 type UseChatSessionStateArgs = {
   isActive: boolean;
@@ -35,6 +34,8 @@ type UseChatSessionStateArgs = {
   /** When each session's `chat.subscribe` was last sent; guards stale idle acks. */
   statusCheckSentAtRef: MutableRefObject<Map<string, number>>;
   sessionStore: SessionStore;
+  /** Grouping folds hidden reasoning rows away, so it decides the row count. */
+  showThinking: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -116,6 +117,7 @@ export function useChatSessionState({
   resetStreamingState,
   statusCheckSentAtRef,
   sessionStore,
+  showThinking,
 }: UseChatSessionStateArgs) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(selectedSession?.id || null);
   const [isLoadingSessionMessages, setIsLoadingSessionMessages] = useState(false);
@@ -123,26 +125,20 @@ export function useChatSessionState({
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [totalMessages, setTotalMessages] = useState(0);
   const [tokenBudget, setTokenBudget] = useState<Record<string, unknown> | null>(null);
-  const [visibleMessageCount, setVisibleMessageCount] = useState(INITIAL_VISIBLE_MESSAGES);
   const [allMessagesLoaded, setAllMessagesLoaded] = useState(false);
   const [isLoadingAllMessages, setIsLoadingAllMessages] = useState(false);
-  const [loadAllJustFinished, setLoadAllJustFinished] = useState(false);
-  const [showLoadAllOverlay, setShowLoadAllOverlay] = useState(false);
   const [viewHiddenCount, setViewHiddenCount] = useState(0);
-
+  // Row a search jump landed on; cleared once its flash has run.
+  const [highlightedItemIndex, setHighlightedItemIndex] = useState<number | null>(null);
   /**
-   * One-shot latch for the load-all overlay: the overlay shows once per
-   * near-top episode and re-arms on session/New-Session resets — NOT on
-   * scrolling away (that edge detection lives inside the scroll anchor).
+   * Bumped whenever the transcript is replaced (session switch, New Session)
+   * so the viewport re-arms its stick to the bottom.
    */
-  const loadAllOverlayShownRef = useRef(false);
+  const [viewportResetSignal, setViewportResetSignal] = useState(0);
   const [searchTarget, setSearchTarget] = useState<{ timestamp?: string; uuid?: string; snippet?: string } | null>(null);
   const searchScrollActiveRef = useRef(false);
   const isLoadingMoreRef = useRef(false);
   const allMessagesLoadedRef = useRef(false);
-  const pendingInitialScrollRef = useRef(true);
-  const loadAllFinishedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const loadAllOverlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastLoadedSessionKeyRef = useRef<string | null>(null);
   /**
    * Tracks the last processed value from `useProjectsState.newSessionTrigger`.
@@ -186,27 +182,15 @@ export function useChatSessionState({
     setTotalMessages(0);
     
     setTokenBudget(null);
-    setVisibleMessageCount(INITIAL_VISIBLE_MESSAGES);
     setAllMessagesLoaded(false);
     allMessagesLoadedRef.current = false;
     setIsLoadingAllMessages(false);
-    setLoadAllJustFinished(false);
-    setShowLoadAllOverlay(false);
     setViewHiddenCount(0);
     setSearchTarget(null);
-    loadAllOverlayShownRef.current = false;
+    setHighlightedItemIndex(null);
     searchScrollActiveRef.current = false;
-    pendingInitialScrollRef.current = true;
+    setViewportResetSignal((signal) => signal + 1);
     lastLoadedSessionKeyRef.current = null;
-
-    if (loadAllOverlayTimerRef.current) {
-      clearTimeout(loadAllOverlayTimerRef.current);
-      loadAllOverlayTimerRef.current = null;
-    }
-    if (loadAllFinishedTimerRef.current) {
-      clearTimeout(loadAllFinishedTimerRef.current);
-      loadAllFinishedTimerRef.current = null;
-    }
   }, [newSessionTrigger, onSessionIdle, resetStreamingState]);
 
   /* ---------------------------------------------------------------- */
@@ -356,9 +340,9 @@ export function useChatSessionState({
   const rewindMessages = useCallback((count: number) => setViewHiddenCount(count), []);
 
   const loadOlderMessages = useCallback(
-    async (container: HTMLDivElement) => {
+    async () => {
       if (!isActive) return false;
-      if (!container || isLoadingMoreRef.current || isLoadingMoreMessages) return false;
+      if (isLoadingMoreRef.current || isLoadingMoreMessages) return false;
       if (allMessagesLoadedRef.current) return false;
       if (!hasMoreMessages || !selectedSession || !selectedProject) return false;
 
@@ -375,30 +359,11 @@ export function useChatSessionState({
         const { slot, prependedCount } = result;
         syncPaginationFromSlot(slot);
 
-        if (prependedCount === 0) {
-          if (!slot.hasMore) {
-            allMessagesLoadedRef.current = true;
-            setAllMessagesLoaded(true);
-            if (loadAllOverlayTimerRef.current) {
-              clearTimeout(loadAllOverlayTimerRef.current);
-              loadAllOverlayTimerRef.current = null;
-            }
-            setShowLoadAllOverlay(false);
-          }
-          return false;
-        }
-
-        setVisibleMessageCount((prev) => prev + SESSION_MESSAGES_PAGE_SIZE);
         if (!slot.hasMore) {
           allMessagesLoadedRef.current = true;
           setAllMessagesLoaded(true);
-          if (loadAllOverlayTimerRef.current) {
-            clearTimeout(loadAllOverlayTimerRef.current);
-            loadAllOverlayTimerRef.current = null;
-          }
-          setShowLoadAllOverlay(false);
         }
-        return true;
+        return prependedCount > 0;
       } finally {
         isLoadingMoreRef.current = false;
       }
@@ -406,66 +371,51 @@ export function useChatSessionState({
     [hasMoreMessages, isActive, isLoadingMoreMessages, selectedProject, selectedSession, sessionStore],
   );
 
-  const scrollContentRef = useRef<HTMLDivElement>(null);
+  /**
+   * The rows the transcript actually renders. Grouping lives here rather than
+   * in the pane because the virtualizer addresses rows by index — the row
+   * count and every index (search jumps, sticking to the tail) must come from
+   * the same list the pane renders.
+   */
+  const transcriptItems = useMemo(
+    () => groupConsecutiveTools(chatMessages, showThinking),
+    [chatMessages, showThinking],
+  );
+
+  /**
+   * Bumps whenever the tail grows, including while the last row is still
+   * streaming and the row count is unchanged.
+   */
+  const tailSignal = useMemo(() => {
+    const lastMessage = chatMessages[chatMessages.length - 1];
+    return chatMessages.length * 1e6 + (lastMessage?.content?.length ?? 0);
+  }, [chatMessages]);
 
   const {
-    scrollContainerRef,
+    scrollRef,
+    virtualizerRef,
     isUserScrolledUp,
-    setIsUserScrolledUp,
-    isPinnedToBottomRef,
-    isNearBottom,
-    scrollToBottom,
-    notifyPaneMounted,
-    notifyContentMutating,
-    stickToBottomSettled,
-    revealMessageRow,
-  } = useChatScrollController({
+    shiftOnPrepend,
+    handleScroll,
+    stickToBottom,
+    scrollToRow,
+  } = useTranscriptViewport({
     isActive,
     hasMoreMessages,
-    isLoadingMore: isLoadingMoreMessages || isLoadingAllMessages,
     allMessagesLoaded,
-    isLoadingSessionMessages,
-    messageCount: chatMessages.length,
-    searchScrollActiveRef,
-    pendingInitialScrollRef,
-    scrollContentRef,
+    tailSignal,
+    rowCount: transcriptItems.length,
     onLoadOlder: loadOlderMessages,
-    onNearTop: (nearTop) => {
-      if (nearTop && hasMoreMessages && !allMessagesLoadedRef.current) {
-        if (!loadAllOverlayShownRef.current) {
-          loadAllOverlayShownRef.current = true;
-          if (loadAllOverlayTimerRef.current) clearTimeout(loadAllOverlayTimerRef.current);
-
-          setShowLoadAllOverlay(true);
-          loadAllOverlayTimerRef.current = setTimeout(() => {
-            setShowLoadAllOverlay(false);
-            loadAllOverlayTimerRef.current = null;
-          }, 2500);
-        }
-      } else if (!nearTop) {
-        loadAllOverlayShownRef.current = false;
-      }
-    },
+    resetSignal: viewportResetSignal,
   });
 
-  const scrollToBottomAndReset = useCallback(() => {
-    scrollToBottom();
-    if (allMessagesLoaded) {
-      setVisibleMessageCount(INITIAL_VISIBLE_MESSAGES);
-      setAllMessagesLoaded(false);
-      allMessagesLoadedRef.current = false;
-    }
-  }, [allMessagesLoaded, scrollToBottom]);
-
-  // Reset scroll/pagination state on session change
+  // Reset scroll state on session change. A search jump owns the viewport, so
+  // it must not be overridden by the initial bottom stick.
   useEffect(() => {
     if (!searchScrollActiveRef.current) {
-      pendingInitialScrollRef.current = true;
-      setVisibleMessageCount(INITIAL_VISIBLE_MESSAGES);
+      setViewportResetSignal((signal) => signal + 1);
     }
-    loadAllOverlayShownRef.current = false;
-    setIsUserScrolledUp(false);
-  }, [selectedProject?.projectId, selectedSession?.id, setIsUserScrolledUp]);
+  }, [selectedProject?.projectId, selectedSession?.id]);
 
 
   // Session replay/subscription remains active regardless of which main tab is
@@ -531,16 +481,12 @@ export function useChatSessionState({
     // in-flight prefix of a run still streaming in another session.
     setHasMoreMessages(false);
     setTotalMessages(0);
-    setVisibleMessageCount(INITIAL_VISIBLE_MESSAGES);
     setAllMessagesLoaded(false);
     allMessagesLoadedRef.current = false;
     setIsLoadingAllMessages(false);
-    setLoadAllJustFinished(false);
-    setShowLoadAllOverlay(false);
     setViewHiddenCount(0);
-    loadAllOverlayShownRef.current = false;
-    if (loadAllOverlayTimerRef.current) clearTimeout(loadAllOverlayTimerRef.current);
-    if (loadAllFinishedTimerRef.current) clearTimeout(loadAllFinishedTimerRef.current);
+    setHighlightedItemIndex(null);
+    setViewportResetSignal((signal) => signal + 1);
 
     if (sessionChanged) {
       setTokenBudget(null);
@@ -598,12 +544,9 @@ export function useChatSessionState({
       try {
         // Skip store refresh during active streaming
         if (!isProcessing) {
-          const shouldStickToBottom = isActiveRef.current && isNearBottom();
+          // Sticking is the viewport's default while pinned; a refresh that
+          // replaces the tail needs no separate scroll choreography.
           await requestLatestMessages(selectedSession.id);
-
-          if (shouldStickToBottom) {
-            stickToBottomSettled();
-          }
         }
       } catch (error) {
         console.error('Error reloading messages from external update:', error);
@@ -613,9 +556,7 @@ export function useChatSessionState({
     reloadExternalMessages();
   }, [
     externalMessageUpdate,
-    isNearBottom,
     requestLatestMessages,
-    stickToBottomSettled,
     selectedProject,
     selectedSession,
     isProcessing,
@@ -678,7 +619,8 @@ export function useChatSessionState({
         return;
       }
       const messages = normalizedToChatMessages(sessionStore.getMessages(sessionId));
-      const targetIndex = findSearchTargetIndex(messages, target);
+      const items = groupConsecutiveTools(messages, showThinking);
+      const targetIndex = findSearchTargetIndex(items, target);
       if (targetIndex < 0) {
         // A miss is knowable from the data: decline instead of the old
         // retry loop that eventually gave up silently.
@@ -686,16 +628,13 @@ export function useChatSessionState({
         return;
       }
 
-      setVisibleMessageCount(
-        resolveSearchWindowSize(messages.length, targetIndex, SEARCH_JUMP_TRAILING_CONTEXT),
-      );
-
-      // The reveal (row lookup, double center, flash) is scroll mechanics —
-      // the scroll controller owns it; the jump releases the viewport when
-      // the reveal settles.
-      revealMessageRow(messages[targetIndex], () => {
-        searchScrollActiveRef.current = false;
-      });
+      // The whole reveal is one index-addressed scroll: the virtualizer mounts
+      // and measures whatever rows that offset needs. No DOM lookup, no
+      // double-centering pass, no settle delay.
+      scrollToRow(targetIndex);
+      setHighlightedItemIndex(targetIndex);
+      searchScrollActiveRef.current = false;
+      window.setTimeout(() => setHighlightedItemIndex(null), SEARCH_HIGHLIGHT_DURATION_MS);
     };
 
     scrollToTarget();
@@ -760,25 +699,12 @@ export function useChatSessionState({
     }
   }, [isProcessing, activeSessionId, refreshTokenUsage]);
 
-  // When new messages or steps are appended at the bottom while the user is scrolled up reading history,
-  // expand visibleMessageCount by the appended delta so that older messages at the top are NEVER evicted/shifted!
-  const previousMessagesLengthRef = useRef(chatMessages.length);
-  useEffect(() => {
-    const diff = chatMessages.length - previousMessagesLengthRef.current;
-    previousMessagesLengthRef.current = chatMessages.length;
-    if (diff > 0 && isUserScrolledUp && !isLoadingMoreRef.current) {
-      setVisibleMessageCount((prev) => expandVisibleCount(prev, diff));
-    }
-  }, [chatMessages.length, isUserScrolledUp]);
-
-  const visibleMessages = useMemo(
-    () => sliceVisibleMessages(chatMessages, visibleMessageCount),
-    [chatMessages, visibleMessageCount],
-  );
-
-  // "Load all" overlay visibility is driven by scroll-to-top in handleScroll;
-  // timers are cleared on session change via the reset effect above.
-
+  /**
+   * Hydrates the entire transcript in one request. Only the search jump needs
+   * this now: with rows virtualized, holding the whole history costs memory in
+   * the store but nothing in the DOM, so there is no user-facing "load all"
+   * affordance to drive it any more.
+   */
   const loadAllMessages = useCallback(async () => {
     if (!isActive) return;
     if (!selectedSession || !selectedProject) return;
@@ -787,11 +713,6 @@ export function useChatSessionState({
     allMessagesLoadedRef.current = true;
     isLoadingMoreRef.current = true;
     setIsLoadingAllMessages(true);
-    setShowLoadAllOverlay(true);
-    if (loadAllOverlayTimerRef.current) {
-      clearTimeout(loadAllOverlayTimerRef.current);
-      loadAllOverlayTimerRef.current = null;
-    }
 
     try {
       const slot = await sessionStore.fetchFromServer(requestSessionId, {
@@ -806,37 +727,19 @@ export function useChatSessionState({
       if (currentSessionId !== requestSessionId) return;
 
       if (slot) {
-        notifyContentMutating();
-
         syncPaginationFromSlot(slot);
-        setVisibleMessageCount(Infinity);
         setAllMessagesLoaded(true);
-
-        setLoadAllJustFinished(true);
-        if (loadAllFinishedTimerRef.current) clearTimeout(loadAllFinishedTimerRef.current);
-        loadAllFinishedTimerRef.current = setTimeout(() => {
-          setLoadAllJustFinished(false);
-          setShowLoadAllOverlay(false);
-          loadAllFinishedTimerRef.current = null;
-        }, 2500);
       } else {
         allMessagesLoadedRef.current = false;
-        setShowLoadAllOverlay(false);
       }
     } catch (error) {
       console.error('Error loading all messages:', error);
       allMessagesLoadedRef.current = false;
-      setShowLoadAllOverlay(false);
     } finally {
       isLoadingMoreRef.current = false;
       setIsLoadingAllMessages(false);
     }
-  }, [currentSessionId, isActive, isLoadingAllMessages, notifyContentMutating, selectedProject, selectedSession, sessionStore]);
-
-  const loadEarlierMessages = useCallback(() => {
-    notifyContentMutating();
-    setVisibleMessageCount((prev) => prev + 100);
-  }, [notifyContentMutating]);
+  }, [currentSessionId, isActive, isLoadingAllMessages, selectedProject, selectedSession, sessionStore]);
 
   return {
     chatMessages,
@@ -855,21 +758,17 @@ export function useChatSessionState({
     tokenBudget,
     setTokenBudget,
     refreshTokenUsage,
-    visibleMessageCount,
-    visibleMessages,
-    loadEarlierMessages,
+    transcriptItems,
+    highlightedItemIndex,
     loadAllMessages,
     allMessagesLoaded,
     isLoadingAllMessages,
-    loadAllJustFinished,
-    showLoadAllOverlay,
     createDiff,
-    scrollContainerRef,
-    scrollContentRef,
-    stickToBottomSettled,
-    scrollToBottomAndReset,
-    isNearBottom,
-    notifyPaneMounted,
+    scrollRef,
+    virtualizerRef,
+    shiftOnPrepend,
+    handleScroll,
+    stickToBottom,
     requestLatestMessages,
   };
 }

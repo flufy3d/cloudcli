@@ -9,13 +9,17 @@ import { describe, expect, it } from 'vitest';
  *
  * `content-visibility: auto` on `.chat-message` rows made off-screen rows
  * flip between their `contain-intrinsic-size` estimate and real height at
- * the browser's render-band edge; every flip forced native scroll anchoring
- * to compensate, flipping more rows — a self-sustaining geometry oscillation
- * users saw as flicker/jump while scrolling up (re-introduced twice via
- * upstream merges). Off-screen skipping is LazyMessageRow's job, whose
- * placeholders reuse measured heights and keep geometry stable. This test
- * exists because no unit seam can exercise a real layout engine; the
- * end-to-end guard is scripts/perf/chat-scroll-up-stability.mjs.
+ * the browser's render-band edge; every flip forced scroll compensation,
+ * flipping more rows — a self-sustaining geometry oscillation users saw as
+ * flicker/jump while scrolling up (re-introduced twice via upstream merges).
+ *
+ * Off-screen skipping now belongs to the virtualizer, which measures each row
+ * it mounts and adjusts the scroll offset by exactly that measurement. A row
+ * that ALSO resizes itself underneath the browser's own heuristic would feed
+ * it heights it did not cause, so the rule stands for the same reason under a
+ * different owner. This test exists because no unit seam can exercise a real
+ * layout engine; the end-to-end guard is
+ * scripts/perf/chat-scroll-up-stability.mjs.
  */
 describe('transcript row CSS', () => {
   const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../../../src/index.css'), 'utf8');

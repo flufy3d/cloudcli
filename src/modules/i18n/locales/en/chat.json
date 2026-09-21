@@ -196,13 +196,6 @@
       "sessionMessages": "Loading session messages..."
     },
     "messages": {
-      "showingOf": "Showing {{shown}} of {{total}} messages",
-      "scrollToLoad": "Scroll up to load more",
-      "showingLast": "Showing last {{count}} messages ({{total}} total)",
-      "loadEarlier": "Load earlier messages",
-      "loadAll": "Load all messages",
-      "loadingAll": "Loading all messages...",
-      "allLoaded": "All messages loaded",
       "perfWarning": "All messages loaded — scrolling may be slower. Click \"Scroll to bottom\" to restore performance."
     }
   },
@@ -415,5 +408,9 @@
     "tokensLabel_other": "tokens",
     "escClosesModal": "Esc closes the modal.",
     "close": "Close"
+  },
+  "localProxy": {
+    "linkHint": "This address only exists on the server; CloudCLI opens it through its local proxy.",
+    "failed": "CloudCLI could not open this server-local address."
   }
 }

@@ -17,6 +17,7 @@ import type { NormalizedMessage, ServerEvent } from '@/shared/types';
 import type { SessionHistoryPage, SessionPageFetcher } from '@/modules/chat/utils/sessionTimelineStore';
 import { SessionTimelineStore } from '@/modules/chat/utils/sessionTimelineStore';
 import type { SessionMessagesRequestOptions } from '@/modules/chat/utils/sessionMessagePagination';
+import { SESSION_MESSAGES_PAGE_SIZE } from '@/modules/chat/utils/sessionMessagePagination';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -78,12 +79,12 @@ afterEach(() => {
 test('an identical latest refresh bails out and keeps every cached identity when nothing is prunable', async () => {
   const page = { messages: [msg(1), msg(2)], total: 2, hasMore: false };
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page },
-    { params: { limit: 20, offset: 0 }, page: { messages: [msg(1), msg(2)], total: 2, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [msg(1), msg(2)], total: 2, hasMore: false } },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emit(store, {
     kind: 'tool_use',
     id: 'rt-tool-live',
@@ -107,12 +108,12 @@ test('an identical latest refresh bails out and keeps every cached identity when
 
 test('a delayed replay row is pruned by an otherwise identical refresh', async () => {
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page: { messages: [msg(1), msg(2)], total: 2, hasMore: false } },
-    { params: { limit: 20, offset: 0 }, page: { messages: [msg(1), msg(2)], total: 2, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [msg(1), msg(2)], total: 2, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [msg(1), msg(2)], total: 2, hasMore: false } },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   store.appendRealtime(SESSION_ID, msg(2));
 
   const result = await store.refreshLatestFromServer(SESSION_ID);
@@ -126,14 +127,14 @@ test('a delayed replay row is pruned by an otherwise identical refresh', async (
 
 test('a drifting offset during fetchMore realigns from the tail, then retries with the realigned offset', async () => {
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page: { messages: [msg(3), msg(4)], total: 6, hasMore: true } },
-    { params: { limit: 20, offset: 2 }, page: { messages: [msg(2)], total: 7, hasMore: true } },
-    { params: { limit: 20, offset: 0 }, page: { messages: [msg(3), msg(4), msg(5)], total: 7, hasMore: true } },
-    { params: { limit: 20, offset: 3 }, page: { messages: [msg(2)], total: 7, hasMore: true } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [msg(3), msg(4)], total: 6, hasMore: true } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 2 }, page: { messages: [msg(2)], total: 7, hasMore: true } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [msg(3), msg(4), msg(5)], total: 7, hasMore: true } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 3 }, page: { messages: [msg(2)], total: 7, hasMore: true } },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   const outcome = await store.fetchMore(SESSION_ID);
 
   assert.equal(outcome.prependedCount, 1);
@@ -162,7 +163,7 @@ test('an older-page read waits behind an in-flight latest refresh before calcula
   const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
 
   // Prime the slot: [m3, m4] of a six-row transcript.
-  const initial = store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  const initial = store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   await flushMicrotasks();
   assert.equal(resolvers.length, 1);
   resolvers[0]({ messages: [msg(3), msg(4)], total: 6, hasMore: true });
@@ -218,7 +219,9 @@ test('a streaming row anchors its timestamp at segment start and finalizes in pl
 
   const finalized = store.getMessages(SESSION_ID).find((row) => row.content === 'Hello');
   assert.ok(finalized);
-  assert.match(finalized!.id, /^text_/);
+  // A streamed segment with no engine row yet is held under a placeholder id;
+  // the engine's own row takes its place when it arrives.
+  assert.match(finalized!.id, /^__streamed_/);
   assert.equal(finalized!.timestamp, anchoredTimestamp);
   assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, realtimeCountBefore,
     'finalization replaces the streaming row in place');
@@ -244,17 +247,17 @@ test('a persisted Antigravity row replaces its keyed stream even after a newer u
   const newerUser = msg(3, { provider: 'antigravity', content: 'continue with the implementation' });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser, persistedReply, newerUser], total: 3, hasMore: false },
     },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -285,21 +288,21 @@ test('a keyed Antigravity stream survives an empty first refresh and is pruned w
   });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser, newerUser], total: 2, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser, persistedReply, newerUser], total: 3, hasMore: false },
     },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -311,7 +314,7 @@ test('a keyed Antigravity stream survives an empty first refresh and is pruned w
   await store.refreshLatestFromServer(SESSION_ID);
   let matchingRows = store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent);
   assert.equal(matchingRows.length, 1);
-  assert.match(matchingRows[0].id, /^text_/);
+  assert.match(matchingRows[0].id, /^__streamed_/);
   assert.equal(matchingRows[0].providerRowKey, providerRowKey);
 
   await store.refreshLatestFromServer(SESSION_ID);
@@ -331,17 +334,17 @@ test('a complete keyed history row owns its realtime counterpart regardless of b
   });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
     },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -367,11 +370,11 @@ test('a keyed history prefix yields to the complete Antigravity stream', async (
   const initialUser = msg(1, { provider: 'antigravity', content: 'write the complete plan' });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [initialUser, msg(2, {
           id: 'msg_session_7',
@@ -387,7 +390,7 @@ test('a keyed history prefix yields to the complete Antigravity stream', async (
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -414,11 +417,11 @@ test('a near-identical keyed Antigravity history row yields to richer markdown-f
   const initialUser = msg(1, { provider: 'antigravity', content: '解释 Canvas 和 DOM 的分工' });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [initialUser, msg(2, {
           id: 'msg_session_7b',
@@ -434,7 +437,7 @@ test('a near-identical keyed Antigravity history row yields to richer markdown-f
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -461,11 +464,11 @@ test('a unique provider row key treats changed wording as the same persisted row
   const initialUser = msg(1, { provider: 'antigravity', content: '确认离线模式是否可用' });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [initialUser, msg(2, {
           id: 'msg_session_7c',
@@ -480,7 +483,7 @@ test('a unique provider row key treats changed wording as the same persisted row
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -508,11 +511,11 @@ test('a partial Antigravity stream suffix yields to the complete persisted histo
   const initialUser = msg(1, { provider: 'antigravity', content: '解释去重机制' });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [initialUser, msg(2, {
           id: 'msg_session_7d',
@@ -527,7 +530,7 @@ test('a partial Antigravity stream suffix yields to the complete persisted histo
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -577,11 +580,11 @@ test('a keyed Antigravity stream suffix with pangu spacing and missing markdown 
   const initialUser = msg(1, { provider: 'antigravity', content: '分析原因' });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [initialUser, msg(2, {
           id: 'msg_session_7e',
@@ -596,7 +599,7 @@ test('a keyed Antigravity stream suffix with pangu spacing and missing markdown 
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -626,17 +629,17 @@ test('different provider row keys preserve identical Antigravity text as distinc
   });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
     },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -671,11 +674,11 @@ test('a duplicated persisted provider row key does not discard any candidate by 
   });
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: { messages: [initialUser], total: 1, hasMore: false },
     },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [initialUser, firstPersistedReply, secondPersistedReply],
         total: 3,
@@ -685,7 +688,7 @@ test('a duplicated persisted provider row key does not discard any candidate by 
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
   emitAntigravity(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
@@ -769,7 +772,7 @@ test('crossing between unkeyed stdout and keyed Antigravity text closes each str
 test('optimistic user, thinking, and same-turn assistant echoes are absorbed into the merged view', async () => {
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [
           msg(1, { content: 'what is the answer?' }),
@@ -783,19 +786,19 @@ test('optimistic user, thinking, and same-turn assistant echoes are absorbed int
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
-
   const at = (n: number) => new Date(BASE_TIME + n * 1000).toISOString();
   // Sent before this page existed, which is the only order reality produces:
-  // a prompt is not on disk until it has been sent. The stamp is what the
-  // store records at send time.
+  // a prompt is not on disk until it has been sent. The store records the
+  // transcript's last row at that moment — here, nothing at all.
   store.appendRealtime(SESSION_ID,
     msg(1, {
       id: 'local_user_echo',
       content: 'what is the answer?',
       timestamp: at(1),
-      replacesAfterRowCount: 0,
     }));
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+
   store.appendRealtime(SESSION_ID, {
     id: 'rt_thinking_echo',
     sessionId: SESSION_ID,
@@ -804,8 +807,11 @@ test('optimistic user, thinking, and same-turn assistant echoes are absorbed int
     timestamp: at(2),
     provider: 'claude',
   } as NormalizedMessage);
+  // The live reply arrives under the engine's own id — the same id the
+  // persisted row carries — so recognising it as the same row is a lookup,
+  // not a comparison of what it says.
   store.appendRealtime(SESSION_ID, {
-    id: 'text_streamed_echo',
+    id: 'm4',
     sessionId: SESSION_ID,
     kind: 'text',
     role: 'assistant',
@@ -840,10 +846,12 @@ test('a live provider echo merges into its optimistic user row before history re
   }));
   emit(store, providerEcho);
 
+  // The echo takes the stand-in's place, so the prompt carries the engine's
+  // own identity — and its edit/fork anchor — before any refresh.
   let userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
   assert.deepEqual(
     userRows.map((row) => ({ id: row.id, transcriptAnchorId: row.transcriptAnchorId })),
-    [{ id: 'local_prompt', transcriptAnchorId: 'claude-user-uuid' }],
+    [{ id: 'claude-user-uuid', transcriptAnchorId: 'claude-user-uuid' }],
   );
 
   await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
@@ -854,7 +862,7 @@ test('a live provider echo merges into its optimistic user row before history re
 test('a live assistant reply cannot overtake the optimistic user row when clocks disagree', async () => {
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [msg(2, { content: 'answer from an earlier turn' })],
         total: 1,
@@ -864,7 +872,7 @@ test('a live assistant reply cannot overtake the optimistic user row when clocks
   ]);
   const store = new SessionTimelineStore({ fetchPage });
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   // The browser clock is ahead of the server clock, but append order still
   // captures causality: the question was sent before its reply arrived.
@@ -903,13 +911,13 @@ test('the resume seq keeps the maximum observed value per session', () => {
 test('notify fires only for the active session', async () => {
   const notified: string[] = [];
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page: { messages: [msg(1)], total: 1, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [msg(1)], total: 1, hasMore: false } },
   ]);
   const store = new SessionTimelineStore({ fetchPage, notify: (sid) => notified.push(sid) });
   store.setActiveSession(SESSION_ID);
 
   store.appendRealtime('sess-background', msg(1, { sessionId: 'sess-background' }));
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   // Background writes never notify; active-session writes do.
   assert.deepEqual(notified.filter((sid) => sid === 'sess-background'), []);
@@ -942,12 +950,12 @@ const persistedWriteCard = (toolId: string): NormalizedMessage => ({
 
 test('a live card whose call is not persisted yet survives the refresh', async () => {
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page: { messages: [msg(1)], total: 1, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [msg(1)], total: 1, hasMore: false } },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
   emit(store, liveWriteCard('live_zcode_1'));
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   const merged = store.getMessages(SESSION_ID);
   assert.equal(merged.filter((message) => message.kind === 'tool_use').length, 1);
@@ -957,7 +965,7 @@ test('a live card whose call is not persisted yet survives the refresh', async (
 test('tool cards without a provable user turn remain visible rather than cross-turn claiming', async () => {
   const fetchPage = scriptedFetcher([
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [persistedWriteCard('msg_1_part_2'), persistedWriteCard('msg_3_part_4')],
         total: 2,
@@ -969,7 +977,7 @@ test('tool cards without a provable user turn remain visible rather than cross-t
   emit(store, liveWriteCard('live_zcode_1'));
   emit(store, liveWriteCard('live_zcode_2'));
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   const toolCards = store.getMessages(SESSION_ID).filter((message) => message.kind === 'tool_use');
   assert.equal(toolCards.length, 4, 'unanchored calls stay visible');
@@ -1017,7 +1025,7 @@ test('a repeated local user prompt cannot prove a stale server turn for tool rec
   const staleServerUser = msg(1, { id: 'server-old-user', content: '继续', role: 'user' });
   const staleServerTool = persistedWriteCard('server-old-tool');
   const fetchPage = scriptedFetcher([{
-    params: { limit: 20, offset: 0 },
+    params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
     page: { messages: [staleServerUser, staleServerTool], total: 2, hasMore: false },
   }]);
   const store = new SessionTimelineStore({ fetchPage });
@@ -1025,7 +1033,7 @@ test('a repeated local user prompt cannot prove a stale server turn for tool rec
 
   store.appendRealtime(SESSION_ID, currentLocalUser);
   store.appendRealtime(SESSION_ID, liveWriteCard('live-current-tool'));
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   const toolCards = store.getMessages(SESSION_ID).filter((message) => message.kind === 'tool_use');
   assert.deepEqual(
@@ -1042,7 +1050,7 @@ test('an Edit for the same path in a later user turn cannot claim an earlier per
   firstEdit.toolInput = { file_path: '/a.ts', content: 'first change' };
   secondEdit.toolInput = { file_path: '/a.ts', content: 'second change' };
   const fetchPage = scriptedFetcher([{
-    params: { limit: 20, offset: 0 },
+    params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
     page: { messages: [firstUser, firstEdit, secondUser, secondEdit], total: 4, hasMore: false },
   }]);
   const store = new SessionTimelineStore({ fetchPage });
@@ -1051,7 +1059,7 @@ test('an Edit for the same path in a later user turn cannot claim an earlier per
   emit(store, secondUser);
   emit(store, liveWriteCard('live-second-edit'));
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   assert.ok(store.getMessages(SESSION_ID).some((message) => message.id === 'rt-live-second-edit'));
 });
@@ -1249,14 +1257,14 @@ test('a wholesale session reload keeps a genuinely pending repeated prompt', asy
   const reply = msg(2, { id: 'srv-reply', content: 'done' });
   const page = { messages: [earlier, reply], total: 2, hasMore: false };
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page },
-    { params: { limit: 20, offset: 0 }, page: { ...page, messages: [earlier, reply] } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { ...page, messages: [earlier, reply] } },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   store.appendRealtime(SESSION_ID, msg(3, { id: 'local_repeat', content: 'continue' }));
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   assert.deepEqual(
     store.getMessages(SESSION_ID).filter((row) => row.role === 'user').map((row) => row.id),
@@ -1284,11 +1292,11 @@ test('an older page prepended after sending does not strand the optimistic promp
   };
 
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page: { messages: [newest], total: 2, hasMore: true } },
-    { params: { limit: 20, offset: 1 }, page: { messages: [older], total: 2, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: [newest], total: 2, hasMore: true } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 1 }, page: { messages: [older], total: 2, hasMore: false } },
   ]);
   const store = new SessionTimelineStore({ fetchPage });
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   // Sent when one row was on screen.
   store.appendRealtime(SESSION_ID, {
@@ -1296,15 +1304,21 @@ test('an older page prepended after sending does not strand the optimistic promp
     provider: 'claude', kind: 'text', role: 'user', content: 'continue',
   });
   assert.equal(
-    store.getSessionSlot(SESSION_ID)?.realtimeMessages.find((row) => row.id === 'local_repeat')?.replacesAfterRowCount,
-    1,
+    store.getSessionSlot(SESSION_ID)?.pendingPrompts.get('local_repeat')?.afterRowId,
+    'srv-new',
+    'the prompt anchors on the row the transcript ended with when it was sent',
   );
 
-  await store.fetchMore(SESSION_ID, { limit: 20 });
+  await store.fetchMore(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE });
 
-  const stamp = store.getSessionSlot(SESSION_ID)
-    ?.realtimeMessages.find((row) => row.id === 'local_repeat')?.replacesAfterRowCount;
-  assert.equal(stamp, 2, 'the stamp must shift by the number of rows prepended');
+  // The anchor is an id, so prepending an older page above it changes
+  // nothing. The row-count stamp this replaced had to be rewritten on every
+  // such page, and a wholesale refresh left it pointing past the prompt's own
+  // copy — after which the prompt could never retire at all.
+  assert.equal(
+    store.getSessionSlot(SESSION_ID)?.pendingPrompts.get('local_repeat')?.afterRowId,
+    'srv-new',
+  );
 
   const userRows = store.getMessages(SESSION_ID).filter((row) => row.role === 'user');
   assert.equal(userRows.length, 2, 'the sent prompt must not be retired by the older identical one');
@@ -1321,10 +1335,10 @@ test('returning to a tool-heavy tail does not resurrect retired user echoes', as
     msg(4, { id: 'server-a2', content: 'a2' }),
   ];
   const fetchPage = scriptedFetcher([
-    { params: { limit: 20, offset: 0 }, page: { messages: turn1, total: 2, hasMore: false } },
-    { params: { limit: 20, offset: 0 }, page: { messages: turn2, total: 4, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: turn1, total: 2, hasMore: false } },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: { messages: turn2, total: 4, hasMore: false } },
     {
-      params: { limit: 20, offset: 0 },
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
       page: {
         messages: [msg(6, { id: 'tail-tool', kind: 'tool_use', role: undefined, content: '' })],
         total: 6,
@@ -1335,9 +1349,9 @@ test('returning to a tool-heavy tail does not resurrect retired user echoes', as
   const store = new SessionTimelineStore({ fetchPage });
 
   store.appendRealtime(SESSION_ID, msg(1, { id: 'local_u1', content: 'u1' }));
-  await store.refreshLatestFromServer(SESSION_ID, { limit: 20 });
+  await store.refreshLatestFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE });
   store.appendRealtime(SESSION_ID, msg(3, { id: 'local_u2', content: 'u2' }));
-  await store.refreshLatestFromServer(SESSION_ID, { limit: 20 });
+  await store.refreshLatestFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE });
   store.appendRealtime(SESSION_ID, msg(5, { id: 'local_u3', content: 'u3' }));
 
   assert.deepEqual(
@@ -1346,7 +1360,7 @@ test('returning to a tool-heavy tail does not resurrect retired user echoes', as
     'precondition: two persisted turns precede the current pending prompt',
   );
 
-  await store.fetchFromServer(SESSION_ID, { limit: 20, offset: 0 });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
 
   assert.deepEqual(
     store.getMessages(SESSION_ID).filter((row) => row.role === 'user').map((row) => row.id),
@@ -1358,9 +1372,8 @@ test('returning to a tool-heavy tail does not resurrect retired user echoes', as
 /**
  * A user row can reach the live stream without ever having been an optimistic
  * prompt: a second tab (or phone) sent it, or the engine echoed it back on a
- * resume. Retirement keys off the `local_` prefix, so such a row was retained
- * forever and rendered beside its own persisted copy — the prompt appeared
- * twice, and a reload did not clear it.
+ * resume. It arrives under the engine's own id, the same id the transcript
+ * will hold, so the refresh recognises it without looking at what it says.
  */
 test('a user row that never was an optimistic prompt is pruned once the transcript holds it', async () => {
   const store = new SessionTimelineStore({
@@ -1374,7 +1387,7 @@ test('a user row that never was an optimistic prompt is pruned once the transcri
     }),
   });
 
-  store.appendRealtime(SESSION_ID, msg(1, { id: 'live_user', content: 'ship it' }));
+  store.appendRealtime(SESSION_ID, msg(1, { id: 'srv_user', content: 'ship it' }));
   await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
 
   const prompts = store.getMessages(SESSION_ID).filter(
@@ -1383,8 +1396,8 @@ test('a user row that never was an optimistic prompt is pruned once the transcri
   assert.equal(prompts.length, 1, 'the prompt must not render as both a live copy and a persisted one');
 });
 
-/** Two genuinely distinct sends of the same text must both survive: the claim
- * is one-to-one, so the second live row keeps its own persisted counterpart. */
+/** Two genuinely distinct sends of the same text must both survive: they are
+ * two engine rows with two ids, and nothing collapses rows by content. */
 test('repeated identical prompts each keep exactly one row', async () => {
   const store = new SessionTimelineStore({
     fetchPage: async () => ({
@@ -1397,12 +1410,76 @@ test('repeated identical prompts each keep exactly one row', async () => {
     }),
   });
 
-  store.appendRealtime(SESSION_ID, msg(1, { id: 'live_a', content: 'again' }));
-  store.appendRealtime(SESSION_ID, msg(3, { id: 'live_b', content: 'again' }));
+  store.appendRealtime(SESSION_ID, msg(1, { id: 'srv_a', content: 'again' }));
+  store.appendRealtime(SESSION_ID, msg(3, { id: 'srv_b', content: 'again' }));
   await store.refreshLatestFromServer(SESSION_ID, { limit: 50 });
 
   const prompts = store.getMessages(SESSION_ID).filter(
     (row) => row.kind === 'text' && row.role === 'user' && row.content === 'again',
   );
   assert.equal(prompts.length, 2, 'two real sends must not collapse into one');
+});
+
+/**
+ * The reported failure, end to end.
+ *
+ * The user sends a prompt, then switches away and back (or the search jump
+ * or load-all path runs), which reloads the whole window. That page already
+ * contains the engine's copy of the prompt, because the engine persisted it
+ * the moment it arrived. The send-time stamp used to be rewritten to the end
+ * of that page on every wholesale load, which put the prompt's own copy
+ * *before* the first row it was allowed to pair with — so it never paired,
+ * and the prompt stayed on screen beside its persisted copy until the page
+ * was reloaded. A second refresh could not fix it either: the stamp was
+ * rewritten to the new end each time.
+ */
+test('a full reload that already holds the prompt still retires it', async () => {
+  const page = {
+    messages: [
+      msg(1, { id: 'srv-old-user', content: 'earlier question' }),
+      msg(2, { id: 'srv-old-reply', content: 'earlier answer', role: 'assistant' }),
+    ],
+    total: 2,
+    hasMore: false,
+  };
+  const pageWithPrompt = {
+    messages: [
+      ...page.messages,
+      msg(3, { id: 'srv-prompt', content: 'fix it' }),
+      msg(4, { id: 'srv-reply', content: 'fixing', role: 'assistant' }),
+    ],
+    total: 4,
+    hasMore: false,
+  };
+  const fetchPage = scriptedFetcher([
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: pageWithPrompt },
+    { params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 }, page: pageWithPrompt },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  store.appendRealtime(SESSION_ID, msg(5, { id: 'local_fix', content: 'fix it' }));
+
+  // Switching to another tab and back reloads the whole window, and by then
+  // the engine has written the prompt.
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+
+  const prompts = store.getMessages(SESSION_ID).filter(
+    (row) => row.kind === 'text' && row.role === 'user' && row.content === 'fix it',
+  );
+  assert.deepEqual(
+    prompts.map((row) => row.id),
+    ['srv-prompt'],
+    'the prompt must render once, as its persisted copy',
+  );
+
+  // And it stays retired across further reloads.
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  assert.equal(
+    store.getMessages(SESSION_ID).filter(
+      (row) => row.kind === 'text' && row.role === 'user' && row.content === 'fix it',
+    ).length,
+    1,
+  );
 });

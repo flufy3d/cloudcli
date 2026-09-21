@@ -97,6 +97,12 @@ export class ChatSessionWriter {
       );
       return;
     }
+    if (checked.contractViolations.length > 0) {
+      console.error(
+        `[ChatSessionWriter] ${this.options.provider} broke the row-identity contract: `
+        + `${checked.contractViolations.join('; ')}.`,
+      );
+    }
     if (checked.strippedKeys.length > 0) {
       console.error(
         `[ChatSessionWriter] ${this.options.provider} emitted fields the wire contract does not declare, `

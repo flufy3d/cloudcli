@@ -1,6 +1,6 @@
 {
   "name": "cloudcli",
-  "version": "2.4.3",
+  "version": "2.5.0",
   "productName": "CloudCLI",
   "description": "A web-based UI for Claude Code CLI",
   "type": "module",
@@ -204,6 +204,7 @@
     "remark-math": "^6.0.0",
     "tailwind-merge": "^3.3.1",
     "undici": "^7.29.1",
+    "virtua": "^0.52.3",
     "web-push": "^3.6.7",
     "ws": "^8.14.2"
   },

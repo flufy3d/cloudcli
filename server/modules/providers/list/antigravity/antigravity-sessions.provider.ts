@@ -72,6 +72,19 @@ function buildAntigravityToolId(stepIndex: number | undefined, positionInEntry: 
     : `tool_${stepIndex + 1 + positionInEntry}`;
 }
 
+/**
+ * The row id both transports must produce for one tool call.
+ *
+ * Antigravity reports a call twice — live at its own step, and in history on
+ * the planner entry one step earlier — so the step number alone names two
+ * different rows. `buildAntigravityToolId` already reconciles that into one
+ * call identity; deriving the row id from it is what lets the client see the
+ * live card and the persisted card as the same row instead of rendering both.
+ */
+function buildAntigravityToolRowId(sessionId: string | null, toolId: string): string {
+  return `msg_${sessionId ?? ''}_${toolId}`;
+}
+
 function buildAntigravityAssistantRowKey(stepIndex: number | undefined): string | undefined {
   return stepIndex === undefined ? undefined : `assistant-step:${stepIndex}`;
 }
@@ -550,7 +563,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         const toolId = buildAntigravityToolId(stepIndex, null);
 
         messages.push(createNormalizedMessage({
-          id: generateMessageId(PROVIDER),
+          id: buildAntigravityToolRowId(sessionId, toolId),
           kind: 'tool_use',
           toolName,
           toolInput: parameters,
@@ -569,7 +582,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         const isError = state === 'ERROR';
 
         messages.push(createNormalizedMessage({
-          id: generateMessageId(PROVIDER),
+          id: `${buildAntigravityToolRowId(sessionId, toolId)}_result`,
           kind: 'tool_result',
           toolId,
           content: isError ? (readToolErrorMessage(toolInfo?.error) ?? 'Tool execution error') : unwrapSystemMessageContent(output),
@@ -710,7 +723,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                 const toolId = buildAntigravityToolId(nativeStepIndex, t);
 
                 normalizedMessages.push(createNormalizedMessage({
-                  id: `${baseId}_tc_${t}`,
+                  id: buildAntigravityToolRowId(sessionId, toolId),
                   sessionId,
                   timestamp: createdAt,
                   provider: PROVIDER,

@@ -1002,6 +1002,7 @@ async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubag
 
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
+
   for await (const line of rl) {
     if (!line.trim()) {
       continue;
@@ -1453,6 +1454,32 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     splitShellFollowers.delete(callId);
   };
 
+  /**
+   * Gives every row the identity of the rollout entry it came from.
+   *
+   * Rows are pushed from dozens of branches that each end in `continue`, so
+   * the stamping happens one entry late (and once more after the loop) rather
+   * than at every push site. Without it the rows a history read produces get
+   * a fresh random id each time, and the client has nothing to match the live
+   * copy of the same row against — which is how one reply renders twice.
+   *
+   * The rollout's own `id` is preferred; `ordinal` is the append-only
+   * position the file itself records and is just as reproducible.
+   */
+  let pendingRowIdentity: { key: string; from: number } | null = null;
+  const stampPendingRowIdentity = (): void => {
+    if (!pendingRowIdentity) {
+      return;
+    }
+    const { key, from } = pendingRowIdentity;
+    for (let index = from; index < messages.length; index++) {
+      if (!messages[index].uuid) {
+        messages[index].uuid = index === from ? key : `${key}_${index - from}`;
+      }
+    }
+    pendingRowIdentity = null;
+  };
+
   for await (const line of rl) {
     if (!line.trim()) {
       continue;
@@ -1474,6 +1501,13 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     // that produce no transcript entry of their own, and each of those
     // branches ends in a `continue`.
     turns.observe(entry.type, payload);
+
+    stampPendingRowIdentity();
+    pendingRowIdentity = {
+      key: readNonEmptyString(payload.id as string | undefined)
+        ?? (typeof entry.ordinal === 'number' ? `ord_${entry.ordinal}` : `line_${messages.length}`),
+      from: messages.length,
+    };
 
     // ── event_msg ──────────────────────────────────────────────────────────
     if (entry.type === 'event_msg') {
@@ -2029,6 +2063,9 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     }
   }
 
+  // The last entry's rows have no following iteration to stamp them.
+  stampPendingRowIdentity();
+
   // Every file row needs a result or the UI shows it as still running. The
   // patch outcome is known only after `patch_apply_end` (which may never
   // arrive), so results are emitted once the whole file has been read.
@@ -2036,6 +2073,9 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     const failed = group.success === false;
     for (const row of group.rows) {
       messages.push({
+        // Named after the call it settles: these rows are produced after the
+        // file has been read, so the per-entry stamping cannot reach them.
+        uuid: `${row.toolCallId}_result`,
         type: 'tool_result',
         timestamp: group.timestamp,
         toolCallId: row.toolCallId,

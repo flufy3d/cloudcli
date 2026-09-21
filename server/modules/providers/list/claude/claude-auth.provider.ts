@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { hasKeychainItem } from '@/modules/providers/shared/credentials/macos-keychain.js';
 import { createCliInstallationProbe } from '@/modules/providers/shared/installation/cli-installation-probe.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import type { IProviderAuth } from '@/shared/interfaces.js';
@@ -21,11 +22,32 @@ const hasErrorCode = (error: unknown, code: string): boolean => (
   error instanceof Error && 'code' in error && error.code === code
 );
 
+/**
+ * The macOS login keychain item Claude Code stores its account credential in.
+ * The account attribute is left as `unknown`, so only the service is matched.
+ */
+const CLAUDE_KEYCHAIN_SERVICE = 'Claude Code-credentials';
+
+/**
+ * Injectable collaborators. Only tests pass these: a real macOS machine that
+ * is logged in would otherwise make every "not authenticated" fixture pass.
+ */
+type ClaudeProviderAuthDeps = {
+  hasKeychainCredentials?: () => boolean;
+};
+
 const installationProbe = createCliInstallationProbe({
   command: () => resolveClaudeCodeExecutablePath(process.env.CLAUDE_CLI_PATH) ?? 'claude',
 });
 
 export class ClaudeProviderAuth implements IProviderAuth {
+  private readonly hasKeychainCredentials: () => boolean;
+
+  constructor(deps: ClaudeProviderAuthDeps = {}) {
+    this.hasKeychainCredentials = deps.hasKeychainCredentials
+      ?? (() => hasKeychainItem({ service: CLAUDE_KEYCHAIN_SERVICE }));
+  }
+
   /**
    * Checks whether the Claude Code CLI is available on this host.
    */
@@ -151,20 +173,20 @@ export class ClaudeProviderAuth implements IProviderAuth {
           };
         }
 
-        return {
+        return this.keychainFallback({
           authenticated: false,
           email: null,
           method: null,
           error: 'Claude login has expired. Run claude /login again.',
-        };
+        });
       }
 
-      return {
+      return this.keychainFallback({
         authenticated: false,
         email: null,
         method: null,
         error: missingCredentialsError,
-      };
+      });
     } catch (error) {
       let errorMessage = 'Unable to read Claude credentials. Run claude /login again.';
 
@@ -174,12 +196,32 @@ export class ClaudeProviderAuth implements IProviderAuth {
         errorMessage = 'Claude credentials are unreadable. Run claude /login again.';
       }
 
-      return {
+      return this.keychainFallback({
         authenticated: false,
         email: null,
         method: null,
         error: errorMessage,
-      };
+      });
     }
+  }
+
+  /**
+   * Last resort before reporting a logged-out account: on macOS, Claude Code
+   * keeps the account credential in the login keychain and writes
+   * `~/.claude/.credentials.json` only for MCP plugin tokens, so a file with
+   * no usable `claudeAiOauth` says nothing about whether the user is signed
+   * in. Without this probe the Settings tab reported "not authenticated" for
+   * every macOS login while chats kept working, because the chat path
+   * authenticates through the CLI/SDK instead of this detection chain.
+   *
+   * The keychain item is opaque on purpose: reading the secret would raise an
+   * authorization dialog, and its account attribute is `unknown`, so email
+   * stays null.
+   */
+  private keychainFallback(fileVerdict: ClaudeCredentialsStatus): ClaudeCredentialsStatus {
+    if (this.hasKeychainCredentials()) {
+      return { authenticated: true, email: null, method: 'keychain' };
+    }
+    return fileVerdict;
   }
 }

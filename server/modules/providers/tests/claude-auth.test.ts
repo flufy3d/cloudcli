@@ -20,6 +20,11 @@ type CheckCredentialsResult = {
 const checkCredentials = (auth: ClaudeProviderAuth): Promise<CheckCredentialsResult> =>
   (auth as unknown as { checkCredentials: () => Promise<CheckCredentialsResult> }).checkCredentials();
 
+// The keychain probe is always stubbed here: on a real macOS machine that is
+// logged in, the live probe would turn every "not authenticated" fixture green.
+const authWithoutKeychain = () => new ClaudeProviderAuth({ hasKeychainCredentials: () => false });
+const authWithKeychain = () => new ClaudeProviderAuth({ hasKeychainCredentials: () => true });
+
 const ENV_KEYS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'] as const;
 
 const withEnv = async (
@@ -93,7 +98,7 @@ test('checkCredentials: CLAUDE_CODE_OAUTH_TOKEN set is authenticated via environ
     });
 
     await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'test-oauth-token' }, async () => {
-      const status = await checkCredentials(new ClaudeProviderAuth());
+      const status = await checkCredentials(authWithoutKeychain());
       assert.equal(status.authenticated, true);
       assert.equal(status.method, 'environment');
     });
@@ -108,7 +113,7 @@ test('checkCredentials: CLAUDE_CODE_OAUTH_TOKEN configured via settings.json env
     });
 
     await withEnv({}, async () => {
-      const status = await checkCredentials(new ClaudeProviderAuth());
+      const status = await checkCredentials(authWithoutKeychain());
       assert.equal(status.authenticated, true);
       assert.equal(status.method, 'environment');
     });
@@ -123,7 +128,7 @@ test('checkCredentials: no CLAUDE_CODE_OAUTH_TOKEN, valid credentials file falls
     });
 
     await withEnv({}, async () => {
-      const status = await checkCredentials(new ClaudeProviderAuth());
+      const status = await checkCredentials(authWithoutKeychain());
       assert.equal(status.authenticated, true);
       assert.equal(status.method, 'credentials_file');
       assert.equal(status.email, 'someone@example.com');
@@ -138,7 +143,7 @@ test('checkCredentials: no CLAUDE_CODE_OAUTH_TOKEN, expired credentials file rep
     });
 
     await withEnv({}, async () => {
-      const status = await checkCredentials(new ClaudeProviderAuth());
+      const status = await checkCredentials(authWithoutKeychain());
       assert.equal(status.authenticated, false);
       assert.match(status.error ?? '', /expired/i);
     });
@@ -158,7 +163,7 @@ test('checkCredentials: expired access token with a live refresh token is still 
     });
 
     await withEnv({}, async () => {
-      const status = await checkCredentials(new ClaudeProviderAuth());
+      const status = await checkCredentials(authWithoutKeychain());
       assert.equal(status.authenticated, true);
       assert.equal(status.method, 'credentials_file');
       assert.equal(status.email, 'someone@example.com');
@@ -177,7 +182,7 @@ test('checkCredentials: expired access token with a refresh token that has no re
     });
 
     await withEnv({}, async () => {
-      const status = await checkCredentials(new ClaudeProviderAuth());
+      const status = await checkCredentials(authWithoutKeychain());
       assert.equal(status.authenticated, true);
       assert.equal(status.method, 'credentials_file');
     });
@@ -196,7 +201,7 @@ test('checkCredentials: expired access token with an expired refresh token repor
     });
 
     await withEnv({}, async () => {
-      const status = await checkCredentials(new ClaudeProviderAuth());
+      const status = await checkCredentials(authWithoutKeychain());
       assert.equal(status.authenticated, false);
       assert.match(status.error ?? '', /expired/i);
     });
@@ -208,10 +213,64 @@ test('checkCredentials: ANTHROPIC_API_KEY takes precedence over CLAUDE_CODE_OAUT
     await withEnv(
       { ANTHROPIC_API_KEY: 'test-api-key', CLAUDE_CODE_OAUTH_TOKEN: 'test-oauth-token' },
       async () => {
-        const status = await checkCredentials(new ClaudeProviderAuth());
+        const status = await checkCredentials(authWithoutKeychain());
         assert.equal(status.authenticated, true);
         assert.equal(status.method, 'api_key');
       },
     );
+  });
+});
+
+test('checkCredentials: macOS keychain credentials count as authenticated when the file has no claudeAiOauth', async () => {
+  await withTempHome(async (homeDir) => {
+    // What Claude Code actually leaves on macOS: the file holds only the MCP
+    // plugin token while the account credential lives in the login keychain.
+    await writeCredentialsFile(homeDir, { mcpOAuth: { 'some-server': { accessToken: 'x' } } });
+
+    await withEnv({}, async () => {
+      const status = await checkCredentials(authWithKeychain());
+      assert.equal(status.authenticated, true);
+      assert.equal(status.method, 'keychain');
+      assert.equal(status.email, null);
+    });
+  });
+});
+
+test('checkCredentials: macOS keychain credentials count as authenticated when no credentials file exists', async () => {
+  await withTempHome(async () => {
+    await withEnv({}, async () => {
+      const status = await checkCredentials(authWithKeychain());
+      assert.equal(status.authenticated, true);
+      assert.equal(status.method, 'keychain');
+    });
+  });
+});
+
+test('checkCredentials: keychain credentials rescue a credentials file whose tokens have all expired', async () => {
+  await withTempHome(async (homeDir) => {
+    await writeCredentialsFile(homeDir, {
+      claudeAiOauth: {
+        accessToken: 'stale-token',
+        refreshToken: 'stale-refresh-token',
+        expiresAt: 1_000_000_000_000,
+        refreshTokenExpiresAt: 1_000_000_000_000,
+      },
+    });
+
+    await withEnv({}, async () => {
+      const status = await checkCredentials(authWithKeychain());
+      assert.equal(status.authenticated, true);
+      assert.equal(status.method, 'keychain');
+    });
+  });
+});
+
+test('checkCredentials: no credentials file and no keychain item reports not authenticated', async () => {
+  await withTempHome(async () => {
+    await withEnv({}, async () => {
+      const status = await checkCredentials(authWithoutKeychain());
+      assert.equal(status.authenticated, false);
+      assert.match(status.error ?? '', /not authenticated/i);
+    });
   });
 });

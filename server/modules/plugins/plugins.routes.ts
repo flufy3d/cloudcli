@@ -1,7 +1,8 @@
 import fs from 'node:fs';
-import http from 'node:http';
 
 import express from 'express';
+
+import { forwardToLoopbackService } from '@/shared/utils.js';
 
 import type { createPluginsService } from './plugins.service.js';
 
@@ -46,19 +47,18 @@ export function createPluginsRouter(service: ReturnType<typeof createPluginsServ
         headers[`x-plugin-secret-${key.toLowerCase()}`] = String(value);
       }
       const query = req.url.includes('?') ? `?${req.url.split('?').slice(1).join('?')}` : '';
-      const proxyRequest = http.request({
-        hostname: '127.0.0.1', port, path: `/${wildcardPath(req)}${query}`, method: req.method, headers,
-      }, (proxyResponse) => {
-        res.writeHead(proxyResponse.statusCode ?? 502, proxyResponse.headers);
-        proxyResponse.pipe(res);
-      });
-      proxyRequest.on('error', next);
-      if (req.headers['content-length'] && req.body !== undefined) {
-        const body = JSON.stringify(req.body);
-        proxyRequest.setHeader('content-length', Buffer.byteLength(body));
-        proxyRequest.write(body);
-      }
-      proxyRequest.end();
+      const hasBody = Boolean(req.headers['content-length']) && req.body !== undefined;
+      forwardToLoopbackService(
+        {
+          port,
+          path: `/${wildcardPath(req)}${query}`,
+          method: req.method,
+          headers,
+          body: hasBody ? JSON.stringify(req.body) : undefined,
+        },
+        res,
+        next,
+      );
     } catch (error) { next(error); }
   });
   router.delete('/:name', respond((req) => service.uninstall(routeParameter(req.params.name))));
