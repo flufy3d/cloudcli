@@ -106,6 +106,8 @@ CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在�
 由 `provider-catalog-parity.test.ts` 跨树钉住——这正是它此前缺的：
 旧的三张散表没有守卫，Cursor 明明会写 `cwd`，表里却写着不支持，工作目录字段因此对 Cursor 用户一直不可见。
 
+**受管 MCP（CloudCLI 自带的桥）**：`providerMcpService.addMcpServerToAllProviders` 遍历 live registry 向六家写入同一条 stdio/HTTP 条目，逐 provider 收集结果、单家失败不阻塞；`envFor(provider)` 可按引擎追加 env。两个使用者：`cloudcli-browser`（浏览器自动化，见 browser-use 模块）与 `cloudcli-scheduled-tasks`（定时任务，`envFor` 注入 `CLOUDCLI_SCHEDULED_JOBS_PROVIDER`，让桥知道自己来自哪个引擎）。两者都由 Settings 的全局开关驱动注册/注销，并在启动时 `syncAgentMcpIfNeeded()` 幂等对账，桥的 stdio 框架共用 `server/shared/mcp-stdio.ts`。
+
 ## 差异吃在适配器里，不漏给前端
 
 引擎的私有包装与字段命名**必须在各自适配器里归一化掉**，共用的渲染与展示代码不得认识任何一家。

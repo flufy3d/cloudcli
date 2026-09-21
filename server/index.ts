@@ -53,7 +53,9 @@ import {
 import {
     closeScheduledJobDispatcher,
     initializeScheduledJobDispatcher,
+    scheduledJobsMcpRoutes,
     scheduledJobsRoutes,
+    scheduledJobsSettingsService,
 } from './modules/scheduled-jobs/index.js';
 import { assetsRoutes } from './modules/assets/index.js';
 import { fileTreeRoutes } from './modules/file-tree/index.js';
@@ -208,6 +210,9 @@ app.use('/api/browser-use', authenticateToken, browserUseRoutes);
 app.use('/api/providers', authenticateToken, providerRoutes);
 app.use('/api/scheduled-messages', authenticateToken, scheduledMessagesRoutes);
 app.use('/api/scheduled-jobs', authenticateToken, scheduledJobsRoutes);
+
+// Scheduled Tasks MCP bridge API (local token protected)
+app.use('/api/scheduled-jobs-mcp', scheduledJobsMcpRoutes);
 
 // Agent API Routes (uses API key authentication)
 app.use('/api/agent', agentRoutes);
@@ -398,6 +403,12 @@ async function startServer() {
             // Ensure managed MCP servers (like browser-use) are synced to all configured providers if enabled
             await browserUseService.syncAgentMcpIfNeeded().catch((err) => {
                 console.warn('[Browser] Failed to sync agent MCP configuration during startup:', getErrorMessage(err));
+            });
+
+            // Reconcile the scheduled-tasks MCP bridge when the feature is on,
+            // so engines installed after the toggle still get it.
+            await scheduledJobsSettingsService.syncAgentMcpIfNeeded().catch((err) => {
+                console.warn('[ScheduledJobs] Failed to sync MCP configuration during startup:', getErrorMessage(err));
             });
         });
 
