@@ -510,6 +510,59 @@ test('OpenCode sessions provider reads sqlite history and token usage', { concur
 });
 
 /**
+ * OpenCode never names a transcript row on the live stream: assistant text
+ * arrives as `message.part.delta` fragments under the part id and the
+ * finished row is never sent, so `id` cannot join the streamed reply to its
+ * persisted copy. The part id is what both paths carry, and both publish it as
+ * the row key so the client reconciles the two by identity instead of by
+ * comparing the text of one against the other.
+ */
+test('OpenCode publishes one row key for a reply on both paths', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-row-key-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await createOpenCodeDatabase(tempRoot, workspacePath);
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('open-session-1');
+
+    const persistedReply = history.messages.find((message) => message.content === 'The provider is wired.');
+    assert.equal(persistedReply?.providerRowKey, 'opencode-part:part-assistant-text');
+
+    const live = provider.normalizeMessage({
+      type: 'text',
+      id: 'part-assistant-text',
+      partID: 'part-assistant-text',
+      sessionID: 'open-session-1',
+      text: 'The provider is wired.',
+    }, null);
+
+    assert.equal(live.length, 1);
+    assert.equal(live[0]?.kind, 'stream_delta');
+    assert.equal(live[0]?.providerRowKey, persistedReply?.providerRowKey);
+
+    // The prompt is rendered from the optimistic row, never reconciled through
+    // a key, so a user turn carries none.
+    const persistedPrompt = history.messages.find((message) => message.role === 'user');
+    assert.equal(persistedPrompt?.providerRowKey, undefined);
+
+    // An emitter that does not name the part leaves the row unkeyed rather
+    // than inventing a key that could only ever match nothing.
+    const unkeyed = provider.normalizeMessage({
+      type: 'text',
+      sessionID: 'open-session-1',
+      text: 'The provider is wired.',
+    }, null);
+    assert.equal(unkeyed[0]?.providerRowKey, undefined);
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+/**
  * Seeds a single OpenCode session with a controllable stored title and first
  * user message. Uses a minimal schema (only the columns the synchronizer reads)
  * with a plain-text user part so the derived name is unambiguous.

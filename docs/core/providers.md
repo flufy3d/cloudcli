@@ -245,7 +245,8 @@ id 必须字节相同。** 这条有两道闸门守着：
 | codex | rollout 的 `payload.id`（`msg_…`/`rs_…`/`ctc_…`），缺失时用 append-only 的 `ordinal` | 实时 `item_completed` 的 item id 与 rollout 里同一条 `response_item.id` 相同 |
 | antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id |
 | zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
-| cursor / opencode | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
+| opencode | `(message_id, part_id)`；其余切面未盘点 | 实时流不发行 id（只有 `message.part.delta` 片段），故 assistant 正文由 `providerRowKey: opencode-part:<part_id>` 对账。**按 part 而非 message 取 key**：一个回合"正文→工具→正文"会落两条正文行，共用一个 key 就成了二义匹配，两边都对不上 |
+| cursor | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
 
 引擎确实什么都没给时**不要伪造**：随机值会让对账从"知道自己不知道"变成"自信地答错"。
 正确做法是让推导落在引擎记录的确定性属性上（文件内序号、step 号、数据库主键都算），

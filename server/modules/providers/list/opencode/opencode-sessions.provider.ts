@@ -129,6 +129,28 @@ const isUserTextEcho = (raw: AnyRecord): boolean => {
     || hasUserRole(raw.part);
 };
 
+/**
+ * The cross-transport identity of one OpenCode assistant text row.
+ *
+ * A persisted row is named `(message_id, part_id)`, but the live stream never
+ * names a row: assistant text arrives as `message.part.delta` fragments the
+ * client accumulates into a bubble of its own, so the two paths cannot be
+ * joined on `id`. The part id is what both sides do carry — one text part is
+ * one transcript row on both — so it becomes the row key and the client
+ * reconciles the streamed body against the persisted one through it.
+ *
+ * Keying per part rather than per message matters: a turn that writes text,
+ * calls a tool, then writes more text persists two text rows, and one shared
+ * key for both would be ambiguous and reconcile neither.
+ *
+ * Consumers: `normalizeMessage` (live deltas, keyed off the envelope's
+ * `partID`) and `normalizeHistoryRows` (persisted rows). Both must derive the
+ * key the same way or the streamed reply renders beside its persisted copy.
+ */
+function buildOpenCodeTextRowKey(partId: string): string {
+  return `opencode-part:${partId}`;
+}
+
 export class OpenCodeSessionsProvider implements IProviderSessions {
   /**
    * Normalizes live OpenCode events into frontend messages.
@@ -163,6 +185,11 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         return [];
       }
 
+      // The runtime names the streaming part on the envelope. An emitter
+      // that does not (the older `opencode run --format json` lines) leaves
+      // the row unkeyed rather than invent a key nothing could match.
+      const partId = readOptionalString(raw.partID);
+
       return [createNormalizedMessage({
         id: baseId,
         sessionId: eventSessionId,
@@ -171,6 +198,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         kind: 'stream_delta',
         content,
         transcriptAnchorId: readOptionalString(raw.messageID) ?? undefined,
+        ...(partId ? { providerRowKey: buildOpenCodeTextRowKey(partId) } : {}),
       })];
     }
 
@@ -377,6 +405,11 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
             images: parsedImages.attachments.length > 0 ? parsedImages.attachments : undefined,
             files: parsedFiles.attachments.length > 0 ? parsedFiles.attachments : undefined,
             transcriptAnchorId: row.message_id,
+            // The live stream never names this row — it sends deltas under the
+            // part id — so the part id is the only identity the two paths
+            // share. Without it the streamed reply and this row are two rows
+            // nothing but their text could relate.
+            ...(messageRole === 'user' ? {} : { providerRowKey: buildOpenCodeTextRowKey(row.part_id) }),
           }));
         }
         continue;
