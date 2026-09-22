@@ -41,6 +41,7 @@ const repoRoot = path.resolve(thisDir, '..', '..', '..', '..');
 const stubDir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'agy-e2e-stub-'));
 const stubPath = path.join(stubDir, 'agy');
 const argsFilePath = path.join(stubDir, 'args.txt');
+const stdinFilePath = path.join(stubDir, 'stdin.txt');
 const cwdFilePath = path.join(stubDir, 'cwd.txt');
 const sleepModeMarkerPath = path.join(stubDir, 'sleep-mode');
 const failModeMarkerPath = path.join(stubDir, 'fail-mode');
@@ -57,20 +58,38 @@ if (process.env.AGY_FAIL_FILE && fs.existsSync(process.env.AGY_FAIL_FILE)) {
 if (process.env.AGY_MODE_FILE && fs.existsSync(process.env.AGY_MODE_FILE)) {
   process.on('SIGTERM', () => process.exit(0));
   setInterval(() => {}, 1000);
-} else if (process.env.AGY_MULTI_FILE && fs.existsSync(process.env.AGY_MULTI_FILE)) {
-  // One turn with two pure-text segments separated by a tool call — the
-  // transcript shape behind the "reply shows twice" bug: history stores each
-  // PLANNER_RESPONSE segment as its own text row.
-  console.log(JSON.stringify({ event: 'init', conversation_id: 'stub-conv-multi', init: { cwd: '/tmp' } }));
-  console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'First segment.' } }));
-  console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 3, state: 'ACTIVE', step_type: 'tool', tool_name: 'shell', tool_info: { parameters: { command: 'pwd' } } } }));
-  console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 3, state: 'DONE', step_type: 'tool', tool_info: { output: '/tmp' } } }));
-  console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 4, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Second segment.' } }));
-  console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'stub-conv-multi', status: 'SUCCESS', usage: { total_tokens: 7 } } }));
 } else {
-  console.log(JSON.stringify({ event: 'init', conversation_id: 'stub-conv-1', init: { cwd: '/tmp' } }));
-  console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-1', step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: 'OK' } }));
-  console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'stub-conv-1', status: 'SUCCESS', usage: { total_tokens: 42 } } }));
+  // --input-format stream-json: the turn arrives as one NDJSON line on stdin
+  // and the process stays alive until stdin closes, mirroring the real CLI.
+  let stdinBuffer = '';
+  let replayed = false;
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    stdinBuffer += chunk;
+    if (replayed || !stdinBuffer.includes('\\n')) return;
+    replayed = true;
+    fs.writeFileSync(process.env.AGY_STDIN_FILE, stdinBuffer.split('\\n')[0] + '\\n');
+    replay();
+  });
+  process.stdin.on('end', () => process.exit(0));
+}
+
+function replay() {
+  if (process.env.AGY_MULTI_FILE && fs.existsSync(process.env.AGY_MULTI_FILE)) {
+    // One turn with two pure-text segments separated by a tool call — the
+    // transcript shape behind the "reply shows twice" bug: history stores each
+    // PLANNER_RESPONSE segment as its own text row.
+    console.log(JSON.stringify({ event: 'init', conversation_id: 'stub-conv-multi', init: { cwd: '/tmp' } }));
+    console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'First segment.' } }));
+    console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 3, state: 'ACTIVE', step_type: 'tool', tool_name: 'shell', tool_info: { parameters: { command: 'pwd' } } } }));
+    console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 3, state: 'DONE', step_type: 'tool', tool_info: { output: '/tmp' } } }));
+    console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-multi', step_index: 4, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Second segment.' } }));
+    console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'stub-conv-multi', status: 'SUCCESS', usage: { total_tokens: 7 } } }));
+  } else {
+    console.log(JSON.stringify({ event: 'init', conversation_id: 'stub-conv-1', init: { cwd: '/tmp' } }));
+    console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-1', step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: 'OK' } }));
+    console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'stub-conv-1', status: 'SUCCESS', usage: { total_tokens: 42 } } }));
+  }
 }
 `;
 
@@ -131,6 +150,7 @@ before(async () => {
       CLOUDCLI_ANTIGRAVITY_PATH: stubPath,
       CLOUDCLI_ANTIGRAVITY_DATA_DIR: agyDataDir,
       AGY_ARGS_FILE: argsFilePath,
+      AGY_STDIN_FILE: stdinFilePath,
       AGY_CWD_FILE: cwdFilePath,
       AGY_MODE_FILE: sleepModeMarkerPath,
       AGY_FAIL_FILE: failModeMarkerPath,
@@ -231,6 +251,15 @@ async function readRecordedArgs(): Promise<string[]> {
   return content.split('\n').filter((line) => line.length > 0);
 }
 
+/** The NDJSON turn the stub received on stdin, or null before it arrived. */
+async function readRecordedStdinTurn(): Promise<{ event: string; message: { content: string } } | null> {
+  try {
+    return JSON.parse(await fs.readFile(stdinFilePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
 async function readRecordedCwd(): Promise<string> {
   const content = await fs.readFile(cwdFilePath, 'utf8');
   return content.trim();
@@ -281,9 +310,17 @@ test('chat.send drives the full WebUI path: REST session → WS stream → remap
     );
 
     const args = await readRecordedArgs();
-    for (const expected of ['-p', 'hello from e2e', '--output-format', 'stream-json']) {
+    for (const expected of ['-p=', '--input-format', '--output-format', 'stream-json']) {
       assert.ok(args.includes(expected), `expected ${expected} in stub argv: ${JSON.stringify(args)}`);
     }
+    // The prompt rides stdin, not argv: one-shot `-p "<prompt>"` lets agy kill
+    // the turn's subagents and background commands seconds after the root
+    // agent goes idle.
+    assert.equal((await readRecordedStdinTurn())?.message.content, 'hello from e2e');
+    assert.ok(
+      args.every((arg) => !arg.includes('hello from e2e')),
+      `prompt must not reach argv: ${JSON.stringify(args)}`,
+    );
     // The agy CLI (≤1.1.24) registers the spawn cwd as workspace metadata but
     // still runs its shell tool in ~/.gemini/antigravity-cli/scratch; only an
     // explicit --add-dir makes the agent actually operate in the project.
@@ -350,7 +387,7 @@ test('a second chat.send resumes the provider conversation via the persisted id 
     // turn's argv specifically before asserting the resume flag.
     for (let i = 0; i < 100; i += 1) {
       try {
-        const content = await fs.readFile(argsFilePath, 'utf8');
+        const content = await fs.readFile(stdinFilePath, 'utf8');
         if (content.includes('second turn')) break;
       } catch {
         // stub has not run yet
@@ -360,7 +397,7 @@ test('a second chat.send resumes the provider conversation via the persisted id 
     await waitFor(ws, (msg) => msg.kind === 'complete' && msg.sessionId === appSessionId, 'second complete');
 
     const args = await readRecordedArgs();
-    assert.ok(args.includes('second turn'), `args file must hold the second turn's argv: ${JSON.stringify(args)}`);
+    assert.equal((await readRecordedStdinTurn())?.message.content, 'second turn');
     const conversationIndex = args.indexOf('--conversation');
     assert.ok(conversationIndex !== -1, `resume must pass --conversation: ${JSON.stringify(args)}`);
     assert.equal(args[conversationIndex + 1], 'stub-conv-1', 'resume must use the provider-native conversation id from the DB');

@@ -29,7 +29,6 @@ import type {
 import {
   createCompleteMessage,
   createNormalizedMessage,
-  flattenPromptForWindowsShell,
   generateMessageId,
   readObjectRecord,
   readOptionalString,
@@ -73,11 +72,32 @@ const PERMISSION_MODE_ARGS: Record<string, string[]> = {
 };
 
 /**
- * Default timeout for `agy` print mode execution. Set to 30 minutes to allow
- * long-running subagent tasks (such as deep code reviews) to finish without
- * being terminated by the CLI's default 5-minute hard timeout.
+ * How long a run may go without any stdout activity before it is considered
+ * hung. 30 minutes leaves room for a deep subagent review to think between
+ * events while still bounding a wedged process.
+ *
+ * The value is passed to `agy --print-timeout` too, but that flag is inert
+ * under `--input-format stream-json` (measured: a run with
+ * `--print-timeout 20s` stayed alive long past its result event and only
+ * exited when stdin closed). The CLI therefore offers no upper bound of its
+ * own and the watchdog below is the real one.
  */
 const DEFAULT_PRINT_TIMEOUT = '30m';
+
+/**
+ * Parses a Go duration string (`30m`, `90s`, `1h30m`, `500ms`) into
+ * milliseconds. Returns null when the string carries no recognizable unit, so
+ * an unparsable override degrades to the default rather than to no timeout at
+ * all. `0` is preserved as "no limit", matching agy's own `--print-timeout 0`.
+ */
+function parseGoDurationMs(value: string): number | null {
+  const trimmed = value.trim();
+  if (/^0[a-z]*$/i.test(trimmed)) return 0;
+  const units: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
+  const matches = [...trimmed.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/gi)];
+  if (matches.length === 0) return null;
+  return matches.reduce((total, [, amount, unit]) => total + Number(amount) * units[unit.toLowerCase()], 0);
+}
 
 /**
  * Active process map keyed by session ID.
@@ -191,6 +211,11 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
        * the first non-text event after text deltas closes the segment.
        */
       let agentResponseSegmentOpen = false;
+      /**
+       * Set when the watchdog killed a wedged run, so `close` reports the
+       * timeout instead of a bare signal termination.
+       */
+      let watchdogExpired = false;
 
       const processKey = sessionId || capturedSessionId || `agy_${Date.now()}_${keylessRunCounter += 1}`;
       // Numbers the interrupted-stream notices of this run so two of them
@@ -203,9 +228,11 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
        * agy reports actionable errors there.
        */
       const describeFailure = (code: number | null): string => {
-        const base = code === null
-          ? 'Antigravity CLI terminated by signal.'
-          : `Antigravity CLI exited with code ${code}`;
+        const base = watchdogExpired
+          ? `Antigravity CLI produced no output for ${printTimeout} and was terminated.`
+          : code === null
+            ? 'Antigravity CLI terminated by signal.'
+            : `Antigravity CLI exited with code ${code}`;
         const stderr = stderrTail.trim();
         return stderr ? `${base}\nstderr:\n${stderr}` : base;
       };
@@ -273,21 +300,38 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         args.push('--add-dir', cwd);
       }
 
+      const printTimeout = readOptionalString(options.printTimeout)
+        ?? process.env.CLOUDCLI_ANTIGRAVITY_PRINT_TIMEOUT
+        ?? DEFAULT_PRINT_TIMEOUT;
+
       // Prompt with attachments
       const hasAttachments =
         normalizeAttachmentDescriptors(options.images).length > 0
         || normalizeAttachmentDescriptors(options.files).length > 0;
 
+      // The prompt travels over stdin as one NDJSON line rather than as an
+      // argv entry. `agy -p "<prompt>"` runs the turn in one-shot print mode,
+      // where the CLI shuts itself down a few seconds after the root agent
+      // goes idle — it logs `root agent idle; waiting up to 5s for N
+      // background task(s)` and then `terminating N background task(s) on
+      // exit`. Every asynchronous task the agent dispatches (a subagent, a
+      // backgrounded run_command) dies there, and agy still reports
+      // `status: SUCCESS`, so the run looks finished while its real result is
+      // never produced. Feeding the turn through `--input-format stream-json`
+      // keeps stdin open, which keeps the CLI alive until we close it, so
+      // those tasks run to completion and their output streams back in.
+      let stdinTurn: string | null = null;
       if ((command && command.trim()) || hasAttachments) {
         const promptWithAttachments = appendFilesInputTag(
           appendImagesInputTag(command || '', options.images),
           options.files,
         );
-        args.push('-p', flattenPromptForWindowsShell(promptWithAttachments));
+        // Over stdin the prompt is JSON-encoded, so newlines survive as-is
+        // and no shell flattening is needed.
+        stdinTurn = `${JSON.stringify({ event: 'user', message: { content: promptWithAttachments } })}\n`;
+        args.push('-p=');
+        args.push('--input-format', 'stream-json');
         args.push('--output-format', 'stream-json');
-        const printTimeout = readOptionalString(options.printTimeout)
-          ?? process.env.CLOUDCLI_ANTIGRAVITY_PRINT_TIMEOUT
-          ?? DEFAULT_PRINT_TIMEOUT;
         args.push('--print-timeout', printTimeout);
       }
 
@@ -336,6 +380,19 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       console.debug(`[AntigravityRuntime] Spawning agy with flags: ${args.filter((arg) => arg.startsWith('--')).join(' ')}`);
 
       let stdoutBuffer = '';
+
+      /**
+       * Closes the child's stdin once, bound to the process spawned below.
+       * Assigned after spawn; the no-op default covers the (unreachable)
+       * window before that, and the idempotence keeps a duplicated result
+       * event from writing to a finished stream.
+       */
+      let closeStdinTurn = (): void => {};
+
+      /**
+       * Re-arms the inactivity watchdog. Assigned after spawn.
+       */
+      let touchWatchdog = (): void => {};
 
       const processLine = (line: string) => {
         if (!line || !line.trim()) return;
@@ -456,6 +513,18 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             const isError = resultData?.status === 'ERROR' || Boolean(resultData?.error);
             const errorMessage = readOptionalString(resultData?.error);
 
+            // A finished turn releases the stdin that was holding the CLI
+            // open: agy exits on EOF and `close` settles the run. An
+            // interrupted-stream result is deliberately excluded — agy has
+            // injected its own continuation prompt and is still working, so
+            // closing stdin here would EOF the CLI mid-task and resurrect the
+            // very "async work silently killed" bug stdin ownership exists to
+            // prevent. Its eventual real result closes stdin instead, and the
+            // watchdog bounds the wait if that result never comes.
+            if (!(isError && isStreamInterruptedNotice(errorMessage))) {
+              closeStdinTurn();
+            }
+
             if (isError && isStreamInterruptedNotice(errorMessage)) {
               // agy reports a broken backend stream with this canned error and
               // simultaneously injects a continuation prompt into the
@@ -532,7 +601,69 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
 
       activeProcesses.set(processKey, agyProcess);
 
+      let stdinClosed = false;
+      closeStdinTurn = () => {
+        if (stdinClosed) return;
+        stdinClosed = true;
+        agyProcess.stdin?.end();
+      };
+
+      // Holding stdin open is the only thing keeping the CLI alive, and
+      // --print-timeout does not apply in this mode, so a run whose result
+      // event never arrives (crashed CLI, truncated stdout, a result line
+      // mangled by agy's interleaved plain-text notices) would otherwise hang
+      // forever with the session stuck in "processing". The watchdog bounds
+      // that: every stdout chunk re-arms it, and expiry terminates the child
+      // so `close` can settle the run as a failure.
+      const watchdogMs = parseGoDurationMs(printTimeout) ?? parseGoDurationMs(DEFAULT_PRINT_TIMEOUT) ?? 0;
+      let watchdogTimer: NodeJS.Timeout | null = null;
+      const clearWatchdog = () => {
+        if (watchdogTimer) {
+          clearTimeout(watchdogTimer);
+          watchdogTimer = null;
+        }
+      };
+      touchWatchdog = () => {
+        if (watchdogMs <= 0) return;
+        clearWatchdog();
+        watchdogTimer = setTimeout(() => {
+          watchdogTimer = null;
+          watchdogExpired = true;
+          console.error(
+            `[AntigravityRuntime] No output for ${printTimeout}; terminating wedged run ${processKey}`,
+          );
+          closeStdinTurn();
+          agyProcess.kill('SIGTERM');
+        }, watchdogMs);
+        // A pending watchdog must never be the reason the server stays alive.
+        watchdogTimer.unref?.();
+      };
+      touchWatchdog();
+
+      // stdin errors are reported, never swallowed: a failed prompt write
+      // means agy never receives the turn, which would otherwise present as a
+      // silent hang with nothing in the log. EPIPE against an already-dead
+      // child is the one benign case — its exit is reported through
+      // `close`/`error` anyway.
+      agyProcess.stdin?.on('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EPIPE') return;
+        console.error('[Antigravity CLI stdin error]:', err);
+      });
+      if (stdinTurn) {
+        agyProcess.stdin?.write(stdinTurn, (err) => {
+          if (!err) return;
+          // The turn never reached agy, so no result will ever arrive: fail
+          // the run now rather than waiting out the watchdog.
+          console.error('[AntigravityRuntime] Failed to deliver the turn over stdin:', err);
+          clearWatchdog();
+          agyProcess.kill('SIGTERM');
+        });
+      } else {
+        closeStdinTurn();
+      }
+
       agyProcess.stdout?.on('data', (data: Buffer) => {
+        touchWatchdog();
         stdoutBuffer += data.toString('utf8');
         const lines = stdoutBuffer.split(/\r?\n/);
         stdoutBuffer = lines.pop() ?? '';
@@ -549,6 +680,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       });
 
       agyProcess.on('close', (code: number | null) => {
+        clearWatchdog();
         activeProcesses.delete(processKey);
 
         if (stdoutBuffer.trim()) {
@@ -597,7 +729,10 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         // agy reports actionable errors (auth, quota, bad flags) on stderr
         // only; surface the captured tail to the user instead of leaving it
         // in the server console.
-        if (code !== 0 && stderrTail.trim()) {
+        // A watchdog kill leaves stderr empty and, when the child exits on
+        // SIGTERM cleanly, a zero code too — so it gets its own arm: the user
+        // must see why the run stopped, not just a bare complete.
+        if (watchdogExpired || (code !== 0 && stderrTail.trim())) {
           writer.send(createNormalizedMessage({
             id: generateMessageId(PROVIDER),
             kind: 'error',
@@ -609,7 +744,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         }
 
         notifyTerminalState({ code });
-        if (code === 0 || (streamInterruptedResult && !sawErrorResult)) {
+        if (!watchdogExpired && (code === 0 || (streamInterruptedResult && !sawErrorResult))) {
           settleOnce(() => resolve({ sessionId: capturedSessionId || sessionId, success: true }));
         } else {
           settleOnce(() => reject(new Error(describeFailure(code))));
@@ -617,6 +752,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       });
 
       agyProcess.on('error', (err: Error) => {
+        clearWatchdog();
         activeProcesses.delete(processKey);
         console.error('[Antigravity CLI error]:', err);
 
@@ -641,9 +777,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         notifyTerminalState({ error: err });
         settleOnce(() => reject(err));
       });
-
-      // Close stdin
-      agyProcess.stdin?.end();
     });
   }
 

@@ -27,6 +27,7 @@ import { AntigravitySessionsProvider } from '../list/antigravity/antigravity-ses
 const stubDir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'agy-stub-'));
 const stubPath = path.join(stubDir, 'agy');
 const argsFilePath = path.join(stubDir, 'args.txt');
+const stdinFilePath = path.join(stubDir, 'stdin.txt');
 
 const stubScript = `#!/usr/bin/env node
 const fs = require('fs');
@@ -54,6 +55,38 @@ if (mode === 'sleep') {
   // agy exits non-zero after an ERROR result; the degraded path must still
   // resolve the run.
   process.exit(1);
+} else if (mode === 'stdin-turn') {
+  // Mirrors the real CLI's --input-format stream-json contract: the turn
+  // arrives on stdin, and the process only exits once stdin reaches EOF.
+  let stdin = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    stdin += chunk;
+    const line = stdin.split('\\n')[0];
+    if (stdin.includes('\\n') && !global.__sentTurn) {
+      global.__sentTurn = true;
+      fs.writeFileSync(process.env.AGY_STDIN_FILE, line + '\\n');
+      console.log(JSON.stringify({ event: 'init', conversation_id: 'stub-conv-stdin', init: { cwd: '/tmp' } }));
+      console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'stub-conv-stdin', status: 'SUCCESS', usage: { total_tokens: 3 } } }));
+    }
+  });
+  process.stdin.on('end', () => process.exit(0));
+} else if (mode === 'silent') {
+  // Never writes to stdout: the watchdog is the only thing that can end this.
+  process.on('SIGTERM', () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else if (mode === 'interrupted-then-done') {
+  // agy's interrupted-stream result is not terminal: it keeps working and
+  // emits a real result later. Closing stdin on the first one would EOF the
+  // CLI before that, so this stub only exits on stdin EOF.
+  console.log(JSON.stringify({ event: 'init', conversation_id: 'stub-conv-resume', init: { cwd: '/tmp' } }));
+  console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'stub-conv-resume', status: 'ERROR', error: 'The stream was interrupted. Please continue the task you were working on.' } }));
+  setTimeout(() => {
+    console.log(JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'stub-conv-resume', step_index: 4, state: 'DONE', step_type: 'agent_response', text_delta: 'RESUMED_OK' } }));
+    console.log(JSON.stringify({ event: 'result', result: { conversation_id: 'stub-conv-resume', status: 'SUCCESS', usage: { total_tokens: 5 } } }));
+  }, 300);
+  process.stdin.resume();
+  process.stdin.on('end', () => process.exit(0));
 } else if (mode === 'noisy') {
   console.log('connecting to backend...');
   console.log(JSON.stringify({ event: 'init', conversation_id: 'stub-conv-noisy', init: { cwd: '/tmp' } }));
@@ -74,6 +107,7 @@ fsSync.writeFileSync(stubPath, stubScript, { mode: 0o755 });
 
 process.env.CLOUDCLI_ANTIGRAVITY_PATH = stubPath;
 process.env.AGY_ARGS_FILE = argsFilePath;
+process.env.AGY_STDIN_FILE = stdinFilePath;
 delete process.env.AGY_STUB_MODE;
 
 const sessionsProvider = new AntigravitySessionsProvider();
@@ -168,6 +202,43 @@ test('runtime maps permissionMode onto agy flags', async () => {
       assert.ok(!args.includes(flag), `${scenario.permissionMode}: ${flag} must not appear in ${JSON.stringify(args)}`);
     }
   }
+});
+
+test('runtime delivers the turn over stdin and closes it on the result', async () => {
+  // agy's one-shot `-p "<prompt>"` mode shuts the CLI down a few seconds
+  // after the root agent goes idle, killing any subagent or backgrounded
+  // command it dispatched while still reporting SUCCESS. Holding the turn on
+  // stdin under --input-format stream-json is what keeps those tasks alive,
+  // so the prompt must never travel as an argv entry again.
+  const runtime = new AntigravityRuntimeProvider();
+  const { writer } = createWriter();
+  const prompt = 'line one\nline two';
+
+  await fs.rm(argsFilePath, { force: true });
+  await fs.rm(stdinFilePath, { force: true });
+  process.env.AGY_STUB_MODE = 'stdin-turn';
+  try {
+    // The stub only exits on stdin EOF, so this run resolving at all proves
+    // the result event closed stdin.
+    await runtime.run(prompt, { sessionId: 'sess-stdin' }, writer, context);
+  } finally {
+    delete process.env.AGY_STUB_MODE;
+  }
+
+  const args = await readRecordedArgs();
+  assert.ok(args.includes('-p='), `expected an empty -p in ${JSON.stringify(args)}`);
+  const inputFormatIndex = args.indexOf('--input-format');
+  assert.notEqual(inputFormatIndex, -1, `expected --input-format in ${JSON.stringify(args)}`);
+  assert.equal(args[inputFormatIndex + 1], 'stream-json');
+  assert.ok(
+    args.every((arg) => !arg.includes('line one')),
+    `prompt must not reach argv: ${JSON.stringify(args)}`,
+  );
+
+  const delivered = JSON.parse(await fs.readFile(stdinFilePath, 'utf8'));
+  assert.equal(delivered.event, 'user');
+  // Newlines survive the JSON encoding; the old argv path flattened them.
+  assert.equal(delivered.message.content, prompt);
 });
 
 test('runtime forces skip-permissions from toolsSettings without duplicates', async () => {
@@ -489,6 +560,60 @@ test('runtime reports normalization failures as errors instead of raw text', asy
   } finally {
     delete process.env.AGY_STUB_MODE;
   }
+});
+
+test('a run that stops producing output is terminated by the watchdog', async () => {
+  // --print-timeout is inert under --input-format stream-json (a run outlives
+  // it and only exits on stdin EOF), and stdin is now held open until the
+  // result event. Without a server-side watchdog a CLI that never reports a
+  // result would hang this promise, the child process and the session's
+  // "processing" state forever.
+  const runtime = new AntigravityRuntimeProvider();
+  const { messages, writer } = createWriter();
+
+  process.env.AGY_STUB_MODE = 'silent';
+  try {
+    await assert.rejects(
+      runtime.run('hello', { sessionId: 'sess-watchdog', printTimeout: '300ms' }, writer, context),
+      /produced no output for 300ms/,
+      'a silent run must be terminated and reported, not left hanging',
+    );
+  } finally {
+    delete process.env.AGY_STUB_MODE;
+  }
+
+  // The user has to learn why the run stopped, so the timeout reaches the
+  // transcript rather than only the server log.
+  assert.ok(
+    messages.some((msg) => msg.kind === 'error' && String(msg.content).includes('produced no output')),
+    'the watchdog timeout must surface as an error row',
+  );
+  assert.ok(messages.some((msg) => msg.kind === 'complete'), 'the run must still complete');
+});
+
+test('an interrupted-stream result keeps stdin open so the resumed turn finishes', async () => {
+  // agy answers a broken backend stream with an ERROR result and then resumes
+  // the turn itself. Treating that result as terminal and closing stdin would
+  // EOF the CLI mid-task — the same "async work silently killed" failure the
+  // stdin handover exists to prevent.
+  const runtime = new AntigravityRuntimeProvider();
+  const { messages, writer } = createWriter();
+
+  process.env.AGY_STUB_MODE = 'interrupted-then-done';
+  try {
+    await runtime.run('hello', { sessionId: 'sess-resume', printTimeout: '30s' }, writer, context);
+  } finally {
+    delete process.env.AGY_STUB_MODE;
+  }
+
+  assert.ok(
+    JSON.stringify(messages).includes('RESUMED_OK'),
+    'the post-interruption output must still reach the client',
+  );
+  assert.ok(
+    messages.some((msg) => msg.kind === 'task_notification'),
+    'the interruption itself is still reported as a quiet notice',
+  );
 });
 
 test('runtime defaults print-timeout to 30m and allows option override', async () => {
