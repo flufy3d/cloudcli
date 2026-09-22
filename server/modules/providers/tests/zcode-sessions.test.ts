@@ -1087,3 +1087,49 @@ test('live and history mint the same toolId for one call (engine callID == toolC
     );
   });
 });
+
+/**
+ * The engine stamps every session event with a fresh `crypto.randomUUID()`,
+ * so the envelope id changes on every delta. Only `payload.assistantMessageId`
+ * names the reply, and the client closes a streamed segment whenever the row
+ * key changes — deriving the key from the envelope therefore cuts one reply
+ * into one bubble per delta.
+ */
+test('text deltas of one reply share a row key across changing event ids', () => {
+  const provider = new ZCodeSessionsProvider();
+  const deltas = ['加', '两个「石头纹理强、', '带裂纹」的重口味方案'].map((delta, index) =>
+    provider.normalizeMessage(
+      {
+        type: 'model_streaming',
+        id: `evt_${index}_${Math.random()}`,
+        sessionId: 'sess_key',
+        payload: { kind: 'text_delta', delta, assistantMessageId: 'msg_reply_1' },
+      },
+      'sess_key'
+    )[0]
+  );
+
+  for (const delta of deltas) {
+    assert.equal(delta.kind, 'stream_delta');
+    assert.equal(delta.providerRowKey, 'zcode-message:msg_reply_1');
+  }
+});
+
+test('an engine that omits assistantMessageId still keeps one key per text segment', () => {
+  const provider = new ZCodeSessionsProvider();
+  const emit = (kind: string, delta?: string) =>
+    provider.normalizeMessage(
+      { type: 'model_streaming', id: `evt_${Math.random()}`, sessionId: 'sess_legacy', payload: { kind, delta } },
+      'sess_legacy'
+    );
+
+  emit('text_start');
+  const first = emit('text_delta', 'first')[0];
+  const second = emit('text_delta', ' second')[0];
+  assert.equal(first.providerRowKey, second.providerRowKey);
+
+  emit('text_end');
+  emit('text_start');
+  const nextSegment = emit('text_delta', 'other')[0];
+  assert.notEqual(nextSegment.providerRowKey, first.providerRowKey);
+});

@@ -261,18 +261,19 @@ test('antigravity names one tool call the same way on both paths', () => {
 /**
  * ZCode names a persisted row `(message_id, part_id)` but its live stream
  * only mentions the message: assistant text arrives as `text_delta` events
- * and no row id is ever sent, so `id` cannot join the two paths. The message
- * id is what both sides carry, and it is published as the row key so the
- * client reconciles the streamed reply with the persisted one by identity
- * rather than by comparing the text of the two.
+ * carrying `assistantMessageId`, while the event envelope's `id` is a random
+ * UUID minted per event and joins nothing. The message id is what both sides
+ * carry, and it is published as the row key so the client reconciles the
+ * streamed reply with the persisted one by identity rather than by comparing
+ * the text of the two.
  */
 test('zcode publishes one row key for a reply on both paths', () => {
   const messageId = 'msg_muaj6bc0_a3536698';
   const live = zcode.normalizeMessage({
     type: 'model_streaming',
-    id: messageId,
+    id: 'd1f2f0d4-0f6a-4a1e-9d2a-6c9f2a1b7c33',
     sessionId: SESSION_ID,
-    payload: { kind: 'text_delta', delta: 'the answer' },
+    payload: { kind: 'text_delta', delta: 'the answer', assistantMessageId: messageId },
   }, SESSION_ID);
 
   assert.equal(live.length, 1);

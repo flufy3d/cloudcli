@@ -28,11 +28,12 @@ export const ZCODE_CANCELLED_NOTICE_KEY = 'taskNotices.replyInterrupted';
  * The cross-transport identity of one ZCode assistant text row.
  *
  * ZCode names a persisted row `(message_id, part_id)` but its live stream
- * only ever mentions the message: text arrives as `text_delta` events under
- * the message id and no row id is ever sent, so the two paths cannot be
- * joined on `id`. The message id is the one thing both sides do carry, so it
- * becomes the row key and the client reconciles the streamed body against
- * the persisted one through it.
+ * only ever mentions the message: text arrives as `text_delta` events whose
+ * `payload.assistantMessageId` is the reply's message id, while the event
+ * envelope's own `id` is a fresh `crypto.randomUUID()` per event and joins
+ * nothing. The message id is the one thing both sides carry, so it becomes
+ * the row key and the client reconciles the streamed body against the
+ * persisted one through it.
  *
  * Consumers: this normalizer (live deltas) and `zcode-sessions.provider.ts`
  * (persisted rows). Both must derive the key the same way or the streamed
@@ -166,6 +167,13 @@ export class ZCodeLiveEventNormalizer {
    * announce and leave all but one tool card permanently blank.
    */
   private readonly toolInputStreams = new Map<string, Map<string, ToolInputStream>>();
+  /**
+   * Per-session message id of the assistant text segment currently
+   * streaming. Engine generations that omit `assistantMessageId` still open
+   * and close each segment with `text_start`/`text_end`, so the first delta's
+   * identity is cached and reused for the rest of that segment.
+   */
+  private readonly textRowMessageIds = new Map<string, string>();
 
   normalize(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
     const raw = readObjectRecord(rawMessage);
@@ -278,6 +286,7 @@ export class ZCodeLiveEventNormalizer {
     const stateKey = sessionId ?? '';
     this.reasoningBlockIds.delete(stateKey);
     this.toolInputStreams.delete(stateKey);
+    this.textRowMessageIds.delete(stateKey);
   }
 
   private normalizeScheduledTool(
@@ -373,6 +382,13 @@ export class ZCodeLiveEventNormalizer {
     }
 
     if (kind === 'text_start' || kind === 'text_end') {
+      // A segment boundary drops the cached identity: the next segment is a
+      // different row and must not inherit this one's key.
+      this.textRowMessageIds.delete(stateKey);
+      const openingMessageId = kind === 'text_start' ? readOptionalString(payload.assistantMessageId) : undefined;
+      if (openingMessageId) {
+        this.textRowMessageIds.set(stateKey, openingMessageId);
+      }
       return [createNormalizedMessage({
         id: baseId,
         sessionId,
@@ -387,15 +403,16 @@ export class ZCodeLiveEventNormalizer {
       if (!content) {
         return [];
       }
+      const messageId = this.resolveTextRowMessageId(stateKey, payload, baseId);
       return [createNormalizedMessage({
-        id: baseId,
+        id: messageId,
         sessionId,
         timestamp,
         provider: PROVIDER,
         kind: 'stream_delta',
         role: 'assistant',
         content,
-        providerRowKey: buildZCodeTextRowKey(baseId),
+        providerRowKey: buildZCodeTextRowKey(messageId),
       })];
     }
 
@@ -450,6 +467,33 @@ export class ZCodeLiveEventNormalizer {
     const id = `${baseId}_reasoning`;
     this.reasoningBlockIds.set(stateKey, id);
     return id;
+  }
+
+  /**
+   * The message id every delta of one assistant text segment is emitted
+   * under, and therefore the identity of its row.
+   *
+   * The engine stamps each session event with its own random UUID, so the
+   * envelope id changes between two deltas of the same reply; only
+   * `payload.assistantMessageId` names the reply. Because the client closes a
+   * streamed segment whenever the row key changes, an envelope-derived key
+   * would cut every reply into one bubble per delta. Engine generations that
+   * send no `assistantMessageId` fall back to the first delta's envelope id,
+   * cached until `text_end` closes the segment: the row stays whole live even
+   * though it cannot reconcile with the persisted copy by identity.
+   */
+  private resolveTextRowMessageId(stateKey: string, payload: AnyRecord, baseId: string): string {
+    const named = readOptionalString(payload.assistantMessageId);
+    if (named) {
+      this.textRowMessageIds.set(stateKey, named);
+      return named;
+    }
+    const cached = this.textRowMessageIds.get(stateKey);
+    if (cached) {
+      return cached;
+    }
+    this.textRowMessageIds.set(stateKey, baseId);
+    return baseId;
   }
 
   private registerToolInputStream(stateKey: string, toolCallId: string, toolName: string): ToolInputStream {
