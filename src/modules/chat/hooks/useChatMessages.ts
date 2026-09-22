@@ -178,6 +178,7 @@ function convertRow(
             type: 'assistant',
             content: text,
             timestamp: msg.timestamp,
+            memoryCitations: msg.memoryCitations,
             ...sharedMetadata,
           });
         }

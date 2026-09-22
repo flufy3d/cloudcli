@@ -283,5 +283,9 @@
   "localProxy": {
     "linkHint": "Bu adres yalnızca sunucuda bulunur; CloudCLI onu yerel proxy üzerinden açar.",
     "failed": "CloudCLI bu sunucu yerel adresini açamadı."
+  },
+  "memory": {
+    "used_one": "{{count}} bellek kaydı kullanıldı",
+    "used_other": "{{count}} bellek kaydı kullanıldı"
   }
 }

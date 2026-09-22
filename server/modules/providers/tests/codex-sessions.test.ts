@@ -8,7 +8,8 @@ import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/datab
 import { CodexSessionSynchronizer } from '@/modules/providers/list/codex/codex-session-synchronizer.provider.js';
 import { AppError } from '@/shared/utils.js';
 import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
-import { readCodexMemoryCitations, readCodexProposedPlan } from '@/modules/providers/list/codex/codex-thread-items.js';
+import { readCodexProposedPlan } from '@/modules/providers/list/codex/codex-thread-items.js';
+import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
@@ -458,7 +459,7 @@ test('Codex memory citations are lifted out of the reply they trail', () => {
     '</oai-mem-citation>',
   ].join('\n');
 
-  const { text, memoryCitations } = readCodexMemoryCitations(reply);
+  const { text, memoryCitations } = liftMemoryCitations('codex', reply);
 
   assert.equal(text, 'Here is the answer.');
   assert.deepEqual(memoryCitations, [

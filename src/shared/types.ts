@@ -13,6 +13,7 @@ import type { McpScope, McpTransport } from '@shared/protocol/capabilities';
 import type { LoadingProgressEvent as LoadingProgress } from '@shared/protocol/frames';
 import type {
   LLMProvider,
+  MemoryCitation,
   MessageKind,
   NormalizedMessage as WireNormalizedMessage,
 } from '@shared/protocol/chatEvents';
@@ -353,6 +354,12 @@ export type ChatMessage = {
   isLocalCommandStdout?: boolean;
   isCompactSummary?: boolean;
   isSubagentContainer?: boolean;
+  /**
+   * Stored memory this reply drew on, lifted out of the engine's in-prose
+   * markup by the provider adapter. Rendered as a footnote under the reply so
+   * a memory-derived claim stays traceable.
+   */
+  memoryCitations?: MemoryCitation[];
 }
 
 /** The user's locally persisted Claude preferences (default permission mode and allowed/disallowed tool lists, plus project sort order) read from and written back to browser storage. */

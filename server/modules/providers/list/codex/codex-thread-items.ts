@@ -27,8 +27,9 @@
  * `codex-runtime.provider.ts` (live run).
  */
 
+import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 import { toImageAttachments } from '@/shared/image-attachments.js';
-import type { AnyRecord, MemoryCitation } from '@/shared/types.js';
+import type { AnyRecord } from '@/shared/types.js';
 import { readObjectRecord } from '@/shared/utils.js';
 
 /**
@@ -575,53 +576,6 @@ export function readCodexProposedPlan(text: string): string | null {
 }
 
 /**
- * The block Codex appends to a reply that leaned on its memory files. It is
- * always the last thing in the message and is meant for programmatic parsing,
- * so it reads as raw XML when left in the prose.
- */
-const CODEX_MEMORY_CITATION_BLOCK = /<oai-mem-citation>([\s\S]*?)<\/oai-mem-citation>\s*$/i;
-
-/**
- * Lifts Codex's memory citations out of an assistant reply.
- *
- * The block names the memory files and line ranges the answer drew on, which
- * is worth showing — but as a footnote under the reply, not as markup inside
- * it. The trailing `<rollout_ids>` list is dropped: those are handles to
- * earlier rollouts the transcript view has no way to open.
- *
- * Consumer: this module's renderer, and `codex-sessions.test.ts`.
- */
-export function readCodexMemoryCitations(text: string): { text: string; memoryCitations?: MemoryCitation[] } {
-  const block = CODEX_MEMORY_CITATION_BLOCK.exec(text);
-  if (!block) {
-    return { text };
-  }
-
-  const entries = /<citation_entries>([\s\S]*?)<\/citation_entries>/i.exec(block[1])?.[1] ?? '';
-  const memoryCitations: MemoryCitation[] = [];
-  for (const line of entries.split('\n')) {
-    const entry = line.trim();
-    if (!entry) {
-      continue;
-    }
-
-    const noteMarker = entry.indexOf('|note=');
-    const source = (noteMarker === -1 ? entry : entry.slice(0, noteMarker)).trim();
-    if (!source) {
-      continue;
-    }
-
-    const note = noteMarker === -1
-      ? ''
-      : entry.slice(noteMarker + '|note='.length).trim().replace(/^\[/, '').replace(/\]$/, '').trim();
-    memoryCitations.push(note ? { source, note } : { source });
-  }
-
-  const prose = text.slice(0, block.index).trimEnd();
-  return memoryCitations.length > 0 ? { text: prose, memoryCitations } : { text: prose };
-}
-
-/**
  * Turns a tool name into the label the transcript shows.
  *
  * Consumer: this module's renderer, and the subagent panel in
@@ -664,7 +618,7 @@ export function codexThreadItemToRows(item: CodexThreadItem, timestamp: string):
     }
 
     case 'agent_message': {
-      const cited = readCodexMemoryCitations(item.text);
+      const cited = liftMemoryCitations('codex', item.text);
       if (!cited.text.trim()) {
         return [];
       }

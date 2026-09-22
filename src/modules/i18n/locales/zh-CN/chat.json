@@ -318,5 +318,9 @@
   "localProxy": {
     "linkHint": "这个地址只存在于服务器本机，CloudCLI 将通过本地代理打开。",
     "failed": "CloudCLI 无法打开这个服务器本机地址。"
+  },
+  "memory": {
+    "used_one": "引用了 {{count}} 条记忆",
+    "used_other": "引用了 {{count}} 条记忆"
   }
 }

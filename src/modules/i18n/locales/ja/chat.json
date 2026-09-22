@@ -271,5 +271,9 @@
   "localProxy": {
     "linkHint": "このアドレスはサーバー上にのみ存在します。CloudCLI がローカルプロキシ経由で開きます。",
     "failed": "このサーバーローカルのアドレスを開けませんでした。"
+  },
+  "memory": {
+    "used_one": "{{count}} 件のメモリを参照",
+    "used_other": "{{count}} 件のメモリを参照"
   }
 }

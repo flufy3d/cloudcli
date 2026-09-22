@@ -310,5 +310,9 @@
   "localProxy": {
     "linkHint": "Esta dirección solo existe en el servidor; CloudCLI la abre mediante su proxy local.",
     "failed": "CloudCLI no pudo abrir esta dirección local del servidor."
+  },
+  "memory": {
+    "used_one": "Se usó {{count}} memoria",
+    "used_other": "Se usaron {{count}} memorias"
   }
 }

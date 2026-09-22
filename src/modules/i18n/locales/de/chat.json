@@ -283,5 +283,9 @@
   "localProxy": {
     "linkHint": "Diese Adresse existiert nur auf dem Server; CloudCLI öffnet sie über den lokalen Proxy.",
     "failed": "CloudCLI konnte diese serverlokale Adresse nicht öffnen."
+  },
+  "memory": {
+    "used_one": "{{count}} Erinnerung verwendet",
+    "used_other": "{{count}} Erinnerungen verwendet"
   }
 }

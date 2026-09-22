@@ -304,5 +304,9 @@
   "localProxy": {
     "linkHint": "이 주소는 서버에만 존재하므로 CloudCLI가 로컬 프록시로 엽니다.",
     "failed": "이 서버 로컬 주소를 열지 못했습니다."
+  },
+  "memory": {
+    "used_one": "메모리 {{count}}개 참조",
+    "used_other": "메모리 {{count}}개 참조"
   }
 }

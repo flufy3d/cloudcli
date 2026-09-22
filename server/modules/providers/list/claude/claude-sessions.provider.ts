@@ -31,6 +31,7 @@ import {
 } from '@/shared/utils.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import { summarizeClaudeTokenUsage } from '@/modules/providers/services/claude-usage.js';
+import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 
 const PROVIDER = 'claude';
 
@@ -1053,6 +1054,10 @@ export class ClaudeSessionsProvider implements IProviderSessions {
         let partIndex = 0;
         for (const part of raw.message.content) {
           if (part.type === 'text' && part.text) {
+            // Claude wraps a memory-derived sentence in <cc-memory> tags. They
+            // are provenance markup, not prose: unwrapped here so the sentence
+            // reads normally and the sources become a footnote instead.
+            const cited = liftMemoryCitations(PROVIDER, part.text);
             messages.push(createNormalizedMessage({
               id: `${baseId}_${partIndex}`,
               sessionId,
@@ -1060,7 +1065,8 @@ export class ClaudeSessionsProvider implements IProviderSessions {
               provider: PROVIDER,
               kind: 'text',
               role: 'assistant',
-              content: part.text,
+              content: cited.text,
+              memoryCitations: cited.memoryCitations,
             }));
           } else if (part.type === 'tool_use') {
             messages.push(createNormalizedMessage({
@@ -1086,6 +1092,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
           partIndex++;
         }
       } else if (typeof raw.message.content === 'string') {
+        const cited = liftMemoryCitations(PROVIDER, raw.message.content);
         messages.push(createNormalizedMessage({
           id: baseId,
           sessionId,
@@ -1093,7 +1100,8 @@ export class ClaudeSessionsProvider implements IProviderSessions {
           provider: PROVIDER,
           kind: 'text',
           role: 'assistant',
-          content: raw.message.content,
+          content: cited.text,
+          memoryCitations: cited.memoryCitations,
         }));
       }
       return messages;
