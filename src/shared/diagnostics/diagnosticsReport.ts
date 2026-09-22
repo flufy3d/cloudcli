@@ -3,9 +3,10 @@
  *
  * A user reporting a problem should never have to know which kind of report to
  * take. Startup timings, service-worker state, the websocket frames in both
- * directions, what the timeline ended up holding, and how the server says
- * recent runs ended are all the same question asked from different sides —
- * "what actually happened in this tab?" — so they are one file.
+ * directions, what the timeline ended up holding, the swipes that failed to
+ * scroll it, and how the server says recent runs ended are all the same
+ * question asked from different sides — "what actually happened in this tab?"
+ * — so they are one file.
  *
  * Nothing here contains message bodies, credentials, headers or URL query
  * parameters: frames keep truncated field summaries, resource URLs are
@@ -18,6 +19,8 @@
 import { api, readApiJson } from '@/shared/api';
 import { readRecordedFrames } from '@/shared/diagnostics/frameRecorder';
 import type { RecordedFrame } from '@/shared/diagnostics/frameRecorder';
+import { readScrollScreenings } from '@/shared/diagnostics/scrollScreening';
+import type { ScrollScreening } from '@/shared/diagnostics/scrollScreening';
 import { createStartupDiagnosticsSection } from '@/shared/diagnostics/startupDiagnostics';
 import type { StartupDiagnosticsSection } from '@/shared/diagnostics/startupDiagnostics';
 import type { NormalizedMessage, RunOutcomeRecord, TimelineSnapshot } from '@/shared/types';
@@ -29,7 +32,7 @@ const REQUESTED_SERVER_RUNS = 50;
 const MAX_SUMMARY_LENGTH = 120;
 
 export type DiagnosticsReport = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   takenAt: string;
   sessionId: string | null;
   /** Both directions, oldest first, including frames from earlier page loads. */
@@ -44,6 +47,8 @@ export type DiagnosticsReport = {
     runEnded: boolean;
   } | null;
   startup: StartupDiagnosticsSection | null;
+  /** Touches that should have scrolled the transcript and did not. */
+  scrollScreenings: ScrollScreening[];
   /**
    * How the server says recent runs ended, or why it could not be asked. The
    * report is still worth having when this fails — an unreachable server is
@@ -78,7 +83,7 @@ export function buildDiagnosticsReport(input: {
   serverRuns: RunOutcomeRecord[] | { error: string };
 }): DiagnosticsReport {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     takenAt: new Date().toISOString(),
     sessionId: input.sessionId,
     frames: [...readRecordedFrames()],
@@ -98,6 +103,7 @@ export function buildDiagnosticsReport(input: {
       }
       : null,
     startup: input.startup,
+    scrollScreenings: [...readScrollScreenings()],
     serverRuns: input.serverRuns,
     privacy: {
       includesChatContent: false,

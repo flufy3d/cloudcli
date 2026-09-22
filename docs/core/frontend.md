@@ -83,11 +83,18 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 
 诊断只有**一份报告、两个入口**：设置 → 诊断，和聊天导出菜单里的「Diagnostics (.json)」。
 两者调用同一个 `src/shared/diagnostics/diagnosticsReport.ts`，区别只在有没有会话可描述。
-报告由四段组成：
+报告由五段组成：
 
 - **启动与 PWA**（`startupDiagnostics.ts`）：当前及最近五次页面启动的导航/绘制指标、
   应用生命周期标记、聚合后的资源耗时、长任务、PWA/SW/Cache Storage 状态和运行环境。
 - **连接帧**（`frameRecorder.ts`）：WebSocket **双向**帧的常驻录制。
+- **滚动筛查**（`scrollScreening.ts`）：在聊天消息面板上筛出「手指划了却没滚动」的触摸。
+  「列表滚不动」有三种成因——虚拟列表总高塌陷到只剩一屏（无可滚区间）、透明图层盖住面板
+  （手指根本没碰到滚动容器）、主线程被长任务占满（触摸事件排队）——事后长得一模一样，
+  修法却相反。因此每条记录都带上判定所需的事实：本次触摸的位移与 `scrollTop` 实际变化、
+  面板几何与计算后的 `overflow-y`/`touch-action`/`contain`/`transform`、面板中心点的
+  `elementFromPoint` 命中者、以及触摸事件从产生到被处理的最大延迟。
+  平时零开销：passive 监听，只在触摸时比两个数，判定成立才读一次样。
 - **时间线**：导出时刻 `serverMessages` / `realtimeMessages` 的行 id 列表、乐观行退休映射、`runEnded`。
 - **服务端运行结束记录**：`GET /api/diagnostics/runs`，即后端对每次 run 为什么结束的判定
   （见 [chat.md](./chat.md)）。拉取失败写 `{ error }`，不让一段失败毁掉整份报告。
