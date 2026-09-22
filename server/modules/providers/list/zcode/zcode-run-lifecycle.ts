@@ -179,6 +179,20 @@ const ANSWERED_PERMISSION_TTL_MS = 5 * 60 * 1000;
 const PENDING_PERMISSION_TTL_MS = 30 * 60 * 1000;
 
 /**
+ * The literal the engine's plan-approval reader accepts as "the user approved
+ * this plan"; every other answer string is fed back to the model as revision
+ * feedback, and an absent one is read as a plain denial.
+ */
+const PLAN_APPROVAL_ANSWER = 'approve';
+
+/**
+ * The reason stamped on a denial that carried no message of its own. Plan
+ * approval has to tell it apart from real user feedback: a denial with
+ * feedback goes back to the model as revision notes, a bare one declines.
+ */
+const DEFAULT_DENY_REASON = 'Denied by user';
+
+/**
  * Lifecycle tunables, injectable for tests.
  */
 export type ZCodeRunLifecycleOptions = {
@@ -476,7 +490,7 @@ export class ZCodeRunLifecycle {
       return;
     }
 
-    this.answerPendingPermission(requestId, { result: { decision: 'deny', reason: decision.message ?? 'Denied by user' } });
+    this.answerPendingPermission(requestId, { result: { decision: 'deny', reason: decision.message ?? DEFAULT_DENY_REASON } });
     this.retractPendingPermission(requestId, details);
   }
 
@@ -489,9 +503,14 @@ export class ZCodeRunLifecycle {
    * requestUserInput schema parses before it goes back to the engine. The
    * answered-decision record and the stacked-resolver re-announcement flow are
    * shared verbatim with the permission bridge.
+   *
+   * Plan approval (ExitPlanMode) rides the same method under a different
+   * payload contract, so the reshape needs to know which one it is answering —
+   * see `translateAnswerToUserInputShape`.
    */
   private handleUserInputRequest(request: ProtocolServerRequest): ServerRequestAnswer | Promise<ServerRequestAnswer> {
     const params = request.params ?? {};
+    const planApproval = isPlanApprovalRequest(params);
     const requestId = readOptionalString(params.requestId);
     const sessionId = readOptionalString(params.sessionId);
     if (!requestId) {
@@ -501,7 +520,7 @@ export class ZCodeRunLifecycle {
     this.sweepExpiredPermissions();
     const answered = this.answeredPermissions.get(requestId);
     if (answered && answered.toolCallId === readOptionalString(params.toolCallId)) {
-      return translateAnswerToUserInputShape(answered.answer);
+      return translateAnswerToUserInputShape(answered.answer, planApproval);
     }
 
     const stack = this.pendingPermissionResolvers.get(requestId);
@@ -511,7 +530,7 @@ export class ZCodeRunLifecycle {
         pending.lastAnnouncedAt = Date.now();
       }
       return new Promise<ServerRequestAnswer>((resolve) => {
-        stack.push((answer) => resolve(translateAnswerToUserInputShape(answer)));
+        stack.push((answer) => resolve(translateAnswerToUserInputShape(answer, planApproval)));
       });
     }
 
@@ -553,7 +572,7 @@ export class ZCodeRunLifecycle {
 
     return new Promise<ServerRequestAnswer>((resolve) => {
       const resolvers = this.pendingPermissionResolvers.get(requestId);
-      resolvers?.push((answer) => resolve(translateAnswerToUserInputShape(answer)));
+      resolvers?.push((answer) => resolve(translateAnswerToUserInputShape(answer, planApproval)));
     });
   }
 
@@ -664,6 +683,17 @@ export class ZCodeRunLifecycle {
 }
 
 /**
+ * Whether a `interaction/requestUserInput` frame is the ExitPlanMode approval
+ * prompt rather than an AskUserQuestion. The engine tags the former with
+ * `schema.interaction: 'plan_approval'`; the toolName check keeps older frames
+ * that predate the tag working.
+ */
+function isPlanApprovalRequest(params: Record<string, unknown>): boolean {
+  return readOptionalString(readJsonRecord(params.schema)?.interaction) === 'plan_approval'
+    || readOptionalString(params.toolName) === 'ExitPlanMode';
+}
+
+/**
  * Reshapes a `{decision}` permission answer into the strict
  * `{action, content?, reason?}` shape the engine's requestUserInput schema
  * parses — an unexpected key there fails validation and would fail the tool
@@ -671,11 +701,17 @@ export class ZCodeRunLifecycle {
  * delivers its collected `answers` (via `updatedInput`), so it maps to accept
  * plus content; deny maps to decline; anything else cancels, which the engine
  * reads as "the question was never answered".
+ *
+ * Plan approval is the same method with a different payload contract, so it
+ * gets its own reshape (`translatePlanApprovalAnswer`).
  */
-function translateAnswerToUserInputShape(answer: ServerRequestAnswer): ServerRequestAnswer {
+function translateAnswerToUserInputShape(answer: ServerRequestAnswer, planApproval = false): ServerRequestAnswer {
   const decision = 'result' in answer ? readJsonRecord(answer.result) : null;
   if (!decision) {
     return { result: { action: 'cancel' } };
+  }
+  if (planApproval) {
+    return translatePlanApprovalAnswer(decision);
   }
   if (decision.decision === 'modify') {
     const modifiedInput = readJsonRecord(decision.modifiedInput);
@@ -686,4 +722,27 @@ function translateAnswerToUserInputShape(answer: ServerRequestAnswer): ServerReq
     return { result: { action: 'accept', content: {} } };
   }
   return { result: { action: 'decline', reason: typeof decision.reason === 'string' ? decision.reason : undefined } };
+}
+
+/**
+ * Reshapes a decision on the ExitPlanMode approval prompt. The engine does not
+ * read `action: 'accept'` alone as approval: it looks for the `approve` token
+ * in `content.answer`, treats any other answer text as revision feedback the
+ * model sees verbatim, and reports a bare accept as
+ * "Permission denied for ExitPlanMode" — which is what the Build button used
+ * to produce. A denial carrying a message therefore travels as feedback; one
+ * without a message is a plain decline.
+ */
+function translatePlanApprovalAnswer(decision: Record<string, unknown>): ServerRequestAnswer {
+  if (decision.decision === 'allow' || decision.decision === 'modify') {
+    return { result: { action: 'accept', content: { answer: PLAN_APPROVAL_ANSWER } } };
+  }
+  const reason = typeof decision.reason === 'string' ? decision.reason : undefined;
+  const feedback = reason?.trim();
+  // A feedback text that happens to be the approve token would silently flip a
+  // rejection into an approval, so it falls back to the decline shape.
+  if (feedback && feedback !== DEFAULT_DENY_REASON && feedback.toLowerCase() !== PLAN_APPROVAL_ANSWER) {
+    return { result: { action: 'accept', content: { answer: feedback } } };
+  }
+  return { result: { action: 'decline', ...(reason ? { reason } : {}) } };
 }
