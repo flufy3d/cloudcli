@@ -178,6 +178,11 @@ export async function openCodexAppServer(
     pending.delete(message.id);
   });
 
+  // Set by `close()` so the exit log can say whether cloudcli asked the
+  // process to stop or it went away on its own — the two look identical in
+  // the engine's own transcript, which records only that its turn ended.
+  let closedByClient = false;
+
   const failPending = (reason: string) => {
     if (exitReason) {
       return;
@@ -192,6 +197,10 @@ export async function openCodexAppServer(
 
   child.on('error', (error) => failPending(error.message));
   child.on('exit', (code, signal) => {
+    console.log(
+      `[Codex] app-server exited (code ${code ?? 'null'}, signal ${signal ?? 'null'}, `
+      + `closedByCloudCLI=${closedByClient})`,
+    );
     failPending(`codex app-server exited (code ${code ?? 'null'}, signal ${signal ?? 'null'})`);
   });
   // A child that dies mid-request leaves its pipes broken, and the next write
@@ -243,6 +252,7 @@ export async function openCodexAppServer(
       return;
     }
     closed = true;
+    closedByClient = true;
     reader.close();
     child.kill();
   };

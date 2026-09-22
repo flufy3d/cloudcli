@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.5.8 / 2026-09-22
+> 基准：2.5.10 / 2026-09-22
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -79,29 +79,38 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 改后端声明而忘了改它会直接让测试红。
 - 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染。
 
-## 诊断报告（帧录制）
+## 诊断报告（统一入口）
 
-`src/shared/diagnostics/frameRecorder.ts` 常驻录制 WebSocket 的**双向**帧，聊天导出菜单里的
-「Diagnostics (.json)」把它连同当前会话的时间线状态一起写成文件。
+诊断只有**一份报告、两个入口**：设置 → 诊断，和聊天导出菜单里的「Diagnostics (.json)」。
+两者调用同一个 `src/shared/diagnostics/diagnosticsReport.ts`，区别只在有没有会话可描述。
+报告由四段组成：
 
-为什么需要它：消息重复是这个项目反复出现的缺陷，而历次排查都只能依赖**引擎落盘的 transcript**——
-那份记录只能证明引擎收到/写出了什么，永远证明不了「客户端自己多画了一行」「同一帧到了两次」
-「某次发送被服务端拒了」。报告补的正是这三类事实：每帧只留决定行身份的字段
-（`kind` / `id` / `toolId` / `role` / `seq` + 截断摘要），加上导出时刻的
-`serverMessages` / `realtimeMessages` 行 id 列表、乐观行的退休映射、`runEnded`。
+- **启动与 PWA**（`startupDiagnostics.ts`）：当前及最近五次页面启动的导航/绘制指标、
+  应用生命周期标记、聚合后的资源耗时、长任务、PWA/SW/Cache Storage 状态和运行环境。
+- **连接帧**（`frameRecorder.ts`）：WebSocket **双向**帧的常驻录制。
+- **时间线**：导出时刻 `serverMessages` / `realtimeMessages` 的行 id 列表、乐观行退休映射、`runEnded`。
+- **服务端运行结束记录**：`GET /api/diagnostics/runs`，即后端对每次 run 为什么结束的判定
+  （见 [chat.md](./chat.md)）。拉取失败写 `{ error }`，不让一段失败毁掉整份报告。
 
-两条设计约束：
+为什么要合成一份：用户报障时说的是「又慢又断」，他不该先判断该导哪种报告；而慢和断的证据
+本来就分散在这四处，分成两份文件只会每次都少一半。
+
+三条设计约束：
 
 - **默认开着**。环形缓冲有上限、正文只存摘要，代价是几百 KB；需要先打开才录的日志，
   等于在真正出问题的那一次没有日志。
+- **跨刷新存活**。帧按节流写进 sessionStorage（`pagehide` 兜底），下次加载读回并保留原
+  `load` 标记，报告里能看出刷新边界在哪。只在内存里的录制等于没有：等用户想起要导出时，
+  出事的那个标签页通常已经刷新过了——这是实测栽过的坑。
 - **store 是按挂载创建的，不是模块单例**，所以报告不能直接 import 它；由 `useSessionStore`
   注册一个读取器，导出控件按当前会话 id 取。
 
-### 启动与 PWA 诊断
-
-设置 → 诊断导出的文件来自 `src/shared/diagnostics/startupDiagnostics.ts`，与聊天帧诊断分开：它只记录当前及最近五次页面启动的导航/绘制指标、应用生命周期标记、聚合后的资源耗时、长任务、PWA/SW/Cache Storage 状态和粗略运行环境，专门用于对比首开与热启动。记录只留在浏览器 localStorage，用户手动下载；不得自动上报。
-
-隐私是格式契约：启动报告不得包含聊天正文、凭证、Cookie、请求头或 URL query；只有构建产物的 `/assets/` 路径可保留文件名，API、其他同源资源和外站资源分别归类为 `/api`、`same_origin_other`、`external`。浏览器不支持的性能条目写 `null`，不可伪造为零。应用可用性路径若变更，须继续用 `markStartupMilestone()` 标记入口执行、React 首次提交、认证完成与工作区首次提交，使版本间报告可比。
+隐私是格式契约：报告不得包含聊天正文、凭证、Cookie、请求头或 URL query。帧只留决定行身份的
+字段（`kind` / `id` / `toolId` / `role` / `seq` + 截断摘要）；只有构建产物的 `/assets/`
+路径可保留文件名，API、其他同源资源和外站资源分别归类为 `/api`、`same_origin_other`、
+`external`；服务端运行记录只有标识、计时和计数。浏览器不支持的性能条目写 `null`，不可伪造为零。
+应用可用性路径若变更，须继续用 `markStartupMilestone()` 标记入口执行、React 首次提交、
+认证完成与工作区首次提交，使版本间报告可比。记录只留在本地，用户手动下载；不得自动上报。
 
 ## 性能守则（硬约束，都是踩过坑的）
 

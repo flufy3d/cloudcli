@@ -905,12 +905,16 @@
     "unknownError": "Unknown error"
   },
   "diagnostics": {
-    "title": "Startup diagnostics",
-    "description": "Export browser-local startup and PWA measurements for performance analysis.",
-    "privacy": "The file excludes chat content, credentials, request headers and URL query parameters. It contains browser, network, performance and Service Worker state only.",
+    "title": "Diagnostics",
+    "description": "Export one file covering how this page started, what the connection carried, and how the server's recent runs ended.",
+    "includesStartup": "Startup and PWA: first paint timings, slow resources, long tasks, service worker and cache state.",
+    "includesFrames": "Connection record: every frame this page exchanged with the server, kept across reloads (identifying fields only).",
+    "includesRuns": "Run outcomes: how the server says each recent run ended — finished, failed, stopped by you, or the engine going away on its own.",
+    "privacy": "The file excludes chat content, credentials, request headers and URL query parameters. Identifiers, timings and state only.",
     "export": "Export diagnostics",
     "exporting": "Preparing export…",
-    "clearHistory": "Clear diagnostic history",
+    "clearHistory": "Clear recorded diagnostics",
+    "clearedNotice": "Cleared. Reproduce the problem, then export — the file will hold only that.",
     "exportSuccess": "Diagnostics file downloaded.",
     "exportFailed": "Could not create the diagnostics file. Check browser download permissions and try again."
   },

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { clearRunOutcomes, readRunOutcomes } from '@/modules/diagnostics/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { connectedClients } from '@/modules/websocket/services/websocket-state.service.js';
 
@@ -128,7 +129,7 @@ test('complete marks the run finished and duplicate completes are dropped', asyn
     assert.equal(chatRunRegistry.isProcessing('app-run-3'), false);
 
     // completeRun is also a no-op once the run already completed.
-    chatRunRegistry.completeRun('app-run-3', { exitCode: 1 });
+    chatRunRegistry.completeRun('app-run-3', { exitCode: 1, reason: 'client_abort' });
     assert.equal(connection.frames.filter((frame) => frame.kind === 'complete').length, 1);
   });
 });
@@ -160,12 +161,12 @@ test('a finished run\'s safety net cannot complete the session\'s next run', asy
     assert.ok(secondRun);
 
     // First run's safety net fires late: it must not touch the new run.
-    chatRunRegistry.completeRunIfCurrent(firstRun, { exitCode: 1 });
+    chatRunRegistry.completeRunIfCurrent(firstRun, { exitCode: 1, reason: 'dispatch_failed' });
     assert.equal(chatRunRegistry.isProcessing('app-run-9'), true);
     assert.equal(connection.frames.filter((frame) => frame.kind === 'complete').length, 1);
 
     // The second run's own safety net still works while it is current.
-    chatRunRegistry.completeRunIfCurrent(secondRun, { exitCode: 1 });
+    chatRunRegistry.completeRunIfCurrent(secondRun, { exitCode: 1, reason: 'dispatch_failed' });
     assert.equal(chatRunRegistry.isProcessing('app-run-9'), false);
     assert.equal(connection.frames.filter((frame) => frame.kind === 'complete').length, 2);
   });
@@ -195,7 +196,7 @@ test('listRunningRuns returns only currently running app sessions', async () => 
     });
     assert.ok(runningRun);
 
-    chatRunRegistry.completeRun('app-run-7', { exitCode: 0 });
+    chatRunRegistry.completeRun('app-run-7', { exitCode: 0, reason: 'engine_completed' });
 
     const runningSessions = chatRunRegistry.listRunningRuns();
     assert.deepEqual(runningSessions.map((session) => session.sessionId), ['app-run-8']);
@@ -377,7 +378,7 @@ test('startRun rejects a second concurrent run for the same session', async () =
     assert.equal(second, null);
 
     // After the run finishes a new one is allowed again.
-    chatRunRegistry.completeRun('app-run-6', { exitCode: 0 });
+    chatRunRegistry.completeRun('app-run-6', { exitCode: 0, reason: 'engine_completed' });
     const third = chatRunRegistry.startRun({
       appSessionId: 'app-run-6',
       provider: 'opencode',
@@ -388,3 +389,78 @@ test('startRun rejects a second concurrent run for the same session', async () =
     assert.ok(third);
   });
 });
+
+
+/**
+ * Every engine ends its runs through the same registry branch, so the reason
+ * a run stopped must be recorded identically for all of them. Pinning all four
+ * engines in use keeps a provider-specific regression from hiding behind the
+ * one engine a bug report happened to mention.
+ */
+for (const provider of ['claude', 'codex', 'antigravity', 'zcode'] as const) {
+  test(`${provider}: an engine's own clean completion is recorded as engine_completed`, async () => {
+    await withIsolatedDatabase(() => {
+      clearRunOutcomes();
+      sessionsDb.createAppSession(`outcome-ok-${provider}`, provider, '/workspace/demo');
+      const run = chatRunRegistry.startRun({
+        appSessionId: `outcome-ok-${provider}`,
+        provider,
+        providerSessionId: null,
+        connection: new FakeConnection(),
+        userId: null,
+      });
+      assert.ok(run);
+
+      run.writer.send({ kind: 'complete', provider, sessionId: 'native', exitCode: 0 });
+
+      const [recorded] = readRunOutcomes();
+      assert.equal(recorded?.sessionId, `outcome-ok-${provider}`);
+      assert.equal(recorded?.provider, provider);
+      assert.equal(recorded?.reason, 'engine_completed');
+    });
+  });
+
+  test(`${provider}: an engine that ends non-zero is recorded as engine_failed`, async () => {
+    await withIsolatedDatabase(() => {
+      clearRunOutcomes();
+      sessionsDb.createAppSession(`outcome-fail-${provider}`, provider, '/workspace/demo');
+      const run = chatRunRegistry.startRun({
+        appSessionId: `outcome-fail-${provider}`,
+        provider,
+        providerSessionId: null,
+        connection: new FakeConnection(),
+        userId: null,
+      });
+      assert.ok(run);
+
+      run.writer.send({ kind: 'complete', provider, sessionId: 'native', exitCode: 1 });
+
+      assert.equal(readRunOutcomes()[0]?.reason, 'engine_failed');
+    });
+  });
+
+  test(`${provider}: a client abort outranks the exit code the abort produced`, async () => {
+    await withIsolatedDatabase(() => {
+      clearRunOutcomes();
+      sessionsDb.createAppSession(`outcome-abort-${provider}`, provider, '/workspace/demo');
+      const run = chatRunRegistry.startRun({
+        appSessionId: `outcome-abort-${provider}`,
+        provider,
+        providerSessionId: null,
+        connection: new FakeConnection(),
+        userId: null,
+      });
+      assert.ok(run);
+
+      chatRunRegistry.completeRun(`outcome-abort-${provider}`, {
+        exitCode: 0,
+        aborted: true,
+        reason: 'client_abort',
+      });
+
+      const [recorded] = readRunOutcomes();
+      assert.equal(recorded?.reason, 'client_abort');
+      assert.equal(recorded?.exitCode, 0);
+    });
+  });
+}

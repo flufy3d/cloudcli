@@ -495,14 +495,18 @@
     "runningStatus": "執行中"
   },
   "diagnostics": {
-    "title": "啟動診斷",
-    "description": "匯出僅保存在瀏覽器本機的啟動與 PWA 指標，用來排查開啟緩慢的問題。",
-    "privacy": "檔案不包含聊天正文、憑證、請求標頭或 URL 查詢參數，只包含瀏覽器、網路、效能與 Service Worker 狀態。",
-    "export": "匯出診斷日誌",
+    "title": "診斷",
+    "description": "匯出一份診斷檔案，涵蓋這個頁面的啟動過程、連線收發記錄，以及伺服器端最近的執行結束情況。",
+    "includesStartup": "啟動與 PWA：首屏耗時、慢資源、長任務、Service Worker 與快取狀態。",
+    "includesFrames": "連線記錄：本頁與伺服器之間收發的每一個訊框（僅保留識別欄位，重新整理後仍會保留）。",
+    "includesRuns": "執行結束記錄：伺服器記下的每次對話執行是怎麼結束的——跑完、出錯、被你按了停止，還是引擎自己斷了。",
+    "privacy": "檔案不包含聊天內容、憑證、請求標頭或 URL 查詢參數，只有識別碼、計時與狀態。",
+    "export": "匯出診斷檔案",
     "exporting": "正在準備匯出…",
-    "clearHistory": "清除診斷歷史",
+    "clearHistory": "清空已記錄的診斷資料",
+    "clearedNotice": "已清空。重現問題後再匯出，檔案裡只會有這一次的記錄。",
     "exportSuccess": "診斷檔案已下載。",
-    "exportFailed": "無法產生診斷檔案，請檢查瀏覽器下載權限後再試一次。"
+    "exportFailed": "無法產生診斷檔案，請檢查瀏覽器下載權限後重試。"
   },
   "sessions": {
     "title": "会话管理",

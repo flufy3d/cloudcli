@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { beforeEach, test } from 'vitest';
 
 import {
-  buildStartupDiagnosticsReport,
+  buildStartupDiagnosticsSection,
   clearStartupDiagnosticsHistory,
   recordStartupDiagnosticsSnapshot,
   readStartupDiagnosticsHistory,
@@ -52,7 +52,7 @@ test('keeps only the newest startup records for cross-build comparison', () => {
 });
 
 test('reports unsupported metrics as null instead of manufacturing a zero', () => {
-  const report = buildStartupDiagnosticsReport({
+  const section = buildStartupDiagnosticsSection({
     build: 'v2.5.8-abc',
     takenAt: '2026-09-22T00:00:00.000Z',
     navigation: { ttfbMs: 42 },
@@ -62,12 +62,6 @@ test('reports unsupported metrics as null instead of manufacturing a zero', () =
     pwa: { supported: false },
   });
 
-  assert.equal(report.schemaVersion, 1);
-  assert.equal(report.current.metrics.fcpMs, null);
-  assert.equal(report.current.pwa.supported, false);
-  assert.deepEqual(report.privacy, {
-    includesChatContent: false,
-    includesCredentials: false,
-    resourceUrlsAreSanitized: true,
-  });
+  assert.equal(section.current.metrics.fcpMs, null);
+  assert.equal(section.current.pwa.supported, false);
 });

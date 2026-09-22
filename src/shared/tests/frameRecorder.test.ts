@@ -6,31 +6,20 @@
 
 import assert from 'node:assert/strict';
 
-import { beforeEach, test } from 'vitest';
+import { beforeEach, test, vi } from 'vitest';
 
-import type { NormalizedMessage } from '@/shared/types';
 import {
-  buildDiagnosticsReport,
+  persistRecordedFrames,
   readRecordedFrames,
   recordInboundFrame,
   recordOutboundFrame,
   resetRecordedFrames,
+  restoreRecordedFrames,
 } from '@/shared/diagnostics/frameRecorder';
 
 beforeEach(() => {
   resetRecordedFrames();
 });
-
-function row(overrides: Partial<NormalizedMessage>): NormalizedMessage {
-  return {
-    id: 'row-1',
-    sessionId: 'sess-a',
-    timestamp: '2026-01-01T00:00:00.000Z',
-    provider: 'codex',
-    kind: 'text',
-    ...overrides,
-  } as NormalizedMessage;
-}
 
 test('both directions are recorded in arrival order with the fields identity turns on', () => {
   recordOutboundFrame({ type: 'chat.send', sessionId: 'sess-a', content: '继续' });
@@ -58,35 +47,53 @@ test('a long body is summarized rather than stored whole', () => {
   assert.ok(frame.summary?.endsWith('…'));
 });
 
-test('the report pairs the frames with the rows the timeline is holding', () => {
-  recordOutboundFrame({ type: 'chat.send', sessionId: 'sess-a', content: '继续' });
-  recordInboundFrame({ kind: 'text', role: 'user', id: 'item-u1', sessionId: 'sess-a', content: '继续' });
+test('frames survive a page reload, which is when a report is usually taken', () => {
+  recordOutboundFrame({ type: 'chat.abort', sessionId: 'sess-a' });
+  recordInboundFrame({ kind: 'complete', sessionId: 'sess-a' });
+  persistRecordedFrames();
 
-  const report = buildDiagnosticsReport(
-    'sess-a',
-    [row({ id: 'local_1', role: 'user', content: '继续' }), row({ id: 'item-u1', role: 'user', content: '继续' })],
-    {
-      serverMessages: [row({ id: 'item-u1', role: 'user' })],
-      realtimeMessages: [row({ id: 'local_1', role: 'user' })],
-      retiredOptimisticUserAnchors: [],
-      pendingPrompts: [['local_1', { afterRowId: null }]],
-      runEnded: false,
-    },
-  );
+  // A reload keeps sessionStorage but empties the module's memory. Without
+  // this the recorder is blank exactly when the user goes looking: the tab
+  // that saw the incident has long since been refreshed.
+  resetRecordedFrames({ keepStorage: true });
+  assert.equal(readRecordedFrames().length, 0);
+  restoreRecordedFrames();
 
-  assert.equal(report.sessionId, 'sess-a');
-  assert.equal(report.frames.length, 2);
-  // Two rendered rows against one send is exactly the shape of the bug this
-  // report exists to identify, and the report has to make it readable.
-  assert.deepEqual(report.timeline?.rendered.map((r) => r.id), ['local_1', 'item-u1']);
-  assert.deepEqual(report.timeline?.server, ['item-u1']);
-  assert.deepEqual(report.timeline?.realtime, ['local_1']);
-  assert.deepEqual(report.timeline?.retiredOptimisticUserAnchors, []);
+  const frames = readRecordedFrames();
+  assert.deepEqual(frames.map((frame) => frame.kind), ['chat.abort', 'complete']);
+  assert.ok(frames.every((frame) => frame.load), 'each frame names the page load that recorded it');
 });
 
-test('a report taken with no session open still carries the frames', () => {
-  recordInboundFrame({ kind: 'chat_subscribed', sessionId: 'sess-a' });
-  const report = buildDiagnosticsReport(null, null, null);
-  assert.equal(report.timeline, null);
-  assert.equal(report.frames.length, 1);
+test('a restored frame is marked as belonging to an earlier page load', async () => {
+  recordOutboundFrame({ type: 'chat.send', sessionId: 'sess-a', content: 'first load' });
+  persistRecordedFrames();
+  const loadBeforeReload = readRecordedFrames()[0]?.load;
+
+  // A real reload re-evaluates the module, which is what mints a new load id;
+  // clearing the buffer in place cannot reproduce that.
+  vi.resetModules();
+  const reloaded = await import('@/shared/diagnostics/frameRecorder');
+  reloaded.recordOutboundFrame({ type: 'chat.send', sessionId: 'sess-a', content: 'second load' });
+
+  const [restored, fresh] = reloaded.readRecordedFrames();
+  assert.equal(restored.load, loadBeforeReload);
+  assert.notEqual(fresh.load, restored.load, 'a new page load must be distinguishable from the restored one');
+});
+
+test('clearing the recorder also clears what a reload would restore', () => {
+  recordOutboundFrame({ type: 'chat.send', sessionId: 'sess-a', content: '继续' });
+  persistRecordedFrames();
+
+  resetRecordedFrames();
+  restoreRecordedFrames();
+
+  assert.equal(readRecordedFrames().length, 0);
+});
+
+test('unreadable stored frames are discarded rather than breaking the recorder', () => {
+  window.sessionStorage.setItem('cloudcli-diagnostic-frames-v1', '{not json');
+  restoreRecordedFrames();
+  recordInboundFrame({ kind: 'text', sessionId: 'sess-a', content: 'still recording' });
+
+  assert.deepEqual(readRecordedFrames().map((frame) => frame.kind), ['text']);
 });

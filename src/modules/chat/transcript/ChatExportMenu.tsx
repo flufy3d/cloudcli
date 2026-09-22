@@ -3,7 +3,7 @@ import { Download, FileJson, FileText, Stethoscope, type LucideIcon } from 'luci
 import type { ChatMessage, DiffLine } from '@/shared/types';
 import { ActionMenu, type ActionMenuItem } from '@/shared/ui/ActionMenu';
 import { downloadTranscriptExport, downloadPDF, getAvailableExportFormats, type EXPORT_FORMATS } from '@/modules/chat/utils/chatExport';
-import { downloadDiagnosticsReport } from '@/shared/diagnostics/frameRecorder';
+import { downloadDiagnosticsReport } from '@/shared/diagnostics/diagnosticsReport';
 
 type ChatExportMenuProps = {
   messages: ChatMessage[];
@@ -70,7 +70,7 @@ export default function ChatExportMenu({ messages, sessionTitle, provider, sessi
       key: 'diagnostics',
       label: 'Diagnostics (.json)',
       icon: Stethoscope,
-      onSelect: () => downloadDiagnosticsReport(sessionId ?? null),
+      onSelect: () => void downloadDiagnosticsReport(sessionId ?? null),
     },
   ];
 

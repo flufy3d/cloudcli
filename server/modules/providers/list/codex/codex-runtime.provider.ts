@@ -676,6 +676,10 @@ function abortCodexSession(sessionId: string) {
   }
 
   session.status = 'aborted';
+  console.log(
+    `[Codex] Aborting session ${sessionId} (thread ${session.threadId ?? 'unknown'}, `
+    + `turn ${session.turnId ?? 'none'}) — started ${session.startedAt}`,
+  );
   if (session.threadId && session.turnId) {
     session.connection
       .call('turn/interrupt', { threadId: session.threadId, turnId: session.turnId })

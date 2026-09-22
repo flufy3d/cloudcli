@@ -15,7 +15,7 @@
 import { useEffect, useState } from 'react';
 
 import { SessionTimelineStore } from '@/modules/chat/utils/sessionTimelineStore';
-import { registerTimelineSnapshotSource } from '@/shared/diagnostics/frameRecorder';
+import { registerTimelineSnapshotSource } from '@/shared/diagnostics/diagnosticsReport';
 
 export type { MessageKind, NormalizedMessage } from '@/shared/types';
 export type { SessionSlot, SessionStatus } from '@/modules/chat/utils/sessionTimelineStore';

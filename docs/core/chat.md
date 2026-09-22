@@ -1,6 +1,6 @@
 # 聊天链路（Chat Pipeline）
 
-> 基准：2.5.1 / 2026-09-22
+> 基准：2.5.10 / 2026-09-22
 > **核心文档**：改动 `server/modules/websocket/**` 或 `src/modules/chat/**` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -43,12 +43,21 @@
 - 批准记忆（`rememberEntry`）各引擎语义不同：claude 往 `allowedTools` 追加一条规则，codex 改答 `acceptForSession`（由引擎自己记住本会话）。
 - **谁来复核由引擎配置决定，适配器不覆盖**：codex 的 `approvals_reviewer`（`user` / `auto_review` / `guardian_subagent`）决定请求是否在到达客户端前就被自动裁决；在 `thread/start` 里写死这个值等于悄悄推翻用户自己的设置。
 
-## 诊断报告
+## run 的结束原因（诊断契约）
 
-聊天导出菜单里的「Diagnostics (.json)」导出 WebSocket **双向**帧的常驻录制
-（`src/shared/diagnostics/frameRecorder.ts`）加上当前会话的时间线状态。它补的是引擎
-transcript 永远给不出的三类事实：客户端自己多画的行、到了两次的帧、被服务端拒绝的发送。
-细节见 [frontend.md](./frontend.md)。
+每个 run 无论怎么结束，都只从 `chat-run-registry.service.ts` 里 `complete` 那一个分支离开，
+所以结束原因在那里**统一记录一次**，与引擎无关：`engine_completed` / `engine_failed` /
+`client_abort` / `superseded` / `dispatch_failed`。前三个之外的两个由调用方在发出终止
+`complete` 前标记（`completeRun` / `completeRunIfCurrent` 的 `reason` 是必填参数），
+引擎自己结束的则按 exitCode 判定。
+
+为什么必须是这条契约：引擎落盘的 transcript 只能记下「这一轮被中断了」，永远说不出是谁中断的——
+用户按了停止、调度消息抢占、派发阶段抛错、还是引擎进程自己没了，在它眼里长得一模一样。
+少了这个字段，一次「聊着聊着就断了」的报障就只能靠猜。
+
+记录进 `server/modules/diagnostics`（有界内存日志 + 进程日志），`GET /api/diagnostics/runs`
+读出来，前端诊断报告把它和自己那半边证据合成一份文件（见 [frontend.md](./frontend.md)）。
+跨引擎一致性由 `chat-run-registry.test.ts` 对四个在用引擎逐一钉住。
 
 ## 落盘同步（run 之外的第二条持久化路）
 

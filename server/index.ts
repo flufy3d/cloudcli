@@ -52,6 +52,7 @@ import {
 } from './modules/scheduled-messages/index.js';
 import { assetsRoutes } from './modules/assets/index.js';
 import { fileTreeRoutes } from './modules/file-tree/index.js';
+import { diagnosticsRoutes } from './modules/diagnostics/index.js';
 import { createLocalProxyRouter, localProxyAbsolutePathFallback } from './modules/local-proxy/index.js';
 import { worktreesRoutes } from './modules/worktrees/index.js';
 import {
@@ -162,6 +163,9 @@ app.use('/api/auth', authRoutes);
 
 // File Tree API Routes (protected)
 app.use('/api/file-tree', authenticateToken, fileTreeRoutes);
+
+// Diagnostics API Routes (protected)
+app.use('/api/diagnostics', authenticateToken, diagnosticsRoutes);
 
 // Projects API Routes (protected)
 app.use('/api/projects', authenticateToken, projectModuleRoutes);

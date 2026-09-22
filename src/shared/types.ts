@@ -1599,3 +1599,46 @@ type SessionHistoryPage = {
   hasMore: boolean;
   tokenUsage?: unknown;
 };
+
+// ---------------------------
+//----------------- DIAGNOSTICS ------------
+
+/**
+ * What the chat timeline was holding for one session when a diagnostics report
+ * was taken.
+ *
+ * The timeline merges two sources (persisted history and the live stream), and
+ * the failures worth reporting are disagreements between them — a row rendered
+ * twice, or a prompt that never retired. Reported together with the frames
+ * that produced them, so the report shows both the input and the result.
+ *
+ * Produced by the chat module's session store, consumed by the diagnostics
+ * report builder.
+ */
+export type TimelineSnapshot = {
+  serverMessages: NormalizedMessage[];
+  realtimeMessages: NormalizedMessage[];
+  retiredOptimisticUserAnchors: Array<[string, string]>;
+  pendingPrompts: Array<[string, unknown]>;
+  runEnded: boolean;
+};
+
+/**
+ * One finished run as the server recorded it, mirroring the backend's
+ * `RunOutcome`.
+ *
+ * `reason` is the field worth reading: it is what separates "the user pressed
+ * stop" from "the engine went away", which the engine's own transcript cannot
+ * distinguish after the fact.
+ */
+export type RunOutcomeRecord = {
+  sessionId: string;
+  provider: string;
+  reason: string;
+  exitCode: number;
+  startedAtIso: string;
+  endedAtIso: string;
+  durationMs: number;
+  eventCount: number;
+  lastSeq: number;
+};

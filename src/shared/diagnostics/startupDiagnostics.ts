@@ -63,8 +63,14 @@ type StartupReportInput = {
   pwa: Partial<StartupPwaState>;
 };
 
-type StartupDiagnosticsReport = {
-  schemaVersion: 1;
+/**
+ * The startup half of the diagnostics report.
+ *
+ * It is a section rather than a report of its own: a slow open and a dropped
+ * session are usually reported together ("it was slow, then it disconnected"),
+ * and one file that answers both is one file to ask the user for.
+ */
+export type StartupDiagnosticsSection = {
   current: StartupReportInput & {
     environment: {
       userAgent: string;
@@ -75,11 +81,6 @@ type StartupDiagnosticsReport = {
     milestones: Record<string, number>;
   };
   history: StartupSnapshot[];
-  privacy: {
-    includesChatContent: false;
-    includesCredentials: false;
-    resourceUrlsAreSanitized: true;
-  };
 };
 
 type ConnectionInformation = {
@@ -315,7 +316,7 @@ async function readPwaState(): Promise<StartupPwaState> {
   }
 }
 
-function readEnvironment(): StartupDiagnosticsReport['current']['environment'] {
+function readEnvironment(): StartupDiagnosticsSection['current']['environment'] {
   const connection = (navigator as Navigator & { connection?: ConnectionInformation }).connection;
   return {
     userAgent: navigator.userAgent,
@@ -333,21 +334,20 @@ function readEnvironment(): StartupDiagnosticsReport['current']['environment'] {
   };
 }
 
-/** Builds the serializable report shape. Exported so tests pin privacy guarantees. */
-export function buildStartupDiagnosticsReport(input: StartupReportInput): StartupDiagnosticsReport {
+/**
+ * Builds the serializable startup section.
+ *
+ * Consumers: `createStartupDiagnosticsSection`, and the tests that pin the
+ * "an unsupported metric is null, never a manufactured zero" guarantee.
+ */
+export function buildStartupDiagnosticsSection(input: StartupReportInput): StartupDiagnosticsSection {
   return {
-    schemaVersion: 1,
     current: {
       ...input,
       environment: readEnvironment(),
       milestones: { ...milestones },
     },
     history: readStartupDiagnosticsHistory(),
-    privacy: {
-      includesChatContent: false,
-      includesCredentials: false,
-      resourceUrlsAreSanitized: true,
-    },
   };
 }
 
@@ -375,10 +375,14 @@ export function startStartupDiagnostics(): void {
   window.addEventListener('load', () => window.setTimeout(persist, 5_000), { once: true });
 }
 
-/** Reads the live page, including the asynchronous service-worker and cache state. */
-export async function createStartupDiagnosticsReport(): Promise<StartupDiagnosticsReport> {
+/**
+ * Reads the live page, including the asynchronous service-worker and cache
+ * state. Consumer: `diagnosticsReport`, which folds this into the one report
+ * the UI exports.
+ */
+export async function createStartupDiagnosticsSection(): Promise<StartupDiagnosticsSection> {
   const pwa = await readPwaState();
-  return buildStartupDiagnosticsReport({
+  return buildStartupDiagnosticsSection({
     build: BUILD_INFO.describe || `${APP_VERSION}-${BUILD_INFO.commit}`,
     takenAt: new Date().toISOString(),
     navigation: readNavigation(),
@@ -387,18 +391,4 @@ export async function createStartupDiagnosticsReport(): Promise<StartupDiagnosti
     longTasks: [...longTasks],
     pwa,
   });
-}
-
-/** Downloads the privacy-scoped startup and PWA report for manual sharing. */
-export async function downloadStartupDiagnosticsReport(): Promise<void> {
-  const report = await createStartupDiagnosticsReport();
-  const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `cloudcli-startup-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
 }
