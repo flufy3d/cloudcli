@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.5.2 / 2026-09-22
+> 基准：2.5.8 / 2026-09-22
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -97,6 +97,12 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 - **store 是按挂载创建的，不是模块单例**，所以报告不能直接 import 它；由 `useSessionStore`
   注册一个读取器，导出控件按当前会话 id 取。
 
+### 启动与 PWA 诊断
+
+设置 → 诊断导出的文件来自 `src/shared/diagnostics/startupDiagnostics.ts`，与聊天帧诊断分开：它只记录当前及最近五次页面启动的导航/绘制指标、应用生命周期标记、聚合后的资源耗时、长任务、PWA/SW/Cache Storage 状态和粗略运行环境，专门用于对比首开与热启动。记录只留在浏览器 localStorage，用户手动下载；不得自动上报。
+
+隐私是格式契约：启动报告不得包含聊天正文、凭证、Cookie、请求头或 URL query；只有构建产物的 `/assets/` 路径可保留文件名，API、其他同源资源和外站资源分别归类为 `/api`、`same_origin_other`、`external`。浏览器不支持的性能条目写 `null`，不可伪造为零。应用可用性路径若变更，须继续用 `markStartupMilestone()` 标记入口执行、React 首次提交、认证完成与工作区首次提交，使版本间报告可比。
+
 ## 性能守则（硬约束，都是踩过坑的）
 
 1. **行身份稳定**：时间线 store 的两条不变量（字节等价行复用实例；更新只有原地 upsert / 保身份全量替换两种）。`React.memo`、WeakMap 转换缓存（`useChatMessages.ts`）、DOM 锚定全部依赖它。
@@ -115,7 +121,7 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 
 ## PWA 与版本
 
-- `public/manifest.json` + `public/sw.js`（注册在 `src/main.tsx` / `index.html`）；SW 不缓存 HTML 与 hash 资源名文件，**刷新即得新版本**；唯一旧窗口场景靠"设置 → 关于"的版本提示（`__APP_VERSION__` 由 vite define 注入，`__BUILD_INFO__` 含 git describe）。
+- `public/manifest.json` + `public/sw.js`（当前由 `src/main.tsx` 与 `index.html` 注册）；HTML 始终走网络，hash 静态资源走 cache-first，API 与 WebSocket 永不经 SW；因此刷新可拿到新版本，已缓存资源可复用。设置 → 关于的版本提示用 `__APP_VERSION__`（vite define）与含 git describe 的 `__BUILD_INFO__` 判断长驻窗口是否过期。
 - 冷启动会话恢复：`src/shared/sessionProtection*` / `useSessionProtection`——仅 standalone 模式记忆并预验证回跳；恢复 effect 必须声明在记录 effect 之前（顺序敏感）。
 - Web Push 复用 SW：`src/modules/settings/hooks/useWebPush.ts`，服务端 VAPID 在 `server/modules/notifications/`。
 

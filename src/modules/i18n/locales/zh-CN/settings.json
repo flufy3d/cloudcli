@@ -113,6 +113,7 @@
     "browser": "浏览器",
     "notifications": "通知",
     "plugins": "插件",
+    "diagnostics": "诊断",
     "about": "关于"
   },
   "sessions": {
@@ -703,5 +704,15 @@
     "installAriaLabel": "插件 git 仓库 URL",
     "tab": "标签",
     "runningStatus": "运行中"
+  },
+  "diagnostics": {
+    "title": "启动诊断",
+    "description": "导出仅保存在浏览器本地的启动和 PWA 指标，用于排查打开慢的问题。",
+    "privacy": "文件不包含聊天正文、凭证、请求头或 URL 查询参数，只包含浏览器、网络、性能和 Service Worker 状态。",
+    "export": "导出诊断日志",
+    "exporting": "正在准备导出…",
+    "clearHistory": "清空诊断历史",
+    "exportSuccess": "诊断文件已下载。",
+    "exportFailed": "无法生成诊断文件，请检查浏览器下载权限后重试。"
   }
 }

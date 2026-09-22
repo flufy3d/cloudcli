@@ -113,6 +113,7 @@
     "browser": "Browser",
     "notifications": "Notifications",
     "plugins": "Plugins",
+    "diagnostics": "Diagnostics",
     "about": "About"
   },
   "sessions": {
@@ -902,6 +903,16 @@
     "globalAddFailed": "Failed to add MCP server to all providers. {{details}}",
     "deleteConfirm": "Are you sure you want to delete this MCP server?",
     "unknownError": "Unknown error"
+  },
+  "diagnostics": {
+    "title": "Startup diagnostics",
+    "description": "Export browser-local startup and PWA measurements for performance analysis.",
+    "privacy": "The file excludes chat content, credentials, request headers and URL query parameters. It contains browser, network, performance and Service Worker state only.",
+    "export": "Export diagnostics",
+    "exporting": "Preparing export…",
+    "clearHistory": "Clear diagnostic history",
+    "exportSuccess": "Diagnostics file downloaded.",
+    "exportFailed": "Could not create the diagnostics file. Check browser download permissions and try again."
   },
   "about": {
     "tagline": "Open-source AI coding assistant interface",

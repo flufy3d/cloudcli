@@ -1,4 +1,5 @@
-import { BrowserRouter as Router, Navigate, Route, Routes } from 'react-router-dom';
+import { useEffect } from 'react';
+import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
 import { I18nextProvider } from 'react-i18next';
 
 import { ThemeProvider } from '@/shared/context/ThemeContext';
@@ -10,6 +11,7 @@ import { PluginsProvider } from '@/modules/plugins/context/PluginsContext';
 import WorkspaceErrorBoundary from '@/modules/project-workspace/WorkspaceErrorBoundary';
 import { ProjectWorkspaceRoute } from '@/modules/project-workspace';
 import i18n from '@/modules/i18n/config';
+import { markStartupMilestone } from '@/shared/diagnostics/startupDiagnostics';
 
 const DEPLOYMENT_ASSET_DIRECTORIES = new Set(['assets', 'static', 'icons', 'images']);
 
@@ -119,6 +121,10 @@ function detectRouterBasename() {
 /** Rendered by main.tsx; mounts the shared providers, the auth gate and the project workspace routes. */
 export default function App() {
   const routerBasename = detectRouterBasename();
+
+  useEffect(() => {
+    markStartupMilestone('react_committed');
+  }, []);
 
   return (
     <I18nextProvider i18n={i18n}>
