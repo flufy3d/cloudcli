@@ -29,7 +29,7 @@ export const PROVIDER_FALLBACK_CATALOG = {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
   },
   codex: {
-    defaultModel: 'gpt-5.6-sol',
+    defaultModel: 'gpt-6-sol',
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
   },
   opencode: {
