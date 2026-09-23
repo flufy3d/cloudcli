@@ -82,6 +82,18 @@
 
 压缩**刚结束的那一刻占用不可知**（opencode 的摘要消息带的是刚被压缩掉的旧对话用量，实测 319k；真实占用要等下一个回合；zcode 引擎自己压缩时把摘要写成带 `summary` 对象的 user 行，同样跳过），所以 `ProviderTokenUsageResult` 用 `compacted: true` + `used: 0` 表达"已重置、token 数未知"（前端 `readTokenBudgetFromUsage` 与实时 `token_budget` 帧都判这个标记，不会继续挂着旧数字）。唯一当下可测的量是**摘要本身的大小**：摘要的正文存在 `part` 表（`message.data` 里没有 `content`），`readOpenCodeMessageTextBytes` 累计其 `text` 分片的 UTF-8 字节数，作为 `summaryBytes` 随 `compacted` 一起给出（摘要消息自己的 `tokens` 是这次总结调用读进去的旧对话，不能用）。前端用它显示"压缩摘要 · 9.4KB"直到下一个回合拿到真实占用；`/cost` 经 `commands.routes.ts` 透传同样的标记与字节数，把误导性的 0 行换成摘要大小行。
 
+## Claude 会话进程：保活与复用（`claude-live-session.ts`）
+
+claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启动了后台工作的回合必须把进程保活**：SDK 的输入流一旦结束就关 stdin，CLI 按 print wind-down 杀掉所有后台 shell/agent（`Bash(run_in_background)`、子代理、Monitor/Cron 等）。因此 runtime 用可推送的输入流（`createClaudeHeldPromptStream`）让 stdin 一直开着，回合结束后进程进入 idle 保活态，等待后台任务回报（CLI 会推一轮 follow-up 回合）；静默上限 `BG_WAIT_CEILING_MS`（30 分钟，同时作为 `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` 传给 CLI 约束后台 agent）只是兜底，任何流消息都会把倒计时往后推。
+
+保活带来的核心约束：**用户在新回合发消息时绝不能重启进程**——那正是把后台任务杀掉的旧行为（`releaseInput()` → stdin EOF → wind-down）。`queryClaudeSDK` 因此在起新进程前先尝试**复用**：把新 prompt 推进活进程的输入流（同一进程内开启新回合，后台任务不受影响），并把这个新 run 的 writer 接上——事件循环的每回合状态（writer、complete、token 预算、idle 判定）都挂在 turn 对象上，adopted 回合的 `complete` 由新 run 的 writer 发出，原进程所属 run 的 promise 到进程退出才结算。复用条件（`canReuseClaudeLiveProcess` + 进程指纹 `buildClaudeProcessFingerprint`）全部满足才复用：模型/effort/permissionMode/cwd/工具白黑名单/MCP 配置逐项一致（改任一设置就重启，绝不悄悄用旧设置跑）、进程未进入 wind-down（`released`）、当前没有回合在跑、且不是编辑消息（`resumeAnchorId`/`resumeFromScratch` 必须新进程 resume 到锚点）。不满足时回退旧路径：释放保活进程 + 起新进程。
+
+**回合归属**：每条 prompt 都带客户端 `uuid`，CLI 在回合首帧与 `result` 上回显（`user_message_uuid(_uuids)`）。runtime 用它把 `result` 绑到正确的 turn，从而区分"用户回合的 result"（发 `complete`、结算提交者）与"CLI 自己推的后台 follow-up 回合的 result"（只做 `notifyBackgroundWorkCompleted`，不得结束用户正在跑的 run）。老版本 CLI 不回显时按到达顺序归属（旧行为）。
+
+**后台工作判定**：以 CLI 的任务生命周期帧为准——`background_tasks_changed`（全量替换语义）与 `task_started`（`is_backgrounded`）维护存活任务集合、`task_notification` 移除，`ambient` 任务（内部看护进程）不计；集合跨回合存活，所以"上一回合启动的任务"在新回合结束时仍然撑住保活。保活条件是"集合非空 **或** 本回合工具检测命中"：集合管跨回合的旧任务，每回合的 `Bash(run_in_background)`/延迟工具检测（`startsBackgroundWork`）兜住 CLI 还没来得及报帧的新任务，也兼容不报任务帧的旧 CLI。完成通知只在集合确实清空时发（旧 CLI 保持"follow-up result 即完成"的旧读法）。
+
+契约的实测探针：`scripts/probe/claude-bg-reuse-probe.mjs`（真实 CLI 验证三件事：第二条消息不杀后台任务、result 回显客户端 uuid、任务帧存在）。
+
 ## 共享基础设施（写新引擎前先看）
 
 
