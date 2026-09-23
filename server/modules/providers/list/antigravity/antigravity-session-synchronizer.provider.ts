@@ -49,7 +49,7 @@ function isTopLevelConversation(row: AntigravitySummaryRow): boolean {
  *
  * Contributes Antigravity's row mapping to the shared SQLite synchronizer
  * skeleton: only top-level conversations are indexed, the workspace is decoded
- * from `workspace_uris` (falling back to the process cwd),
+ * from `workspace_uris` (a row without one is skipped),
  * `last_modified_time` is an ISO string, and each session row carries the path
  * of its per-session brain transcript via `resolveJsonlPath`.
  */
@@ -136,7 +136,10 @@ export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<An
   }
 
   protected getProjectPath(row: AntigravitySummaryRow): string | null {
-    return parseAntigravityWorkspacePath(row.workspace_uris) ?? process.cwd();
+    // No cwd fallback: the server's own working directory is never the
+    // workspace of a conversation agy recorded, and substituting it filed
+    // those rows under whatever directory the process happened to start in.
+    return parseAntigravityWorkspacePath(row.workspace_uris);
   }
 
   /** Defends against a future query change accidentally reintroducing child rows. */

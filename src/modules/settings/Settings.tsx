@@ -17,6 +17,7 @@ import NotificationsSettingsTab from '@/modules/settings/tabs/NotificationsSetti
 import TasksSettingsTab from '@/modules/settings/tabs/tasks-settings/TasksSettingsTab';
 import { PluginSettingsTab } from '@/modules/plugins';
 import AboutTab from '@/modules/settings/tabs/AboutTab';
+import DiagnosticsSettingsTab from '@/modules/settings/tabs/DiagnosticsSettingsTab';
 import { useSettingsController } from '@/modules/settings/hooks/useSettingsController';
 import { useWebPush } from '@/modules/settings/hooks/useWebPush';
 import type { SettingsProps } from '@/shared/types';
@@ -63,7 +64,6 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
     providerAuthStatus,
     openLoginForProvider,
     showLoginModal,
-    setShowLoginModal,
     closeLoginModal,
     loginProvider,
     handleLoginComplete,
@@ -234,6 +234,8 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
               {activeTab === 'voice' && <VoiceSettingsTab />}
 
               {activeTab === 'plugins' && <PluginSettingsTab />}
+
+              {activeTab === 'diagnostics' && <DiagnosticsSettingsTab />}
 
               {activeTab === 'about' && <AboutTab />}
             </div>

@@ -13,6 +13,7 @@ import type { McpScope, McpTransport } from '@shared/protocol/capabilities';
 import type { LoadingProgressEvent as LoadingProgress } from '@shared/protocol/frames';
 import type {
   LLMProvider,
+  MemoryCitation,
   MessageKind,
   NormalizedMessage as WireNormalizedMessage,
 } from '@shared/protocol/chatEvents';
@@ -396,6 +397,12 @@ export type ChatMessage = {
   isLocalCommandStdout?: boolean;
   isCompactSummary?: boolean;
   isSubagentContainer?: boolean;
+  /**
+   * Stored memory this reply drew on, lifted out of the engine's in-prose
+   * markup by the provider adapter. Rendered as a footnote under the reply so
+   * a memory-derived claim stays traceable.
+   */
+  memoryCitations?: MemoryCitation[];
 }
 
 /** The user's locally persisted Claude preferences (default permission mode and allowed/disallowed tool lists, plus project sort order) read from and written back to browser storage. */
@@ -1098,7 +1105,7 @@ export type AgentContext = {
 };
 
 /** Identifier of a top-level section in the settings dialog; use it whenever a tab is stored, compared or requested so deep links, the sidebar and the command palette all agree on the same set of names. */
-export type SettingsMainTab = 'agents' | 'sessions' | 'appearance' | 'git' | 'api' | 'voice' | 'tasks' | 'browser' | 'scheduled' | 'notifications' | 'plugins' | 'about';
+export type SettingsMainTab = 'agents' | 'sessions' | 'appearance' | 'git' | 'api' | 'voice' | 'tasks' | 'browser' | 'scheduled' | 'notifications' | 'plugins' | 'diagnostics' | 'about';
 
 /** The coding-agent CLI a settings screen is configuring, aliasing LLMProvider so agent-scoped settings read as being about an agent rather than a chat model. */
 export type AgentProvider = LLMProvider;
@@ -1647,4 +1654,47 @@ type SessionHistoryPage = {
   total: number;
   hasMore: boolean;
   tokenUsage?: unknown;
+};
+
+// ---------------------------
+//----------------- DIAGNOSTICS ------------
+
+/**
+ * What the chat timeline was holding for one session when a diagnostics report
+ * was taken.
+ *
+ * The timeline merges two sources (persisted history and the live stream), and
+ * the failures worth reporting are disagreements between them — a row rendered
+ * twice, or a prompt that never retired. Reported together with the frames
+ * that produced them, so the report shows both the input and the result.
+ *
+ * Produced by the chat module's session store, consumed by the diagnostics
+ * report builder.
+ */
+export type TimelineSnapshot = {
+  serverMessages: NormalizedMessage[];
+  realtimeMessages: NormalizedMessage[];
+  retiredOptimisticUserAnchors: Array<[string, string]>;
+  pendingPrompts: Array<[string, unknown]>;
+  runEnded: boolean;
+};
+
+/**
+ * One finished run as the server recorded it, mirroring the backend's
+ * `RunOutcome`.
+ *
+ * `reason` is the field worth reading: it is what separates "the user pressed
+ * stop" from "the engine went away", which the engine's own transcript cannot
+ * distinguish after the fact.
+ */
+export type RunOutcomeRecord = {
+  sessionId: string;
+  provider: string;
+  reason: string;
+  exitCode: number;
+  startedAtIso: string;
+  endedAtIso: string;
+  durationMs: number;
+  eventCount: number;
+  lastSeq: number;
 };

@@ -86,14 +86,15 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
-    supportsPermissionRequests: false,
+    // `app-server` asks for sandbox escalations as JSON-RPC requests and
+    // blocks the turn until one is answered, so they reach the same approval
+    // card Claude's `canUseTool` callback raises.
+    supportsPermissionRequests: true,
     supportsTokenUsage: true,
     supportsQuota: true,
     supportsEffort: true,
-    // Not from the Codex SDK, which only starts and resumes threads: both ride
-    // the same CLI's `app-server` protocol, whose `thread/fork` copies a
-    // thread up to a chosen turn. Editing is that fork plus a new prompt,
-    // which is how Codex's own IDE clients do it.
+    // `thread/fork` copies a thread up to a chosen turn; editing is that fork
+    // plus a new prompt, which is how Codex's own IDE clients do it.
     supportsMessageEditing: true,
     supportsSessionForking: true,
     // `thread/compact/start` on the same app-server transport the fork rides.

@@ -109,6 +109,7 @@
     "attachFiles": "附加檔案",
     "attachImages": "附加圖片",
     "send": "傳送",
+    "sending": "傳送中…",
     "stop": "停止",
     "hintText": {
       "ctrlEnter": "Ctrl+Enter 傳送 • Shift+Enter 換行 • Tab 切換模式 • / 斜線指令",
@@ -338,5 +339,9 @@
   "localProxy": {
     "linkHint": "這個位址只存在於伺服器本機，CloudCLI 將透過本機代理開啟。",
     "failed": "CloudCLI 無法開啟這個伺服器本機位址。"
+  },
+  "memory": {
+    "used_one": "引用了 {{count}} 條記憶",
+    "used_other": "引用了 {{count}} 條記憶"
   }
 }

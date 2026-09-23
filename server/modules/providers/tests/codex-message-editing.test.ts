@@ -54,8 +54,22 @@ function turn(turnId: string, prompts: string[]): TranscriptRow[] {
   return [
     { type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
     { type: 'turn_context', payload: { turn_id: turnId, cwd: '/tmp' } },
-    ...prompts.map((message) => ({ type: 'event_msg', payload: { type: 'user_message', message } })),
-    { type: 'event_msg', payload: { type: 'agent_message', message: `answer to ${prompts[0]}` } },
+    ...prompts.map((message, index) => ({
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        turn_id: turnId,
+        item: { type: 'UserMessage', id: `${turnId}-u${index}`, content: [{ type: 'text', text: message }] },
+      },
+    })),
+    {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        turn_id: turnId,
+        item: { type: 'AgentMessage', id: `${turnId}-a0`, content: [{ type: 'Text', text: `answer to ${prompts[0]}` }] },
+      },
+    },
     { type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } },
   ];
 }

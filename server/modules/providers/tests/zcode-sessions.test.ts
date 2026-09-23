@@ -1162,6 +1162,11 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
   await withZCodeStorage(async (storageDir) => {
     await createFixtureDatabase(storageDir, 'sess_sync');
 
+    // Session indexing only admits a workspace that exists on disk, so the
+    // fixture's directory has to be a real one.
+    const workspaceDir = path.join(storageDir, 'workspace');
+    await mkdir(workspaceDir, { recursive: true });
+
     // The synchronizer reads the session table, which the history fixture
     // does not create: add the top-level row plus a subagent row to filter.
     const Database = (await import('better-sqlite3')).default;
@@ -1180,8 +1185,8 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
       const insertSession = db.prepare(
         'INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)',
       );
-      insertSession.run('sess_sync', null, '/workspace/sess_sync', 'Fixture session', 1000, 2000);
-      insertSession.run('sess_subagent_agent_x', 'sess_sync', '/workspace/sess_sync', 'Subagent', 9000, 9500);
+      insertSession.run('sess_sync', null, workspaceDir, 'Fixture session', 1000, 2000);
+      insertSession.run('sess_subagent_agent_x', 'sess_sync', workspaceDir, 'Subagent', 9000, 9500);
     } finally {
       db.close();
     }
@@ -1192,8 +1197,7 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
 
       const indexed = sessionsDb.getSessionByProviderSessionId('sess_sync');
       assert.equal(indexed?.provider, 'zcode');
-      // normalizeProjectPath applies host path rules, so Windows stores backslashes.
-      assert.equal(indexed?.project_path, path.normalize('/workspace/sess_sync'));
+      assert.equal(indexed?.project_path, workspaceDir);
       assert.equal(indexed?.custom_name, 'Fixture session');
       assert.equal(indexed?.jsonl_path, null);
 
@@ -1233,4 +1237,50 @@ test('live and history mint the same toolId for one call (engine callID == toolC
       'the persisted toolId must equal the live one, or exact-id pruning breaks',
     );
   });
+});
+
+/**
+ * The engine stamps every session event with a fresh `crypto.randomUUID()`,
+ * so the envelope id changes on every delta. Only `payload.assistantMessageId`
+ * names the reply, and the client closes a streamed segment whenever the row
+ * key changes — deriving the key from the envelope therefore cuts one reply
+ * into one bubble per delta.
+ */
+test('text deltas of one reply share a row key across changing event ids', () => {
+  const provider = new ZCodeSessionsProvider();
+  const deltas = ['加', '两个「石头纹理强、', '带裂纹」的重口味方案'].map((delta, index) =>
+    provider.normalizeMessage(
+      {
+        type: 'model_streaming',
+        id: `evt_${index}_${Math.random()}`,
+        sessionId: 'sess_key',
+        payload: { kind: 'text_delta', delta, assistantMessageId: 'msg_reply_1' },
+      },
+      'sess_key'
+    )[0]
+  );
+
+  for (const delta of deltas) {
+    assert.equal(delta.kind, 'stream_delta');
+    assert.equal(delta.providerRowKey, 'zcode-message:msg_reply_1');
+  }
+});
+
+test('an engine that omits assistantMessageId still keeps one key per text segment', () => {
+  const provider = new ZCodeSessionsProvider();
+  const emit = (kind: string, delta?: string) =>
+    provider.normalizeMessage(
+      { type: 'model_streaming', id: `evt_${Math.random()}`, sessionId: 'sess_legacy', payload: { kind, delta } },
+      'sess_legacy'
+    );
+
+  emit('text_start');
+  const first = emit('text_delta', 'first')[0];
+  const second = emit('text_delta', ' second')[0];
+  assert.equal(first.providerRowKey, second.providerRowKey);
+
+  emit('text_end');
+  emit('text_start');
+  const nextSegment = emit('text_delta', 'other')[0];
+  assert.notEqual(nextSegment.providerRowKey, first.providerRowKey);
 });

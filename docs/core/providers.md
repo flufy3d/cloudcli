@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.4.3 / 2026-09-21
+> 基准：2.5.1 / 2026-09-22
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -100,12 +100,26 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启
 都在 `server/modules/providers/shared/`：
 
 - `engine-path/cli-engine-path.ts`：引擎二进制定位工厂——env 覆盖 → PATH → 平台安装路径，带 TTL 正/负缓存。配套 `installation/cli-installation-probe.ts` 探测原语。zcode / antigravity 有各自薄封装（`list/zcode/zcode-engine-path.ts` 等）。
-- `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定、基础设施工作区准入过滤（pnpm store 与 node_modules 下的会话目录不入库，见 `isInfrastructureWorkspacePath`；系统临时目录是合法工作区，临时克隆与复现仓要照常出现在项目列表里）。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
+- `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
+- `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类；受管技能写入目标由各引擎覆盖 `getGlobalSkillSource()` 决定（claude → `~/.claude/skills`；codex / cursor / zcode / antigravity → `~/.agents/skills`；opencode → `~/.config/opencode/skills`），不覆盖即拒绝写入。
-- 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，专用于 `thread/fork` 这类 SDK 表达不了的操作）。zcode supervisor 拉起 `app-server` 时先剥离环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留指向 App 自己的运行期文件），再注入 `zcode-provider-config.ts` 解析出的 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` / `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` / `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`——桌面端本来会传这三个变量，裸 spawn 缺了它引擎定位不到 provider 目录，`session/create` 会一直挂到超时（模型一个都用不了）。
+- 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，这些请求产生的 item 通知流，以及反向的审批请求）。zcode supervisor 拉起 `app-server` 时先剥离环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留指向 App 自己的运行期文件），再注入 `zcode-provider-config.ts` 解析出的 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` / `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` / `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`——桌面端本来会传这三个变量，裸 spawn 缺了它引擎定位不到 provider 目录，`session/create` 会一直挂到超时（模型一个都用不了）。
 - zcode 附件通道：上传描述符在 runtime 内映射为 `session/send` 的原生 `attachments` 项（`{kind, filename, mimeType, sizeBytes, localPath}`，localPath 必须绝对；引擎静默丢弃无法映射的形状），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
 - zcode 发送链路（引擎 0.16.9）：引擎对 `session/create` / `session/resume` / `session/send` 做严格 schema 校验，多一个键就报 -32602（`runtimeModel` 正是被拒的那个），所以请求只带 schema 声明的字段——resume 只发 `sessionId`，create 只发 workspace 描述符；模型选择经 `session/setModel` 设在会话上（reasoning 档位必须放 `model.options.reasoningLevel`，缺省取引擎目录里的 `defaultLevel`，恢复会话时强制重选以清掉 "model unavailable"（-32031）警告）。会话工作区必须由 `workspacePath` / `cwd` 显式给出：runtime 不再回退 `process.cwd()`，否则部署目录会被同步器登记成项目。
 - 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession`）。
+
+## 会话索引准入：哪些工作区能变成项目
+
+引擎各自记录会话的工作目录，同步器据此建项目行。判定统一走 `shared/sessions/workspace-admission.ts` 的 `admitsWorkspacePath`——六家引擎的同步器（SQLite 骨架一处 + claude / codex / cursor 各一处）都必须调用它，**新引擎接入时这是第 2 步的一部分**。两条拒绝规则：
+
+1. **包管理器与运行时内部**：路径含 `node_modules` 或 pnpm 的 `.pnpm` 段（`server/shared/utils.ts` 的 `isInfrastructureWorkspacePath`）。
+2. **已消失且从未登记过的目录**：`mktemp -d` 沙箱里跑过一次的引擎会长期把该目录记为工作区，目录被系统回收后，这类行每次重扫都会复活成同一批空项目。
+
+系统临时目录本身**不是**拒绝理由——`/tmp` 下的临时克隆、复现仓是正常工作现场，一刀切会让这些会话从项目列表里无声消失。区分真项目与一次性沙箱的是"目录是否还在"，不是"在不在 /tmp"。
+
+"已登记过"这一半同样不能省：外置盘或网络卷没挂载时目录暂时不存在，但项目行已在，会话照常更新。准入失败只阻止**新建**项目，永不删除既有数据。
+
+引擎解析不出工作区时同步器返回 `null` 跳过该行，不拿服务端自己的 cwd 顶替——那只会把会话记到服务恰好启动的目录名下。
 
 ## 引擎自有数据根
 
@@ -174,6 +188,13 @@ CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在�
   `ExitPlanMode` 计划卡。实时、会话读取、持久化三条归一化路径**都要做**；
   此前持久化那条漏了，共用的消息渲染组件便长出一段只给 codex 用的剥标签逻辑。
 
+- **正文里的记忆标记**：引擎会给「用到了存储记忆」的回复打上机器可读标记——codex 在末尾追加
+  `<oai-mem-citation>` 块，claude 用 `<cc-memory filenames="…">` 把引用到的那句话包起来。
+  形态不同但性质一样：它们是溯源标记不是正文，留在里面就是一堆裸标签。
+  `providers/shared/memory-citations.ts` 是唯一的剥离点，`liftMemoryCitations(provider, text)`
+  归一化成 `memoryCitations`，前端统一渲染成回复下方的折叠脚注。新引擎在这个模块里加一条模式，
+  不要在自己的适配器里另写一份。注意两种形态的处理方式相反：codex 是整块切掉，claude 是脱壳保留内容。
+
 判断标准很简单：如果一段共用代码需要知道「这是哪家引擎」才能正确工作，那它就放错了地方。
 
 ## 线上契约：一份定义
@@ -217,11 +238,11 @@ CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在�
 `kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
 外加乐观回显的簿记字段 `replacesAnchorId`。
 
-**工具卡同样要两路描述一致。** Codex 的实时与历史 `toolId` 来自两个 id 空间
-（SDK item id ／ rollout `call_id`），精确匹配结构性地不可能，只能靠「工具名 + 完整入参」指纹。
-因此入参必须逐字相同：命令文本统一成 shell 包装里的那条命令（`readCodexCommandLine`），
-多命令脚本在历史侧**按命令拆行**，与实时每条命令一个 item 的粒度对齐，
-也与本适配器子代理路径的既有做法一致。
+**工具卡同样要两路描述一致。** 描述一致的正解是两路读同一份记录，而不是把两份不同的记录
+对齐到同一个指纹上——codex 现在两路都读 ThreadItem，`toolId` 与入参因此天然相同
+（命令文本仍统一成 shell 包装里的那条命令，因为两种序列化一个给数组、一个给字符串）。
+
+**一条 item 在实时流里只发一次，除非它真的在推进。** 引擎宣布一条 item 的开始和完成时，只有"用户在等"的那几类（命令执行、补丁、MCP 调用、协作 spawn）值得把开始态也发出去——客户端按工具 id 合并两帧。正文和推理开始时是空的，内容靠 delta 到达；正文 delta 走 `stream_delta` 帧，推理只在完成时发一条（客户端的 thinking 合并是**追加**语义，重发累积文本会把内容叠成前缀串）。
 
 **历史只能包含转录行。** `complete`、`stream_delta`、`stream_end`、`session_created`
 描述的是"一次运行正在进行"，历史里没有运行，也就不该出现这些 kind。
@@ -229,11 +250,10 @@ zcode 曾为每个持久化 step 产出一条 `complete`——真实会话里占
 一行都渲染不出来，却照样计入分页、计入每一次遍历转录的扫描、计入客户端发送时记录的行数。
 `history-kind-standard.test.ts` 对四家逐一把关。
 
-**子代理的线程 id 也是适配器的责任。** Codex 用 `agent_thread_id` 指向子代理自己的同级 rollout；
-该 id 曾只从 `sub_agent_activity` 顶层事件读取，而当前版本把它放在 `item_completed` 的
-`SubAgentActivity` 项里，于是 id 永远拿不到、子代理卡片一律空时间线。
-两种形状现在都路由到同一个处理函数（`applySubagentActivity`）——
-引擎换事件形状是常态，认一种就等于埋一颗定时炸弹。
+**子代理的线程 id 也是适配器的责任。** Codex 用 `agent_thread_id` 指向子代理自己的同级 rollout，
+该 id 来自 `SubAgentActivity` 项；spawn 本身也只以这个项出现在 item 流里，
+所以 `Task` 行就以它的 item id 命名，`completed` / `interrupted` 再用同一个 id 收尾。
+子代理自己的 rollout 用与主线程完全相同的读法（item 流 + 同一个行渲染器）铺进折叠面板。
 
 **跨路行身份是适配器的责任，不是前端的猜测活。** 一条持久化的行存在两份——
 运行中的实时帧，和之后历史读回的那一行。前端把两份显示成一行的唯一诚实依据是**同一个 `id`**；
@@ -254,11 +274,19 @@ id 必须字节相同。** 这条有两道闸门守着：
 | 引擎 | 行身份 | 依据 |
 | --- | --- | --- |
 | claude | 落盘 `uuid` | 实时 SDK 消息与落盘行的 `uuid` 同值，两路归一化出的 id 逐行相同 |
-| codex | rollout 的 `payload.id`（`msg_…`/`rs_…`/`ctc_…`），缺失时用 append-only 的 `ordinal` | 实时 `item_completed` 的 item id 与 rollout 里同一条 `response_item.id` 相同 |
+| codex | ThreadItem 的 `id`（`msg_…`/`rs_…`/`exec-<uuid>`/`call_…`），一项多行时后缀 `_<n>` / `_result` | 两路读的是同一个 ThreadItem：app-server 实时推 `item/started`+`item/completed`，rollout 把同一项写进 `event_msg`→`item_completed`，id 逐字相同 |
 | antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id |
 | zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
 | opencode | `(message_id, part_id)`；其余切面未盘点 | 实时流不发行 id（只有 `message.part.delta` 片段），故 assistant 正文由 `providerRowKey: opencode-part:<part_id>` 对账。**按 part 而非 message 取 key**：一个回合"正文→工具→正文"会落两条正文行，共用一个 key 就成了二义匹配，两边都对不上 |
 | cursor | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
+
+**引擎同时提供「原始记录」和「组装好的记录」时，两路都读组装的那一份。** codex 的 rollout 里
+既有 Responses API 的原始条目（`response_item`：`custom_tool_call` 及其输出、`function_call`、
+`message`），也有引擎自己组装好的 ThreadItem（`event_msg` → `item_completed`）；app-server
+实时推送的正是后者。读原始条目意味着自己重建一遍引擎已经做过的事——把 exec 脚本反解成命令、
+把补丁反解成逐文件 diff、把输出回填到调用上——而重建出来的东西带的是原始条目的 id，
+和实时那份对不上，于是每条回复渲染两遍。读组装记录则两路同源：一个词汇表
+（`codex-thread-items.ts`）、一个行渲染器、一套 id。
 
 引擎确实什么都没给时**不要伪造**：随机值会让对账从"知道自己不知道"变成"自信地答错"。
 正确做法是让推导落在引擎记录的确定性属性上（文件内序号、step 号、数据库主键都算），
@@ -270,19 +298,23 @@ id 必须字节相同。** 这条有两道闸门守着：
 `providerRowKey` 只在行 id 本身无法跨路相等、但 provider 能从两路原生数据复建出同一身份时使用；
 它不承担展示 id、WebSocket `seq`、排序 `sequence` 或编辑锚点的职责。
 
-Codex 的两路在 `normalizeHistoryEntry` 汇合——实时 `agent_message` 带 `message.role`，
-在 `normalizeMessage` 开头就被转到这里，所以 key 在汇合点统一取，
-而不是在看似对应的实时分支里各取一次。
-
 **`providerRowKey` 的边界**：前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
 
-**工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（codex/antigravity 现状——三命名空间无桥、锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。
+**工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（antigravity 现状——锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。
 
 **Antigravity 转录读取**：`antigravity-transcript.provider.ts` 是 compact `transcript.jsonl` 与 `transcript_full.jsonl` 的唯一读取入口。它按原生 `step_index` 以 full 覆盖同一步、保留 compact 尚未被 full 追上的尾部，并跳过损坏 JSONL 尾行；历史正文同时带明确的完整度事实。历史专属 thinking 不进入可见时间线，因为它没有可与实时流对应的稳定身份。
 
 **会话层级要求**：会话列表只索引顶层、可由用户继续对话的 provider 会话。Antigravity 使用其摘要库的 `parent_conversation_id` 与 `nesting_depth` 识别子 agent；子 agent 不写入活动列表，已被旧版本索引的行会软归档，原始 transcript 与本地元数据保留。缺少这两个字段的旧版 Antigravity 摘要库按顶层兼容读取。
 
 ### ⚠ 已知坑
+
+- **一次性 CLI 的异步任务会被静默掐死**：`agy` 的一次性 print 模式（`agy -p "<prompt>"`）在 root agent 转入 idle 后只等几秒就关停整个 CLI，日志为 `root agent idle; waiting up to 5s for N background task(s)` → `terminating N background task(s) on exit`。子代理和被放到后台执行的 `run_command` 都在这里死掉，而 CLI 仍然吐出 `status: SUCCESS`，于是前端收到 complete、任务看着「做完了」，真正的结果永远不会回来。antigravity runtime 因此把这一轮的 prompt 作为一行 NDJSON（`{"event":"user","message":{"content":"…"}}`）写进 stdin 并用 `--input-format stream-json` 启动：stdin 保持打开 → CLI 不自行关停 → 异步任务跑完，结果照常从 stream 回流；收到 `result` 事件后再关闭 stdin 让进程退出。**prompt 一旦退回 argv，这个保护就没了。**
+
+  代价是超时责任转移到了服务端：`--print-timeout` 在该模式下不生效（实测一轮带 `20s` 上限的 run 在 result 之后依然存活，直到 stdin 关闭才退出），而 stdin 又由我们持有，所以 result 事件一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住。runtime 因此自带一个**以 stdout 活动续期的看门狗**，取值就是 `printTimeout`，到期 SIGTERM 并按失败收尾。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 等于又一次把异步工作掐死，所以只有真正的 result 才关。
+
+  接新的 CLI 引擎时先问两句：它的非交互模式在主循环 idle 之后如何处置未完成的后台任务；以及谁为「进程永远不退」兜底。
+
+- **会话内的权限模式归引擎所有**：app-server 形态的引擎把权限模式持久化在会话上（zcode 写 `session.permission`），而模型会在一轮里自行切进计划模式。因此设置里的权限模式是**变更时下发**，不是每轮重申：`zcode-runtime.provider.ts` 记住每个引擎会话最后下发的模式，值没变就不发 `session/setMode`。每轮重申会在两轮之间把计划模式抹掉，模型下一次调 `ExitPlanMode` 直接拿到「can only be used while plan mode is active」，审批卡片根本不会出现，而模型可以把这句报错读成「已获批准」继续动手。进程内缓存意味着服务重启后的第一条消息仍会下发一次——这是为了让重启期间改过的设置必定生效而留的取舍。
 
 - **常驻引擎的 stderr**：app-server 形态的引擎（zcode/codex）stderr 常驻嘈杂，别逐行转发日志——supervisor/客户端保留尾部环形缓冲（zcode 4000 字符），崩溃/crash-loop/session-lost 的错误全部附带尾部；engine 崩溃的真实死因只在 stderr 里。
 

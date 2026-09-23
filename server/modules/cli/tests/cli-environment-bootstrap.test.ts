@@ -34,8 +34,8 @@ async function runCliBootstrapFixture(isPlatform: boolean): Promise<BootstrapRes
     await mkdir(fixtureCliDirectory, { recursive: true });
     // Mirror the real application root's ESM context: with no package.json of
     // its own the fixture defaults to CommonJS, and the CJS-transpiled import
-    // chain then require()s the ESM-only @openai/codex-sdk, whose exports map
-    // has no `require` condition — a format that production never runs in.
+    // chain then require()s ESM-only dependencies whose exports map has no
+    // `require` condition — a format that production never runs in.
     await writeFile(path.join(fixtureRoot, 'package.json'), '{"type":"module"}\n', 'utf8');
     await Promise.all([
       copyFile(

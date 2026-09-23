@@ -181,6 +181,7 @@ function ChatInterface({
     isDragActive,
     openAttachmentPicker,
     handleSubmit,
+    isSubmitting,
     queuedDraft,
     editingAnchorId,
     beginEditMessage,
@@ -524,6 +525,7 @@ function ChatInterface({
           hasInput={Boolean(input.trim())}
           onClearInput={handleClearInput}
           onSubmit={handleSubmit}
+          isSubmitting={isSubmitting}
           isDragActive={isDragActive}
           queuedDraft={queuedDraft}
           onEditQueuedDraft={editQueuedDraft}

@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { memo, useCallback, useMemo } from 'react';
+import { memo, useCallback, useEffect, useMemo } from 'react';
 import type { RefObject } from 'react';
 import { Virtualizer } from 'virtua';
 import type { VirtualizerHandle } from 'virtua';
@@ -11,6 +11,7 @@ import type { MessageListItem } from '@/modules/chat/utils/toolGrouping';
 import MessageComponent from '@/modules/chat/transcript/MessageComponent';
 import ToolGroupContainer from '@/modules/chat/transcript/ToolGroupContainer';
 import ChatExportMenu from '@/modules/chat/transcript/ChatExportMenu';
+import { observeScrollStuck } from '@/shared/diagnostics/scrollScreening';
 
 type ChatMessagesPaneProps = {
   /** The scroll container, owned by `useTranscriptViewport`. */
@@ -110,6 +111,13 @@ function ChatMessagesPane({
   selectedProject,
 }: ChatMessagesPaneProps) {
   const { t } = useTranslation('chat');
+
+  // Screens the touches that should have scrolled the transcript but did not,
+  // so a report taken after "the list won't scroll" says which cause it was.
+  useEffect(() => {
+    const pane = scrollRef.current;
+    return pane ? observeScrollStuck(pane) : undefined;
+  }, [scrollRef]);
 
   // Stable, deterministic keys for the rows rendered this pass.
   //
@@ -249,6 +257,7 @@ function ChatMessagesPane({
             messages={chatMessages}
             sessionTitle={selectedSession?.title}
             provider={selectedSession?.provider || provider}
+            sessionId={selectedSession?.id ?? null}
             createDiff={createDiff}
           />
         </div>

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -49,7 +49,7 @@ class FixtureSynchronizer extends SqliteSessionSynchronizer<FixtureRow> {
   }
 
   protected getProjectPath(row: FixtureRow): string | null {
-    return row.id === 'no-project' ? null : `/workspace/${row.id}`;
+    return row.id === 'no-project' ? null : fixtureWorkspacePath(path.dirname(this.dbPath), row.id);
   }
 
   protected deriveSessionName(_db: Database.Database, row: FixtureRow): string | null {
@@ -78,6 +78,15 @@ async function withIsolatedDatabase(runTest: () => Promise<void>): Promise<void>
   }
 }
 
+/**
+ * Workspace directory the fixture rows claim. Session indexing only admits a
+ * workspace that still exists on disk, so the fixtures create these for real
+ * instead of naming an imaginary `/workspace/...` path.
+ */
+function fixtureWorkspacePath(directory: string, sessionId: string): string {
+  return path.join(directory, 'workspaces', sessionId);
+}
+
 /** Creates the fixture provider database with two dated session rows. */
 async function createFixtureDatabase(directory: string, rows: FixtureRow[]): Promise<string> {
   const dbPath = path.join(directory, 'fixture.db');
@@ -87,6 +96,7 @@ async function createFixtureDatabase(directory: string, rows: FixtureRow[]): Pro
     const insert = db.prepare('INSERT INTO session (id, title, updated_ms) VALUES (?, ?, ?)');
     for (const row of rows) {
       insert.run(row.id, row.title, row.updated_ms);
+      await mkdir(fixtureWorkspacePath(directory, row.id), { recursive: true });
     }
   } finally {
     db.close();
@@ -142,7 +152,7 @@ test('scan upserts rows, keeps custom names, and reports the first session id', 
     await withIsolatedDatabase(async () => {
       // A pre-existing app session with a custom name keeps it; the fallback
       // title on an existing row does not.
-      sessionsDb.createAppSession('app-b', 'zcode', '/workspace/sess_b', 'My custom name');
+      sessionsDb.createAppSession('app-b', 'zcode', fixtureWorkspacePath(tempDir, 'sess_b'), 'My custom name');
 
       const synchronizer = new FixtureSynchronizer(dbPath);
       const processed = await synchronizer.synchronize();
@@ -186,6 +196,7 @@ test('incremental syncs read only rows newer than the high-water mark', async ()
       } finally {
         db.close();
       }
+      await mkdir(fixtureWorkspacePath(tempDir, 'sess_newest'), { recursive: true });
 
       assert.equal(await synchronizer.synchronizeFile(path.join(tempDir, 'fixture.db')), 'sess_newest');
       assert.equal(sessionsDb.getSessionByProviderSessionId('sess_old')?.custom_name, 'Old');
@@ -205,13 +216,37 @@ test('binds provider-discovered sessions to pending app sessions', async () => {
   try {
     await withIsolatedDatabase(async () => {
       // The app created a session and is waiting for the provider id to arrive.
-      sessionsDb.createAppSession('app-pending', 'zcode', '/workspace/sess_pending');
+      sessionsDb.createAppSession('app-pending', 'zcode', fixtureWorkspacePath(tempDir, 'sess_pending'));
 
       const synchronizer = new FixtureSynchronizer(dbPath);
       assert.equal(await synchronizer.synchronize(), 1);
 
       const bound = sessionsDb.getSessionById('app-pending');
       assert.equal(bound?.provider_session_id, 'sess_pending');
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('rows whose workspace directory has vanished are skipped', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'sqlite-synchronizer-'));
+  const dbPath = await createFixtureDatabase(tempDir, [
+    { id: 'sess_reaped', title: 'Sandbox run', updated_ms: 1_000 },
+    { id: 'sess_live', title: 'Real project', updated_ms: 2_000 },
+  ]);
+
+  try {
+    // An engine that ran inside a `mktemp -d` sandbox keeps naming that
+    // directory long after the system reaped it; indexing the row would
+    // re-create the same ghost project on every restart.
+    await rm(fixtureWorkspacePath(tempDir, 'sess_reaped'), { recursive: true, force: true });
+
+    await withIsolatedDatabase(async () => {
+      const synchronizer = new FixtureSynchronizer(dbPath);
+      assert.equal(await synchronizer.synchronize(), 1);
+      assert.equal(sessionsDb.getSessionByProviderSessionId('sess_reaped'), null);
+      assert.ok(sessionsDb.getSessionByProviderSessionId('sess_live'));
     });
   } finally {
     await rm(tempDir, { recursive: true, force: true });

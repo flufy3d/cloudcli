@@ -6,6 +6,7 @@ import { spawn } from 'cross-spawn';
 import { rgPath } from '@vscode/ripgrep';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { readCodexRolloutItem } from '@/modules/providers/list/codex/codex-thread-items.js';
 
 type AnyRecord = Record<string, any>;
 type SearchableProvider = 'claude' | 'codex';
@@ -497,35 +498,6 @@ function extractClaudeSearchableMessage(entry: AnyRecord): ClaudeSearchableMessa
   };
 }
 
-function extractCodexText(content: unknown): string {
-  if (typeof content === 'string') {
-    return content;
-  }
-
-  if (!Array.isArray(content)) {
-    return '';
-  }
-
-  return content
-    .map((item) => {
-      if (!item || typeof item !== 'object') {
-        return '';
-      }
-
-      const record = item as AnyRecord;
-      if (
-        (record.type === 'input_text' || record.type === 'output_text' || record.type === 'text')
-        && typeof record.text === 'string'
-      ) {
-        return record.text;
-      }
-
-      return '';
-    })
-    .filter(Boolean)
-    .join(' ');
-}
-
 function normalizeSearchableSessions(rows: SessionRepositoryRow[]): SearchableSessionRow[] {
   const normalizedRows: SearchableSessionRow[] = [];
   const projectArchiveStateByPath = new Map<string, boolean>();
@@ -1009,16 +981,30 @@ async function parseClaudeSessionMatches(
   return runtime.claudeFileResultsCache.get(fileKey)?.get(session.session_id) ?? null;
 }
 
-function isVisibleCodexUserMessage(payload: AnyRecord | null | undefined): boolean {
-  if (!payload || payload.type !== 'user_message') {
-    return false;
+/**
+ * Reads the searchable text of one Codex rollout entry.
+ *
+ * Only the assembled `item_completed` items are read, for the same reason the
+ * transcript reader reads only those: the raw `response_item` records beside
+ * them also carry the context Codex injects into a turn (AGENTS.md, plugin
+ * lists), which is not something the user ever wrote or read.
+ */
+function readCodexSearchableEntry(entry: AnyRecord): { text: string; role: 'user' | 'assistant' } | null {
+  if (entry.type !== 'event_msg' || (entry.payload as AnyRecord)?.type !== 'item_completed') {
+    return null;
   }
 
-  if (payload.kind && payload.kind !== 'plain') {
-    return false;
+  const item = readCodexRolloutItem((entry.payload as AnyRecord).item);
+  if (!item) {
+    return null;
   }
-
-  return typeof payload.message === 'string' && payload.message.trim().length > 0;
+  if (item.kind === 'user_message') {
+    return item.text.trim() ? { text: item.text, role: 'user' } : null;
+  }
+  if (item.kind === 'agent_message' || item.kind === 'reasoning') {
+    return item.text.trim() ? { text: item.text, role: 'assistant' } : null;
+  }
+  return null;
 }
 
 async function parseCodexSessionMatches(
@@ -1048,41 +1034,9 @@ async function parseCodexSessionMatches(
         continue;
       }
 
-      let text: string | null = null;
-      let role: 'user' | 'assistant' | null = null;
-
-      if (entry.type === 'event_msg' && isVisibleCodexUserMessage(entry.payload as AnyRecord)) {
-        text = String(entry.payload.message);
-        role = 'user';
-      } else if (
-        entry.type === 'event_msg'
-        && entry.payload?.type === 'agent_reasoning'
-        && typeof entry.payload?.text === 'string'
-      ) {
-        text = String(entry.payload.text);
-        role = 'assistant';
-      } else if (entry.type === 'response_item' && entry.payload?.type === 'message') {
-        const payload = entry.payload as AnyRecord;
-        if (payload.role === 'user') {
-          text = extractCodexText(payload.content);
-          role = 'user';
-        } else if (payload.role === 'assistant') {
-          text = extractCodexText(payload.content);
-          role = 'assistant';
-        }
-      } else if (entry.type === 'response_item' && entry.payload?.type === 'reasoning') {
-        const summaryText = Array.isArray(entry.payload.summary)
-          ? entry.payload.summary
-            .map((item: AnyRecord) => (typeof item?.text === 'string' ? item.text : ''))
-            .filter(Boolean)
-            .join('\n')
-          : '';
-
-        if (summaryText.trim()) {
-          text = summaryText;
-          role = 'assistant';
-        }
-      }
+      const searchable = readCodexSearchableEntry(entry);
+      const text = searchable?.text ?? null;
+      const role = searchable?.role ?? null;
 
       if (!text || !role) {
         continue;

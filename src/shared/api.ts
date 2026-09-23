@@ -519,6 +519,14 @@ export const api = {
     deleteDraft: (scope: string) => del('/api/user/drafts', { scope }),
   },
 
+  // Diagnostics: the server's record of how recent runs ended, folded into the
+  // report the settings page exports.
+  diagnostics: {
+    runs: (limit?: number) =>
+      get(`/api/diagnostics/runs${typeof limit === 'number' ? query({ limit }) : ''}`),
+    clearRuns: () => del('/api/diagnostics/runs'),
+  },
+
   // Server-side settings: API keys, stored credentials, notifications, web push
   settings: {
     apiKeys: () => get('/api/settings/api-keys'),

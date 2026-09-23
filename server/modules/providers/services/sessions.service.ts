@@ -70,6 +70,59 @@ type SessionDetails = {
 
 const MAX_CLOUDCLI_SESSION_NAME_WORDS = 4;
 
+/**
+ * How long a `clientRequestId` keeps pointing at the session it allocated.
+ *
+ * Long enough to absorb every duplicate that a single user action can produce
+ * (double click, retried fetch, a second tab replaying the same submit), short
+ * enough that the map stays a handful of entries.
+ */
+const CREATE_SESSION_IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Sessions already allocated for a `clientRequestId`, keyed by that id.
+ *
+ * The composer cannot allocate a session id itself (the id must be
+ * database-backed before the first `chat.send`), so a send that is submitted
+ * twice would otherwise open two conversations for one message. The client
+ * stamps one id per submit attempt and this map turns every repeat of that
+ * attempt into the same answer.
+ */
+const createdSessionsByClientRequestId = new Map<string, { result: CreateAppSessionResult; expiresAt: number }>();
+
+function readIdempotentSession(clientRequestId: string, now: number): CreateAppSessionResult | null {
+  const recorded = createdSessionsByClientRequestId.get(clientRequestId);
+  if (!recorded) {
+    return null;
+  }
+  if (recorded.expiresAt <= now) {
+    createdSessionsByClientRequestId.delete(clientRequestId);
+    return null;
+  }
+  // The recorded session can be deleted inside the TTL window; replaying a row
+  // that no longer exists would send the user to a dead conversation, so the
+  // request falls through and allocates a fresh one.
+  if (!sessionsDb.getSessionById(recorded.result.sessionId)) {
+    createdSessionsByClientRequestId.delete(clientRequestId);
+    return null;
+  }
+  return recorded.result;
+}
+
+function rememberIdempotentSession(clientRequestId: string, result: CreateAppSessionResult, now: number): void {
+  // Expired entries are dropped on write so the map never outgrows the
+  // requests actually in flight; there is no separate sweep timer.
+  for (const [key, recorded] of createdSessionsByClientRequestId) {
+    if (recorded.expiresAt <= now) {
+      createdSessionsByClientRequestId.delete(key);
+    }
+  }
+  createdSessionsByClientRequestId.set(clientRequestId, {
+    result,
+    expiresAt: now + CREATE_SESSION_IDEMPOTENCY_TTL_MS,
+  });
+}
+
 function buildCloudCliSessionName(initialMessage: string): string {
   const words = initialMessage.trim().split(/\s+/).filter(Boolean);
   return words.slice(0, MAX_CLOUDCLI_SESSION_NAME_WORDS).join(' ') || 'Untitled Session';
@@ -255,6 +308,7 @@ export const sessionsService = {
     provider: LLMProvider,
     projectPath: string,
     initialMessage: string,
+    options: { clientRequestId?: string | null } = {},
   ): CreateAppSessionResult {
     const normalizedProjectPath = projectPath.trim();
     if (!normalizedProjectPath) {
@@ -264,16 +318,34 @@ export const sessionsService = {
       });
     }
 
+    // One submit attempt may reach this route several times (double click,
+    // fetch retry, a duplicate frame from another tab). Replaying the first
+    // answer is what keeps one message from opening several conversations.
+    const clientRequestId = options.clientRequestId?.trim() || null;
+    const now = Date.now();
+    if (clientRequestId) {
+      const alreadyCreated = readIdempotentSession(clientRequestId, now);
+      if (alreadyCreated) {
+        return alreadyCreated;
+      }
+    }
+
     const sessionId = randomUUID();
     const sessionName = buildCloudCliSessionName(initialMessage);
     sessionsDb.createAppSession(sessionId, provider, normalizedProjectPath, sessionName);
 
-    return {
+    const result: CreateAppSessionResult = {
       sessionId,
       provider,
       projectPath: normalizedProjectPath,
       sessionName,
     };
+
+    if (clientRequestId) {
+      rememberIdempotentSession(clientRequestId, result, now);
+    }
+
+    return result;
   },
 
   /**

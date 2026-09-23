@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.4.8 / 2026-09-21
+> 基准：2.5.10 / 2026-09-22
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -80,6 +80,46 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 `src/shared/mcpCapabilitiesFallback.ts`——该文件**零 import**，因为跨树 parity 测试要从服务端目录读它；
 改后端声明而忘了改它会直接让测试红。
 
+## 诊断报告（统一入口）
+
+诊断只有**一份报告、两个入口**：设置 → 诊断，和聊天导出菜单里的「Diagnostics (.json)」。
+两者调用同一个 `src/shared/diagnostics/diagnosticsReport.ts`，区别只在有没有会话可描述。
+报告由五段组成：
+
+- **启动与 PWA**（`startupDiagnostics.ts`）：当前及最近五次页面启动的导航/绘制指标、
+  应用生命周期标记、聚合后的资源耗时、长任务、PWA/SW/Cache Storage 状态和运行环境。
+- **连接帧**（`frameRecorder.ts`）：WebSocket **双向**帧的常驻录制。
+- **滚动筛查**（`scrollScreening.ts`）：在聊天消息面板上筛出「手指划了却没滚动」的触摸。
+  「列表滚不动」有三种成因——虚拟列表总高塌陷到只剩一屏（无可滚区间）、透明图层盖住面板
+  （手指根本没碰到滚动容器）、主线程被长任务占满（触摸事件排队）——事后长得一模一样，
+  修法却相反。因此每条记录都带上判定所需的事实：本次触摸的位移与 `scrollTop` 实际变化、
+  面板几何与计算后的 `overflow-y`/`touch-action`/`contain`/`transform`、面板中心点的
+  `elementFromPoint` 命中者、以及触摸事件从产生到被处理的最大延迟。
+  平时零开销：passive 监听，只在触摸时比两个数，判定成立才读一次样。
+- **时间线**：导出时刻 `serverMessages` / `realtimeMessages` 的行 id 列表、乐观行退休映射、`runEnded`。
+- **服务端运行结束记录**：`GET /api/diagnostics/runs`，即后端对每次 run 为什么结束的判定
+  （见 [chat.md](./chat.md)）。拉取失败写 `{ error }`，不让一段失败毁掉整份报告。
+
+为什么要合成一份：用户报障时说的是「又慢又断」，他不该先判断该导哪种报告；而慢和断的证据
+本来就分散在这四处，分成两份文件只会每次都少一半。
+
+三条设计约束：
+
+- **默认开着**。环形缓冲有上限、正文只存摘要，代价是几百 KB；需要先打开才录的日志，
+  等于在真正出问题的那一次没有日志。
+- **跨刷新存活**。帧按节流写进 sessionStorage（`pagehide` 兜底），下次加载读回并保留原
+  `load` 标记，报告里能看出刷新边界在哪。只在内存里的录制等于没有：等用户想起要导出时，
+  出事的那个标签页通常已经刷新过了——这是实测栽过的坑。
+- **store 是按挂载创建的，不是模块单例**，所以报告不能直接 import 它；由 `useSessionStore`
+  注册一个读取器，导出控件按当前会话 id 取。
+
+隐私是格式契约：报告不得包含聊天正文、凭证、Cookie、请求头或 URL query。帧只留决定行身份的
+字段（`kind` / `id` / `toolId` / `role` / `seq` + 截断摘要）；只有构建产物的 `/assets/`
+路径可保留文件名，API、其他同源资源和外站资源分别归类为 `/api`、`same_origin_other`、
+`external`；服务端运行记录只有标识、计时和计数。浏览器不支持的性能条目写 `null`，不可伪造为零。
+应用可用性路径若变更，须继续用 `markStartupMilestone()` 标记入口执行、React 首次提交、
+认证完成与工作区首次提交，使版本间报告可比。记录只留在本地，用户手动下载；不得自动上报。
+
 ## 性能守则（硬约束，都是踩过坑的）
 
 1. **行身份稳定**：时间线 store 的两条不变量（字节等价行复用实例；更新只有原地 upsert / 保身份全量替换两种）。`React.memo`、WeakMap 转换缓存（`useChatMessages.ts`）、DOM 锚定全部依赖它。
@@ -98,7 +138,7 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 
 ## PWA 与版本
 
-- `public/manifest.json` + `public/sw.js`（注册在 `src/main.tsx` / `index.html`）；SW 不缓存 HTML 与 hash 资源名文件，**刷新即得新版本**；唯一旧窗口场景靠"设置 → 关于"的版本提示（`__APP_VERSION__` 由 vite define 注入，`__BUILD_INFO__` 含 git describe）。
+- `public/manifest.json` + `public/sw.js`（当前由 `src/main.tsx` 与 `index.html` 注册）；HTML 始终走网络，hash 静态资源走 cache-first，API 与 WebSocket 永不经 SW；因此刷新可拿到新版本，已缓存资源可复用。设置 → 关于的版本提示用 `__APP_VERSION__`（vite define）与含 git describe 的 `__BUILD_INFO__` 判断长驻窗口是否过期。
 - 冷启动会话恢复：`src/shared/sessionProtection*` / `useSessionProtection`——仅 standalone 模式记忆并预验证回跳；恢复 effect 必须声明在记录 effect 之前（顺序敏感）。
 - Web Push 复用 SW：`src/modules/settings/hooks/useWebPush.ts`，服务端 VAPID 在 `server/modules/notifications/`。
 

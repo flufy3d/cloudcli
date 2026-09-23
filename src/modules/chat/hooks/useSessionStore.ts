@@ -12,9 +12,10 @@
  * Backend transcript is the source of truth; no localStorage for messages.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { SessionTimelineStore } from '@/modules/chat/utils/sessionTimelineStore';
+import { registerTimelineSnapshotSource } from '@/shared/diagnostics/diagnosticsReport';
 
 export type { MessageKind, NormalizedMessage } from '@/shared/types';
 export type { SessionSlot, SessionStatus } from '@/modules/chat/utils/sessionTimelineStore';
@@ -33,5 +34,28 @@ export function useSessionStore(): SessionTimelineStore {
   const [store] = useState(() => new SessionTimelineStore({
     notify: () => setTick(n => n + 1),
   }));
+
+  // Lets the diagnostics report read the timeline it is reporting on. The
+  // store is per-mount, so it cannot be imported by the report builder.
+  useEffect(() => {
+    registerTimelineSnapshotSource((sessionId) => {
+      const slot = store.getSessionSlot(sessionId);
+      if (!slot) {
+        return null;
+      }
+      return {
+        rendered: store.getMessages(sessionId),
+        snapshot: {
+          serverMessages: slot.serverMessages,
+          realtimeMessages: slot.realtimeMessages,
+          retiredOptimisticUserAnchors: [...slot.retiredOptimisticUserAnchors.entries()],
+          pendingPrompts: [...slot.pendingPrompts.entries()],
+          runEnded: slot.runEnded,
+        },
+      };
+    });
+    return () => registerTimelineSnapshotSource(null);
+  }, [store]);
+
   return store;
 }

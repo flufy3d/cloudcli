@@ -102,6 +102,7 @@
     "attachFiles": "Allega file",
     "attachImages": "Allega immagini",
     "send": "Invia",
+    "sending": "Invio…",
     "stop": "Ferma",
     "hintText": {
       "ctrlEnter": "Ctrl+Invio per inviare • Shift+Invio per nuova riga • Tab per cambiare modalità • / per comandi",
@@ -291,5 +292,9 @@
   "localProxy": {
     "linkHint": "Questo indirizzo esiste solo sul server; CloudCLI lo apre tramite il proxy locale.",
     "failed": "CloudCLI non è riuscito ad aprire questo indirizzo locale del server."
+  },
+  "memory": {
+    "used_one": "Usata {{count}} memoria",
+    "used_other": "Usate {{count}} memorie"
   }
 }

@@ -4,6 +4,7 @@ import { useAuth } from '@/modules/auth';
 import { IS_PLATFORM } from '@/shared/utils';
 import { expireAuthSession, isAuthTokenExpired } from '@/shared/api';
 import type { ServerEvent } from '@/shared/types';
+import { recordInboundFrame, recordOutboundFrame } from '@/shared/diagnostics/frameRecorder';
 
 
 export type { ServerEvent };
@@ -126,6 +127,9 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       websocket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data) as ServerEvent;
+          // Recorded before dispatch, so the report shows arrival order even
+          // when a listener throws on the frame.
+          recordInboundFrame(data);
           dispatch(data);
         } catch (error) {
           console.error('Error parsing WebSocket message:', error);
@@ -157,6 +161,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
 
   const sendMessage = useCallback((message: unknown) => {
     const socket = wsRef.current;
+    recordOutboundFrame(message);
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
     } else {

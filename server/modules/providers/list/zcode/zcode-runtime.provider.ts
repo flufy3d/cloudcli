@@ -116,6 +116,33 @@ const PERMISSION_MODE_MAP: Record<string, string> = {
 };
 
 /**
+ * The ZCode mode last pushed to each engine session, so a follow-up turn only
+ * calls `session/setMode` when the configured mode actually changed — see
+ * `configureSessionMode` for why re-pushing is harmful. Module-level because a
+ * run may be served by a fresh provider instance.
+ */
+const appliedPermissionModes = new Map<string, string>();
+
+/**
+ * How many sessions the mode cache tracks. Evicting the oldest entry only
+ * costs one redundant push on that session's next turn, so a plain bound is
+ * enough to keep a long-lived server from growing the map forever.
+ */
+const APPLIED_MODE_CACHE_LIMIT = 500;
+
+function rememberAppliedPermissionMode(sessionId: string, zcodeMode: string): void {
+  appliedPermissionModes.delete(sessionId);
+  appliedPermissionModes.set(sessionId, zcodeMode);
+  while (appliedPermissionModes.size > APPLIED_MODE_CACHE_LIMIT) {
+    const oldest = appliedPermissionModes.keys().next();
+    if (oldest.done) {
+      break;
+    }
+    appliedPermissionModes.delete(oldest.value);
+  }
+}
+
+/**
  * The run-lifecycle registry shared by the provider class and the
  * permissions facet below. Module-level like the protocol client singleton:
  * `zcodeRuntimePermissions` must answer request ids that any provider
@@ -795,7 +822,19 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
   /**
    * Configures session permission mode using mapping from §5.
    *
-   * Maps CloudCLI permission modes to ZCode modes and calls session/setMode.
+   * Maps CloudCLI permission modes to ZCode modes and calls session/setMode —
+   * but only when the mode is actually new to the session, because the engine
+   * owns the live mode from there on. ZCode persists it per session
+   * (`session.permission`) and the model moves the session into plan mode by
+   * itself mid-turn; a per-turn reassertion of the configured mode cancels
+   * that plan mode between turns, and the model's next `ExitPlanMode` then
+   * fails with "can only be used while plan mode is active" instead of raising
+   * the approval card — an error the model is free to misread as approval.
+   *
+   * The cache lives in the process, so the first send after a server restart
+   * pushes again (and can still cancel a plan mode entered before the
+   * restart). That is the deliberate trade: a cold cache must not swallow a
+   * mode the user changed while the server was down.
    */
   private async configureSessionMode(
     sessionId: string,
@@ -805,12 +844,17 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
 
     const zcodeMode = PERMISSION_MODE_MAP[permissionMode] ?? 'build';
 
+    if (appliedPermissionModes.get(sessionId) === zcodeMode) {
+      return;
+    }
+
     try {
       await protocolClient.sendRequest('session/setMode', {
         sessionId,
         mode: zcodeMode,
       });
 
+      rememberAppliedPermissionMode(sessionId, zcodeMode);
       console.debug(`[ZCodeRuntime] Set mode for session ${sessionId}: ${permissionMode} → ${zcodeMode}`);
     } catch (error) {
       console.warn(`[ZCodeRuntime] Failed to set mode ${zcodeMode} for session ${sessionId}:`, error);

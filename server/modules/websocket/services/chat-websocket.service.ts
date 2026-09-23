@@ -390,7 +390,7 @@ async function dispatchRun(
     // "processing" forever on every connected client. Scoped to THIS run —
     // a queued message can start the session's next run before this promise
     // settles, and the session-keyed completeRun would kill that new run.
-    chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1 });
+    chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1, reason: 'dispatch_failed' });
     sessionsDb.touchSession(sessionId);
   }
 
@@ -524,11 +524,16 @@ async function handleChatAbort(
     return;
   }
 
+  console.log(
+    `[ChatWebSocket] chat.abort received for session ${sessionId} (${run.provider}), `
+    + `run started ${Date.now() - run.startedAt}ms ago`,
+  );
   const success = await dependencies.runtime.abort(run.provider, sessionId);
 
   chatRunRegistry.completeRun(sessionId, {
     exitCode: success ? 0 : 1,
     aborted: true,
+    reason: 'client_abort',
   });
 }
 
@@ -688,6 +693,7 @@ export async function runDetachedChatTurn(
     chatRunRegistry.completeRun(input.sessionId, {
       exitCode: aborted ? 0 : 1,
       aborted: true,
+      reason: 'superseded',
     });
   }
 

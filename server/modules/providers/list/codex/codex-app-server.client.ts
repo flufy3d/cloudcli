@@ -3,22 +3,23 @@ import { stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import readline from 'node:readline';
 
+import type { AnyRecord } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
 
 /**
  * Minimal JSON-RPC client for `codex app-server`.
  *
- * Codex ships two entry points and they expose different things. The
- * `@openai/codex-sdk` this app runs conversations through is a wrapper around
- * `codex exec`, and its whole surface is `startThread` and `resumeThread` —
- * there is no way to branch a thread or to resume one partway. The same
- * binary's `app-server` subcommand speaks JSON-RPC and does have that
- * primitive, `thread/fork`, which is what the Codex IDE clients build their
- * own "fork" and "edit an earlier message" on top of.
+ * `app-server` is the transport this app runs Codex over: conversations
+ * (`thread/start`, `turn/start` and the item notifications those produce),
+ * and the thread surgery an edited message needs (`thread/fork`, which the
+ * Codex IDE clients build their own "fork" and "edit an earlier message" on
+ * top of).
  *
- * So this is a second transport to the same CLI, opened only for the
- * operations the SDK cannot express. Everything else still goes through the
- * SDK.
+ * The alternative, `codex exec` — what `@openai/codex-sdk` wraps — was
+ * dropped: it cannot branch a thread, and its event stream numbers items per
+ * process (`item_0`, `item_1`, restarting every turn) instead of reporting
+ * the ids Codex records in the rollout, which left the live transcript and a
+ * history read with no row identity in common.
  */
 
 /** How long a single request may take before the child is killed. */
@@ -34,18 +35,8 @@ const COMPACT_NOTIFICATION_TIMEOUT_MS = 10 * 60_000;
 
 type JsonRpcResponse = {
   id?: number;
-  method?: string;
-  params?: unknown;
   result?: unknown;
   error?: { code?: number; message?: string };
-};
-
-/** One registration for `waitForNotification`. */
-type NotificationWaiter = {
-  predicate: (params: Record<string, unknown>) => boolean;
-  resolve: () => void;
-  reject: (error: Error) => void;
-  timer: NodeJS.Timeout;
 };
 
 /**
@@ -80,24 +71,45 @@ function resolveCodexLauncher(): string {
 }
 
 /**
- * Runs one exchange against a freshly spawned `codex app-server`.
+ * One open connection to a `codex app-server` child.
  *
- * A process per operation rather than a pooled long-lived one: the handshake
- * costs a fraction of a second, forking happens at most once per user action,
- * and a shared child would need lifecycle handling — restarts, back-pressure,
- * a crash taking every pending fork with it — for no measurable gain next to
- * the model turn that follows.
+ * Consumers: `withAppServer` (short one-shot exchanges such as `thread/fork`)
+ * and `codex-runtime.provider.ts`, which keeps a connection for the length of
+ * a turn so it can receive the item stream.
  */
-async function withAppServer<T>(
-  run: (
-    call: (method: string, params: unknown) => Promise<unknown>,
-    waitForNotification: (
-      method: string,
-      predicate?: (params: Record<string, unknown>) => boolean,
-      timeoutMs?: number,
-    ) => Promise<void>,
-  ) => Promise<T>,
-): Promise<T> {
+export type CodexAppServerConnection = {
+  /** Sends a JSON-RPC request and resolves with its result. */
+  call(method: string, params: unknown): Promise<unknown>;
+  /** Kills the child. Safe to call more than once. */
+  close(): void;
+};
+
+/** What a caller must supply to receive the server's own traffic. */
+export type CodexAppServerHandlers = {
+  /** Every server-to-client notification, in arrival order. */
+  onNotification?: (method: string, params: AnyRecord) => void;
+  /**
+   * Every server-to-client *request*. Returning a value answers it; returning
+   * `undefined` rejects it as unsupported. A promise is awaited, which is what
+   * lets an approval wait on a human.
+   *
+   * Answering is not optional: an approval request nobody replies to leaves
+   * the turn blocked on it forever.
+   */
+  onRequest?: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
+  /** Called once when the child dies, with whatever explains it. */
+  onExit?: (reason: string) => void;
+};
+
+/**
+ * Spawns `codex app-server`, completes the handshake, and returns the open
+ * connection.
+ *
+ * Consumer: `withAppServer` and the Codex runtime.
+ */
+export async function openCodexAppServer(
+  handlers: CodexAppServerHandlers = {},
+): Promise<CodexAppServerConnection> {
   const launcher = resolveCodexLauncher();
   const child = spawn(process.execPath, [launcher, 'app-server'], {
     env: process.env,
@@ -115,68 +127,95 @@ async function withAppServer<T>(
 
   let nextRequestId = 1;
   const pending = new Map<number, (response: JsonRpcResponse) => void>();
-  const notificationWaiters = new Map<string, NotificationWaiter[]>();
   let exitReason: string | null = null;
+
+  const write = (message: unknown): void => {
+    child.stdin?.write(`${JSON.stringify(message)}\n`);
+  };
 
   const reader = readline.createInterface({ input: child.stdout });
   reader.on('line', (line) => {
     if (!line.trim()) {
       return;
     }
-    let message: JsonRpcResponse;
+    let message: JsonRpcResponse & { method?: string; params?: unknown };
     try {
-      message = JSON.parse(line) as JsonRpcResponse;
+      message = JSON.parse(line) as JsonRpcResponse & { method?: string; params?: unknown };
     } catch {
-      // Server-to-client notifications and any non-JSON banner are not
-      // replies to anything this client asked for.
+      // A non-JSON banner is not a reply to anything this client asked for.
+      return;
+    }
+
+    if (typeof message.method === 'string') {
+      const params = (message.params ?? {}) as AnyRecord;
+      if (typeof message.id === 'number') {
+        // A server-to-client request. It must be answered or whatever asked
+        // for it waits forever — including an approval, which resolves only
+        // once a human answers it.
+        const requestId = message.id;
+        const unsupported = () => write({
+          jsonrpc: '2.0',
+          id: requestId,
+          error: { code: -32601, message: `cloudcli does not implement "${message.method}".` },
+        });
+        void (async () => {
+          try {
+            const result = await handlers.onRequest?.(message.method as string, params);
+            if (result === undefined) {
+              unsupported();
+              return;
+            }
+            write({ jsonrpc: '2.0', id: requestId, result });
+          } catch (error) {
+            write({
+              jsonrpc: '2.0',
+              id: requestId,
+              error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+            });
+          }
+        })();
+        return;
+      }
+      handlers.onNotification?.(message.method, params);
       return;
     }
 
     if (typeof message.id !== 'number') {
-      // Server-initiated notification: hand it to whichever `call` is waiting
-      // for that method. Runtimes that only issue requests ignore this path.
-      if (typeof message.method === 'string') {
-        const waiters = notificationWaiters.get(message.method);
-        const index = waiters?.findIndex((waiter) => waiter.predicate((message.params ?? {}) as Record<string, unknown>)) ?? -1;
-        if (waiters && index >= 0) {
-          const [waiter] = waiters.splice(index, 1);
-          clearTimeout(waiter.timer);
-          waiter.resolve();
-        }
-      }
       return;
     }
-
     pending.get(message.id)?.(message);
     pending.delete(message.id);
   });
 
+  // Set by `close()` so the exit log can say whether cloudcli asked the
+  // process to stop or it went away on its own — the two look identical in
+  // the engine's own transcript, which records only that its turn ended.
+  let closedByClient = false;
+
   const failPending = (reason: string) => {
+    if (exitReason) {
+      return;
+    }
     exitReason = reason;
     for (const resolve of pending.values()) {
       resolve({ error: { message: reason } });
     }
     pending.clear();
-    for (const waiters of notificationWaiters.values()) {
-      for (const waiter of waiters) {
-        clearTimeout(waiter.timer);
-        waiter.reject(new AppError(`Codex app-server is not running: ${reason}`, {
-          code: 'CODEX_APP_SERVER_UNAVAILABLE',
-          statusCode: 502,
-        }));
-      }
-    }
-    notificationWaiters.clear();
+    handlers.onExit?.(stderr.trim() ? `${reason} — ${stderr.trim().split('\n').slice(-1)[0]}` : reason);
   };
 
   child.on('error', (error) => failPending(error.message));
   child.on('exit', (code, signal) => {
+    console.log(
+      `[Codex] app-server exited (code ${code ?? 'null'}, signal ${signal ?? 'null'}, `
+      + `closedByCloudCLI=${closedByClient})`,
+    );
     failPending(`codex app-server exited (code ${code ?? 'null'}, signal ${signal ?? 'null'})`);
   });
   // A child that dies mid-request leaves its pipes broken, and the next write
   // raises EPIPE on the stream rather than at the call site. Without a
   // listener that is an unhandled 'error' event, which takes the whole server
-  // down over one failed fork.
+  // down over one failed call.
   child.stdin?.on('error', (error) => failPending(error.message));
   child.stdout?.on('error', (error) => failPending(error.message));
   child.stderr?.on('error', () => {});
@@ -213,72 +252,75 @@ async function withAppServer<T>(
         resolve(response.result);
       });
 
-      child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      write({ jsonrpc: '2.0', id, method, params });
     });
 
-  /**
-   * Resolves the first server notification matching `method` (and `predicate`),
-   * or rejects on timeout / child death. Register before issuing the request
-   * that triggers the notification: notifications carry no id, so a waiter
-   * added afterwards races the server.
-   */
-  const waitForNotification = (
-    method: string,
-    predicate: (params: Record<string, unknown>) => boolean = () => true,
-    timeoutMs = REQUEST_TIMEOUT_MS,
-  ): Promise<void> =>
-    new Promise((resolve, reject) => {
-      if (exitReason) {
-        reject(new AppError(`Codex app-server is not running: ${exitReason}`, {
-          code: 'CODEX_APP_SERVER_UNAVAILABLE',
-          statusCode: 502,
-        }));
-        return;
-      }
-
-      const waiters = notificationWaiters.get(method) ?? [];
-      const waiter: NotificationWaiter = {
-        predicate,
-        resolve,
-        reject,
-        timer: setTimeout(() => {
-          const list = notificationWaiters.get(method);
-          const index = list?.indexOf(waiter) ?? -1;
-          if (list && index >= 0) {
-            list.splice(index, 1);
-          }
-          reject(new AppError(`Codex app-server did not report "${method}" within ${timeoutMs}ms.`, {
-            code: 'CODEX_APP_SERVER_TIMEOUT',
-            statusCode: 504,
-          }));
-        }, timeoutMs),
-      };
-      waiters.push(waiter);
-      notificationWaiters.set(method, waiters);
-    });
+  let closed = false;
+  const close = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    closedByClient = true;
+    reader.close();
+    child.kill();
+  };
 
   try {
-    // `capabilities` is deliberately empty. `thread/fork` with `lastTurnId` is
-    // in the stable protocol; only `beforeTurnId` and the turn-listing methods
-    // are gated behind `experimentalApi`, and neither is needed here.
+    // `capabilities` is deliberately empty. `thread/fork` with `lastTurnId`,
+    // `turn/start` and the item notifications are all in the stable protocol;
+    // only `beforeTurnId` and the turn-listing methods are gated behind
+    // `experimentalApi`, and none of those is needed here.
     await call('initialize', {
       clientInfo: { name: 'cloudcli', title: 'CloudCLI', version: '1' },
       capabilities: {},
     });
-    child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
+    write({ jsonrpc: '2.0', method: 'initialized', params: {} });
+  } catch (error) {
+    close();
+    throw error;
+  }
 
-    return await run(call, waitForNotification);
+  return { call, close };
+}
+
+/**
+ * The indirection production and tests share for opening a connection.
+ *
+ * `codex-runtime.provider.ts` goes through this rather than calling
+ * `openCodexAppServer` directly so a test can substitute a fake server the
+ * same way the previous runtime's tests substituted the SDK's thread class.
+ * Production never replaces it.
+ */
+export const codexAppServerTransport = { open: openCodexAppServer };
+
+/**
+ * Runs one exchange against a freshly spawned `codex app-server`.
+ *
+ * A process per operation rather than a pooled long-lived one: the handshake
+ * costs a fraction of a second, forking happens at most once per user action,
+ * and a shared child would need lifecycle handling — restarts, back-pressure,
+ * a crash taking every pending fork with it — for no measurable gain next to
+ * the model turn that follows.
+ */
+async function withAppServer<T>(
+  run: (call: (method: string, params: unknown) => Promise<unknown>) => Promise<T>,
+): Promise<T> {
+  let exitReason: string | null = null;
+  const connection = await openCodexAppServer({ onExit: (reason) => { exitReason = reason; } });
+
+  try {
+    return await run(connection.call);
   } catch (error) {
     if (error instanceof AppError && exitReason) {
-      throw new AppError(`${error.message}${stderr ? ` — ${stderr.trim().split('\n').slice(-1)[0]}` : ''}`, {
+      throw new AppError(`${error.message} — ${exitReason}`, {
         code: error.code,
         statusCode: error.statusCode,
       });
     }
     throw error;
   } finally {
-    reader.close();
-    child.kill();
+    connection.close();
   }
 }
 
@@ -345,29 +387,50 @@ export const codexAppServer = {
    * conversation it is replacing.
    */
   async compactThread(input: { threadId: string }): Promise<void> {
-    return withAppServer(async (call, waitForNotification) => {
-      // Register both completion signals before starting: the compacting turn
-      // ends with a `contextCompaction` item, and the turn boundary itself is
-      // the fallback for builds that emit only one of the two.
-      const compactionFinished = Promise.any([
-        waitForNotification(
-          'item/completed',
-          (params) => (
-            params.threadId === input.threadId
-            && (params.item as { type?: unknown } | undefined)?.type === 'contextCompaction'
-          ),
-          COMPACT_NOTIFICATION_TIMEOUT_MS,
-        ),
-        waitForNotification(
-          'turn/completed',
-          (params) => params.threadId === input.threadId,
-          COMPACT_NOTIFICATION_TIMEOUT_MS,
-        ),
-      ]);
-
-      await call('thread/resume', { threadId: input.threadId });
-      await call('thread/compact/start', { threadId: input.threadId });
-      await compactionFinished;
+    let settleFinished!: () => void;
+    let failFinished!: (error: Error) => void;
+    const finished = new Promise<void>((resolve, reject) => {
+      settleFinished = resolve;
+      failFinished = reject;
     });
+
+    // Both completion signals are watched from before the request goes out:
+    // the compacting turn ends with a `contextCompaction` item, and the turn
+    // boundary itself is the fallback for builds that emit only one of the two.
+    const connection = await openCodexAppServer({
+      onNotification: (method, params) => {
+        const compactionItem = params.item as { type?: unknown } | undefined;
+        if (
+          (method === 'item/completed'
+            && params.threadId === input.threadId
+            && compactionItem?.type === 'contextCompaction')
+          || (method === 'turn/completed' && params.threadId === input.threadId)
+        ) {
+          settleFinished();
+        }
+      },
+      onExit: (reason) => {
+        failFinished(new AppError(`Codex app-server is not running: ${reason}`, {
+          code: 'CODEX_APP_SERVER_UNAVAILABLE',
+          statusCode: 502,
+        }));
+      },
+    });
+
+    const timer = setTimeout(() => {
+      failFinished(new AppError(
+        `Codex app-server did not report the compaction within ${COMPACT_NOTIFICATION_TIMEOUT_MS}ms.`,
+        { code: 'CODEX_APP_SERVER_TIMEOUT', statusCode: 504 },
+      ));
+    }, COMPACT_NOTIFICATION_TIMEOUT_MS);
+
+    try {
+      await connection.call('thread/resume', { threadId: input.threadId });
+      await connection.call('thread/compact/start', { threadId: input.threadId });
+      await finished;
+    } finally {
+      clearTimeout(timer);
+      connection.close();
+    }
   },
 };

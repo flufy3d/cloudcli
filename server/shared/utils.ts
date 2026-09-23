@@ -730,14 +730,14 @@ export const readStringRecord = (value: unknown): Record<string, string> | undef
  * pnpm's `.pnpm` virtual store and any `node_modules` segment.
  *
  * A system temp root is **not** infrastructure. Working out of `/tmp` is
- * ordinary — a scratch clone, a bug repro — and rejecting it made those
- * sessions vanish from the project list with no error to explain it. The
- * deployment leak this guard exists for lands in the pnpm store, which the
- * segment filters already cover, and the runtime no longer falls back to its
- * own cwd, so the temp-root rule only ever cost real projects.
+ * ordinary — a scratch clone, a bug repro — and rejecting it makes those
+ * sessions vanish from the project list with no error to explain it. A
+ * one-shot sandbox under a temp root is caught instead by the
+ * directory-exists half of `admitsWorkspacePath`, which never touches a
+ * directory the user can still open.
  *
- * Consumers: the SQLite session synchronizer skeleton (row admission) and
- * its tests.
+ * Consumers: `admitsWorkspacePath` (the session-indexing gate every engine
+ * goes through) and its tests.
  */
 export const isInfrastructureWorkspacePath = (projectPath: string): boolean => {
   const normalized = projectPath.trim().replace(/\/+$/, '');

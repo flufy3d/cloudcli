@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import { PaletteOpsProvider } from '@/modules/command-palette';
@@ -12,6 +12,7 @@ import { useDeviceSettings } from '@/shared/hooks/useDeviceSettings';
 import { useLastSessionRestore } from '@/shared/hooks/useLastSessionRestore';
 import { useVisualViewportKeyboardOffset } from '@/modules/project-workspace/hooks/useVisualViewportKeyboardOffset';
 import ProjectWorkspaceShell from '@/modules/project-workspace/ProjectWorkspaceShell';
+import { markStartupMilestone } from '@/shared/diagnostics/startupDiagnostics';
 
 const MemoizedProjectWorkspaceRouteContent = memo(ProjectWorkspaceRouteContent);
 
@@ -37,6 +38,9 @@ function ProjectWorkspaceRouteContent() {
   // Fork feature (d87c7c3): a PWA cold start lands on `/` — reopen the last
   // viewed session when the stored id still resolves.
   useLastSessionRestore({ sessionId });
+  useEffect(() => {
+    markStartupMilestone('workspace_committed');
+  }, []);
 
   return (
     <ProjectsStateProvider

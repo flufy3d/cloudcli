@@ -1,10 +1,12 @@
 import { sessionsDb } from '@/modules/database/index.js';
+import { recordRunOutcome } from '@/modules/diagnostics/index.js';
 import { ChatSessionWriter } from '@/modules/websocket/services/chat-session-writer.service.js';
 import { broadcastSessionUpserted } from '@/modules/websocket/services/session-upsert-broadcast.service.js';
 import type {
   LLMProvider,
   NormalizedMessage,
   RealtimeClientConnection,
+  RunOutcomeReason,
 } from '@/shared/types.js';
 
 type ChatRunStatus = 'running' | 'completed';
@@ -46,6 +48,14 @@ type ChatRun = {
   writer: ChatSessionWriter;
   startedAt: number;
   completedAt: number | null;
+  /**
+   * Why this run is about to end, when the end was decided here rather than
+   * by the engine: the abort path, the supersede path, and the dispatch-error
+   * safety net each stamp it before the terminal `complete` goes out. Left
+   * null for a run the engine ended itself, which is then classified from its
+   * exit code.
+   */
+  endReason: RunOutcomeReason | null;
 };
 
 /**
@@ -131,6 +141,19 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
     outbound.actualSessionId = run.appSessionId;
     run.status = 'completed';
     run.completedAt = Date.now();
+    // Every run leaves through this one branch, whichever runtime produced it
+    // and whoever decided it should stop, so this is the only place that can
+    // record why it ended without each provider having to remember to.
+    recordRunOutcome({
+      sessionId: run.appSessionId,
+      provider: run.provider,
+      reason: run.endReason ?? (readExitCode(message) === 0 ? 'engine_completed' : 'engine_failed'),
+      exitCode: readExitCode(message),
+      startedAt: run.startedAt,
+      endedAt: run.completedAt,
+      eventCount: run.events.length + 1,
+      lastSeq: run.lastSeq,
+    });
     evictRunLater(run.appSessionId);
   }
 
@@ -140,6 +163,12 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
   }
 
   return outbound;
+}
+
+/** Reads a terminal event's exit code, defaulting to a failure it cannot read. */
+function readExitCode(message: NormalizedMessage): number {
+  const value = (message as NormalizedMessage & { exitCode?: unknown }).exitCode;
+  return typeof value === 'number' ? value : 1;
 }
 
 /**
@@ -222,6 +251,7 @@ export const chatRunRegistry = {
       writer: null as unknown as ChatSessionWriter,
       startedAt: Date.now(),
       completedAt: null,
+      endReason: null,
     };
 
     run.writer = new ChatSessionWriter({
@@ -316,12 +346,16 @@ export const chatRunRegistry = {
    * marked running. Used when a provider runtime throws or resolves without
    * having produced its own terminal event, and by the abort path.
    */
-  completeRun(appSessionId: string, opts: { exitCode: number; aborted?: boolean }): void {
+  completeRun(
+    appSessionId: string,
+    opts: { exitCode: number; aborted?: boolean; reason: RunOutcomeReason },
+  ): void {
     const run = runs.get(appSessionId);
     if (!run || run.status !== 'running') {
       return;
     }
 
+    run.endReason = opts.reason;
     run.writer.sendComplete(opts);
   },
 
@@ -333,11 +367,15 @@ export const chatRunRegistry = {
    * milliseconds of the previous turn ending) — the session-keyed
    * `completeRun` would terminate that newer run.
    */
-  completeRunIfCurrent(run: ChatRun, opts: { exitCode: number; aborted?: boolean }): void {
+  completeRunIfCurrent(
+    run: ChatRun,
+    opts: { exitCode: number; aborted?: boolean; reason: RunOutcomeReason },
+  ): void {
     if (runs.get(run.appSessionId) !== run || run.status !== 'running') {
       return;
     }
 
+    run.endReason = opts.reason;
     run.writer.sendComplete(opts);
   },
 

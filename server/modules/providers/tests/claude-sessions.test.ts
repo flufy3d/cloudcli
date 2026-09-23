@@ -144,6 +144,48 @@ async function writeClaudeSubagentSession(projectDirectory: string): Promise<str
   return parentPath;
 }
 
+test('an assistant reply keeps its prose and reports the memory it cited', () => {
+  // Claude marks a memory-derived sentence with <cc-memory> tags. They are
+  // provenance markup, not prose: leaving them in renders raw tags in the
+  // transcript, which is what the user sees today on every cited reply.
+  const provider = new ClaudeSessionsProvider();
+
+  const [message] = provider.normalizeMessage({
+    uuid: 'row-1',
+    type: 'assistant',
+    timestamp: new Date().toISOString(),
+    message: {
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: 'Sure. <cc-memory filenames="deploy.md">Deploys are yours to run.</cc-memory>',
+      }],
+    },
+  }, 'session-1');
+
+  assert.equal(message.content, 'Sure. Deploys are yours to run.');
+  assert.deepEqual(message.memoryCitations, [{ source: 'deploy.md' }]);
+});
+
+test('an assistant reply sent as a plain string is cited the same way', () => {
+  // Both content shapes reach this normalizer (live runs and history rows
+  // differ), so a fix applied to only one of them would come back on reload.
+  const provider = new ClaudeSessionsProvider();
+
+  const [message] = provider.normalizeMessage({
+    uuid: 'row-2',
+    type: 'assistant',
+    timestamp: new Date().toISOString(),
+    message: {
+      role: 'assistant',
+      content: '<cc-memory filenames="notes.md">Noted.</cc-memory>',
+    },
+  }, 'session-1');
+
+  assert.equal(message.content, 'Noted.');
+  assert.deepEqual(message.memoryCitations, [{ source: 'notes.md' }]);
+});
+
 test('Claude history attaches a subagent transcript stored under the session directory', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-subagent-'));
 

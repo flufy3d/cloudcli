@@ -240,3 +240,42 @@ test('deleteOrArchiveSessionById archives without force and broadcasts the remov
     assert.deepEqual(connection.frames[0].sessionIds, ['app-id-2']);
   });
 });
+
+test('a repeated create-session request with the same clientRequestId reuses the first session', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const first = sessionsService.createAppSession('codex', '/tmp/idempotent-project', 'hello there', {
+      clientRequestId: 'client-request-1',
+    });
+    const second = sessionsService.createAppSession('codex', '/tmp/idempotent-project', 'hello there', {
+      clientRequestId: 'client-request-1',
+    });
+
+    assert.equal(second.sessionId, first.sessionId);
+    assert.equal(
+      sessionsDb.getSessionsByProjectPathIncludingArchived('/tmp/idempotent-project').length,
+      1,
+    );
+  });
+});
+
+test('create-session requests without a clientRequestId still allocate distinct sessions', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const first = sessionsService.createAppSession('codex', '/tmp/distinct-project', 'hello');
+    const second = sessionsService.createAppSession('codex', '/tmp/distinct-project', 'hello');
+
+    assert.notEqual(second.sessionId, first.sessionId);
+  });
+});
+
+test('distinct clientRequestIds allocate distinct sessions', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const first = sessionsService.createAppSession('codex', '/tmp/two-requests-project', 'hello', {
+      clientRequestId: 'client-request-a',
+    });
+    const second = sessionsService.createAppSession('codex', '/tmp/two-requests-project', 'hello', {
+      clientRequestId: 'client-request-b',
+    });
+
+    assert.notEqual(second.sessionId, first.sessionId);
+  });
+});

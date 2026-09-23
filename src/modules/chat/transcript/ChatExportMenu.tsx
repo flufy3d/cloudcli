@@ -1,13 +1,16 @@
-import { Download, FileJson, FileText, type LucideIcon } from 'lucide-react';
+import { Download, FileJson, FileText, Stethoscope, type LucideIcon } from 'lucide-react';
 
 import type { ChatMessage, DiffLine } from '@/shared/types';
 import { ActionMenu, type ActionMenuItem } from '@/shared/ui/ActionMenu';
 import { downloadTranscriptExport, downloadPDF, getAvailableExportFormats, type EXPORT_FORMATS } from '@/modules/chat/utils/chatExport';
+import { downloadDiagnosticsReport } from '@/shared/diagnostics/diagnosticsReport';
 
 type ChatExportMenuProps = {
   messages: ChatMessage[];
   sessionTitle?: string;
   provider?: string;
+  /** The session the diagnostics report describes; without it the report is frames only. */
+  sessionId?: string | null;
   createDiff: (oldStr: string, newStr: string) => DiffLine[];
 };
 
@@ -24,7 +27,7 @@ const FORMAT_ICONS: Record<(typeof EXPORT_FORMATS)[number]['id'], LucideIcon> = 
  * the scroll container could not be trusted to do (stacking contexts and
  * containing blocks quietly break that trick).
  */
-export default function ChatExportMenu({ messages, sessionTitle, provider, createDiff }: ChatExportMenuProps) {
+export default function ChatExportMenu({ messages, sessionTitle, provider, sessionId, createDiff }: ChatExportMenuProps) {
   if (messages.length === 0) {
     return null;
   }
@@ -54,12 +57,22 @@ export default function ChatExportMenu({ messages, sessionTitle, provider, creat
     }
   };
 
-  const items: ActionMenuItem[] = getAvailableExportFormats().map((format) => ({
-    key: format.id,
-    label: format.label,
-    icon: FORMAT_ICONS[format.id],
-    onSelect: () => void handleExport(format.id),
-  }));
+  const items: ActionMenuItem[] = [
+    ...getAvailableExportFormats().map((format) => ({
+      key: format.id,
+      label: format.label,
+      icon: FORMAT_ICONS[format.id],
+      onSelect: () => void handleExport(format.id),
+    })),
+    {
+      // Not a transcript format: it is what the transcript cannot show —
+      // the frames that produced it and the rows the client is holding.
+      key: 'diagnostics',
+      label: 'Diagnostics (.json)',
+      icon: Stethoscope,
+      onSelect: () => void downloadDiagnosticsReport(sessionId ?? null),
+    },
+  ];
 
   return (
     <ActionMenu

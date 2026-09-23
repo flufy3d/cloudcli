@@ -1321,3 +1321,54 @@ export type CliApplication = {
 export type SandboxCommandService = {
   execute(argumentsList: string[]): Promise<number>;
 };
+
+// ---------------------------
+//----------------- DIAGNOSTICS MODULE CONTRACTS ------------
+
+/**
+ * Why one chat run stopped.
+ *
+ * This is the field that tells a "the session just died" report apart from a
+ * "the user pressed stop" report. The engine's own transcript on disk records
+ * only that its turn was interrupted — it cannot say who interrupted it — so
+ * without this the two are indistinguishable after the fact.
+ *
+ * - `engine_completed`: the runtime streamed its own terminal `complete` with
+ *   exit code 0.
+ * - `engine_failed`: the runtime ended with a non-zero exit code, or reported
+ *   an error before it ended.
+ * - `client_abort`: a browser sent `chat.abort` (the stop button, or the
+ *   global Escape key).
+ * - `superseded`: a new turn (a scheduled message) deliberately cancelled the
+ *   run that was still in progress.
+ * - `dispatch_failed`: the dispatch threw before any engine `complete`
+ *   arrived, so the terminal event was synthesized on the runtime's behalf.
+ */
+export type RunOutcomeReason =
+  | 'engine_completed'
+  | 'engine_failed'
+  | 'client_abort'
+  | 'superseded'
+  | 'dispatch_failed';
+
+/**
+ * What the diagnostics module records when a run ends, and what the
+ * diagnostics route hands back.
+ *
+ * Deliberately free of message content: identifiers, timings and counters
+ * only, so the log can be exported from the UI and attached to a bug report
+ * without leaking a conversation.
+ */
+export type RunOutcome = {
+  sessionId: string;
+  provider: LLMProvider;
+  reason: RunOutcomeReason;
+  exitCode: number;
+  startedAtIso: string;
+  endedAtIso: string;
+  durationMs: number;
+  /** How many live events the run emitted, as a rough measure of its size. */
+  eventCount: number;
+  /** The session's sequence watermark when the run ended. */
+  lastSeq: number;
+};

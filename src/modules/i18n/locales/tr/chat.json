@@ -102,6 +102,7 @@
     "attachFiles": "Dosya ekle",
     "attachImages": "Resim ekle",
     "send": "Gönder",
+    "sending": "Gönderiliyor…",
     "stop": "Durdur",
     "hintText": {
       "ctrlEnter": "Göndermek için Ctrl+Enter • Yeni satır için Shift+Enter • Mod değiştirmek için Tab • Slash komutları için /",
@@ -291,5 +292,9 @@
   "localProxy": {
     "linkHint": "Bu adres yalnızca sunucuda bulunur; CloudCLI onu yerel proxy üzerinden açar.",
     "failed": "CloudCLI bu sunucu yerel adresini açamadı."
+  },
+  "memory": {
+    "used_one": "{{count}} bellek kaydı kullanıldı",
+    "used_other": "{{count}} bellek kaydı kullanıldı"
   }
 }

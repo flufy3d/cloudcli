@@ -22,6 +22,7 @@ import ChatMessageImages from '@/modules/chat/transcript/ChatMessageImages';
 import ChatMessageFiles from '@/modules/chat/transcript/ChatMessageFiles';
 import { Markdown } from '@/modules/chat/transcript/Markdown';
 import { StreamingMarkdown } from '@/modules/chat/transcript/StreamingMarkdown';
+import { MemoryCitations } from '@/modules/chat/transcript/MemoryCitations';
 import MessageCopyControl from '@/modules/chat/transcript/MessageCopyControl';
 import MessageSpeakControl from '@/modules/chat/transcript/MessageSpeakControl';
 
@@ -460,6 +461,10 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
                   );
                 })()}
               </div>
+            )}
+
+            {message.memoryCitations && message.memoryCitations.length > 0 && (
+              <MemoryCitations citations={message.memoryCitations} />
             )}
 
             {(shouldShowAssistantCopyControl || (!isGrouped && !message.isThinking)) && (

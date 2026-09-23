@@ -91,7 +91,7 @@ export const PROVIDER_CATALOG = {
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
     defaultPermissionMode: 'default',
-    defaultModel: 'gpt-5.6-sol',
+    defaultModel: 'gpt-6-sol',
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,

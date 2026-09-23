@@ -7,7 +7,9 @@ import test from 'node:test';
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { CodexSessionSynchronizer } from '@/modules/providers/list/codex/codex-session-synchronizer.provider.js';
 import { AppError } from '@/shared/utils.js';
-import { CodexSessionsProvider, parseCodexExecScript, readCodexMemoryCitations, readCodexProposedPlan } from '@/modules/providers/list/codex/codex-sessions.provider.js';
+import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
+import { readCodexProposedPlan } from '@/modules/providers/list/codex/codex-thread-items.js';
+import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
@@ -153,100 +155,6 @@ test('Codex synchronizer leaves indexed sessions untitled when no name is availa
   }
 });
 
-test('Codex history translates wrapped exec scripts into the tools they ran', { concurrency: false }, async () => {
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-exec-history-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
-  const restoreHomeDir = patchHomeDir(tempRoot);
-
-  try {
-    const providerSessionId = 'codex-exec-1';
-    const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
-    // Every shape Codex's "code mode" emits. Only a wrapper nothing recognizes
-    // may stay labelled `exec`; the rest must name the work they performed.
-    const wrappedCalls = [
-      {
-        callId: 'shell-command-1',
-        input: 'const cmds = ["echo one", "echo two"]; await Promise.all(cmds.map(command => tools.shell_command({ command })));',
-        expectedToolName: 'Bash',
-        // One row per command now: the live stream emits a command_execution
-        // item each, and a joined card matches none of them. The first row
-        // keeps the call id; the second is asserted separately below.
-        expectedToolInput: JSON.stringify({ command: 'echo one' }),
-      },
-      {
-        callId: 'json-shell-command-1',
-        input: 'const r = await tools.shell_command({"command":"Get-Content -Raw README.md","workdir":"C:\\\\workspace","timeout_ms":10000}); text(r)',
-        expectedToolName: 'Bash',
-        expectedToolInput: JSON.stringify({ command: 'Get-Content -Raw README.md' }),
-      },
-      {
-        callId: 'exec-command-1',
-        input: 'await tools.exec_command({"cmd":"npm test","workdir":"/repo","yield_time_ms":10000});',
-        expectedToolName: 'Bash',
-        expectedToolInput: JSON.stringify({ command: 'npm test' }),
-      },
-      {
-        callId: 'web-run-1',
-        input: 'await tools.web__run({ search_query: [{ q: "Codex" }, { q: "rollout format" }] });',
-        expectedToolName: 'WebSearch',
-        expectedToolInput: JSON.stringify({ query: 'Codex | rollout format' }),
-      },
-      {
-        callId: 'unknown-1',
-        input: 'await tools.unknown_wrapper({ value: true });',
-        expectedToolName: 'exec',
-        expectedToolInput: 'await tools.unknown_wrapper({ value: true });',
-      },
-    ];
-    const transcriptLines = [
-      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
-    ];
-    for (const call of wrappedCalls) {
-      transcriptLines.push(
-        JSON.stringify({
-          type: 'response_item',
-          payload: { type: 'custom_tool_call', name: 'exec', call_id: call.callId, input: call.input },
-        }),
-        JSON.stringify({
-          type: 'response_item',
-          payload: { type: 'custom_tool_call_output', call_id: call.callId, output: `result:${call.callId}` },
-        }),
-      );
-    }
-    await writeFile(transcriptPath, `${transcriptLines.join('\n')}\n`, 'utf8');
-
-    await withIsolatedDatabase(async () => {
-      sessionsDb.createAppSession('app-exec-1', 'codex', workspacePath);
-      sessionsDb.assignProviderSessionId('app-exec-1', providerSessionId);
-      await new CodexSessionSynchronizer().synchronize();
-
-      const history = await new CodexSessionsProvider().fetchHistory('app-exec-1');
-      const toolUses = history.messages.filter((message) => message.kind === 'tool_use');
-      const toolUsesById = new Map(toolUses.map((message) => [message.toolId, message]));
-
-      // The two-command script contributes one extra row beyond its call.
-      assert.equal(toolUses.length, wrappedCalls.length + 1);
-      const secondCommandRow = toolUses.find(
-        (message) => message.toolId?.startsWith('shell-command-1~'),
-      );
-      assert.ok(secondCommandRow, 'the script\'s second command needs its own row');
-      assert.equal(secondCommandRow.toolInput, JSON.stringify({ command: 'echo two' }));
-
-      for (const call of wrappedCalls) {
-        const toolUse = toolUsesById.get(call.callId);
-        assert.ok(toolUse, `missing row for ${call.callId}`);
-        assert.equal(toolUse.toolName, call.expectedToolName);
-        assert.equal(toolUse.toolInput, call.expectedToolInput);
-        assert.equal(toolUse.toolResult?.content, `result:${call.callId}`);
-      }
-    });
-  } finally {
-    restoreHomeDir();
-    await rm(tempRoot, { recursive: true, force: true });
-  }
-});
-
 test('Codex history reads 0.153-era prompts from item_completed UserMessage rows', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-user-153-'));
   const workspacePath = path.join(tempRoot, 'workspace');
@@ -270,7 +178,10 @@ test('Codex history reads 0.153-era prompts from item_completed UserMessage rows
         type: 'event_msg',
         payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'first prompt' }] } },
       }),
-      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first answer' }] } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'AgentMessage', id: 'msg-a1', content: [{ type: 'Text', text: 'first answer' }] } },
+      }),
       JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } }),
       JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-2' } }),
       JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn-2' } }),
@@ -278,7 +189,10 @@ test('Codex history reads 0.153-era prompts from item_completed UserMessage rows
         type: 'event_msg',
         payload: { type: 'item_completed', turn_id: 'turn-2', item: { type: 'UserMessage', id: 'item-u2', content: [{ type: 'text', text: 'second prompt' }] } },
       }),
-      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'second answer' }] } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'item_completed', turn_id: 'turn-2', item: { type: 'AgentMessage', id: 'msg-a2', content: [{ type: 'Text', text: 'second answer' }] } },
+      }),
       JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-2' } }),
     ];
     const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
@@ -389,59 +303,6 @@ test('getTokenUsage 404s when no rollout file can be located', async () => {
   }
 });
 
-test('Codex history strips the sandbox envelopes from shell output', { concurrency: false }, async () => {
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-exec-output-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
-  const restoreHomeDir = patchHomeDir(tempRoot);
-
-  try {
-    const providerSessionId = 'codex-output-1';
-    const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
-    await writeFile(transcriptPath, `${[
-      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
-      JSON.stringify({
-        type: 'response_item',
-        payload: {
-          type: 'custom_tool_call',
-          name: 'exec',
-          call_id: 'failing-1',
-          input: 'await tools.shell_command({ command: "npm test" });',
-        },
-      }),
-      // Codex nests two report headers: one for the sandbox script and one for
-      // the command it ran. Neither belongs in a chat transcript.
-      JSON.stringify({
-        type: 'response_item',
-        payload: {
-          type: 'custom_tool_call_output',
-          call_id: 'failing-1',
-          output: [
-            { type: 'input_text', text: 'Script failed\nWall time 1.2 seconds\nOutput:\n' },
-            { type: 'input_text', text: 'Script error:\nExit code: 1\nWall time: 1.1 seconds\nOutput:\n1 test failed\n' },
-          ],
-        },
-      }),
-    ].join('\n')}\n`, 'utf8');
-
-    await withIsolatedDatabase(async () => {
-      sessionsDb.createAppSession('app-output-1', 'codex', workspacePath);
-      sessionsDb.assignProviderSessionId('app-output-1', providerSessionId);
-      await new CodexSessionSynchronizer().synchronize();
-
-      const history = await new CodexSessionsProvider().fetchHistory('app-output-1');
-      const bash = history.messages.find((message) => message.kind === 'tool_use');
-
-      assert.equal(bash?.toolName, 'Bash');
-      assert.equal(bash?.toolResult?.content, '1 test failed\n');
-      assert.equal(bash?.toolResult?.isError, true, 'a non-zero exit code must mark the row failed');
-    });
-  } finally {
-    restoreHomeDir();
-    await rm(tempRoot, { recursive: true, force: true });
-  }
-});
-
 test('Codex history renders one file row per patched file, from the applied diff', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-patch-history-'));
   const workspacePath = path.join(tempRoot, 'workspace');
@@ -451,42 +312,24 @@ test('Codex history renders one file row per patched file, from the applied diff
   try {
     const providerSessionId = 'codex-patch-1';
     const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
-    const patch = [
-      '*** Begin Patch',
-      '*** Update File: /repo/a.ts',
-      '@@',
-      '-const a = 1;',
-      '+const a = 2;',
-      '*** Update File: /repo/b.ts',
-      '@@',
-      '-const b = 1;',
-      '+const b = 2;',
-      '*** End Patch',
-    ].join('\n');
-
     await writeFile(transcriptPath, `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
-      JSON.stringify({
-        type: 'response_item',
-        payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'patch-1', input: patch },
-      }),
-      // The out-of-band report carries the real diffs, keyed by path in an
-      // order that does not follow the patch body.
+      // Codex applies the patch and reports the result as one assembled item,
+      // keyed by path. The raw `custom_tool_call` beside it is not read.
       JSON.stringify({
         type: 'event_msg',
         payload: {
-          type: 'patch_apply_end',
-          call_id: 'patch-1',
-          success: true,
-          changes: {
-            '/repo/b.ts': { type: 'update', unified_diff: '@@\n-const b = 1;\n+const b = 22;\n' },
-            '/repo/a.ts': { type: 'update', unified_diff: '@@\n-const a = 1;\n+const a = 22;\n' },
+          type: 'item_completed',
+          item: {
+            type: 'FileChange',
+            id: 'exec-patch-1',
+            status: 'completed',
+            changes: {
+              '/repo/b.ts': { type: 'update', unified_diff: '@@\n-const b = 1;\n+const b = 22;\n' },
+              '/repo/a.ts': { type: 'update', unified_diff: '@@\n-const a = 1;\n+const a = 22;\n' },
+            },
           },
         },
-      }),
-      JSON.stringify({
-        type: 'response_item',
-        payload: { type: 'custom_tool_call_output', call_id: 'patch-1', output: '{}' },
       }),
     ].join('\n')}\n`, 'utf8');
 
@@ -499,14 +342,15 @@ test('Codex history renders one file row per patched file, from the applied diff
       const edits = history.messages.filter((message) => message.kind === 'tool_use');
 
       assert.equal(edits.length, 2, 'the patch must not be rendered twice');
+      // Both rows are named after the item, so a second read produces the
+      // same two ids and the live copies they replace.
+      assert.deepEqual(edits.map((edit) => edit.id).sort(), ['exec-patch-1_0', 'exec-patch-1_1']);
       const byPath = new Map(edits.map((edit) => {
         const input = JSON.parse(String(edit.toolInput)) as { file_path: string; new_string: string };
         return [input.file_path, { edit, input }];
       }));
 
       assert.equal(byPath.get('/repo/a.ts')?.edit.toolName, 'Edit');
-      // The applied diff wins over the one reconstructed from the call input,
-      // and it must land on the row for its own file.
       assert.equal(byPath.get('/repo/a.ts')?.input.new_string, 'const a = 22;');
       assert.equal(byPath.get('/repo/b.ts')?.input.new_string, 'const b = 22;');
       for (const edit of edits) {
@@ -532,23 +376,19 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
 
     await writeFile(transcriptPath, `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
-      JSON.stringify({
-        type: 'response_item',
-        payload: {
-          type: 'function_call',
-          name: 'spawn_agent',
-          call_id: 'spawn-1',
-          arguments: JSON.stringify({ task_name: 'test_agent_1' }),
-        },
-      }),
+      // A spawn reaches the item stream only as this lifecycle event, so the
+      // Task row is built from it and keeps its id.
       JSON.stringify({
         type: 'event_msg',
         payload: {
-          type: 'sub_agent_activity',
-          kind: 'started',
-          event_id: 'spawn-1',
-          agent_thread_id: agentThreadId,
-          agent_path: '/root/test_agent_1',
+          type: 'item_completed',
+          item: {
+            type: 'SubAgentActivity',
+            id: 'spawn-1',
+            kind: 'started',
+            agent_thread_id: agentThreadId,
+            agent_path: '/root/test_agent_1',
+          },
         },
       }),
       JSON.stringify({
@@ -571,17 +411,18 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
           payload: { id: agentThreadId, cwd: workspacePath, thread_source: 'subagent', agent_nickname: 'Hegel' },
         }),
         JSON.stringify({
-          type: 'response_item',
+          type: 'event_msg',
           payload: {
-            type: 'custom_tool_call',
-            name: 'exec',
-            call_id: 'agent-call-1',
-            input: 'await tools.shell_command({ command: "ls" });',
+            type: 'item_completed',
+            item: {
+              type: 'CommandExecution',
+              id: 'exec-agent-call-1',
+              command: ['/bin/zsh', '-lc', 'ls'],
+              status: 'completed',
+              aggregated_output: 'README.md\n',
+              exit_code: 0,
+            },
           },
-        }),
-        JSON.stringify({
-          type: 'response_item',
-          payload: { type: 'custom_tool_call_output', call_id: 'agent-call-1', output: 'Exit code: 0\nOutput:\nREADME.md\n' },
         }),
       ].join('\n')}\n`,
       'utf8',
@@ -606,6 +447,7 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
       assert.equal(task.subagentTools?.[0].kind, 'tool');
       assert.equal(task.subagentTools?.[0].toolName, 'Bash');
       assert.equal(task.subagentTools?.[0].toolResult?.content, 'README.md\n');
+      assert.equal(task.id, 'spawn-1', 'the Task row is named after the lifecycle item');
     });
   } finally {
     restoreHomeDir();
@@ -628,7 +470,7 @@ test('Codex memory citations are lifted out of the reply they trail', () => {
     '</oai-mem-citation>',
   ].join('\n');
 
-  const { text, memoryCitations } = readCodexMemoryCitations(reply);
+  const { text, memoryCitations } = liftMemoryCitations('codex', reply);
 
   assert.equal(text, 'Here is the answer.');
   assert.deepEqual(memoryCitations, [
@@ -650,15 +492,17 @@ test('a plan followed by a memory citation is still recognized as a plan', async
     await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
       JSON.stringify({
-        type: 'response_item',
+        type: 'event_msg',
         payload: {
-          type: 'message',
-          role: 'assistant',
-          id: 'plan-1',
-          content: [{
-            type: 'output_text',
-            text: '<proposed_plan>\n# Ship it\n</proposed_plan>\n\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[prior deploy steps]\n</citation_entries>\n</oai-mem-citation>',
-          }],
+          type: 'item_completed',
+          item: {
+            type: 'AgentMessage',
+            id: 'plan-1',
+            content: [{
+              type: 'Text',
+              text: '<proposed_plan>\n# Ship it\n</proposed_plan>\n\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[prior deploy steps]\n</citation_entries>\n</oai-mem-citation>',
+            }],
+          },
         },
       }),
     ].join('\n')}\n`, 'utf8');
@@ -672,7 +516,7 @@ test('a plan followed by a memory citation is still recognized as a plan', async
       const plan = history.messages.find((message) => message.toolName === 'ExitPlanMode');
 
       assert.ok(plan, 'the trailing citation block must not hide the plan envelope');
-      assert.equal(JSON.parse(String(plan.toolInput)).plan, '# Ship it');
+      assert.deepEqual(plan.toolInput, { plan: '# Ship it' });
       assert.deepEqual(plan.memoryCitations, [{ source: 'MEMORY.md:1-2', note: 'prior deploy steps' }]);
       assert.ok(
         !history.messages.some((message) => JSON.stringify(message).includes('oai-mem-citation')),
@@ -682,84 +526,6 @@ test('a plan followed by a memory citation is still recognized as a plan', async
   } finally {
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });
-  }
-});
-
-test('an exec script that updates the plan yields the steps it set', () => {
-  const operations = parseCodexExecScript([
-    'const p = await tools.update_plan({plan:[',
-    '  {step:"Confirm the current workspace",status:"completed"},',
-    '  {step:"Check the Git working-tree status",status:"in_progress"},',
-    '  {step:"Identify the project",status:"pending"}',
-    ']});',
-    'text(p);',
-  ].join('\n'));
-
-  assert.deepEqual(operations, [{
-    kind: 'plan',
-    todos: [
-      { content: 'Confirm the current workspace', status: 'completed' },
-      { content: 'Check the Git working-tree status', status: 'in_progress' },
-      { content: 'Identify the project', status: 'pending' },
-    ],
-  }]);
-});
-
-/**
- * Codex >=0.144 reports every multi-agent collaboration call as one live
- * `collab_tool_call` item. Spawns must render as subagent Task cards and close
- * out with a paired result, while pure orchestration calls stay hidden — the
- * same contract the history reader enforces.
- */
-const collabEvent = (overrides: Record<string, unknown>) => ({
-  type: 'item',
-  itemType: 'collab_tool_call',
-  itemId: 'item_18',
-  tool: 'spawn_agent',
-  status: 'in_progress',
-  receiverAgents: [{ thread_id: '01a07105', agent_nickname: 'Chandrasekhar' }],
-  ...overrides,
-});
-
-test('a live collab spawn renders as a Task card while in progress', () => {
-  const provider = new CodexSessionsProvider();
-  const messages = provider.normalizeMessage(collabEvent({}), 'session-1');
-
-  assert.equal(messages.length, 1);
-  assert.equal(messages[0].kind, 'tool_use');
-  assert.equal(messages[0].toolName, 'Task');
-  assert.equal(messages[0].status, 'in_progress');
-  const input = JSON.parse(String(messages[0].toolInput));
-  assert.equal(input.description, 'Chandrasekhar');
-});
-
-test('a completed live collab spawn closes with a paired result row', () => {
-  const provider = new CodexSessionsProvider();
-  const messages = provider.normalizeMessage(collabEvent({ status: 'completed' }), 'session-1');
-
-  assert.equal(messages.length, 2);
-  assert.equal(messages[1].kind, 'tool_result');
-  assert.equal(messages[1].toolId, 'item_18');
-  assert.equal(messages[1].isError, false);
-  assert.match(String(messages[1].content), /Chandrasekhar finished/);
-});
-
-test('a failed live collab spawn marks its result as an error', () => {
-  const provider = new CodexSessionsProvider();
-  const messages = provider.normalizeMessage(collabEvent({ status: 'failed' }), 'session-1');
-
-  assert.equal(messages.length, 2);
-  assert.equal(messages[1].isError, true);
-});
-
-test('live collab orchestration calls are hidden from the transcript', () => {
-  const provider = new CodexSessionsProvider();
-  for (const tool of ['wait', 'send_message', 'followup_task', 'interrupt_agent', 'list_agents', 'close_agent']) {
-    assert.deepEqual(
-      provider.normalizeMessage(collabEvent({ tool }), 'session-1'),
-      [],
-      `${tool} must not render a tool row`,
-    );
   }
 });
 
@@ -773,34 +539,36 @@ test('an interrupted subagent closes its Task row instead of running forever', a
     const providerSessionId = 'codex-subagent-interrupted-1';
     const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
     await mkdir(sessionsDir, { recursive: true });
-    // Event shapes mirror a real rollout: the spawn's `message` is an
-    // encrypted transport blob, the activity `started` event carries the
+    // Event shapes mirror a real rollout: the `started` activity carries the
     // agent path, and the agent later dies without ever sending a
     // FINAL_ANSWER that would close its Task card.
     await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
       JSON.stringify({
-        type: 'response_item',
+        type: 'event_msg',
         payload: {
-          type: 'function_call',
-          call_id: 'call_spawn_1',
-          name: 'spawn_agent',
-          arguments: JSON.stringify({ task_name: 'review_normalizer', fork_turns: 'all', message: 'gAAAAA-encrypted-blob' }),
+          type: 'item_completed',
+          item: {
+            type: 'SubAgentActivity',
+            id: 'call_spawn_1',
+            agent_path: '/root/review_normalizer',
+            agent_thread_id: 'thread-1',
+            kind: 'started',
+          },
         },
       }),
       JSON.stringify({
         type: 'event_msg',
         payload: {
-          type: 'sub_agent_activity',
-          event_id: 'call_spawn_1',
-          agent_path: '/root/review_normalizer',
-          agent_thread_id: 'thread-1',
-          kind: 'started',
+          type: 'item_completed',
+          item: {
+            type: 'SubAgentActivity',
+            id: 'interrupt-1',
+            agent_path: '/root/review_normalizer',
+            agent_thread_id: 'thread-1',
+            kind: 'interrupted',
+          },
         },
-      }),
-      JSON.stringify({
-        type: 'event_msg',
-        payload: { type: 'sub_agent_activity', agent_path: '/root/review_normalizer', kind: 'interrupted' },
       }),
     ].join('\n')}\n`, 'utf8');
 
@@ -823,102 +591,6 @@ test('an interrupted subagent closes its Task row instead of running forever', a
   }
 });
 
-test('normalizeMessage on completed file_change emits tool_use and tool_result pairs', () => {
-  const provider = new CodexSessionsProvider();
-  const event = {
-    type: 'item',
-    itemType: 'file_change',
-    itemId: 'item_file_change_1',
-    status: 'completed',
-    changes: [
-      { path: '/repo/docs/AGENTS.md', kind: 'update' },
-      { path: '/repo/README.md', kind: 'add' },
-    ],
-  };
-  const messages = provider.normalizeMessage(event, 'session-1');
-
-  assert.equal(messages.length, 4);
-
-  // First file: Edit
-  assert.equal(messages[0].kind, 'tool_use');
-  assert.equal(messages[0].toolName, 'Edit');
-  assert.equal(messages[0].toolId, 'item_file_change_1_0');
-  assert.deepEqual(messages[0].toolInput, { file_path: '/repo/docs/AGENTS.md', old_string: '', new_string: '' });
-
-  assert.equal(messages[1].kind, 'tool_result');
-  assert.equal(messages[1].toolId, 'item_file_change_1_0');
-  assert.equal(messages[1].isError, false);
-
-  // Second file: Write
-  assert.equal(messages[2].kind, 'tool_use');
-  assert.equal(messages[2].toolName, 'Write');
-  assert.equal(messages[2].toolId, 'item_file_change_1_1');
-  assert.deepEqual(messages[2].toolInput, { file_path: '/repo/README.md', old_string: '', new_string: '' });
-
-  assert.equal(messages[3].kind, 'tool_result');
-  assert.equal(messages[3].toolId, 'item_file_change_1_1');
-  assert.equal(messages[3].isError, false);
-});
-
-test('normalizeMessage on in_progress file_change emits only tool_use', () => {
-  const provider = new CodexSessionsProvider();
-  const event = {
-    type: 'item',
-    itemType: 'file_change',
-    itemId: 'item_file_change_2',
-    status: 'in_progress',
-    changes: [{ path: '/repo/docs/AGENTS.md', kind: 'update' }],
-  };
-  const messages = provider.normalizeMessage(event, 'session-1');
-
-  assert.equal(messages.length, 1);
-  assert.equal(messages[0].kind, 'tool_use');
-  assert.equal(messages[0].status, 'in_progress');
-});
-
-test('normalizeMessage on failed file_change marks result as error', () => {
-  const provider = new CodexSessionsProvider();
-  const event = {
-    type: 'item',
-    itemType: 'file_change',
-    itemId: 'item_file_change_failed',
-    status: 'failed',
-    changes: [{ path: '/repo/docs/AGENTS.md', kind: 'update' }],
-  };
-  const messages = provider.normalizeMessage(event, 'session-1');
-
-  assert.equal(messages.length, 2);
-  assert.equal(messages[0].kind, 'tool_use');
-  assert.equal(messages[0].status, 'failed');
-  assert.equal(messages[1].kind, 'tool_result');
-  assert.equal(messages[1].isError, true);
-  assert.equal(messages[1].content, 'Failed to apply file changes');
-});
-
-test('normalizeMessage on file_change with empty or non-array changes returns empty array', () => {
-  const provider = new CodexSessionsProvider();
-  assert.deepEqual(
-    provider.normalizeMessage({ type: 'item', itemType: 'file_change', itemId: 'empty_1', status: 'completed', changes: [] }, 'session-1'),
-    [],
-  );
-  assert.deepEqual(
-    provider.normalizeMessage({ type: 'item', itemType: 'file_change', itemId: 'empty_2', status: 'completed', changes: null }, 'session-1'),
-    [],
-  );
-});
-
-
-
-/**
- * A proposed plan is a plan card on every path into the normalizer.
- *
- * Codex wraps a plan in `<proposed_plan>` instead of calling a tool the way
- * Claude does, and the adapter unwraps it onto the same `ExitPlanMode` card so
- * the two providers render identically. Two of the three assistant paths did
- * that; the persisted-message path did not, and the envelope reached the
- * transcript intact — which is why a shared renderer had grown a
- * `provider === 'codex'` branch to strip the tags itself.
- */
 test('a persisted assistant plan normalizes to the same plan card as a live one', () => {
   const provider = new CodexSessionsProvider();
   const plan = '# Rework the merge\n\n1. Anchor the order\n2. Delete the guess';
@@ -975,96 +647,16 @@ test('readCodexProposedPlan ignores an unmatched terminal closing tag', () => {
   );
 });
 
-/**
- * Codex assistant text carries no provider row key, on purpose.
- *
- * The two transports do not share a row identity: the SDK stream numbers items
- * per turn (`item_0`, `item_1`) while the rollout records the model's response
- * id (`msg_…`). An earlier attempt keyed each side with its own value, which is
- * strictly worse than leaving it unset — reconciliation then takes the identity
- * branch, finds no match, declares the rows distinct and renders the reply
- * twice, with the causal fallback skipped entirely.
- */
-test('a Codex reply is left unkeyed because the transports do not share one', () => {
-  const provider = new CodexSessionsProvider();
-
-  const live = provider.normalizeMessage({
-    type: 'item',
-    itemType: 'agent_message',
-    itemId: 'item_1',
-    message: { role: 'assistant', content: 'y.txt' },
-  }, 'sess');
-
-  assert.equal(live.length, 1);
-  assert.equal(live[0].kind, 'text');
-  assert.equal(live[0].providerRowKey, undefined);
-});
-
-/**
- * Tool cards have to describe the same call the same way on both transports,
- * or the client cannot pair them and renders each call twice.
- *
- * Verified against a real rollout: the persisted side parses the `cmd`
- * argument out of the exec script, while the live item reports the command as
- * the shell invocation that ran it — `["/bin/zsh", "-lc", "<cmd>"]` in every
- * one of that session's 124 command executions. Storing the array verbatim can
- * never fingerprint-match the parsed string.
- */
-test('a live command card reports the command, not the shell that ran it', () => {
-  const provider = new CodexSessionsProvider();
-
-  const rows = provider.normalizeMessage({
-    type: 'item',
-    itemType: 'command_execution',
-    itemId: 'exec-1',
-    command: ['/bin/zsh', '-lc', "sed -n '1,240p' /tmp/notes.md"],
-    status: 'completed',
-    output: '',
-  }, 'sess-cmd');
-
-  const toolUse = rows.find((row) => row.kind === 'tool_use');
-  assert.ok(toolUse);
-  assert.deepEqual(toolUse.toolInput, { command: "sed -n '1,240p' /tmp/notes.md" });
-});
-
-test('a live command card already given a plain string keeps it unchanged', () => {
-  const provider = new CodexSessionsProvider();
-
-  const rows = provider.normalizeMessage({
-    type: 'item',
-    itemType: 'command_execution',
-    itemId: 'exec-2',
-    command: 'npm test',
-    status: 'completed',
-    output: '',
-  }, 'sess-cmd');
-
-  const toolUse = rows.find((row) => row.kind === 'tool_use');
-  assert.ok(toolUse);
-  assert.deepEqual(toolUse.toolInput, { command: 'npm test' });
-});
-
-
-/**
- * A spawned agent's timeline only loads if the adapter learns its thread id.
- *
- * Codex reports that id on a SubAgentActivity item. Current builds deliver it
- * inside `item_completed` — a real session's rollout carries ten of them
- * (started / completed / interacted) and not a single legacy
- * `sub_agent_activity` payload, which is the only shape the adapter read. The
- * id therefore never arrived, `findCodexSubagentRollout` was never called, and
- * every Task card rendered with an empty timeline.
- */
 test('a spawned agent picks up its thread id from a SubAgentActivity item', { concurrency: false }, async () => {
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-item-'));
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-thread-'));
   const workspacePath = path.join(tempRoot, 'workspace');
   await mkdir(workspacePath, { recursive: true });
   const restoreHomeDir = patchHomeDir(tempRoot);
-  const providerSessionId = 'codex-subagent-parent';
-  const agentThreadId = 'agent-thread-7c02';
-  const callId = 'call_spawn_1';
 
   try {
+    const providerSessionId = 'codex-subagent-thread-1';
+    const agentThreadId = 'agent-thread-1';
+    const callId = 'call_spawn_lighting';
     const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
     await mkdir(sessionsDir, { recursive: true });
 
@@ -1073,8 +665,11 @@ test('a spawned agent picks up its thread id from a SubAgentActivity item', { co
     await writeFile(path.join(sessionsDir, `rollout-${agentThreadId}.jsonl`), [
       JSON.stringify({ type: 'session_meta', payload: { id: agentThreadId, cwd: workspacePath } }),
       JSON.stringify({
-        type: 'response_item',
-        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'looked at the lighting code' }] },
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: { type: 'AgentMessage', id: 'msg_agent_1', content: [{ type: 'Text', text: 'looked at the lighting code' }] },
+        },
       }),
     ].join('\n') + '\n', 'utf8');
 
@@ -1085,17 +680,7 @@ test('a spawned agent picks up its thread id from a SubAgentActivity item', { co
         type: 'event_msg',
         payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'u1', content: [{ type: 'text', text: 'check the lighting' }] } },
       }),
-      JSON.stringify({
-        type: 'response_item',
-        payload: {
-          type: 'function_call',
-          name: 'spawn_agent',
-          call_id: callId,
-          id: 'fc_spawn_1',
-          arguments: JSON.stringify({ task_name: 'original_lighting', message: 'go look' }),
-        },
-      }),
-      // The shape current Codex emits: a SubAgentActivity inside item_completed.
+      // A spawn reaches the item stream only as a SubAgentActivity.
       JSON.stringify({
         type: 'event_msg',
         payload: {
@@ -1104,7 +689,14 @@ test('a spawned agent picks up its thread id from a SubAgentActivity item', { co
           item: { type: 'SubAgentActivity', id: callId, kind: 'started', agent_thread_id: agentThreadId, agent_path: '/root/original_lighting' },
         },
       }),
-      JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output: 'FINAL_ANSWER: done' } }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'agent_message',
+          author: '/root/original_lighting',
+          content: [{ type: 'input_text', text: 'Message Type: FINAL_ANSWER\nSender: /root/original_lighting\nPayload:\ndone' }],
+        },
+      }),
       JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } }),
     ].join('\n') + '\n', 'utf8');
 
@@ -1129,141 +721,7 @@ test('a spawned agent picks up its thread id from a SubAgentActivity item', { co
   }
 });
 
-test('a live command card unwraps the shell invocation the SDK reports as a string', () => {
-  const provider = new CodexSessionsProvider();
-  const cases: Array<[string, string]> = [
-    ['/bin/zsh -lc ls', 'ls'],
-    ['/bin/zsh -lc "sed -n \'1,20p\' a.md"', "sed -n '1,20p' a.md"],
-    ['/bin/bash -c \'echo hi\'', 'echo hi'],
-    ['npm test', 'npm test'],
-  ];
-
-  for (const [reported, expected] of cases) {
-    const rows = provider.normalizeMessage({
-      type: 'item', itemType: 'command_execution', itemId: 'exec-x',
-      command: reported, status: 'completed', output: '',
-    }, 'sess');
-    const toolUse = rows.find((row) => row.kind === 'tool_use');
-    assert.ok(toolUse, reported);
-    assert.deepEqual(toolUse.toolInput, { command: expected }, `from ${reported}`);
-  }
-});
-
-/**
- * Splitting a multi-command script must not leave cards spinning.
- *
- * The call carries one output, which goes to the row that kept the call id.
- * The rows split out beside it can never receive it, and a tool row without a
- * result renders as still running — permanently, because the call is long
- * finished. They are settled explicitly instead.
- */
-test('every row split out of one exec script is settled, not left running', async () => {
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-split-settle-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
-  const restoreHomeDir = patchHomeDir(tempRoot);
-  const providerSessionId = 'codex-split-settle';
-
-  try {
-    const script = 'const r = await Promise.all(['
-      + 'tools.exec_command({"cmd":"echo one"}),'
-      + 'tools.exec_command({"cmd":"echo two"})'
-      + ']);';
-    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
-    await mkdir(sessionsDir, { recursive: true });
-    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), [
-      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
-      JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'c1', input: script } }),
-      JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'c1', output: 'one\ntwo' } }),
-    ].join('\n') + '\n', 'utf8');
-
-    await withIsolatedDatabase(async () => {
-      sessionsDb.createAppSession('app-split-1', 'codex', workspacePath);
-      sessionsDb.assignProviderSessionId('app-split-1', providerSessionId);
-      await new CodexSessionSynchronizer().synchronize();
-
-      const history = await new CodexSessionsProvider().fetchHistory('app-split-1');
-      const shellRows = history.messages.filter(
-        (message) => message.kind === 'tool_use' && message.toolName === 'Bash',
-      );
-
-      assert.equal(shellRows.length, 2);
-      for (const row of shellRows) {
-        assert.ok(row.toolResult, `${row.toolId} would render as still running`);
-      }
-    });
-  } finally {
-    restoreHomeDir();
-    await rm(tempRoot, { recursive: true, force: true });
-  }
-});
-
-/**
- * A failed script must not show a green tick on the command that broke.
- *
- * The call reports one outcome for the whole script. The rows split out beside
- * the one that kept the call id inherit it, because claiming success on a
- * command nobody verified is worse than the duplicate card the split prevents.
- */
-test('every command of a failed exec script reports the failure', async () => {
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-split-fail-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
-  const restoreHomeDir = patchHomeDir(tempRoot);
-  const providerSessionId = 'codex-split-fail';
-
-  try {
-    const script = 'await Promise.all(['
-      + 'tools.exec_command({"cmd":"echo one"}),'
-      + 'tools.exec_command({"cmd":"exit 1"})'
-      + ']);';
-    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
-    await mkdir(sessionsDir, { recursive: true });
-    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), [
-      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
-      JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', call_id: 'c1', input: script } }),
-      JSON.stringify({
-        type: 'response_item',
-        // The engine's own shape: the exit code leads the payload.
-        payload: { type: 'custom_tool_call_output', call_id: 'c1', output: 'Exit code: 1\nOutput:\none\n' },
-      }),
-    ].join('\n') + '\n', 'utf8');
-
-    await withIsolatedDatabase(async () => {
-      sessionsDb.createAppSession('app-split-fail', 'codex', workspacePath);
-      sessionsDb.assignProviderSessionId('app-split-fail', providerSessionId);
-      await new CodexSessionSynchronizer().synchronize();
-
-      const history = await new CodexSessionsProvider().fetchHistory('app-split-fail');
-      const shellRows = history.messages.filter(
-        (message) => message.kind === 'tool_use' && message.toolName === 'Bash',
-      );
-
-      assert.equal(shellRows.length, 2);
-      const outcomes = shellRows.map((row) => row.toolResult?.isError);
-      assert.deepEqual(
-        outcomes,
-        [true, true],
-        'the second command must not render as a success when the script failed',
-      );
-    });
-  } finally {
-    restoreHomeDir();
-    await rm(tempRoot, { recursive: true, force: true });
-  }
-});
-
-/**
- * A rollout row must come back under the same id every time it is read, and
- * that id must be the one the live SDK already used for the same item.
- *
- * Codex names its items (`msg_…`, `rs_…`, `ctc_…`) and the live
- * `item_completed` event carries the same id, so the two paths can be joined
- * directly. The history reader used to drop those ids and generate a fresh
- * one per read, which left the client comparing reply text to work out
- * whether the streamed row and the persisted row were the same reply.
- */
-test('Codex history rows reuse the rollout item id on every read', { concurrency: false }, async () => {
+test('Codex history rows reuse the item id on every read', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-row-identity-'));
   const workspacePath = path.join(tempRoot, 'workspace');
   await mkdir(workspacePath, { recursive: true });
@@ -1274,18 +732,25 @@ test('Codex history rows reuse the rollout item id on every read', { concurrency
     const lines = [
       JSON.stringify({ type: 'session_meta', ordinal: 0, payload: { id: providerSessionId, cwd: workspacePath } }),
       JSON.stringify({ type: 'event_msg', ordinal: 1, payload: { type: 'task_started', turn_id: 'turn-1' } }),
-      JSON.stringify({ type: 'turn_context', ordinal: 2, payload: { turn_id: 'turn-1' } }),
+      JSON.stringify({
+        type: 'event_msg',
+        ordinal: 2,
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-1',
+          item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'the prompt' }] },
+        },
+      }),
       JSON.stringify({
         type: 'event_msg',
         ordinal: 3,
-        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'the prompt' }] } },
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-1',
+          item: { type: 'AgentMessage', id: 'msg_rollout_1', content: [{ type: 'Text', text: 'the answer' }] },
+        },
       }),
-      JSON.stringify({
-        type: 'response_item',
-        ordinal: 4,
-        payload: { type: 'message', role: 'assistant', id: 'msg_rollout_1', content: [{ type: 'output_text', text: 'the answer' }] },
-      }),
-      JSON.stringify({ type: 'event_msg', ordinal: 5, payload: { type: 'task_complete', turn_id: 'turn-1' } }),
+      JSON.stringify({ type: 'event_msg', ordinal: 4, payload: { type: 'task_complete', turn_id: 'turn-1' } }),
     ];
     const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
     await mkdir(sessionsDir, { recursive: true });

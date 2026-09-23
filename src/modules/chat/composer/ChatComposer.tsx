@@ -87,6 +87,13 @@ type ChatComposerProps = {
   hasInput: boolean;
   onClearInput: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement> | MouseEvent<HTMLButtonElement> | TouchEvent<HTMLButtonElement>) => void;
+  /**
+   * True from the moment a submit is accepted until the backend has the
+   * message — the window where attachments upload and a new conversation's id
+   * is allocated. Shown as a spinning, disabled send button so the click is
+   * visibly acknowledged instead of looking ignored.
+   */
+  isSubmitting: boolean;
   isDragActive: boolean;
   queuedDraft: QueuedDraft | null;
   onEditQueuedDraft: () => void;
@@ -169,6 +176,7 @@ function ChatComposer({
   hasInput,
   onClearInput,
   onSubmit,
+  isSubmitting,
   isDragActive,
   queuedDraft,
   onEditQueuedDraft,
@@ -291,7 +299,9 @@ function ChatComposer({
     : sendByCtrlEnter
       ? t('input.hintText.ctrlEnter')
       : t('input.hintText.enter');
-  const submitAriaLabel = canQueueDraft
+  const submitAriaLabel = isSubmitting
+    ? t('input.sending')
+    : canQueueDraft
     ? hasQueuedDraft
       ? t('input.queue.update', { defaultValue: 'Update queued message' })
       : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
@@ -565,19 +575,21 @@ function ChatComposer({
                       : undefined
               }
               disabled={
-                isLoading
-                  ? false
-                  : isRecording
+                isSubmitting
+                  ? true
+                  : isLoading
                     ? false
-                    : isTranscribing
-                      ? true
-                      : !input.trim() && attachedFiles.length === 0
+                    : isRecording
+                      ? false
+                      : isTranscribing
+                        ? true
+                        : !input.trim() && attachedFiles.length === 0
               }
               aria-label={submitAriaLabel}
               title={submitAriaLabel}
               className="h-10 w-10 sm:h-10 sm:w-10"
             >
-              {isTranscribing ? (
+              {isSubmitting || isTranscribing ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : canQueueDraft ? (
                 <ArrowUpIcon className="h-4 w-4" />

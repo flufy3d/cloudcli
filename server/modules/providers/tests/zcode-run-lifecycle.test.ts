@@ -362,3 +362,80 @@ test('a requestUserInput re-announcement is served from the record without a sec
 
   lifecycle.dispose(handle);
 });
+
+const planApprovalRequest = (id: number, params: Record<string, unknown> = {}): ProtocolServerRequest => ({
+  id,
+  method: 'interaction/requestUserInput',
+  params: {
+    requestId: 'perm_req_plan',
+    sessionId: 'sess_engine_1',
+    toolCallId: 'call_plan',
+    toolName: 'ExitPlanMode',
+    prompt: 'Review this implementation plan.',
+    schema: { interaction: 'plan_approval', toolName: 'ExitPlanMode' },
+    questions: [{
+      header: 'Plan',
+      question: 'Review this implementation plan.',
+      options: [{ value: 'approve', label: 'Approve', description: 'Exit plan mode and start implementation.' }],
+    }],
+    input: { plan: '# Plan' },
+    ...params,
+  },
+});
+
+test('approving a plan answers the engine with the literal approve token', async () => {
+  const lifecycle = new ZCodeRunLifecycle();
+  const { writer } = createWriter();
+  const handle = lifecycle.startRun({ abortKey: 'app-plan', sessionId: 'sess_engine_1', appSessionId: 'app-plan', writer });
+
+  const parked = lifecycle.handleServerRequest(planApprovalRequest(1));
+  lifecycle.resolvePermission('perm_req_plan', { allow: true });
+
+  // The engine reads plan approval as content.answer === 'approve'; an empty
+  // accept is what it reports back as "Permission denied for ExitPlanMode".
+  assert.deepEqual(await parked, { result: { action: 'accept', content: { answer: 'approve' } } });
+
+  lifecycle.dispose(handle);
+});
+
+test('a plan revise request reaches the engine as approval feedback, not a bare decline', async () => {
+  const lifecycle = new ZCodeRunLifecycle();
+  const { writer } = createWriter();
+  const handle = lifecycle.startRun({ abortKey: 'app-plan-revise', sessionId: 'sess_engine_1', appSessionId: 'app-plan-revise', writer });
+
+  const parked = lifecycle.handleServerRequest(planApprovalRequest(1));
+  lifecycle.resolvePermission('perm_req_plan', { allow: false, message: 'Please revise the plan' });
+
+  assert.deepEqual(await parked, { result: { action: 'accept', content: { answer: 'Please revise the plan' } } });
+
+  lifecycle.dispose(handle);
+});
+
+test('a plan denied without feedback declines', async () => {
+  const lifecycle = new ZCodeRunLifecycle();
+  const { writer } = createWriter();
+  const handle = lifecycle.startRun({ abortKey: 'app-plan-deny', sessionId: 'sess_engine_1', appSessionId: 'app-plan-deny', writer });
+
+  const parked = lifecycle.handleServerRequest(planApprovalRequest(1));
+  lifecycle.resolvePermission('perm_req_plan', { allow: false });
+
+  assert.deepEqual(await parked, { result: { action: 'decline', reason: 'Denied by user' } });
+
+  lifecycle.dispose(handle);
+});
+
+test('a late plan re-announcement replays the approve token from the record', async () => {
+  const lifecycle = new ZCodeRunLifecycle();
+  const { messages, writer } = createWriter();
+  const handle = lifecycle.startRun({ abortKey: 'app-plan-re', sessionId: 'sess_engine_1', appSessionId: 'app-plan-re', writer });
+
+  const first = lifecycle.handleServerRequest(planApprovalRequest(1));
+  lifecycle.resolvePermission('perm_req_plan', { allow: true });
+  await first;
+
+  const late = await lifecycle.handleServerRequest(planApprovalRequest(2));
+  assert.deepEqual(late, { result: { action: 'accept', content: { answer: 'approve' } } });
+  assert.equal(messages.filter((msg) => msg.kind === 'permission_request').length, 1);
+
+  lifecycle.dispose(handle);
+});

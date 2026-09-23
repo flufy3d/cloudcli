@@ -114,6 +114,7 @@
     "scheduled": "定时任务",
     "notifications": "通知",
     "plugins": "插件",
+    "diagnostics": "诊断",
     "about": "关于"
   },
   "scheduledJobsSettings": {
@@ -754,5 +755,19 @@
     "installAriaLabel": "插件 git 仓库 URL",
     "tab": "标签",
     "runningStatus": "运行中"
+  },
+  "diagnostics": {
+    "title": "诊断",
+    "description": "导出一份诊断文件，覆盖这个页面的启动过程、连接收发记录和服务端最近的运行结束情况。",
+    "includesStartup": "启动与 PWA：首屏耗时、慢资源、长任务、Service Worker 与缓存状态。",
+    "includesFrames": "连接记录：本页与服务器之间收发的每一帧（只保留识别字段，刷新页面后仍然保留）。",
+    "includesRuns": "运行结束记录：服务端记下的每次对话运行是怎么结束的——跑完、出错、被你点了停止，还是引擎自己掉了。",
+    "privacy": "文件不包含聊天正文、凭证、请求头或 URL 查询参数，只有标识、计时和状态。",
+    "export": "导出诊断文件",
+    "exporting": "正在准备导出…",
+    "clearHistory": "清空已记录的诊断数据",
+    "clearedNotice": "已清空。复现问题后再导出，文件里只会有这次的记录。",
+    "exportSuccess": "诊断文件已下载。",
+    "exportFailed": "无法生成诊断文件，请检查浏览器下载权限后重试。"
   }
 }
