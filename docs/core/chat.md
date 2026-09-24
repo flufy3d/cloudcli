@@ -63,7 +63,7 @@
 
 ## 落盘同步（run 之外的第二条持久化路）
 
-run 结束 → `sessions-watcher.service.ts`（chokidar，watch 根由各引擎 `getSessionWatchTarget()` 声明）→ `session-synchronizer.service.ts` `synchronizeFile` → `sessionsDb` upsert → `session-upserted-broadcast.service.ts` 推 `session_upserted`（侧边栏增量，归 projects 状态管，不归 chat）。会话离开活跃列表（归档：自动归档手动/定时、单会话归档；强制删除）由同一服务推 `session_removed`（批量 `sessionIds` 一帧，前端按 id 从 projects 树剔除，幂等）。历史读取走 `GET /api/providers/sessions/:sessionId/messages`（尾偏移分页：`offset: 0` 是最新一页），读密集缓存见 `session-history-cache.service.ts`。
+run 结束 → `sessions-watcher.service.ts`（chokidar，watch 根由各引擎 `getSessionWatchTarget()` 声明）→ `session-synchronizer.service.ts` `synchronizeFile` → `sessionsDb` upsert → `session-upserted-broadcast.service.ts` 推 `session_upserted`（侧边栏增量，归 projects 状态管，不归 chat）。会话离开活跃列表（归档：自动归档手动/定时、单会话归档；强制删除）由同一服务推 `session_removed`（批量 `sessionIds` 一帧，前端按 id 从 projects 树剔除，幂等）。计划任务的任何增删改（REST 与 agent MCP 同走 `scheduledJobsService`）以及调度器触发后，同一服务推不带数据的 `scheduled_jobs_changed`，`useScheduledJobs` 收到后各自按自己的范围重新拉取（断线重连后也拉一次）——否则 agent 在别的会话里删掉任务，被绑定会话的输入框横幅不会知道。这类不属于任何会话的网关帧必须同时登记进 `GATEWAY_KINDS`、时间线路由表（`action: 'none'`）和 `useChatRealtimeHandlers` 的放行名单，漏掉任何一处，未知帧兜底就会把它当消息插进正在看的会话。历史读取走 `GET /api/providers/sessions/:sessionId/messages`（尾偏移分页：`offset: 0` 是最新一页），读密集缓存见 `session-history-cache.service.ts`。
 
 ## 接收侧：WS 帧 → React 的四层
 

@@ -733,6 +733,8 @@ const SERVER_EVENT_ROUTES: Record<string, { flushesStream: boolean; action: Serv
   // fallback appended it to the viewed session's timeline.
   session_upserted: { flushesStream: false, action: 'none' },
   session_removed: { flushesStream: false, action: 'none' },
+  // Owned by useScheduledJobs; a job-list signal, never a timeline row.
+  scheduled_jobs_changed: { flushesStream: false, action: 'none' },
   loading_progress: { flushesStream: false, action: 'none' },
 };
 
