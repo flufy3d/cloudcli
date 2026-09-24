@@ -1376,3 +1376,20 @@ export type RunOutcome = {
   /** The session's sequence watermark when the run ended. */
   lastSeq: number;
 };
+
+// ---------------------------
+//----------------- SYSTEM SELF-UPDATE ------------
+/**
+ * The self-update contract lives in `shared/protocol/system-update.ts` so the
+ * status route and the version UI read one definition. Used by the system
+ * module's service, module wiring, and routes.
+ */
+export type {
+  SystemUpdateCommit,
+  SystemUpdateJob,
+  SystemUpdateJobState,
+  SystemUpdateMode,
+  SystemUpdateRefusal,
+  SystemUpdateStatus,
+  SystemUpdateUnsupportedReason,
+} from '../../shared/protocol/system-update.js';

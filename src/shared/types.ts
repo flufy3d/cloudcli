@@ -255,18 +255,20 @@ export type Project = {
 
 // ---------------------------
 
-//----------------- RELEASES ------------
+//----------------- SELF-UPDATE ------------
 
-/** The latest GitHub release for the app, rendered by the update prompt and the About tab. */
-export type ReleaseInfo = {
-  title: string;
-  body: string;
-  htmlUrl: string;
-  publishedAt: string;
-};
-
-/** How this CloudCLI install was obtained; decides whether the UI offers a self-update action. */
-export type InstallMode = 'git' | 'npm';
+/**
+ * Self-update status and job shapes served by `/api/system/update*`, rendered by
+ * the sidebar update banner, the version modal and the About tab. Defined once in
+ * `shared/protocol/system-update.ts` for both sides.
+ */
+export type {
+  SystemUpdateCommit,
+  SystemUpdateJob,
+  SystemUpdateMode,
+  SystemUpdateRefusal,
+  SystemUpdateStatus,
+} from '@shared/protocol/system-update';
 
 // ---------------------------
 

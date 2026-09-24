@@ -366,10 +366,7 @@
       "description": "Learn how to use the external API to trigger Claude/Cursor sessions from your applications.",
       "viewLink": "View API Documentation →"
     },
-    "loading": "Loading...",
-    "version": {
-      "updateAvailable": "Update available: v{{version}}"
-    }
+    "loading": "Loading..."
   },
   "tasks": {
     "checking": "Checking TaskMaster installation...",
@@ -982,6 +979,22 @@
     "teamManagementTitle": "Team Management",
     "teamManagementDescription": "Multiple users, role-based access, and shared projects for your team.",
     "licensed": "Licensed under AGPL-3.0",
-    "proCta": "Available with CloudCLI Pro"
+    "proCta": "Available with CloudCLI Pro",
+    "update": {
+      "checkNow": "Check for updates",
+      "checking": "Checking…",
+      "upToDate": "Up to date",
+      "checkFailed": "Could not reach the remote",
+      "commitsBehind_one": "{{count}} new commit",
+      "commitsBehind_other": "{{count}} new commits",
+      "rebuildAvailable": "Local code needs a rebuild",
+      "updating": "Updating…",
+      "unsupported": {
+        "not-git": "Self-update needs a git checkout",
+        "not-pm2": "Self-update needs PM2 supervision",
+        "no-upstream": "The branch tracks no remote",
+        "platform": "Updated by the platform"
+      }
+    }
   }
 }

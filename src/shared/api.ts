@@ -613,6 +613,8 @@ export const api = {
   },
 
   system: {
+    // Self-update of a git checkout under PM2; `refresh` forces a `git fetch`.
+    updateStatus: (refresh = false) => get(`/api/system/update/status${refresh ? '?refresh=1' : ''}`),
     update: () => post('/api/system/update'),
   },
 };

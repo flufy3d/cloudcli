@@ -369,10 +369,7 @@
       "description": "了解如何使用外部 API 从您的应用程序触发 Claude/Cursor 会话。",
       "viewLink": "查看 API 文档 →"
     },
-    "loading": "加载中...",
-    "version": {
-      "updateAvailable": "有可用更新：v{{version}}"
-    }
+    "loading": "加载中..."
   },
   "tasks": {
     "checking": "正在检查 TaskMaster 安装...",
@@ -769,5 +766,22 @@
     "clearedNotice": "已清空。复现问题后再导出，文件里只会有这次的记录。",
     "exportSuccess": "诊断文件已下载。",
     "exportFailed": "无法生成诊断文件，请检查浏览器下载权限后重试。"
+  },
+  "about": {
+    "update": {
+      "checkNow": "检查更新",
+      "checking": "检查中…",
+      "upToDate": "已是最新",
+      "checkFailed": "连接远端失败",
+      "commitsBehind": "{{count}} 个新提交",
+      "rebuildAvailable": "本地代码待构建",
+      "updating": "正在更新…",
+      "unsupported": {
+        "not-git": "自动更新需要 git 仓库目录安装",
+        "not-pm2": "自动更新需要 PM2 托管",
+        "no-upstream": "当前分支没有跟踪远端",
+        "platform": "由平台负责更新"
+      }
+    }
   }
 }

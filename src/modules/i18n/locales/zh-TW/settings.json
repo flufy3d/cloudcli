@@ -315,10 +315,7 @@
       "description": "了解如何使用外部 API 從您的應用程式觸發 Claude/Cursor 工作階段。",
       "viewLink": "查看 API 文件 →"
     },
-    "loading": "載入中...",
-    "version": {
-      "updateAvailable": "有可用更新：v{{version}}"
-    }
+    "loading": "載入中..."
   },
   "tasks": {
     "checking": "正在檢查 TaskMaster 安裝...",
@@ -558,6 +555,23 @@
     "notice": {
       "title": "数据安全说明：",
       "content": "归档操作只会从侧边栏列表中移出旧会话，绝不会删除您的对话历史和磁盘文件。您随时可以在侧边栏点击“归档视图”（顶部箱子图标）查看完整历史记录，或者一键将其恢复回活跃列表中。"
+    }
+  },
+  "about": {
+    "update": {
+      "checkNow": "檢查更新",
+      "checking": "檢查中…",
+      "upToDate": "已是最新",
+      "checkFailed": "連線遠端失敗",
+      "commitsBehind": "{{count}} 個新提交",
+      "rebuildAvailable": "本機程式碼待建置",
+      "updating": "正在更新…",
+      "unsupported": {
+        "not-git": "自動更新需要 git 儲存庫目錄安裝",
+        "not-pm2": "自動更新需要 PM2 託管",
+        "no-upstream": "目前分支沒有追蹤遠端",
+        "platform": "由平台負責更新"
+      }
     }
   }
 }

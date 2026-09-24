@@ -106,6 +106,7 @@ npm run typecheck    # 前后端双 tsconfig --noEmit
 ```
 
 - 本仓库生产实例用 **PM2** 托管，应用名为 `cloudcli`。`pnpm run deploy` 用部署锁串行执行，先构建 tarball，在独立的 `~/.cloudcli/runtime-next-<pid>` 完成生产依赖安装和原生依赖检查，再受控切换为 `~/.cloudcli/runtime`；服务入口固定为 `~/.cloudcli/runtime/node_modules/cloudcli/dist-server/server/index.js`，上一版保留在 `~/.cloudcli/runtime-previous`，启动或健康检查失败时自动恢复。首次从其他入口迁移时会重建 PM2 进程条目，固定入口生效后的部署只做原地重启。全局 `cloudcli` 命令稳定指向该运行目录。部署脚本启动时会把自己重新拉起成 detached 后台进程（日志 `~/.cloudcli/deploy.log`），调用方只跟读日志——终端关闭或 pm2 切换重启了托管调用方的服务，都不会让部署停在半路；中断时 exit 钩子清理暂存目录并明确告知线上未变更。PM2 配置在宿主机，不在仓库内；重启会切断在线 WebSocket（详见根目录 `AGENTS.md`）。
+- **UI 自更新**（仅"仓库目录安装 + PM2 托管"）：`server/modules/system` 定时 `git fetch` 当前分支的上游，与本地 HEAD、运行中构建（`dist/build-info.json`，vite 构建时写入完整 commit）比较——落后上游给「更新并重启」，HEAD 超前于运行构建（本机提交后没构建）给「构建并重启」。点击后服务端只写 `~/.cloudcli/update-state.json` 并拉起 `scripts/self-update.mjs`：它先二次 detach 脱离服务进程树（否则 PM2 的 tree-kill 会连带杀掉它），再 ff-only 拉取 → 依赖变了才停服务装依赖 → 前端构建到 `dist.next`、服务端照常原子晋升 → 替换 `dist` → `pm2 restart`，日志 `~/.cloudcli/update.log`。任一步失败则 `git reset --keep` 回原提交、丢弃暂存产物、拉起服务。脚本的最后一步是重启自己所在的服务，看不到结果，所以由新启动的服务按"启动的构建是否等于目标 commit"判定成功或失败。工作区有未提交改动、与上游分叉、非 git 安装或不在 PM2 下时拒绝执行，并在 UI 上说明原因。仓库链接与 star 角标统一指向 `src/shared/constants.ts` 的 `GITHUB_REPO_*`，不再查询任何 GitHub release。
 - 提交钩子：husky + lint-staged（oxlint）+ commitlint（Conventional Commits）+ 核心文档同步守卫（`scripts/hooks/check-doc-sync.mjs`）。
 
 ## 扩展检查单
