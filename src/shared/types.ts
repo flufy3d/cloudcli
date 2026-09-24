@@ -39,6 +39,10 @@ export type {
   ProviderQuotaData,
   ProviderQuotaGroup,
   ProviderQuotaGroupPartitioning,
+  ProviderQuotaResetConsumeInput,
+  ProviderQuotaResetConsumeResult,
+  ProviderQuotaResetCredit,
+  ProviderQuotaResetCredits,
 } from '@shared/protocol/quota';
 
 export type {

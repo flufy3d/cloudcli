@@ -112,6 +112,10 @@ export type {
   ProviderQuotaData,
   ProviderQuotaGroup,
   ProviderQuotaGroupPartitioning,
+  ProviderQuotaResetConsumeInput,
+  ProviderQuotaResetConsumeResult,
+  ProviderQuotaResetCredit,
+  ProviderQuotaResetCredits,
 } from '../../shared/protocol/quota.js';
 
 /** Backwards-compatible aliases for Antigravity-specific callers */

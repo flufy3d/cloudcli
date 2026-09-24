@@ -42,9 +42,67 @@ export type ProviderQuotaGroup = {
  */
 export type ProviderQuotaGroupPartitioning = 'model-family' | 'bucket';
 
+/**
+ * One consumable quota-reset card ("banked reset") the account holds.
+ *
+ * Spending a card restores the covered allowances immediately instead of
+ * waiting for the windows to roll over; the act itself is irreversible on the
+ * provider side, which is why the UI confirms before calling.
+ */
+export type ProviderQuotaResetCredit = {
+  /** Provider-native id of this grant (Codex credit id / bigmodel recordId). */
+  id: string;
+  /**
+   * Which allowance the card restores: `5h`, `weekly`, or `all`. `all` means
+   * both windows at once (Codex's full reset, bigmodel's week reset which
+   * also refills the 5-hour pool without spending a 5-hour card).
+   */
+  resetType: '5h' | 'weekly' | 'all' | string;
+  /** Provider's own display text for the grant, when it has one. */
+  title?: string;
+  /** How the card was granted (bigmodel: `DIRECT`, promotions, …). */
+  grantType?: string;
+  /** False for cards already spent or expired — informational only. */
+  available: boolean;
+  /** ISO timestamp after which the card can no longer be used. */
+  expireTime?: string;
+};
+
+/** The account's quota-reset card inventory, embedded in `ProviderQuotaData`. */
+export type ProviderQuotaResetCredits = {
+  credits: ProviderQuotaResetCredit[];
+};
+
+/**
+ * Input for spending one of the account's reset cards through
+ * `POST /providers/quota/reset`.
+ *
+ * Deliberately carries no card id: when several available cards match, the
+ * provider spends the soonest-expiring one itself (use-it-or-lose-it).
+ */
+export type ProviderQuotaResetConsumeInput = {
+  /** Which allowance to restore; `5h` and `weekly` may also spend an `all` card. */
+  resetType: '5h' | 'weekly' | 'all' | string;
+};
+
+/** Outcome of a reset-card spend, for the UI to relay verbatim. */
+export type ProviderQuotaResetConsumeResult = {
+  ok: boolean;
+  /**
+   * Coarse outcome category the client localizes from. `message` may carry
+   * provider- or server-language text, so UIs should prefer their own copy
+   * keyed by this code and treat `message` as fallback detail only.
+   */
+  code?: 'reset' | 'noCard' | 'readFailed' | 'notAuthenticated' | 'spendFailed' | 'unknown';
+  /** Human-readable outcome detail; language depends on the source. */
+  message?: string;
+};
+
 /** Account-level quota and rate limit status across model groups. */
 export type ProviderQuotaData = {
   groups: ProviderQuotaGroup[];
   updatedAt: string;
   partitioning: ProviderQuotaGroupPartitioning;
+  /** Present only when the provider reported reset cards at all. */
+  resetCredits?: ProviderQuotaResetCredits;
 };

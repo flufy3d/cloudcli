@@ -591,6 +591,13 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     }
 
     if (payload.type === 'turn_aborted') {
+      // An abort ends the whole agent tree — a spawned agent that never
+      // reported back will receive no FINAL_ANSWER later in the file, so it
+      // is settled here or its Task card renders as running forever. The
+      // result is an error row: the agent did not finish its work.
+      for (const record of subagentsByCallId.values()) {
+        closeSubagent(record, timestamp, 'Subagent ended when the turn was interrupted.', true);
+      }
       messages.push({
         // No item is written for an abort, so the row is named after the
         // append-only position the file itself records: reproducible across

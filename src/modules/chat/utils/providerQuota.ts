@@ -16,6 +16,11 @@ export function buildProviderQuotaUrl(provider: string, forceRefresh = false): s
   return `/api/providers/quota?${searchParams.toString()}`;
 }
 
+/** Builds the backend URL that spends one of the account's quota-reset cards. */
+export function buildProviderQuotaResetUrl(): string {
+  return '/api/providers/quota/reset';
+}
+
 /** Returns null when the model doesn't belong to any known family bucket. */
 function matchesFamily(groupText: string, normalizedModel: string): boolean | null {
   if (normalizedModel.includes('gemini')) {
@@ -83,4 +88,17 @@ export function resolveIsActiveQuotaGroup(
   // Bucket-partitioned providers with no family or model mention at all:
   // treat this non-reserve bucket as the account's general-purpose pool.
   return bucketPartitioned && familyMatch !== null && Boolean(normalizedModel);
+}
+
+/** Keeps the provider's order within each priority while showing active quota first. */
+export function sortQuotaGroupsForModel<T extends { name: string; description?: string }>(
+  groups: readonly T[],
+  currentModel: string | undefined,
+  partitioning?: ProviderQuotaGroupPartitioning,
+): T[] {
+  return [...groups].sort((left, right) => Number(resolveIsActiveQuotaGroup(
+    currentModel, right, groups.length, partitioning,
+  )) - Number(resolveIsActiveQuotaGroup(
+    currentModel, left, groups.length, partitioning,
+  )));
 }

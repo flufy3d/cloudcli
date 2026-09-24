@@ -148,7 +148,7 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启
 `provider-capabilities.catalog.ts` 放**推导不出来的静态事实**（权限模式、默认模型、附件/中止/effort）；
 `provider-capabilities.service.ts` 从**已注册切面推导**其余能力——切面在即能力在，加减切面自动翻转，不必改表。
 `supportsQuota` 就是这样推导的：`auth.getQuota` 存在即为真，而 `provider-token-usage.service.ts`
-本来就按这个方法分发配额请求。
+本来就按这个方法分发配额请求；`supportsQuotaReset`（能否花掉重置卡）同理，看 `auth.consumeQuotaReset`。
 
 前端**不得**用引擎名判断某家能不能做某事，一律读矩阵。这不是洁癖：
 配额分组判定曾把 `getProviderLabel()` 的显示名（`'Codex'`）拿去和引擎 id（`'codex'`）比较，
@@ -165,6 +165,15 @@ claude 则借 Agent SDK 的 control request（`/usage` 背后那个实验接口�
 三家都要拉起进程或走网络，因此统一用 `createProviderQuotaCache`（TTL 两分钟）挡在前面，
 `?refresh=true` 才穿透。claude 那条路额外有一点要守住：喂给 SDK 的输入流一条消息都不产出，
 CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在汇报的额度。
+
+**重置卡（banked reset）随配额载荷搭车**：`ProviderQuotaData.resetCredits` 由各配额适配器
+在读取时顺带解析（`POST /providers/quota/reset` 花卡）。挑卡规则收在共享的
+`pickAvailableResetCredit`——`all` 卡覆盖一切请求，窄卡只精确匹配，多张可用时花最早到期的；
+卡 id 不出适配器边界。调用方传的只是 `resetType`，花卡前各家都重读一次卡列表（缓存可能是旧的），
+成功后作废配额缓存让下次读反映新窗口。codex 走 `account/rateLimitResetCredit/consume`
+（与 read 同一条 app-server 连接，`creditId` + `idempotencyKey`）；zcode 打 BigModel
+`/biz/customer-package-reset/list|use`（第一版只接个人号，团队号要组织/项目 ID；
+claude 的 `/limit-reset` 端点存在但无可验证的卡，暂未接入）。
 
 **MCP 配置格式的能力同样由切面声明**：`IProviderMcp.capabilities` 给出可用 scope、transport、
 是否支持工作目录、是否支持环境变量间接（`env_vars` / `bearer_token_env_var` / `env_http_headers`，

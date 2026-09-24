@@ -504,6 +504,31 @@ async function queryCodex(
                 error: terminalFailure,
               });
             }
+            if (turn?.status === 'interrupted' && currentSession()?.status !== 'aborted') {
+              // Codex ends a usage-limit or shutdown interrupt here rather than
+              // at `failed`. Treating the status as a normal completion sent the
+              // client a clean `complete` while the rollout recorded
+              // `turn_aborted`, so the abort was invisible until history re-read
+              // it and diagnostics logged the run as a success. A stop the user
+              // asked for (`abort` already flagged the session) arrives as the
+              // same status and must stay silent.
+              const message = 'Codex interrupted this turn before it finished. This usually means the account hit a usage limit.';
+              terminalFailure = terminalFailure ?? { message };
+              errorSurfaced = true;
+              sendMessage(ws, createNormalizedMessage({
+                kind: 'error',
+                content: message,
+                sessionId: capturedSessionId || sessionId || null,
+                provider: 'codex',
+              }));
+              notifyRunFailed({
+                userId: normalizedUserId,
+                provider: 'codex',
+                sessionId: appSessionId || capturedSessionId || null,
+                sessionName: sessionSummary,
+                error: terminalFailure,
+              });
+            }
             settle();
             return;
           }

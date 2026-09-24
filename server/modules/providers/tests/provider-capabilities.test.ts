@@ -41,6 +41,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
     supportsQuota: true,
+    supportsQuotaReset: false,
     supportsEffort: true,
     supportsMessageEditing: true,
     supportsSessionForking: true,
@@ -67,6 +68,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsPermissionRequests: false,
     supportsTokenUsage: false,
     supportsQuota: false,
+    supportsQuotaReset: false,
     supportsEffort: false,
     supportsMessageEditing: false,
     supportsSessionForking: false,
@@ -92,6 +94,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
     supportsQuota: true,
+    supportsQuotaReset: true,
     supportsEffort: true,
     // `thread/fork` copies a thread up to a chosen turn; editing is that fork
     // plus a new prompt, which is how Codex's own IDE clients do it.
@@ -122,6 +125,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // OpenCode Go exposes the official usage endpoint (5-hour/weekly/monthly
     // windows), so its auth facet carries getQuota.
     supportsQuota: true,
+    supportsQuotaReset: false,
     supportsEffort: true,
     // The sessions provider resolves an edit anchor and rewinds through the
     // server's `revert` primitive, so editing an already-sent message works.
@@ -153,6 +157,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
     supportsQuota: true,
+    supportsQuotaReset: true,
     supportsEffort: true,
     // No resolveEditAnchor/fork facets: transcripts are append-only for this
     // provider today.
@@ -180,6 +185,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsPermissionRequests: false,
     supportsTokenUsage: true,
     supportsQuota: true,
+    supportsQuotaReset: false,
     supportsEffort: true,
     supportsMessageEditing: false,
     supportsSessionForking: false,

@@ -287,7 +287,28 @@
     "emptyQuotaHint": {
       "claude": "API anahtarı, Bedrock ve Vertex girişlerinde claude.ai abonelik limitleri bulunmaz",
       "codex": "API Anahtarı ile girişler genellikle 5 saatlik veya haftalık limitleri bildirmez"
-    }
+    },
+    "resetCardTitle": "Kullanım sıfırlama kartları",
+    "resetCardHint": "Bir kartı kullanmak, ilgili kotu anında doldurur; sıfırlama penceresini beklemeniz gerekmez.",
+    "resetCardTypeAll": "Tüm kot (5 saat + haftalık)",
+    "resetCardType5h": "5 saatlik kot",
+    "resetCardTypeWeekly": "Haftalık kot",
+    "resetCardAvailable": "{{count}} kullanılabilir",
+    "resetCardExpires": "en yakın son kullanma {{date}}",
+    "resetCardUse": "Kullan",
+    "resetCardConfirmTitle": "Bu sıfırlama kullanılsın mı?",
+    "resetCardConfirmBody": "{{quota}} anında geri yüklenecek. Bu işlem geri alınamaz.",
+    "resetCardConfirm": "Kartı kullan",
+    "resetCardCancel": "İptal",
+    "resetCardSuccess": "Kot sıfırlandı.",
+    "resetCardFailed": "Sıfırlama başarısız oldu. Daha sonra tekrar deneyin.",
+    "resetCardNoCard": "Kullanılabilir sıfırlama kartı yok. En son durumu görmek için yenileyin.",
+    "resetCardReadFailed": "Sıfırlama kartları şu anda okunamadı. Daha sonra tekrar deneyin.",
+    "resetCardNotAuthenticated": "Hesap oturum açmamış. Önce oturum açıp tekrar deneyin.",
+    "resetCardUnknown": "Sıfırlama isteği onaylanmadı. Önce \"Yenile\" ile kotun geri yüklenip yüklenmediğini kontrol edin — körlemesine yeniden denemeyin.",
+    "resetCardUnavailable": "{{count}} kullanılmış veya süresi geçmiş",
+    "resetCardRefreshing": "Kot yenileniyor…",
+    "resetCardWeeklyAlso5h": "Haftalık kotu sıfırlamak 5 saatlik kotu da doldurur ve 5 saatlik kart harcamaz."
   },
   "localProxy": {
     "linkHint": "Bu adres yalnızca sunucuda bulunur; CloudCLI onu yerel proxy üzerinden açar.",

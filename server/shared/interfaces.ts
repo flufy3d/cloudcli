@@ -11,6 +11,8 @@ import type {
   ProviderMcpServer,
   ProviderModelsDefinition,
   ProviderQuotaData,
+  ProviderQuotaResetConsumeInput,
+  ProviderQuotaResetConsumeResult,
   ProviderRuntimeContext,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
@@ -161,6 +163,18 @@ export interface IProviderAuth {
    * the provider token-usage service (GET /providers/quota).
    */
   getQuota?(options?: { forceRefresh?: boolean }): Promise<ProviderQuotaData | null>;
+
+  /**
+   * Spends one of the account's quota-reset cards ("banked reset").
+   *
+   * Optional: only providers whose backend can both read and spend the cards
+   * implement it. The implementation picks the soonest-expiring available
+   * card covering `resetType` itself — callers never handle card ids — and
+   * reports the provider's own outcome wording through the result.
+   */
+  consumeQuotaReset?(
+    input: ProviderQuotaResetConsumeInput,
+  ): Promise<ProviderQuotaResetConsumeResult>;
 }
 
 // ---------------------------

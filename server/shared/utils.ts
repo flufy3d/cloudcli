@@ -32,6 +32,7 @@ import type {
   NormalizedMessage,
   ProviderCurrentActiveModel,
   ProviderModelsDefinition,
+  ProviderQuotaResetCredit,
   ProviderSkillSource,
   SubagentActivity,
   WorkspacePathValidationResult,
@@ -1152,6 +1153,45 @@ export function extractEmailFromJwt(jwtToken: string | null | undefined): string
 
 // ---------------------------
 //----------------- TOKEN USAGE UTILITIES ------------
+/**
+ * Whether one reset card's coverage satisfies a consume request.
+ *
+ * An `all` card restores every window, so it covers any request; a card
+ * naming one window covers only that exact window — spending a weekly card
+ * to refill 5 hours would waste the weekly restore it also carries.
+ */
+export function resetCreditCovers(requestedResetType: string, creditResetType: string): boolean {
+  return creditResetType === 'all' || creditResetType === requestedResetType;
+}
+
+/**
+ * Picks the card to spend for a consume request: among available cards whose
+ * coverage satisfies `resetType`, the soonest-expiring one — use-it-or-lose-it
+ * before hoarding. Cards without an expiry sort last.
+ *
+ * Cards past their expiry are skipped even when the provider still marks them
+ * available: the provider's flag can lag, and spending a dead card would
+ * report a reset that never lands. Shared by the Codex and ZCode quota
+ * adapters so both providers spend cards by the same rule; the caller never
+ * sees card ids.
+ */
+export function pickAvailableResetCredit(
+  credits: readonly ProviderQuotaResetCredit[],
+  resetType: string,
+  now = Date.now(),
+): ProviderQuotaResetCredit | null {
+  const covering = credits
+    .filter((credit) => credit.available
+      && resetCreditCovers(resetType, credit.resetType)
+      && !(credit.expireTime && Date.parse(credit.expireTime) <= now))
+    .sort((left, right) => {
+      const leftTime = left.expireTime ? Date.parse(left.expireTime) : Number.POSITIVE_INFINITY;
+      const rightTime = right.expireTime ? Date.parse(right.expireTime) : Number.POSITIVE_INFINITY;
+      return leftTime - rightTime;
+    });
+  return covering[0] ?? null;
+}
+
 type ProviderQuotaCacheOptions = {
   forceRefresh?: boolean;
 };

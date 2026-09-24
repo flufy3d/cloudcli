@@ -18,6 +18,7 @@ import {
   Server,
   Sparkles,
   TerminalSquare,
+  Ticket,
   Timer,
   Loader2,
   X,
@@ -39,6 +40,7 @@ import type {
   HelpCommandData,
   ModelCommandData,
   ProviderQuotaData,
+  ProviderQuotaResetCredit,
   QuotaBucket,
   QuotaGroup,
   StatusCommandData,
@@ -46,8 +48,10 @@ import type {
 import { authenticatedFetch } from '@/shared/api';
 import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabilities';
 import {
+  buildProviderQuotaResetUrl,
   buildProviderQuotaUrl,
   resolveIsActiveQuotaGroup,
+  sortQuotaGroupsForModel,
 } from '@/modules/chat/utils/providerQuota';
 import { getProviderDisplayName, PROVIDER_DISPLAY_NAMES } from '@/shared/providerDisplay';
 
@@ -665,6 +669,324 @@ function QuotaGroupCard({
   );
 }
 
+/** Stable display order: the full reset first, then the narrow windows. */
+const RESET_CARD_TYPE_ORDER = ['all', '5h', 'weekly'];
+
+function resolveResetCardTypeLabel(resetType: string, t: TFunction): string {
+  if (resetType === 'all') {
+    return t('cost.resetCardTypeAll', { defaultValue: '全部额度（5 小时 + 每周）' });
+  }
+  if (resetType === '5h') {
+    return t('cost.resetCardType5h', { defaultValue: '5 小时额度' });
+  }
+  if (resetType === 'weekly') {
+    return t('cost.resetCardTypeWeekly', { defaultValue: '每周额度' });
+  }
+  return resetType;
+}
+
+type SpendFailure = {
+  /** Localized headline keyed by the backend's outcome code. */
+  title: string;
+  /** Provider's own wording, when it adds something the headline lacks. */
+  detail?: string;
+};
+
+/** Maps the backend's outcome codes to localized, actionable headlines. */
+function resolveSpendFailure(
+  code: string | undefined,
+  detail: string | undefined,
+  t: TFunction,
+): SpendFailure {
+  switch (code) {
+    case 'noCard':
+      return {
+        title: t('cost.resetCardNoCard', {
+          defaultValue: '没有可用的重置卡，请刷新后查看最新状态',
+        }),
+        detail,
+      };
+    case 'readFailed':
+      return {
+        title: t('cost.resetCardReadFailed', {
+          defaultValue: '暂时读不到重置卡信息，请稍后重试',
+        }),
+        detail,
+      };
+    case 'notAuthenticated':
+      return {
+        title: t('cost.resetCardNotAuthenticated', {
+          defaultValue: '账号未登录，请先登录后再试',
+        }),
+      };
+    case 'unknown':
+      // The card may already be spent provider-side: never advise a retry.
+      return {
+        title: t('cost.resetCardUnknown', {
+          defaultValue: '重置请求未确认，请先点「刷新」确认额度是否已恢复，请勿直接重试',
+        }),
+        detail,
+      };
+    default:
+      return {
+        title: t('cost.resetCardFailed', { defaultValue: '重置失败，请稍后重试' }),
+        detail,
+      };
+  }
+}
+
+/**
+ * Lists the account's spendable quota-reset cards ("banked resets") and lets
+ * the user spend one through POST /providers/quota/reset. Only available
+ * cards render as actionable rows; used-up and expired ones show as a counter
+ * alongside them (and once nothing is available the whole block, counter
+ * included, disappears — the account then has no card story to tell). The
+ * confirm dialog exists because the spend is irreversible on the provider
+ * side, and failure copy renders inside it — a masked error would read as
+ * "nothing happened". `isRefreshing` comes from the parent's quota refresh so
+ * buttons stay disabled until the post-spend refresh lands.
+ */
+function ResetCreditsCard({
+  provider,
+  credits,
+  isRefreshing,
+  onSpent,
+  t,
+}: {
+  provider: string;
+  credits: ProviderQuotaResetCredit[];
+  isRefreshing: boolean;
+  onSpent: () => void;
+  t: TFunction;
+}) {
+  // The reset type awaiting confirmation, null when the dialog is closed.
+  const [confirmingResetType, setConfirmingResetType] = useState<string | null>(null);
+  // True while the spend request is in flight.
+  const [isSpending, setIsSpending] = useState(false);
+  // Last failure, kept until the next attempt so the dialog can show it.
+  const [spendFailure, setSpendFailure] = useState<SpendFailure | null>(null);
+  // Localized success note for the just-spent card.
+  const [spendSuccess, setSpendSuccess] = useState<string | null>(null);
+
+  const availableGroups = useMemo(() => {
+    const groups = new Map<string, ProviderQuotaResetCredit[]>();
+    for (const credit of credits) {
+      if (!credit.available) continue;
+      const list = groups.get(credit.resetType) ?? [];
+      list.push(credit);
+      groups.set(credit.resetType, list);
+    }
+    const byEarliestExpiry = (
+      left: ProviderQuotaResetCredit,
+      right: ProviderQuotaResetCredit,
+    ) => (left.expireTime ? Date.parse(left.expireTime) : Infinity)
+      - (right.expireTime ? Date.parse(right.expireTime) : Infinity);
+
+    return [...groups.entries()]
+      .map(([resetType, cards]) => ({ resetType, cards: [...cards].sort(byEarliestExpiry) }))
+      .sort((left, right) => {
+        const leftIndex = RESET_CARD_TYPE_ORDER.indexOf(left.resetType);
+        const rightIndex = RESET_CARD_TYPE_ORDER.indexOf(right.resetType);
+        return (leftIndex === -1 ? RESET_CARD_TYPE_ORDER.length : leftIndex)
+          - (rightIndex === -1 ? RESET_CARD_TYPE_ORDER.length : rightIndex);
+      });
+  }, [credits]);
+
+  const unavailableCount = credits.filter((credit) => !credit.available).length;
+
+  if (availableGroups.length === 0) {
+    return null;
+  }
+
+  const spendCard = async () => {
+    if (!confirmingResetType || isSpending) return;
+    setIsSpending(true);
+    setSpendFailure(null);
+    try {
+      const response = await authenticatedFetch(buildProviderQuotaResetUrl(), {
+        method: 'POST',
+        body: JSON.stringify({ provider, resetType: confirmingResetType }),
+      });
+      const payload = await response.json().catch(() => null) as {
+        data?: { ok?: boolean; code?: string; message?: string };
+        error?: { message?: string };
+      } | null;
+      if (response.ok && payload?.data?.ok) {
+        // Localized copy first — the backend message may be provider-language.
+        setSpendSuccess(t('cost.resetCardSuccess', { defaultValue: '额度已重置' }));
+        setConfirmingResetType(null);
+        onSpent();
+      } else if (response.ok && payload?.data) {
+        setSpendFailure(resolveSpendFailure(payload.data.code, payload.data.message, t));
+      } else {
+        setSpendFailure(resolveSpendFailure(undefined, payload?.error?.message, t));
+      }
+    } catch {
+      setSpendFailure(resolveSpendFailure('unknown', undefined, t));
+    } finally {
+      setIsSpending(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2 rounded-2xl border border-amber-500/25 bg-amber-500/5 p-4">
+      <div className="flex items-center gap-2">
+        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+          <Ticket className="h-4 w-4" />
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-foreground">
+            {t('cost.resetCardTitle', { defaultValue: '用量重置卡' })}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            {t('cost.resetCardHint', { defaultValue: '使用后立即补满对应额度，无需等待刷新窗口' })}
+          </p>
+        </div>
+      </div>
+
+      {availableGroups.map((group) => {
+        const soonestExpiry = group.cards[0]?.expireTime;
+        return (
+          <div
+            key={group.resetType}
+            className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-background/80 px-3 py-2"
+          >
+            <div className="min-w-0">
+              <p className="truncate text-xs font-semibold text-foreground">
+                {resolveResetCardTypeLabel(group.resetType, t)}
+              </p>
+              <p className="truncate text-[11px] text-muted-foreground">
+                {t('cost.resetCardAvailable', {
+                  count: group.cards.length,
+                  defaultValue: `${group.cards.length} 张可用`,
+                })}
+                {soonestExpiry && (
+                  <>
+                    {' · '}
+                    {t('cost.resetCardExpires', {
+                      date: new Date(soonestExpiry).toLocaleString([], {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      }),
+                      defaultValue: `${new Date(soonestExpiry).toLocaleString()} 到期`,
+                    })}
+                  </>
+                )}
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isSpending || isRefreshing}
+              onClick={() => {
+                setSpendFailure(null);
+                setSpendSuccess(null);
+                setConfirmingResetType(group.resetType);
+              }}
+              className="h-7 shrink-0 rounded-lg px-3 text-xs"
+            >
+              {t('cost.resetCardUse', { defaultValue: '使用' })}
+            </Button>
+          </div>
+        );
+      })}
+
+      <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        {isRefreshing ? (
+          <span className="inline-flex items-center gap-1 text-foreground/80">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            {t('cost.resetCardRefreshing', { defaultValue: '正在刷新配额…' })}
+          </span>
+        ) : <span />}
+        {unavailableCount > 0 && (
+          <span>
+            {t('cost.resetCardUnavailable', {
+              count: unavailableCount,
+              defaultValue: `${unavailableCount} 张已使用或已过期`,
+            })}
+          </span>
+        )}
+      </div>
+
+      {spendSuccess && (
+        <p className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400">{spendSuccess}</p>
+      )}
+
+      <Dialog
+        open={confirmingResetType !== null}
+        onOpenChange={(open) => {
+          if (!open && !isSpending) setConfirmingResetType(null);
+        }}
+      >
+        <DialogContent
+          aria-labelledby="reset-card-confirm-title"
+          className="w-[calc(100vw-2rem)] max-w-sm rounded-2xl p-5"
+        >
+          <DialogTitle>{t('cost.resetCardConfirmTitle', { defaultValue: '确认使用重置额度？' })}</DialogTitle>
+
+          <div className="flex items-start gap-3">
+            <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+              <Ticket className="h-5 w-5" />
+            </span>
+            <div className="min-w-0">
+              <h3 id="reset-card-confirm-title" className="text-base font-semibold text-foreground">
+                {t('cost.resetCardConfirmTitle', { defaultValue: '确认使用重置额度？' })}
+              </h3>
+              <p className="mt-1 text-sm leading-5 text-muted-foreground">
+                {t('cost.resetCardConfirmBody', {
+                  quota: resolveResetCardTypeLabel(confirmingResetType ?? '', t),
+                  defaultValue: `将立即恢复「${resolveResetCardTypeLabel(confirmingResetType ?? '', t)}」，本次操作无法撤销`,
+                })}
+              </p>
+            </div>
+          </div>
+
+          {confirmingResetType === 'weekly' && (
+            <p className="mt-3 rounded-lg bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
+              {t('cost.resetCardWeeklyAlso5h', {
+                defaultValue: '重置周额度时会同步恢复 5 小时额度，不额外消耗 5 小时重置卡',
+              })}
+            </p>
+          )}
+
+          {spendFailure && (
+            <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-300">{spendFailure.title}</p>
+              {spendFailure.detail && spendFailure.detail !== spendFailure.title && (
+                <p className="mt-0.5 break-all text-[11px] text-muted-foreground">{spendFailure.detail}</p>
+              )}
+            </div>
+          )}
+
+          <div className="mt-5 flex gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isSpending}
+              onClick={() => setConfirmingResetType(null)}
+              className="h-10 flex-1 rounded-xl"
+            >
+              {t('cost.resetCardCancel', { defaultValue: '取消' })}
+            </Button>
+            <Button
+              type="button"
+              disabled={isSpending}
+              onClick={() => void spendCard()}
+              className="h-10 flex-1 rounded-xl"
+            >
+              {isSpending && <Loader2 className="h-4 w-4 animate-spin" />}
+              {t('cost.resetCardConfirm', { defaultValue: '确认使用' })}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 function CostContent({ data }: { data: CostCommandData }) {
   const { t } = useTranslation('chat');
   // A just-compacted session reports no occupancy: the numbers that exist
@@ -684,6 +1006,9 @@ function CostContent({ data }: { data: CostCommandData }) {
   const quotaProvider = data.provider;
   const supportsQuota = Boolean(
     quotaProvider && providerCapabilities?.[quotaProvider as LLMProvider]?.supportsQuota,
+  );
+  const supportsQuotaReset = Boolean(
+    quotaProvider && providerCapabilities?.[quotaProvider as LLMProvider]?.supportsQuotaReset,
   );
 
   const [quotaData, setQuotaData] = useState<ProviderQuotaData | null>(data.quota ?? null);
@@ -796,7 +1121,11 @@ function CostContent({ data }: { data: CostCommandData }) {
       : []),
   ];
 
-  const quotaGroups = quotaData?.groups ?? [];
+  const quotaGroups = sortQuotaGroupsForModel(
+    quotaData?.groups ?? [],
+    data.model,
+    quotaData?.partitioning,
+  );
 
   return (
     <div className="scrollbar-thin h-full min-h-0 space-y-4 overflow-y-auto pr-1">
@@ -924,6 +1253,16 @@ function CostContent({ data }: { data: CostCommandData }) {
                 );
               })}
             </div>
+          )}
+
+          {!loadingQuota && supportsQuotaReset && quotaProvider && quotaData?.resetCredits && (
+            <ResetCreditsCard
+              provider={quotaProvider}
+              credits={quotaData.resetCredits.credits}
+              isRefreshing={isRefreshing}
+              onSpent={() => void fetchQuota(true)}
+              t={t}
+            />
           )}
         </div>
       )}

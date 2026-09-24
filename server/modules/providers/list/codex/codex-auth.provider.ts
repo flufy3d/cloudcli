@@ -4,10 +4,10 @@ import path from 'node:path';
 
 import { createCliInstallationProbe } from '@/modules/providers/shared/installation/cli-installation-probe.js';
 import type { IProviderAuth } from '@/shared/interfaces.js';
-import type { ProviderAuthStatus, ProviderQuotaData } from '@/shared/types.js';
+import type { ProviderAuthStatus, ProviderQuotaData, ProviderQuotaResetConsumeInput, ProviderQuotaResetConsumeResult } from '@/shared/types.js';
 import { extractEmailFromJwt, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
-import { fetchCodexQuota } from './codex-quota.provider.js';
+import { consumeCodexQuotaReset, fetchCodexQuota } from './codex-quota.provider.js';
 
 type CodexCredentialsStatus = {
   authenticated: boolean;
@@ -49,6 +49,17 @@ export class CodexProviderAuth implements IProviderAuth {
    */
   async getQuota(options?: { forceRefresh?: boolean }): Promise<ProviderQuotaData | null> {
     return fetchCodexQuota(options);
+  }
+
+  /**
+   * Spends one of the account's banked rate-limit reset credits through the
+   * Codex app-server protocol. Consumer: the provider token-usage service
+   * (POST /providers/quota/reset).
+   */
+  async consumeQuotaReset(
+    input: ProviderQuotaResetConsumeInput,
+  ): Promise<ProviderQuotaResetConsumeResult> {
+    return consumeCodexQuotaReset(input);
   }
 
   /**

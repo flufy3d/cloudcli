@@ -455,6 +455,58 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
   }
 });
 
+test('Codex history closes a still-running subagent when its turn was aborted', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-aborted-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-parent-3';
+    const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
+
+    await writeFile(transcriptPath, `${[
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'SubAgentActivity',
+            id: 'spawn-3',
+            kind: 'started',
+            agent_thread_id: 'codex-agent-thread-3',
+            agent_path: '/root/product_review',
+          },
+        },
+      }),
+      // A usage-limit abort ends the whole agent tree: no FINAL_ANSWER and no
+      // completing lifecycle event ever arrive for the spawned agent.
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-3', reason: 'interrupted' },
+      }),
+    ].join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-parent-3', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-parent-3', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-parent-3');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Task');
+
+      assert.ok(task, 'the spawned agent must produce a Task row');
+      assert.equal(task.subagent?.status, 'completed', 'an aborted turn must not leave the Task card running forever');
+      assert.ok(task.toolResult, 'the Task card needs a result row to settle its spinner');
+      assert.equal(task.toolResult?.isError, true, 'an agent the abort cut off did not finish its work');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('Codex memory citations are lifted out of the reply they trail', () => {
   const reply = [
     'Here is the answer.',

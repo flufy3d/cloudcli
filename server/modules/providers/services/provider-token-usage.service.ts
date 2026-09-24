@@ -1,7 +1,13 @@
 import { sessionsDb } from '@/modules/database/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import type { IProvider } from '@/shared/interfaces.js';
-import type { AnyRecord, ProviderQuotaData, ProviderTokenUsageResult } from '@/shared/types.js';
+import type {
+  AnyRecord,
+  ProviderQuotaData,
+  ProviderQuotaResetConsumeInput,
+  ProviderQuotaResetConsumeResult,
+  ProviderTokenUsageResult,
+} from '@/shared/types.js';
 export { summarizeClaudeTokenUsage } from './claude-usage.js';
 import { AppError } from '@/shared/utils.js';
 
@@ -59,6 +65,19 @@ export function createProviderTokenUsageService(
 ) {
   const dependencies = { ...defaultDependencies, ...dependencyOverrides };
 
+  /**
+   * Providers with a reset-card spend currently in flight.
+   *
+   * Spending a card is irreversible and each attempt mints a fresh
+   * idempotency key, so protocol-level dedup cannot protect against two
+   * overlapping requests (double-open tabs, double clicks through to the
+   * backend) reading the same available card and spending it twice. One
+   * spend per provider at a time, enforced at the dispatch point every
+   * caller goes through. Per-service-instance state: the production singleton
+   * gates the whole process, test instances stay isolated.
+   */
+  const inFlightQuotaResets = new Set<string>();
+
   return {
     /**
      * Resolves the provider adapter from one app-facing session id and
@@ -113,6 +132,38 @@ export function createProviderTokenUsageService(
       options?: { forceRefresh?: boolean },
     ): Promise<ProviderQuotaData | null> {
       return dependencies.resolveProvider(provider).auth.getQuota?.(options) ?? null;
+    },
+
+    /**
+     * Spends one of the provider account's quota-reset cards through the
+     * optional auth facet. Throws a typed 400 when the provider cannot spend
+     * cards at all (the UI gates the action on `supportsQuotaReset`, so this
+     * only fires for hand-crafted requests).
+     */
+    async consumeProviderQuotaReset(
+      provider: string,
+      input: ProviderQuotaResetConsumeInput,
+    ): Promise<ProviderQuotaResetConsumeResult> {
+      const consume = dependencies.resolveProvider(provider).auth.consumeQuotaReset;
+      if (!consume) {
+        throw new AppError(`Provider "${provider}" does not support quota reset cards.`, {
+          code: 'QUOTA_RESET_UNSUPPORTED',
+          statusCode: 400,
+        });
+      }
+
+      if (inFlightQuotaResets.has(provider)) {
+        throw new AppError(
+          `A quota reset for "${provider}" is already in progress; wait for it to finish.`,
+          { code: 'QUOTA_RESET_IN_PROGRESS', statusCode: 409 },
+        );
+      }
+      inFlightQuotaResets.add(provider);
+      try {
+        return await consume(input);
+      } finally {
+        inFlightQuotaResets.delete(provider);
+      }
     },
   };
 }

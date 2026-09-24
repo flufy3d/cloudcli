@@ -29,7 +29,8 @@ export type { ProviderCapabilities } from '@/shared/types.js';
  * - the token-usage endpoint rides `sessions.getTokenUsage`.
  * - on-demand compaction rides the runtime's optional `compact` primitive.
  * - account quota rides `auth.getQuota`, which is already how
- *   `provider-token-usage.service.ts` dispatches the request.
+ *   `provider-token-usage.service.ts` dispatches the request; spending a
+ *   reset card rides `auth.consumeQuotaReset` the same way.
  * - the MCP block is the provider's own declaration, passed through verbatim.
  * - interactive permission prompts ride the runtime's optional `permissions`
  *   gateway (claude's SDK bridge; zcode's engine permission bridge).
@@ -37,7 +38,7 @@ export type { ProviderCapabilities } from '@/shared/types.js';
 function deriveCapabilities(providerId: LLMProvider, provider: {
   fork?: unknown;
   runtime?: { permissions?: unknown; compact?: unknown };
-  auth?: { getQuota?: unknown };
+  auth?: { getQuota?: unknown; consumeQuotaReset?: unknown };
   sessions?: { resolveEditAnchor?: unknown; getTokenUsage?: unknown };
   mcp: { capabilities: ProviderMcpCapabilities };
 }): ProviderCapabilities {
@@ -52,6 +53,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     supportsPermissionRequests: Boolean(provider.runtime?.permissions),
     supportsTokenUsage: typeof provider.sessions?.getTokenUsage === 'function',
     supportsQuota: typeof provider.auth?.getQuota === 'function',
+    supportsQuotaReset: typeof provider.auth?.consumeQuotaReset === 'function',
     supportsEffort: catalog.supportsEffort,
     supportsMessageEditing: typeof provider.sessions?.resolveEditAnchor === 'function',
     supportsSessionForking: provider.fork !== undefined,

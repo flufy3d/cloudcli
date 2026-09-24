@@ -158,6 +158,80 @@ test('quota dispatches to the provider auth facet', async () => {
   assert.equal(claudeQuota, null);
 });
 
+test('quota reset dispatches to the auth facet and rejects providers without the facet', async () => {
+  const seenInputs: Array<{ resetType: string }> = [];
+  const service = createProviderTokenUsageService({
+    resolveProvider: (provider) => stubProvider(
+      {},
+      provider === 'codex'
+        ? {
+            consumeQuotaReset: async (input) => {
+              seenInputs.push(input);
+              return { ok: true, message: 'Codex rate limits were reset.' };
+            },
+          }
+        : {},
+    ),
+  });
+
+  const result = await service.consumeProviderQuotaReset('codex', { resetType: 'all' });
+  assert.deepEqual(result, { ok: true, message: 'Codex rate limits were reset.' });
+  assert.deepEqual(seenInputs, [{ resetType: 'all' }]);
+
+  await assert.rejects(
+    () => service.consumeProviderQuotaReset('cursor', { resetType: 'all' }),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal((error as AppError).statusCode, 400);
+      assert.match((error as AppError).message, /does not support quota reset cards/);
+      return true;
+    },
+  );
+});
+
+test('quota reset allows one in-flight spend per provider and rejects the overlap', async () => {
+  let spendCount = 0;
+  let releaseFirstSpend: (() => void) | undefined;
+  const service = createProviderTokenUsageService({
+    resolveProvider: () => stubProvider(
+      {},
+      {
+        consumeQuotaReset: () => {
+          spendCount += 1;
+          // Only the first spend hangs; later ones resolve immediately so the
+          // "slot freed" assertion cannot deadlock on a swallowed release.
+          if (spendCount === 1) {
+            return new Promise((resolve) => {
+              releaseFirstSpend = () => resolve({ ok: true, code: 'reset' });
+            });
+          }
+          return Promise.resolve({ ok: true, code: 'reset' });
+        },
+      },
+    ),
+  });
+
+  const first = service.consumeProviderQuotaReset('codex', { resetType: 'all' });
+  await assert.rejects(
+    () => service.consumeProviderQuotaReset('codex', { resetType: 'all' }),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal((error as AppError).statusCode, 409);
+      assert.match((error as AppError).message, /already in progress/);
+      return true;
+    },
+  );
+  assert.equal(spendCount, 1, 'the overlapping request must never reach the provider');
+
+  releaseFirstSpend?.();
+  const result = await first;
+  assert.deepEqual(result, { ok: true, code: 'reset' });
+
+  // The slot must be freed after the spend settles, not leak.
+  const next = await service.consumeProviderQuotaReset('codex', { resetType: 'all' });
+  assert.deepEqual(next, { ok: true, code: 'reset' });
+});
+
 test('the Claude summarizer reads the newest assistant turn, not the whole conversation', () => {
   const entries = [
     { type: 'assistant', message: { usage: { input_tokens: 5, cache_read_input_tokens: 1000, output_tokens: 50 } } },

@@ -287,7 +287,28 @@
     "emptyQuotaHint": {
       "claude": "Gli accessi con chiave API, Bedrock o Vertex non hanno limiti di abbonamento claude.ai",
       "codex": "L'accesso tramite chiave API di solito non riporta limiti di 5 ore o settimanali"
-    }
+    },
+    "resetCardTitle": "Carte di reset dell'utilizzo",
+    "resetCardHint": "Usare una carta ricarica immediatamente la quota coperta, senza attendere la finestra di reset.",
+    "resetCardTypeAll": "Quota completa (5 ore + settimanale)",
+    "resetCardType5h": "Quota di 5 ore",
+    "resetCardTypeWeekly": "Quota settimanale",
+    "resetCardAvailable": "{{count}} disponibili",
+    "resetCardExpires": "la prima scade il {{date}}",
+    "resetCardUse": "Usa",
+    "resetCardConfirmTitle": "Usare questo reset?",
+    "resetCardConfirmBody": "La tua {{quota}} verrà ripristinata immediatamente. L'operazione non può essere annullata.",
+    "resetCardConfirm": "Usa carta",
+    "resetCardCancel": "Annulla",
+    "resetCardSuccess": "La quota è stata reimpostata.",
+    "resetCardFailed": "Reset non riuscito. Riprova più tardi.",
+    "resetCardNoCard": "Nessuna carta di reset disponibile. Aggiorna per vedere lo stato più recente.",
+    "resetCardReadFailed": "Impossibile leggere le carte di reset in questo momento. Riprova più tardi.",
+    "resetCardNotAuthenticated": "Account non collegato. Accedi prima di riprovare.",
+    "resetCardUnknown": "La richiesta di reset non è stata confermata. Aggiorna la quota per verificare se è stata applicata — non riprovare alla cieca.",
+    "resetCardUnavailable": "{{count}} usate o scadute",
+    "resetCardRefreshing": "Aggiornamento quota…",
+    "resetCardWeeklyAlso5h": "Il reset della quota settimanale ricarica anche quella di 5 ore, senza consumare una carta da 5 ore."
   },
   "localProxy": {
     "linkHint": "Questo indirizzo esiste solo sul server; CloudCLI lo apre tramite il proxy locale.",

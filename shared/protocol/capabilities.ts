@@ -58,6 +58,12 @@ export type ProviderCapabilities = {
    * `supportsTokenUsage` covers.
    */
   supportsQuota: boolean;
+  /**
+   * Whether the provider can also *spend* a quota-reset card ("banked reset"),
+   * not just report quota. Only meaningful together with `supportsQuota` and
+   * a non-empty `resetCredits` payload.
+   */
+  supportsQuotaReset: boolean;
   supportsEffort: boolean;
   /**
    * Whether an already-sent message can be replaced, which requires the

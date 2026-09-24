@@ -113,6 +113,7 @@ export type {
   ProviderQuotaBucket as QuotaBucket,
   ProviderQuotaData,
   ProviderQuotaGroup as QuotaGroup,
+  ProviderQuotaResetCredit,
 } from '@/shared/types';
 
 export type CostCommandData = {

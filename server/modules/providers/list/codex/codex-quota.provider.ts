@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
 
 import spawn from 'cross-spawn';
@@ -6,9 +7,13 @@ import type {
   ProviderQuotaBucket,
   ProviderQuotaData,
   ProviderQuotaGroup,
+  ProviderQuotaResetConsumeInput,
+  ProviderQuotaResetConsumeResult,
+  ProviderQuotaResetCredit,
 } from '@/shared/types.js';
 import {
   createProviderQuotaCache,
+  pickAvailableResetCredit,
   readObjectRecord,
   readOptionalString,
 } from '@/shared/utils.js';
@@ -44,6 +49,10 @@ const defaultDependencies: CodexQuotaDependencies = {
   }),
   now: () => Date.now(),
 };
+
+const QUOTA_INITIALIZE_ID = 'cloudcli-quota-initialize';
+const QUOTA_READ_ID = 'cloudcli-quota-read';
+const QUOTA_CONSUME_ID = 'cloudcli-quota-consume';
 
 function readFiniteNumber(value: unknown): number | null {
   const parsed = Number(value);
@@ -122,6 +131,50 @@ function normalizeSnapshot(
   };
 }
 
+/**
+ * Maps the rate-limit snapshot's reset-credit inventory onto the wire model.
+ *
+ * Every Codex card observed so far is a full reset (`codexRateLimits` — both
+ * the 5-hour and the weekly window), so it maps to `all`. Redeemed and expired
+ * cards stay in the payload with `available: false` so the UI can account for
+ * them; only fresh reads may be spent.
+ */
+function extractCodexResetCredits(snapshot: unknown): ProviderQuotaResetCredit[] {
+  const snapshotRecord = readObjectRecord(snapshot);
+  const inventory = readObjectRecord(snapshotRecord?.rateLimitResetCredits);
+  const rawCredits = Array.isArray(inventory?.credits) ? inventory.credits : [];
+
+  const credits = rawCredits
+    .map((entry): ProviderQuotaResetCredit | null => {
+      const credit = readObjectRecord(entry);
+      const id = readOptionalString(credit?.id);
+      const status = readOptionalString(credit?.status);
+      if (!credit || !id) {
+        return null;
+      }
+
+      const title = readOptionalString(credit.title);
+      const rawResetType = readOptionalString(credit.resetType);
+      const expiresAtSeconds = readFiniteNumber(credit.expiresAt);
+      const expireTime = expiresAtSeconds !== null && expiresAtSeconds > 0
+        ? new Date(expiresAtSeconds * 1000).toISOString()
+        : undefined;
+      return {
+        id,
+        // `codexRateLimits` is today's only observed card kind (full reset).
+        // Unknown future kinds keep their raw name so the shared pick rule
+        // never mistakes a narrower card for an `all` card.
+        resetType: !rawResetType || rawResetType === 'codexRateLimits' ? 'all' : rawResetType,
+        ...(title ? { title } : {}),
+        available: status === 'available',
+        ...(expireTime ? { expireTime } : {}),
+      };
+    })
+    .filter((credit): credit is ProviderQuotaResetCredit => credit !== null);
+
+  return credits;
+}
+
 function normalizeQuotaResponse(value: unknown, nowTimestamp: number): ProviderQuotaData | null {
   const response = readObjectRecord(value);
   if (!response) {
@@ -136,16 +189,40 @@ function normalizeQuotaResponse(value: unknown, nowTimestamp: number): ProviderQ
     : [normalizeSnapshot(response.rateLimits, 'codex')]
       .filter((group): group is ProviderQuotaGroup => group !== null);
 
-  return groups.length > 0
+  if (groups.length === 0) {
+    return null;
+  }
+
+  const resetCredits = extractCodexResetCredits(response);
+  return {
+    groups,
+    updatedAt: new Date(nowTimestamp).toISOString(),
     // One family, split by allowance: the gpt-reserve carve-out sits beside
     // the main pool, so a family match cannot tell them apart.
-    ? { groups, updatedAt: new Date(nowTimestamp).toISOString(), partitioning: 'bucket' as const }
-    : null;
+    partitioning: 'bucket' as const,
+    ...(resetCredits.length > 0 ? { resetCredits: { credits: resetCredits } } : {}),
+  };
 }
 
-function readCodexRateLimits(
+type CodexAppServerCall = {
+  id: string;
+  method: string;
+  params?: unknown;
+};
+
+/**
+ * Opens one app-server session, performs the protocol handshake, and hands
+ * `session` a `call` helper issuing one request/response round trip at a time
+ * over that connection.
+ *
+ * The generic timeout covers the whole session: a hung read delays the consume
+ * behind it, and the child is torn down either way. Handler failures settle
+ * the session promise; an early child exit rejects it through `fail`.
+ */
+function runCodexAppServerSession(
   startAppServer: CodexQuotaDependencies['startAppServer'],
-): Promise<unknown> {
+  session: (call: (request: CodexAppServerCall) => Promise<unknown>) => Promise<void>,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = startAppServer();
     const { stdin, stdout } = child;
@@ -155,7 +232,7 @@ function readCodexRateLimits(
       return;
     }
 
-    let stdoutBuffer = '';
+    const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
     let settled = false;
     let forceKillTimeout: NodeJS.Timeout | null = null;
 
@@ -175,31 +252,43 @@ function readCodexRateLimits(
       forceKillTimeout.unref();
     };
 
-    const finish = (error?: Error, result?: unknown) => {
+    const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       stopChild();
       if (error) reject(error);
-      else resolve(result);
+      else resolve();
+    };
+
+    const fail = (error: Error) => {
+      if (settled) return;
+      for (const entry of pending.values()) entry.reject(error);
+      pending.clear();
+      finish(error);
     };
 
     const timeout = setTimeout(() => {
-      finish(new Error('Timed out while reading Codex account rate limits'));
+      fail(new Error('Timed out while talking to the Codex app-server'));
     }, APP_SERVER_TIMEOUT_MS);
 
     const writeMessage = (message: Record<string, unknown>) => {
       stdin.write(`${JSON.stringify(message)}\n`);
     };
 
-    child.once('error', (error) => finish(error));
-    stdin.once('error', (error) => finish(error));
+    let stdoutBuffer = '';
+
+    const call = (request: CodexAppServerCall) => new Promise((callResolve, callReject) => {
+      pending.set(request.id, { resolve: callResolve, reject: callReject });
+      writeMessage({ id: request.id, method: request.method, params: request.params ?? null });
+    });
+
+    child.once('error', (error) => fail(error));
+    stdin.once('error', (error) => fail(error));
     child.stderr?.resume();
     child.once('exit', (code) => {
       if (forceKillTimeout) clearTimeout(forceKillTimeout);
-      if (!settled) {
-        finish(new Error(`Codex app-server exited before returning rate limits (${code ?? 'unknown'})`));
-      }
+      fail(new Error(`Codex app-server exited before completing the session (${code ?? 'unknown'})`));
     });
 
     stdout.on('data', (chunk: Buffer | string) => {
@@ -219,35 +308,37 @@ function readCodexRateLimits(
           continue;
         }
 
-        if (message.id === 'cloudcli-quota-initialize') {
+        if (message.id === QUOTA_INITIALIZE_ID) {
           const protocolError = readObjectRecord(message.error);
           if (protocolError) {
-            finish(new Error(readOptionalString(protocolError.message) ?? 'Codex initialization failed'));
+            fail(new Error(readOptionalString(protocolError.message) ?? 'Codex initialization failed'));
             continue;
           }
 
           writeMessage({ method: 'initialized' });
-          writeMessage({
-            id: 'cloudcli-quota-read',
-            method: 'account/rateLimits/read',
-            params: null,
-          });
+          session(call).then(
+            () => finish(),
+            (error: unknown) => fail(error instanceof Error ? error : new Error(String(error))),
+          );
           continue;
         }
 
-        if (message.id === 'cloudcli-quota-read') {
-          const protocolError = readObjectRecord(message.error);
-          if (protocolError) {
-            finish(new Error(readOptionalString(protocolError.message) ?? 'Codex rate-limit read failed'));
-          } else {
-            finish(undefined, message.result);
-          }
+        const messageId = typeof message.id === 'string' ? message.id : null;
+        const pendingCall = messageId ? pending.get(messageId) : undefined;
+        if (!messageId || !pendingCall) continue;
+        pending.delete(messageId);
+
+        const protocolError = readObjectRecord(message.error);
+        if (protocolError) {
+          pendingCall.reject(new Error(readOptionalString(protocolError.message) ?? 'Codex app-server request failed'));
+        } else {
+          pendingCall.resolve(message.result);
         }
       }
     });
 
     writeMessage({
-      id: 'cloudcli-quota-initialize',
+      id: QUOTA_INITIALIZE_ID,
       method: 'initialize',
       params: {
         clientInfo: {
@@ -259,6 +350,16 @@ function readCodexRateLimits(
       },
     });
   });
+}
+
+async function readCodexRateLimits(
+  startAppServer: CodexQuotaDependencies['startAppServer'],
+): Promise<unknown> {
+  let result: unknown;
+  await runCodexAppServerSession(startAppServer, async (call) => {
+    result = await call({ id: QUOTA_READ_ID, method: 'account/rateLimits/read', params: null });
+  });
+  return result;
 }
 
 /**
@@ -279,6 +380,65 @@ export async function fetchCodexQuota(
     ),
     dependencies.now,
   );
+}
+
+/**
+ * Spends one of the account's Codex reset credits ("banked reset").
+ *
+ * The same connection first reads the fresh credit inventory — the cached
+ * snapshot may be 2 minutes stale and offer an already-spent card — then
+ * consumes the soonest-expiring available card covering the request, which
+ * for Codex is always a full (5-hour + weekly) reset. A successful spend
+ * invalidates the quota cache so the next read reflects the refilled windows.
+ *
+ * A timeout or dropped connection maps to `code: 'unknown'` rather than a
+ * clean failure: the credit may already have been spent provider-side, and
+ * the UI must steer the user into re-checking the quota instead of retrying
+ * into a double spend. Consumer: CodexProviderAuth.consumeQuotaReset().
+ */
+export async function consumeCodexQuotaReset(
+  input: ProviderQuotaResetConsumeInput,
+  dependencyOverrides: Partial<CodexQuotaDependencies> = {},
+): Promise<ProviderQuotaResetConsumeResult> {
+  const dependencies = { ...defaultDependencies, ...dependencyOverrides };
+
+  let consumeResult: unknown;
+  try {
+    await runCodexAppServerSession(dependencies.startAppServer, async (call) => {
+      const snapshot = await call({ id: QUOTA_READ_ID, method: 'account/rateLimits/read', params: null });
+      const card = pickAvailableResetCredit(extractCodexResetCredits(snapshot), input.resetType);
+      if (!card) {
+        consumeResult = { outcome: 'noCardAvailable' };
+        return;
+      }
+
+      consumeResult = await call({
+        id: QUOTA_CONSUME_ID,
+        method: 'account/rateLimitResetCredit/consume',
+        params: { creditId: card.id, idempotencyKey: randomUUID() },
+      });
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'unknown',
+      message: error instanceof Error ? error.message : 'Codex rate-limit reset did not confirm.',
+    };
+  }
+
+  const outcome = readOptionalString(readObjectRecord(consumeResult)?.outcome) ?? 'unknown';
+  if (outcome === 'reset') {
+    quotaCache.reset();
+    return { ok: true, code: 'reset', message: 'Codex rate limits were reset.' };
+  }
+
+  return {
+    ok: false,
+    code: 'noCard',
+    message: outcome === 'noCardAvailable'
+      ? 'No available quota reset card for this request.'
+      : `Codex declined the reset (outcome: ${outcome}).`,
+  };
 }
 
 /** Resets the Codex quota cache for provider module tests. */

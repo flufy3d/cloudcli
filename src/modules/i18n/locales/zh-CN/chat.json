@@ -326,7 +326,28 @@
     "emptyQuotaHint": {
       "claude": "API Key、Bedrock、Vertex 登录没有 claude.ai 订阅限额",
       "codex": "API Key 登录通常不会提供 ChatGPT 账号的 5 小时和周限额"
-    }
+    },
+    "resetCardTitle": "用量重置卡",
+    "resetCardHint": "使用后立即补满对应额度，无需等待刷新窗口",
+    "resetCardTypeAll": "全部额度（5 小时 + 每周）",
+    "resetCardType5h": "5 小时额度",
+    "resetCardTypeWeekly": "每周额度",
+    "resetCardAvailable": "{{count}} 张可用",
+    "resetCardExpires": "最早 {{date}} 到期",
+    "resetCardUse": "使用",
+    "resetCardConfirmTitle": "确认使用重置额度？",
+    "resetCardConfirmBody": "将立即恢复「{{quota}}」，本次操作无法撤销",
+    "resetCardConfirm": "确认使用",
+    "resetCardCancel": "取消",
+    "resetCardSuccess": "额度已重置",
+    "resetCardFailed": "重置失败，请稍后重试",
+    "resetCardNoCard": "没有可用的重置卡，请刷新后查看最新状态",
+    "resetCardReadFailed": "暂时读不到重置卡信息，请稍后重试",
+    "resetCardNotAuthenticated": "账号未登录，请先登录后再试",
+    "resetCardUnknown": "重置请求未确认，请先点「刷新」确认额度是否已恢复，请勿直接重试",
+    "resetCardUnavailable": "{{count}} 张已使用或已过期",
+    "resetCardRefreshing": "正在刷新配额…",
+    "resetCardWeeklyAlso5h": "重置周额度时会同步恢复 5 小时额度，不额外消耗 5 小时重置卡"
   },
   "localProxy": {
     "linkHint": "这个地址只存在于服务器本机，CloudCLI 将通过本地代理打开。",
