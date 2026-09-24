@@ -914,49 +914,63 @@ function ResetCreditsCard({
           if (!open && !isSpending) setConfirmingResetType(null);
         }}
       >
-        <DialogContent className="max-w-sm rounded-2xl">
-          <DialogTitle>
-            {t('cost.resetCardConfirmTitle', { defaultValue: '确认使用重置额度？' })}
-          </DialogTitle>
-          <p className="text-sm text-muted-foreground">
-            {t('cost.resetCardConfirmBody', {
-              quota: resolveResetCardTypeLabel(confirmingResetType ?? '', t),
-              defaultValue: `将立即恢复「${resolveResetCardTypeLabel(confirmingResetType ?? '', t)}」，本次操作无法撤销`,
-            })}
-          </p>
+        <DialogContent
+          aria-labelledby="reset-card-confirm-title"
+          className="w-[calc(100vw-2rem)] max-w-sm rounded-2xl p-5"
+        >
+          <DialogTitle>{t('cost.resetCardConfirmTitle', { defaultValue: '确认使用重置额度？' })}</DialogTitle>
+
+          <div className="flex items-start gap-3">
+            <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+              <Ticket className="h-5 w-5" />
+            </span>
+            <div className="min-w-0">
+              <h3 id="reset-card-confirm-title" className="text-base font-semibold text-foreground">
+                {t('cost.resetCardConfirmTitle', { defaultValue: '确认使用重置额度？' })}
+              </h3>
+              <p className="mt-1 text-sm leading-5 text-muted-foreground">
+                {t('cost.resetCardConfirmBody', {
+                  quota: resolveResetCardTypeLabel(confirmingResetType ?? '', t),
+                  defaultValue: `将立即恢复「${resolveResetCardTypeLabel(confirmingResetType ?? '', t)}」，本次操作无法撤销`,
+                })}
+              </p>
+            </div>
+          </div>
+
           {confirmingResetType === 'weekly' && (
-            <p className="text-xs text-muted-foreground">
+            <p className="mt-3 rounded-lg bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
               {t('cost.resetCardWeeklyAlso5h', {
                 defaultValue: '重置周额度时会同步恢复 5 小时额度，不额外消耗 5 小时重置卡',
               })}
             </p>
           )}
+
           {spendFailure && (
-            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+            <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
               <p className="text-xs font-medium text-amber-700 dark:text-amber-300">{spendFailure.title}</p>
               {spendFailure.detail && spendFailure.detail !== spendFailure.title && (
                 <p className="mt-0.5 break-all text-[11px] text-muted-foreground">{spendFailure.detail}</p>
               )}
             </div>
           )}
-          <div className="mt-2 flex justify-end gap-2">
+
+          <div className="mt-5 flex gap-2">
             <Button
               type="button"
-              variant="ghost"
-              size="sm"
+              variant="outline"
               disabled={isSpending}
               onClick={() => setConfirmingResetType(null)}
+              className="h-10 flex-1 rounded-xl"
             >
               {t('cost.resetCardCancel', { defaultValue: '取消' })}
             </Button>
             <Button
               type="button"
-              size="sm"
               disabled={isSpending}
               onClick={() => void spendCard()}
-              className="rounded-lg"
+              className="h-10 flex-1 rounded-xl"
             >
-              {isSpending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {isSpending && <Loader2 className="h-4 w-4 animate-spin" />}
               {t('cost.resetCardConfirm', { defaultValue: '确认使用' })}
             </Button>
           </div>
