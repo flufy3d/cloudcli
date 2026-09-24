@@ -231,6 +231,55 @@ test('a failed turn surfaces the error and exits non-zero', async (t) => {
   assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
 });
 
+test('an interrupted turn surfaces as an error, not a silent success', async (t) => {
+  // Codex reports a usage-limit (or user) interrupt as status "interrupted"
+  // rather than "failed". Treating it as a normal completion hid the abort
+  // from the user and recorded the run as engine_completed.
+  installFakeAppServer(t, (fake) => {
+    fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'interrupted', error: null },
+    } as any);
+  });
+  const messages: any[] = [];
+
+  await codexRuntime.run('hey there', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  assert.ok(messages.some((message) => message.kind === 'error' && /interrupted/i.test(String(message.content))));
+  assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
+});
+
+test('a stop the user asked for stays silent when codex reports the interrupt back', async (t) => {
+  // `turn/interrupt` comes back as status "interrupted" too. The abort path
+  // already flagged the session, so this must not raise the usage-limit error
+  // (or a failed-run notification) for a stop the user made themselves. The
+  // aborted-session guard swallows every later notification, and the run
+  // settles through the connection teardown — replayed here as onExit.
+  installFakeAppServer(t, (fake) => {
+    fake.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'inProgress' },
+    } as any);
+    codexRuntime.abort('app-session');
+    fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'interrupted', error: null },
+    } as any);
+    fake.handlers.onExit?.('connection closed after abort');
+  });
+  const messages: any[] = [];
+
+  await codexRuntime.run('hey there', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  assert.ok(!messages.some((message) => message.kind === 'error'), 'a user stop must not surface the usage-limit error');
+});
+
 test('an approval waits for the user and carries the command it is about', async (t) => {
   let answer: Promise<unknown> | undefined;
   installFakeAppServer(t, (fake) => {
