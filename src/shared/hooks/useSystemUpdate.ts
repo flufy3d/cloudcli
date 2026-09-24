@@ -63,7 +63,17 @@ export function useSystemUpdate() {
   useEffect(() => {
     void reload();
     const interval = setInterval(() => void reload(), STATUS_POLL_MS);
-    return () => clearInterval(interval);
+    // Coming back to the tab re-reads the status, so a push made elsewhere (or
+    // a commit made here) shows up without waiting for the next poll. Cheap:
+    // the server still throttles the actual `git fetch`.
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void reload();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [reload]);
 
   const job = status?.job;
