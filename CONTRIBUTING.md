@@ -136,7 +136,7 @@ feat!: redesign settings page layout
 
 ## Releases
 
-Releases follow this fork's manual pipeline, documented in [`AGENTS.md`](AGENTS.md#release-pipeline): a three-file version bump, an annotated tag, a clean-worktree `deploy.mjs --no-bump` deployment, `git push --follow-tags`, and a `gh release` with notes written in Chinese. `CHANGELOG.md` carries upstream history only and is not updated for fork releases.
+Releases follow this fork's manual pipeline, documented in [`AGENTS.md`](AGENTS.md#release-pipeline): a three-file version bump, an annotated tag, a clean-worktree `deploy.mjs` deployment, `git push --follow-tags`, and a `gh release` with notes written in Chinese. `CHANGELOG.md` carries upstream history only and is not updated for fork releases.
 
 ## License
 
