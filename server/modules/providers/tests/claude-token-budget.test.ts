@@ -7,6 +7,10 @@ import {
   extractTokenBudget,
 } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 
+// The fallback window is read from CONTEXT_WINDOW at call time; a developer's
+// .env value would otherwise stand in for the default these tests pin.
+delete process.env.CONTEXT_WINDOW;
+
 test('assistant usage produces a cumulative budget', () => {
   const budget = extractTokenBudget({
     type: 'assistant',
