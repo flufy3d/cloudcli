@@ -84,3 +84,16 @@ export function resolveIsActiveQuotaGroup(
   // treat this non-reserve bucket as the account's general-purpose pool.
   return bucketPartitioned && familyMatch !== null && Boolean(normalizedModel);
 }
+
+/** Keeps the provider's order within each priority while showing active quota first. */
+export function sortQuotaGroupsForModel<T extends { name: string; description?: string }>(
+  groups: readonly T[],
+  currentModel: string | undefined,
+  partitioning?: ProviderQuotaGroupPartitioning,
+): T[] {
+  return [...groups].sort((left, right) => Number(resolveIsActiveQuotaGroup(
+    currentModel, right, groups.length, partitioning,
+  )) - Number(resolveIsActiveQuotaGroup(
+    currentModel, left, groups.length, partitioning,
+  )));
+}

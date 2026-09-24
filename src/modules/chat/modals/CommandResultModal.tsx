@@ -47,6 +47,7 @@ import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabiliti
 import {
   buildProviderQuotaUrl,
   resolveIsActiveQuotaGroup,
+  sortQuotaGroupsForModel,
 } from '@/modules/chat/utils/providerQuota';
 import { getProviderDisplayName, PROVIDER_DISPLAY_NAMES } from '@/shared/providerDisplay';
 
@@ -762,7 +763,11 @@ function CostContent({ data }: { data: CostCommandData }) {
       : []),
   ];
 
-  const quotaGroups = quotaData?.groups ?? [];
+  const quotaGroups = sortQuotaGroupsForModel(
+    quotaData?.groups ?? [],
+    data.model,
+    quotaData?.partitioning,
+  );
 
   return (
     <div className="scrollbar-thin h-full min-h-0 space-y-4 overflow-y-auto pr-1">

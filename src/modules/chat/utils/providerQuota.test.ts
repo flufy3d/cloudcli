@@ -4,6 +4,7 @@ import { test } from 'vitest';
 import {
   buildProviderQuotaUrl,
   resolveIsActiveQuotaGroup,
+  sortQuotaGroupsForModel,
 } from '@/modules/chat/utils/providerQuota';
 
 test('buildProviderQuotaUrl addresses the active provider and optional refresh', () => {
@@ -12,6 +13,16 @@ test('buildProviderQuotaUrl addresses the active provider and optional refresh',
     buildProviderQuotaUrl('antigravity', true),
     '/api/providers/quota?provider=antigravity&refresh=true',
   );
+});
+
+test('sortQuotaGroupsForModel shows the active Codex quota before reserve without changing API data', () => {
+  const reserve = { name: 'gpt-reserve', description: 'Codex Plus plan' };
+  const codex = { name: 'Codex', description: 'Codex Plus plan' };
+  const groups = [reserve, codex];
+
+  assert.deepEqual(sortQuotaGroupsForModel(groups, 'gpt-5.6-terra', 'bucket'), [codex, reserve]);
+  assert.deepEqual(groups, [reserve, codex]);
+  assert.deepEqual(sortQuotaGroupsForModel(groups, undefined, 'bucket'), groups);
 });
 
 test('resolveIsActiveQuotaGroup identifies active session group accurately', () => {
