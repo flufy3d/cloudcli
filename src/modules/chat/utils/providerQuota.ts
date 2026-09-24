@@ -16,6 +16,11 @@ export function buildProviderQuotaUrl(provider: string, forceRefresh = false): s
   return `/api/providers/quota?${searchParams.toString()}`;
 }
 
+/** Builds the backend URL that spends one of the account's quota-reset cards. */
+export function buildProviderQuotaResetUrl(): string {
+  return '/api/providers/quota/reset';
+}
+
 /** Returns null when the model doesn't belong to any known family bucket. */
 function matchesFamily(groupText: string, normalizedModel: string): boolean | null {
   if (normalizedModel.includes('gemini')) {

@@ -11,9 +11,52 @@ import {
 } from '../list/zcode/zcode-credentials.js';
 import {
   clearZCodeQuotaCache,
+  consumeZCodeQuotaReset,
   fetchZCodeQuota,
 } from '../list/zcode/zcode-quota.provider.js';
 import { ZCodeProviderAuth } from '../list/zcode/zcode-auth.provider.js';
+
+/** Serves canned JSON per URL substring and records every request it saw. */
+function createRouteFetch(routes: Record<string, unknown>) {
+  const requests: Array<{ url: string; method: string; body: unknown }> = [];
+  const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+    const target = String(url);
+    const key = Object.keys(routes).find((candidate) => target.includes(candidate));
+    requests.push({ url: target, method: init?.method ?? 'GET', body: init?.body });
+    return {
+      ok: true,
+      json: async () => (key ? routes[key] : {}),
+    } as Response;
+  }) as typeof globalThis.fetch;
+  return { fetchFn, requests };
+}
+
+const authenticatedCredentials = {
+  authenticated: true,
+  accessToken: 'test-token',
+  zcodeJwtToken: null,
+  providerFamily: 'bigmodel' as const,
+  username: 'test_coder',
+  displayName: null,
+  email: 'test_coder',
+  method: 'BigModel OAuth',
+};
+
+const resetListResponse = {
+  code: 200,
+  msg: '操作成功',
+  success: true,
+  data: {
+    customerId: 1,
+    targetType: 'PERSONAL',
+    lastFiveHourResetTime: '2026-09-22 23:49:58',
+    fiveHourResets: [
+      { recordId: 606262, grantType: 'DIRECT', expireTime: '2026-10-18 18:50:54', available: true },
+      { recordId: 758489, grantType: 'DIRECT', expireTime: '2026-09-20 18:06:38', available: false },
+    ],
+    weekResets: [],
+  },
+};
 
 describe('ZCode Credentials & Quota Provider', () => {
   let tempDir: string;
@@ -125,11 +168,11 @@ describe('ZCode Credentials & Quota Provider', () => {
       success: true,
     };
 
-    let requestedUrl = '';
+    let requestedUrls: string[] = [];
     let authHeader = '';
 
     const mockFetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      requestedUrl = String(url);
+      requestedUrls.push(String(url));
       authHeader = (init?.headers as Record<string, string>)?.Authorization || '';
       return {
         ok: true,
@@ -155,7 +198,10 @@ describe('ZCode Credentials & Quota Provider', () => {
     });
 
     assert.ok(quota);
-    assert.equal(requestedUrl, 'https://bigmodel.cn/api/monitor/usage/quota/limit');
+    assert.ok(
+      requestedUrls.some((url) => url === 'https://bigmodel.cn/api/monitor/usage/quota/limit'),
+      'the limits endpoint must be requested',
+    );
     assert.equal(authHeader, 'Bearer test-token');
     assert.equal(quota.groups.length, 1);
 
@@ -221,18 +267,18 @@ describe('ZCode Credentials & Quota Provider', () => {
       now: () => currentTime,
     };
 
-    // First call fetches
+    // First call fetches — one request for the limits, one for the reset cards
     await fetchZCodeQuota({}, deps);
-    assert.equal(fetchCount, 1);
+    assert.equal(fetchCount, 2);
 
     // Call within TTL returns cached without fetch
     currentTime += 10_000;
     await fetchZCodeQuota({}, deps);
-    assert.equal(fetchCount, 1);
+    assert.equal(fetchCount, 2);
 
     // Call with forceRefresh fetches regardless of cache
     await fetchZCodeQuota({ forceRefresh: true }, deps);
-    assert.equal(fetchCount, 2);
+    assert.equal(fetchCount, 4);
   });
 
   test('gracefully degrades to null on HTTP error or network failure', async () => {
@@ -341,5 +387,244 @@ describe('ZCode Credentials & Quota Provider', () => {
   test('ZCodeProviderAuth exposes getQuota and authenticates with real username', async () => {
     const auth = new ZCodeProviderAuth();
     assert.equal(typeof auth.getQuota, 'function');
+  });
+
+  test('attaches the personal reset-card inventory to the quota payload', async () => {
+    clearZCodeQuotaCache();
+    const { fetchFn } = createRouteFetch({
+      '/api/monitor/usage/quota/limit': {
+        code: 200,
+        success: true,
+        data: {
+          level: 'lite',
+          limits: [{ type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 26 }],
+        },
+      },
+      '/api/biz/customer-package-reset/list': resetListResponse,
+    });
+
+    const quota = await fetchZCodeQuota({ forceRefresh: true }, {
+      fetch: fetchFn,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+
+    assert.ok(quota);
+    assert.deepEqual(quota.resetCredits, {
+      credits: [
+        {
+          id: '606262',
+          resetType: '5h',
+          grantType: 'DIRECT',
+          available: true,
+          expireTime: new Date('2026-10-18T18:50:54').toISOString(),
+        },
+        {
+          id: '758489',
+          resetType: '5h',
+          grantType: 'DIRECT',
+          available: false,
+          expireTime: new Date('2026-09-20T18:06:38').toISOString(),
+        },
+      ],
+    });
+  });
+
+  test('omits resetCredits when the card list is empty or its request fails', async () => {
+    clearZCodeQuotaCache();
+    const quotaPayload = {
+      code: 200,
+      success: true,
+      data: {
+        level: 'lite',
+        limits: [{ type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 26 }],
+      },
+    };
+
+    // Empty inventory: the section stays absent
+    const emptyFetch = createRouteFetch({
+      '/api/monitor/usage/quota/limit': quotaPayload,
+      '/api/biz/customer-package-reset/list': {
+        code: 200,
+        success: true,
+        data: { fiveHourResets: [], weekResets: [] },
+      },
+    });
+    const emptyQuota = await fetchZCodeQuota({ forceRefresh: true }, {
+      fetch: emptyFetch.fetchFn,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+    assert.ok(emptyQuota);
+    assert.equal(emptyQuota.resetCredits, undefined);
+
+    // Failing card request: the quota read itself still succeeds
+    const failingCardFetch = (async (url: string | URL | Request) => {
+      if (String(url).includes('customer-package-reset/list')) {
+        throw new Error('card endpoint down');
+      }
+      return { ok: true, json: async () => quotaPayload } as Response;
+    }) as typeof globalThis.fetch;
+    const quota = await fetchZCodeQuota({ forceRefresh: true }, {
+      fetch: failingCardFetch,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+    assert.ok(quota);
+    assert.equal(quota.groups.length, 1);
+    assert.equal(quota.resetCredits, undefined);
+  });
+
+  test('consumeZCodeQuotaReset picks the available card and posts the use request', async () => {
+    clearZCodeQuotaCache();
+    const { fetchFn, requests } = createRouteFetch({
+      '/api/biz/customer-package-reset/list': resetListResponse,
+      '/api/biz/customer-package-reset/use': { code: 200, msg: '操作成功', success: true },
+    });
+
+    const result = await consumeZCodeQuotaReset({ resetType: '5h' }, {
+      fetch: fetchFn,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+
+    assert.deepEqual(result, { ok: true, code: 'reset', message: '5-hour allowance was reset.' });
+    const useRequest = requests.find((request) => request.url.includes('customer-package-reset/use'));
+    assert.ok(useRequest);
+    assert.equal(useRequest.method, 'POST');
+    const body = JSON.parse(String(useRequest.body)) as Record<string, unknown>;
+    assert.deepEqual(body, {
+      targetType: 'PERSONAL',
+      resetType: 'FIVE_HOUR',
+      recordId: 606262,
+      grantType: 'DIRECT',
+      requestId: body.requestId,
+    });
+    assert.equal(typeof body.requestId, 'string');
+    assert.ok((body.requestId as string).length > 0);
+  });
+
+  test('consumeZCodeQuotaReset declines without a use request when nothing is available', async () => {
+    clearZCodeQuotaCache();
+    const { fetchFn, requests } = createRouteFetch({
+      '/api/biz/customer-package-reset/list': resetListResponse,
+      '/api/biz/customer-package-reset/use': { code: 200, msg: '操作成功', success: true },
+    });
+
+    const result = await consumeZCodeQuotaReset({ resetType: 'weekly' }, {
+      fetch: fetchFn,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+
+    assert.equal(result.ok, false);
+    assert.match(result.message ?? '', /No available quota reset card/);
+    assert.equal(
+      requests.some((request) => request.url.includes('customer-package-reset/use')),
+      false,
+    );
+  });
+
+  test('consumeZCodeQuotaReset surfaces the provider message on failure', async () => {
+    clearZCodeQuotaCache();
+    const { fetchFn } = createRouteFetch({
+      '/api/biz/customer-package-reset/list': resetListResponse,
+      '/api/biz/customer-package-reset/use': {
+        code: 500,
+        msg: '指定的重置次数不可用，请刷新后重试',
+        success: false,
+      },
+    });
+
+    const result = await consumeZCodeQuotaReset({ resetType: '5h' }, {
+      fetch: fetchFn,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'spendFailed');
+    assert.match(result.message ?? '', /指定的重置次数不可用/);
+  });
+
+  test('consumeZCodeQuotaReset distinguishes an unreadable card list from having no cards', async () => {
+    clearZCodeQuotaCache();
+    const failingListFetch = (async (url: string | URL | Request) => {
+      if (String(url).includes('customer-package-reset/list')) {
+        return { ok: false, status: 500, json: async () => ({}) } as Response;
+      }
+      throw new Error('use endpoint must never be called');
+    }) as typeof globalThis.fetch;
+
+    const result = await consumeZCodeQuotaReset({ resetType: '5h' }, {
+      fetch: failingListFetch,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'readFailed');
+    assert.match(result.message ?? '', /HTTP 500/);
+  });
+
+  test('consumeZCodeQuotaReset reports an unknown outcome when the use request throws', async () => {
+    clearZCodeQuotaCache();
+    const throwingUseFetch = (async (url: string | URL | Request) => {
+      if (String(url).includes('customer-package-reset/list')) {
+        return { ok: true, json: async () => resetListResponse } as Response;
+      }
+      throw new Error('network unreachable');
+    }) as typeof globalThis.fetch;
+
+    const result = await consumeZCodeQuotaReset({ resetType: '5h' }, {
+      fetch: throwingUseFetch,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'unknown');
+  });
+
+  test('consumeZCodeQuotaReset invalidates the quota cache after a successful spend', async () => {
+    clearZCodeQuotaCache();
+    let fetchCount = 0;
+    const quotaPayload = {
+      code: 200,
+      success: true,
+      data: {
+        level: 'lite',
+        limits: [{ type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 26 }],
+      },
+    };
+    const countingFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      fetchCount += 1;
+      if (String(url).includes('customer-package-reset/use')) {
+        return { ok: true, json: async () => ({ code: 200, msg: '操作成功', success: true }) } as Response;
+      }
+      if (String(url).includes('customer-package-reset/list')) {
+        return { ok: true, json: async () => resetListResponse } as Response;
+      }
+      return { ok: true, json: async () => quotaPayload } as Response;
+    }) as typeof globalThis.fetch;
+    const deps = {
+      fetch: countingFetch,
+      readCredentials: async () => authenticatedCredentials,
+      now: () => 1_000,
+    };
+
+    await fetchZCodeQuota({}, deps);
+    const cachedReads = fetchCount;
+    await fetchZCodeQuota({}, deps);
+    assert.equal(fetchCount, cachedReads, 'second read must come from the cache');
+
+    const result = await consumeZCodeQuotaReset({ resetType: '5h' }, deps);
+    assert.equal(result.ok, true);
+
+    await fetchZCodeQuota({}, deps);
+    assert.equal(
+      fetchCount, cachedReads + 4,
+      'the spend (list + use) must invalidate the cache so the next read refetches (list + limits)',
+    );
   });
 });

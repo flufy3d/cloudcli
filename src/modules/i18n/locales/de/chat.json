@@ -278,7 +278,28 @@
     "emptyQuotaHint": {
       "claude": "API-Schlüssel-, Bedrock- und Vertex-Anmeldungen haben keine Abo-Limits von Claude.ai",
       "codex": "API-Schlüssel-Anmeldungen liefern in der Regel keine 5-Stunden- oder Wochenlimits"
-    }
+    },
+    "resetCardTitle": "Nutzungs-Reset-Karten",
+    "resetCardHint": "Mit einer Karte wird das abgedeckte Kontingent sofort aufgefüllt — ohne Wartezeit auf das Fenster.",
+    "resetCardTypeAll": "Gesamtkontingent (5-Stunden + wöchentlich)",
+    "resetCardType5h": "5-Stunden-Kontingent",
+    "resetCardTypeWeekly": "Wochenkontingent",
+    "resetCardAvailable": "{{count}} verfügbar",
+    "resetCardExpires": "läuft frühestens {{date}} ab",
+    "resetCardUse": "Verwenden",
+    "resetCardConfirmTitle": "Diesen Reset verwenden?",
+    "resetCardConfirmBody": "\"{{quota}}\" wird sofort wiederhergestellt. Dies kann nicht rückgängig gemacht werden.",
+    "resetCardConfirm": "Karte verwenden",
+    "resetCardCancel": "Abbrechen",
+    "resetCardSuccess": "Kontingent wurde zurückgesetzt.",
+    "resetCardFailed": "Zurücksetzen fehlgeschlagen. Bitte später erneut versuchen.",
+    "resetCardNoCard": "Keine Reset-Karte verfügbar. Aktualisieren Sie, um den neuesten Status zu sehen.",
+    "resetCardReadFailed": "Reset-Karten konnten gerade nicht gelesen werden. Bitte später erneut versuchen.",
+    "resetCardNotAuthenticated": "Konto nicht angemeldet. Bitte zuerst anmelden.",
+    "resetCardUnknown": "Die Reset-Anfrage wurde nicht bestätigt. Prüfen Sie zuerst per \"Aktualisieren\", ob das Kontingent wiederhergestellt wurde — nicht einfach erneut versuchen.",
+    "resetCardUnavailable": "{{count}} verbraucht oder abgelaufen",
+    "resetCardRefreshing": "Kontingent wird aktualisiert…",
+    "resetCardWeeklyAlso5h": "Das Zurücksetzen des Wochenkontingents füllt auch das 5-Stunden-Kontingent, ohne eine 5-Stunden-Karte zu verbrauchen."
   },
   "localProxy": {
     "linkHint": "Diese Adresse existiert nur auf dem Server; CloudCLI öffnet sie über den lokalen Proxy.",

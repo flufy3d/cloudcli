@@ -280,7 +280,28 @@
     "emptyQuotaHint": {
       "claude": "Les connexions par clé API, Bedrock ou Vertex n'ont pas de limites d'abonnement claude.ai",
       "codex": "La connexion par clé API n'indique généralement pas de limite de 5 h ou hebdomadaire"
-    }
+    },
+    "resetCardTitle": "Cartes de réinitialisation d'utilisation",
+    "resetCardHint": "Utiliser une carte replit immédiatement le quota concerné, sans attendre la fenêtre de réinitialisation.",
+    "resetCardTypeAll": "Quota complet (5 heures + hebdomadaire)",
+    "resetCardType5h": "Quota de 5 heures",
+    "resetCardTypeWeekly": "Quota hebdomadaire",
+    "resetCardAvailable": "{{count}} disponibles",
+    "resetCardExpires": "la plus proche expire le {{date}}",
+    "resetCardUse": "Utiliser",
+    "resetCardConfirmTitle": "Utiliser cette réinitialisation ?",
+    "resetCardConfirmBody": "Votre {{quota}} sera restauré immédiatement. Cette action est irréversible.",
+    "resetCardConfirm": "Utiliser la carte",
+    "resetCardCancel": "Annuler",
+    "resetCardSuccess": "Le quota a été réinitialisé.",
+    "resetCardFailed": "Échec de la réinitialisation. Réessayez plus tard.",
+    "resetCardNoCard": "Aucune carte de réinitialisation disponible. Actualisez pour voir le dernier état.",
+    "resetCardReadFailed": "Impossible de lire les cartes de réinitialisation pour le moment. Réessayez plus tard.",
+    "resetCardNotAuthenticated": "Compte non connecté. Connectez-vous d'abord puis réessayez.",
+    "resetCardUnknown": "La demande de réinitialisation n'a pas été confirmée. Actualisez le quota pour vérifier si elle a été appliquée — ne réessayez pas aveuglément.",
+    "resetCardUnavailable": "{{count}} utilisées ou expirées",
+    "resetCardRefreshing": "Actualisation du quota…",
+    "resetCardWeeklyAlso5h": "Réinitialiser le quota hebdomadaire remplit aussi le quota de 5 heures, sans consommer de carte 5 heures."
   },
   "localProxy": {
     "linkHint": "Cette adresse n'existe que sur le serveur ; CloudCLI l'ouvre via son proxy local.",

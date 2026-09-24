@@ -266,7 +266,28 @@
     "emptyQuotaHint": {
       "claude": "API キー・Bedrock・Vertex でのログインには claude.ai のサブスクリプション制限がありません",
       "codex": "API キーでのログインでは通常、5時間や週間の制限は提供されません"
-    }
+    },
+    "resetCardTitle": "使用量リセットカード",
+    "resetCardHint": "使用すると対象の枠が即座に回復し、リセット期間を待つ必要がありません。",
+    "resetCardTypeAll": "全枠（5時間 + 週間）",
+    "resetCardType5h": "5時間枠",
+    "resetCardTypeWeekly": "週間枠",
+    "resetCardAvailable": "{{count}} 枚利用可能",
+    "resetCardExpires": "最短 {{date}} に期限切れ",
+    "resetCardUse": "使用",
+    "resetCardConfirmTitle": "リセットを使用しますか？",
+    "resetCardConfirmBody": "「{{quota}}」が即座に回復します。この操作は取り消せません。",
+    "resetCardConfirm": "使用する",
+    "resetCardCancel": "キャンセル",
+    "resetCardSuccess": "使用量をリセットしました。",
+    "resetCardFailed": "リセットに失敗しました。後でもう一度お試しください。",
+    "resetCardNoCard": "利用できるリセットカードがありません。更新して最新状態を確認してください。",
+    "resetCardReadFailed": "リセットカード情報を読み取れませんでした。後でもう一度お試しください。",
+    "resetCardNotAuthenticated": "アカウントが未ログインです。ログインしてからお試しください。",
+    "resetCardUnknown": "リセット要求は確認されていません。先に「更新」で枠が回復したか確認してください。安易に再試行しないでください。",
+    "resetCardUnavailable": "{{count}} 枚は使用済みまたは期限切れ",
+    "resetCardRefreshing": "使用量を更新中…",
+    "resetCardWeeklyAlso5h": "週間枠のリセットは 5 時間枠も同時に回復し、5 時間カードを消費しません。"
   },
   "localProxy": {
     "linkHint": "このアドレスはサーバー上にのみ存在します。CloudCLI がローカルプロキシ経由で開きます。",

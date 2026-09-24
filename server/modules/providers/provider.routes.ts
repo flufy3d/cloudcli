@@ -851,6 +851,33 @@ router.get(
   }),
 );
 
+const QUOTA_RESET_TYPES = new Set(['5h', 'weekly', 'all']);
+
+router.post(
+  '/quota/reset',
+  asyncHandler(async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const provider = typeof body.provider === 'string' ? body.provider.trim().toLowerCase() : '';
+    if (!provider) {
+      throw new AppError('provider is required.', { code: 'INVALID_PROVIDER', statusCode: 400 });
+    }
+
+    const resetType = typeof body.resetType === 'string' ? body.resetType.trim() : '';
+    if (!QUOTA_RESET_TYPES.has(resetType)) {
+      throw new AppError('resetType must be "5h", "weekly" or "all".', {
+        code: 'INVALID_RESET_TYPE',
+        statusCode: 400,
+      });
+    }
+
+    // Irreversible on the provider side: the spend itself is guarded by the
+    // frontend's confirmation step, the idempotency key, and the fresh card
+    // list read that each provider performs before spending.
+    const result = await providerTokenUsageService.consumeProviderQuotaReset(provider, { resetType });
+    res.json(createApiSuccessResponse(result));
+  }),
+);
+
 // Must stay registered after the static and session-specific routes so their
 // literals never match the generic `:sessionId` parameter.
 router.get(

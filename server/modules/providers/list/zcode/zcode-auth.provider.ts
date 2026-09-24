@@ -1,9 +1,14 @@
 import type { IProviderAuth } from '@/shared/interfaces.js';
-import type { ProviderAuthStatus, ProviderQuotaData } from '@/shared/types.js';
+import type {
+  ProviderAuthStatus,
+  ProviderQuotaData,
+  ProviderQuotaResetConsumeInput,
+  ProviderQuotaResetConsumeResult,
+} from '@/shared/types.js';
 
 import { readDecryptedZCodeCredentials } from './zcode-credentials.js';
 import { getEngineVersion, tryResolveEnginePath } from './zcode-engine-path.js';
-import { fetchZCodeQuota } from './zcode-quota.provider.js';
+import { consumeZCodeQuotaReset, fetchZCodeQuota } from './zcode-quota.provider.js';
 
 /**
  * ZCode authentication provider implementing installation, credential
@@ -54,6 +59,17 @@ export class ZCodeProviderAuth implements IProviderAuth {
    */
   async getQuota(options?: { forceRefresh?: boolean }): Promise<ProviderQuotaData | null> {
     return fetchZCodeQuota(options);
+  }
+
+  /**
+   * Spends one of the account's personal-plan reset cards through the
+   * BigModel coding-plan console. Consumer: the provider token-usage service
+   * (POST /providers/quota/reset).
+   */
+  async consumeQuotaReset(
+    input: ProviderQuotaResetConsumeInput,
+  ): Promise<ProviderQuotaResetConsumeResult> {
+    return consumeZCodeQuotaReset(input);
   }
 }
 

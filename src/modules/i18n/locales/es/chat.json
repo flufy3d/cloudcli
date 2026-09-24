@@ -305,7 +305,28 @@
     "emptyQuotaHint": {
       "claude": "Los inicios de sesión con API key, Bedrock o Vertex no tienen límites de suscripción de claude.ai",
       "codex": "Los inicios de sesión con API Key no suelen indicar límites de 5 horas o semanales"
-    }
+    },
+    "resetCardTitle": "Tarjetas de reinicio de uso",
+    "resetCardHint": "Usar una tarjeta rellena de inmediato la cuota cubierta, sin esperar la ventana de reinicio.",
+    "resetCardTypeAll": "Cuota completa (5 h + semanal)",
+    "resetCardType5h": "Cuota de 5 horas",
+    "resetCardTypeWeekly": "Cuota semanal",
+    "resetCardAvailable": "{{count}} disponibles",
+    "resetCardExpires": "la más próxima vence {{date}}",
+    "resetCardUse": "Usar",
+    "resetCardConfirmTitle": "¿Usar este reinicio?",
+    "resetCardConfirmBody": "Tu {{quota}} se restaurará de inmediato. Esta acción no se puede deshacer.",
+    "resetCardConfirm": "Usar tarjeta",
+    "resetCardCancel": "Cancelar",
+    "resetCardSuccess": "La cuota fue reiniciada.",
+    "resetCardFailed": "El reinicio falló. Inténtalo de nuevo más tarde.",
+    "resetCardNoCard": "No hay tarjetas de reinicio disponibles. Actualiza para ver el estado más reciente.",
+    "resetCardReadFailed": "No se pudieron leer las tarjetas de reinicio. Inténtalo de nuevo más tarde.",
+    "resetCardNotAuthenticated": "Sesión no iniciada. Inicia sesión primero e inténtalo de nuevo.",
+    "resetCardUnknown": "La solicitud de reinicio no se confirmó. Actualiza la cuota para comprobar si se aplicó; no la repitas a ciegas.",
+    "resetCardUnavailable": "{{count}} usadas o caducadas",
+    "resetCardRefreshing": "Actualizando cuota…",
+    "resetCardWeeklyAlso5h": "Reiniciar la cuota semanal también rellena la de 5 horas, sin gastar una tarjeta de 5 horas."
   },
   "localProxy": {
     "linkHint": "Esta dirección solo existe en el servidor; CloudCLI la abre mediante su proxy local.",

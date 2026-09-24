@@ -321,7 +321,28 @@
     "emptyQuotaHint": {
       "claude": "API Key、Bedrock、Vertex 登入沒有 claude.ai 訂閱限額",
       "codex": "API Key 登入通常不會提供 5 小時和週限額"
-    }
+    },
+    "resetCardTitle": "用量重置卡",
+    "resetCardHint": "使用後立即補滿對應額度，無需等待刷新視窗",
+    "resetCardTypeAll": "全部額度（5 小時 + 每週）",
+    "resetCardType5h": "5 小時額度",
+    "resetCardTypeWeekly": "每週額度",
+    "resetCardAvailable": "{{count}} 張可用",
+    "resetCardExpires": "最早 {{date}} 到期",
+    "resetCardUse": "使用",
+    "resetCardConfirmTitle": "確認使用重置額度？",
+    "resetCardConfirmBody": "將立即恢復「{{quota}}」，本次操作無法撤銷",
+    "resetCardConfirm": "確認使用",
+    "resetCardCancel": "取消",
+    "resetCardSuccess": "額度已重置",
+    "resetCardFailed": "重置失敗，請稍後再試",
+    "resetCardNoCard": "沒有可用的重置卡，請重新整理後查看最新狀態",
+    "resetCardReadFailed": "暫時讀不到重置卡資訊，請稍後再試",
+    "resetCardNotAuthenticated": "帳號未登入，請先登入後再試",
+    "resetCardUnknown": "重置請求未確認，請先點「重新整理」確認額度是否已恢復，請勿直接重試",
+    "resetCardUnavailable": "{{count}} 張已使用或已過期",
+    "resetCardRefreshing": "正在重新整理配額…",
+    "resetCardWeeklyAlso5h": "重置週額度時會同步恢復 5 小時額度，不額外消耗 5 小時重置卡"
   },
   "localProxy": {
     "linkHint": "這個位址只存在於伺服器本機，CloudCLI 將透過本機代理開啟。",
