@@ -29,6 +29,7 @@ import type { TFunction } from 'i18next';
 import { Badge, Button, Dialog, DialogContent, DialogTitle, Input } from '@/shared/ui';
 import type {
   LLMProvider,
+  ProviderAuthStatusMap,
   ProviderModelActions,
   ProviderModelOption,
   ProviderModelsDefinition,
@@ -64,6 +65,8 @@ type CommandResultModalProps = {
   activeProvider: LLMProvider;
   activeProviderModel: string;
   currentSessionId: string | null;
+  /** Install-probe map from ChatInterface so the model library hides uninstalled provider CLIs. */
+  providerAuthStatus?: ProviderAuthStatusMap;
   onSelectProviderModel: (
     provider: LLMProvider,
     model: string,
@@ -257,6 +260,7 @@ function ModelsContent({
   activeProvider,
   activeProviderModel,
   currentSessionId,
+  providerAuthStatus,
   onSelectProviderModel,
 }: {
   data: ModelCommandData;
@@ -265,6 +269,7 @@ function ModelsContent({
   activeProvider: LLMProvider;
   activeProviderModel: string;
   currentSessionId: string | null;
+  providerAuthStatus?: ProviderAuthStatusMap;
   onSelectProviderModel: CommandResultModalProps['onSelectProviderModel'];
 }) {
   const { t } = useTranslation();
@@ -331,6 +336,7 @@ function ModelsContent({
       <ModelLibraryPanel
         initialProvider={currentProvider}
         providerModelCatalog={providerModelCatalog}
+        providerAuthStatus={providerAuthStatus}
         actions={providerModelActions}
         onDone={() => setManagingModels(false)}
       />
@@ -1275,6 +1281,7 @@ export default function CommandResultModal({
   activeProvider,
   activeProviderModel,
   currentSessionId,
+  providerAuthStatus,
   onSelectProviderModel,
 }: CommandResultModalProps) {
   const { t } = useTranslation();
@@ -1365,6 +1372,7 @@ export default function CommandResultModal({
               activeProvider={activeProvider}
               activeProviderModel={activeProviderModel}
               currentSessionId={currentSessionId}
+              providerAuthStatus={providerAuthStatus}
               onSelectProviderModel={onSelectProviderModel}
             />
           )}

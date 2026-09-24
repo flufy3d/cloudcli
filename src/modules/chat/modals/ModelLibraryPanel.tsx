@@ -14,6 +14,7 @@ import {
 import { Badge, Button, Input, LLMProviderLogo } from '@/shared/ui';
 import type {
   LLMProvider,
+  ProviderAuthStatus,
   ProviderModelActions,
   ProviderModelOption,
   ProviderModelsDefinition,
@@ -27,6 +28,15 @@ import { getProviderDisplayName } from '@/shared/providerDisplay';
 const ALL_PROVIDERS: Array<{ id: LLMProvider; label: string }> = PROVIDER_FALLBACK_ORDER.map(
   (id) => ({ id, label: getProviderDisplayName(id) }),
 );
+
+/**
+ * True only when the provider's install probe has resolved and reported the
+ * CLI missing. The status map starts as all-`installed: false` while probes
+ * run, so an unresolved (loading) probe must never hide a tab or redirect the
+ * initial selection.
+ */
+const isInstallMissing = (status?: ProviderAuthStatus) =>
+  status?.loading !== true && status?.installed === false;
 
 type ModelLibraryPanelProps = {
   initialProvider: LLMProvider;
@@ -53,14 +63,11 @@ export default function ModelLibraryPanel({
 }: ModelLibraryPanelProps) {
   const { t } = useTranslation();
   const visibleProviders = useMemo(() => {
-    return ALL_PROVIDERS.filter((p) => {
-      if (!providerAuthStatus) return true;
-      return providerAuthStatus[p.id]?.installed !== false;
-    });
+    return ALL_PROVIDERS.filter((p) => !isInstallMissing(providerAuthStatus?.[p.id]));
   }, [providerAuthStatus]);
 
   const [selectedProvider, setSelectedProvider] = useState<LLMProvider>(() => {
-    if (providerAuthStatus && providerAuthStatus[initialProvider]?.installed === false) {
+    if (isInstallMissing(providerAuthStatus?.[initialProvider])) {
       const fallback = visibleProviders[0]?.id;
       if (fallback) return fallback;
     }
@@ -76,7 +83,7 @@ export default function ModelLibraryPanel({
   const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
-    if (providerAuthStatus && providerAuthStatus[initialProvider]?.installed === false) {
+    if (isInstallMissing(providerAuthStatus?.[initialProvider])) {
       const fallback = visibleProviders[0]?.id;
       if (fallback) {
         setSelectedProvider(fallback);

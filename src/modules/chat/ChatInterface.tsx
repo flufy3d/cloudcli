@@ -535,6 +535,7 @@ function ChatInterface({
         activeProvider={provider}
         activeProviderModel={currentProviderModel}
         currentSessionId={currentSessionId || selectedSession?.id || null}
+        providerAuthStatus={providerAuthStatus}
         onSelectProviderModel={selectProviderModel}
       />
     </PermissionContext.Provider>
