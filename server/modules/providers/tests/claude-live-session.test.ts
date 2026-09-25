@@ -8,6 +8,7 @@ import {
   createClaudeBackgroundWorkTracker,
   createClaudeHeldPromptStream,
   readClaudeClaimedUserMessageUuids,
+  readClaudeInitUuidStampingSupport,
   type ClaudeInputMessage,
 } from '@/modules/providers/list/claude/claude-live-session.js';
 
@@ -317,5 +318,38 @@ test('an unstamped result closes a follow-up turn but not a waiting explicit one
       uuidStampingSupported: null,
     }),
     true,
+  );
+});
+
+test('the init frame settles uuid stamping support from the CLI version', () => {
+  const init = (version: unknown) => ({ type: 'system', subtype: 'init', claude_code_version: version });
+
+  assert.equal(readClaudeInitUuidStampingSupport(init('2.1.259')), true);
+  assert.equal(readClaudeInitUuidStampingSupport(init('2.1.282')), true);
+  assert.equal(readClaudeInitUuidStampingSupport(init('2.2.0')), true);
+  assert.equal(readClaudeInitUuidStampingSupport(init('3.0.0-beta.1')), true);
+
+  // Older or unreadable versions keep the caller's first-result fallback.
+  assert.equal(readClaudeInitUuidStampingSupport(init('2.1.258')), null);
+  assert.equal(readClaudeInitUuidStampingSupport(init('1.9.999')), null);
+  assert.equal(readClaudeInitUuidStampingSupport(init(undefined)), null);
+  assert.equal(readClaudeInitUuidStampingSupport(init('dev')), null);
+
+  // Only the init frame carries the answer.
+  assert.equal(readClaudeInitUuidStampingSupport({ type: 'system', subtype: 'status', claude_code_version: '2.1.282' }), null);
+  assert.equal(readClaudeInitUuidStampingSupport({ type: 'result', claude_code_version: '2.1.282' }), null);
+});
+
+test('a resume that opens with an unstamped CLI-pushed turn does not finish the waiting user turn', () => {
+  // A stamping CLI known from init: the "background task stopped" follow-up
+  // result carries no uuid, and must not close the explicit turn behind it.
+  assert.equal(
+    claudeResultFinishesTurn({
+      turnUuid: 'user-turn',
+      turnExplicit: true,
+      claimedUuids: [],
+      uuidStampingSupported: readClaudeInitUuidStampingSupport({ type: 'system', subtype: 'init', claude_code_version: '2.1.282' }),
+    }),
+    false,
   );
 });

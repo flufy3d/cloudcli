@@ -228,6 +228,49 @@ export function readClaudeClaimedUserMessageUuids(message: unknown): string[] {
 }
 
 /**
+ * First CLI release known to echo client uuids on reply frames and results: the
+ * build bundled with the SDK whose types introduced `user_message_uuid(s)`.
+ */
+const FIRST_UUID_ECHOING_CLI_VERSION = [2, 1, 259];
+
+/**
+ * Reads, from the CLI's `system/init` frame, whether this process echoes client
+ * uuids — known before the first result, so that result never has to be used
+ * to guess.
+ *
+ * The guess is unsafe: a resumed session can open with a CLI-pushed turn (the
+ * "background task stopped" task-notification) whose unstamped result arrives
+ * first. Reading it as "this CLI never stamps" binds that result to the user's
+ * turn, which ends the run and closes stdin while the real turn is still
+ * running — its background work is then killed at the turn's end.
+ *
+ * Returns true for a known-stamping version, null when the frame is not an
+ * init frame or the version is older/unparseable (the caller keeps its
+ * fallback reading).
+ * Consumers: `claude-runtime.provider.js` (sets its stamping flag from init).
+ * @param message - Raw SDK message
+ */
+export function readClaudeInitUuidStampingSupport(message: unknown): true | null {
+  const record = readJsonRecord(message);
+  if (record?.type !== 'system' || record.subtype !== 'init') {
+    return null;
+  }
+
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(readOptionalString(record.claude_code_version) ?? '');
+  if (!match) {
+    return null;
+  }
+
+  const version = match.slice(1, 4).map(Number);
+  for (let index = 0; index < FIRST_UUID_ECHOING_CLI_VERSION.length; index += 1) {
+    if (version[index] !== FIRST_UUID_ECHOING_CLI_VERSION[index]) {
+      return version[index] > FIRST_UUID_ECHOING_CLI_VERSION[index] ? true : null;
+    }
+  }
+  return true;
+}
+
+/**
  * Decides whether a result finishes the given turn.
  *
  * A result that names a different client uuid belongs to a queued or

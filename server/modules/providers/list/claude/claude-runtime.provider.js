@@ -30,7 +30,8 @@ import {
   claudeResultFinishesTurn,
   createClaudeBackgroundWorkTracker,
   createClaudeHeldPromptStream,
-  readClaudeClaimedUserMessageUuids
+  readClaudeClaimedUserMessageUuids,
+  readClaudeInitUuidStampingSupport
 } from '@/modules/providers/list/claude/claude-live-session.js';
 import {
   CLAUDE_PREDEFINED_MODELS,
@@ -1267,7 +1268,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       // A reply frame claiming a client uuid proves this CLI echoes the field
       // that binds a turn's output to the message that submitted it.
       const claimedUuids = readClaudeClaimedUserMessageUuids(message);
-      if (claimedUuids.length > 0) {
+      // The init frame's CLI version settles it before any result can: a
+      // resumed session may open with an unstamped CLI-pushed turn whose
+      // result must not be mistaken for this run's.
+      if (claimedUuids.length > 0 || readClaudeInitUuidStampingSupport(message) === true) {
         uuidStampingSupported = true;
       }
 
@@ -1307,8 +1311,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       if (message.type === 'result') {
         resultCount += 1;
         if (uuidStampingSupported === null && claimedUuids.length === 0 && resultCount === 1) {
-          // The process's first result is always this run's own prompt, so a
-          // missing uuid here means the CLI predates the binding field.
+          // Fallback for CLIs whose init version did not settle it: read the
+          // process's first result as this run's own prompt, so a missing uuid
+          // means the CLI predates the binding field. Unsafe when a resume
+          // opens with a CLI-pushed turn, hence the init check above.
           uuidStampingSupported = false;
         }
 
