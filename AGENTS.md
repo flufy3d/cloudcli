@@ -49,7 +49,7 @@ Saying "发布/发版本" (release a version) means running this whole pipeline 
 3. `git commit --no-verify -m "chore(release): bump version to X.Y.Z"`, scoped to exactly those three files.
 4. `git tag -a vX.Y.Z -m "CloudCLI X.Y.Z"` (annotated, before any build).
 5. Build and deploy **from a clean worktree of the tag** — the main tree is routinely dirtied by parallel sessions, which bakes `-dirty` into the build fingerprint: `git worktree add --detach /tmp/rel-vX.Y.Z vX.Y.Z`, `cp -Rc node_modules /tmp/rel-vX.Y.Z/` (the repo has no pnpm-lock, so `pnpm install` there fails), then build in the worktree and verify the fingerprint is `vX.Y.Z-<hash>` without `-dirty`.
-6. `git push origin main --follow-tags`, then `gh release create vX.Y.Z -R iazrael/cloudcli --title "CloudCLI X.Y.Z" --notes-file ...` — always pass `-R`; gh defaults to the upstream repo.
+6. `git push origin main --follow-tags`, then `gh release create vX.Y.Z -R flufy3d/cloudcli --title "CloudCLI X.Y.Z" --notes-file ...` — always pass `-R`; `origin` is flufy3d/cloudcli, `upstream` is the read-only iazrael/cloudcli.
 7. Stop before the restart-producing deploy step. Tell the user to run `node scripts/deploy.mjs --no-bump` from the worktree themselves; non-interactive shells need `PATH="$HOME/Library/pnpm:$PATH" PNPM_HOME="$HOME/Library/pnpm"` so pnpm and the stable global CLI entry are available. Resume verification only after the user confirms it completed.
 8. Verify four things: pm2 online with the new version, `curl http://localhost:3030/` returns 200, the fixed runtime's `dist/assets/*.js` fingerprint has no `-dirty`, and `gh release view` confirms the release.
 
