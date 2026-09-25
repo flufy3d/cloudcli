@@ -10,7 +10,9 @@ import type {
   RefObject,
   TouchEvent,
 } from 'react';
-import { PaperclipIcon, MessageSquareIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon } from 'lucide-react';
+import { PaperclipIcon, MessageSquareIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon, CircleHelpIcon } from 'lucide-react';
+
+import { Tooltip } from '@/shared/ui/Tooltip';
 
 import { useVoiceInput } from '@/modules/chat/hooks/useVoiceInput';
 import { useVoiceAvailable } from '@/modules/chat/hooks/useVoiceAvailable';
@@ -523,13 +525,22 @@ function ChatComposer({
           </PromptInputTools>
 
           <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
-            <div
-              className={`hidden text-xs text-muted-foreground/50 transition-opacity duration-200 lg:block ${
-                input.trim() && !canQueueDraft ? 'opacity-0' : 'opacity-100'
-              }`}
+            <Tooltip
+              content={
+                <div className="flex flex-col gap-0.5">
+                  {submitHint.split(' • ').map((line) => (
+                    <span key={line}>{line}</span>
+                  ))}
+                </div>
+              }
             >
-              {submitHint}
-            </div>
+              <span
+                aria-label={submitHint}
+                className="flex h-6 w-6 cursor-help items-center justify-center text-muted-foreground/50 transition-colors hover:text-muted-foreground"
+              >
+                <CircleHelpIcon className="h-3.5 w-3.5" />
+              </span>
+            </Tooltip>
 
             <ScheduleMessagePopover
               disabled={!input.trim()}
