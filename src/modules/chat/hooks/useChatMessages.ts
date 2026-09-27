@@ -275,6 +275,7 @@ function convertRow(
       case 'complete':
       case 'status':
       case 'permission_request':
+      case 'permission_resolved':
       case 'permission_cancelled':
       case 'session_created':
         // Skip — these are handled by useChatRealtimeHandlers

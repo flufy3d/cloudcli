@@ -240,14 +240,18 @@ export function useChatRealtimeHandlers({
           return;
         }
 
+        case 'permission_resolved':
         case 'permission_cancelled': {
           if (directive.requestId && directive.sessionId === activeViewSessionIdRef.current) {
-            const nextPendingPermissionRequests = pendingPermissionRequestsRef.current.filter(
+            const current = pendingPermissionRequestsRef.current;
+            const nextPendingPermissionRequests = current.filter(
               (request: PendingPermissionRequest) => request.requestId !== directive.requestId,
             );
 
-            pendingPermissionRequestsRef.current = nextPendingPermissionRequests;
-            setPendingPermissionRequests(nextPendingPermissionRequests);
+            if (nextPendingPermissionRequests.length !== current.length) {
+              pendingPermissionRequestsRef.current = nextPendingPermissionRequests;
+              setPendingPermissionRequests(nextPendingPermissionRequests);
+            }
           }
           return;
         }

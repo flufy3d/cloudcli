@@ -713,9 +713,6 @@ const SERVER_EVENT_ROUTES: Record<string, { flushesStream: boolean; action: Serv
   interactive_prompt: { flushesStream: true, action: 'append' },
   task_notification: { flushesStream: true, action: 'append' },
   session_created: { flushesStream: true, action: 'append' },
-  // Preserved quirk: this frame persists a row that nothing renders. Kept so
-  // the timeline stays a lossless record until a decision retires it.
-  permission_resolved: { flushesStream: true, action: 'append' },
   thinking: { flushesStream: true, action: 'thinking' },
   tool_use: { flushesStream: true, action: 'toolUse' },
   stream_delta: { flushesStream: false, action: 'streamDelta' },
@@ -727,6 +724,7 @@ const SERVER_EVENT_ROUTES: Record<string, { flushesStream: boolean; action: Serv
   chat_subscribed: { flushesStream: false, action: 'ack' },
   status: { flushesStream: false, action: 'status' },
   permission_request: { flushesStream: false, action: 'permissionRequest' },
+  permission_resolved: { flushesStream: false, action: 'permissionResolved' },
   permission_cancelled: { flushesStream: false, action: 'permissionCancelled' },
   // Sidebar/global events — owned by useProjectsState.
   session_upserted: { flushesStream: false, action: 'none' },
@@ -755,6 +753,7 @@ type ServerEventAction =
   | 'ack'
   | 'status'
   | 'permissionRequest'
+  | 'permissionResolved'
   | 'permissionCancelled'
   | 'none';
 
@@ -789,6 +788,7 @@ export type ServerEventDirective =
       input: unknown;
       context: unknown;
     }
+  | { effect: 'permission_resolved'; sessionId: string | null; requestId: string | null }
   | { effect: 'permission_cancelled'; sessionId: string | null; requestId: string | null };
 
 export type ApplyServerEventOptions = {
@@ -1004,9 +1004,10 @@ export class SessionTimelineStore {
           context: message?.context,
         };
 
+      case 'permissionResolved':
       case 'permissionCancelled':
         return {
-          effect: 'permission_cancelled',
+          effect: route.action === 'permissionResolved' ? 'permission_resolved' : 'permission_cancelled',
           sessionId: sid,
           requestId: message?.requestId || null,
         };
