@@ -505,14 +505,16 @@ async function queryCodex(
               });
             }
             if (turn?.status === 'interrupted' && currentSession()?.status !== 'aborted') {
-              // Codex ends a usage-limit or shutdown interrupt here rather than
-              // at `failed`. Treating the status as a normal completion sent the
-              // client a clean `complete` while the rollout recorded
-              // `turn_aborted`, so the abort was invisible until history re-read
-              // it and diagnostics logged the run as a success. A stop the user
-              // asked for (`abort` already flagged the session) arrives as the
-              // same status and must stay silent.
-              const message = 'Codex interrupted this turn before it finished. This usually means the account hit a usage limit.';
+              // Codex ends a usage-limit, shutdown, or engine-internal interrupt
+              // here rather than at `failed` — on codex 0.155 a spawned agent
+              // finishing mid-turn aborted the whole agent tree as `interrupted`
+              // (fixed upstream in 0.156/#45549 and 0.157/#47340). Treating the
+              // status as a normal completion sent the client a clean `complete`
+              // while the rollout recorded `turn_aborted`, so the abort was
+              // invisible until history re-read it and diagnostics logged the run
+              // as a success. A stop the user asked for (`abort` already flagged
+              // the session) arrives as the same status and must stay silent.
+              const message = 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
               terminalFailure = terminalFailure ?? { message };
               errorSurfaced = true;
               sendMessage(ws, createNormalizedMessage({

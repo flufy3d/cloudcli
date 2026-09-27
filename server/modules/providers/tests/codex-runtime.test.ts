@@ -232,9 +232,11 @@ test('a failed turn surfaces the error and exits non-zero', async (t) => {
 });
 
 test('an interrupted turn surfaces as an error, not a silent success', async (t) => {
-  // Codex reports a usage-limit (or user) interrupt as status "interrupted"
-  // rather than "failed". Treating it as a normal completion hid the abort
-  // from the user and recorded the run as engine_completed.
+  // Codex reports a usage-limit, user, or engine-internal interrupt as status
+  // "interrupted" rather than "failed" — on codex 0.155 a spawned agent
+  // finishing mid-turn aborted the whole agent tree this way. Treating it as a
+  // normal completion hid the abort from the user and recorded the run as
+  // engine_completed.
   installFakeAppServer(t, (fake) => {
     fake.handlers.onNotification?.('turn/completed', {
       threadId: THREAD_ID,
