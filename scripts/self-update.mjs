@@ -14,6 +14,8 @@
 // resets the checkout to where it started and brings the server back.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -106,7 +108,7 @@ try {
   // The new server settles this state on boot; see the system module.
   writeState({ state: 'restarting', step: 'restart', targetCommit });
   log(`build ready at ${targetCommit}; restarting ${appName}`);
-  runShell(`pm2 restart ${appName}`);
+  runShell(pm2RestartCommand());
   log('restart issued');
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -130,8 +132,30 @@ function rollBack() {
     }
   }
   if (progress.stopped) {
-    attempt(`restart ${appName}`, () => runShell(`pm2 restart ${appName}`));
+    attempt(`restart ${appName}`, () => runShell(pm2RestartCommand()));
   }
+}
+
+// A plain `pm2 restart <name>` replays the env PM2 captured at first start, so
+// edits to the ecosystem file's env block would never apply. When that file
+// defines this app for this checkout, restart through it with --update-env;
+// hosts without one (or whose entry points elsewhere) keep the plain restart.
+function pm2RestartCommand() {
+  const pm2Home = process.env.PM2_HOME || path.join(os.homedir(), '.pm2');
+  const ecosystemPath = path.join(pm2Home, 'ecosystem.config.cjs');
+  try {
+    if (fs.existsSync(ecosystemPath)) {
+      const require = createRequire(import.meta.url);
+      const app = require(ecosystemPath)?.apps?.find((entry) => entry?.name === appName);
+      const comparable = (value) => (process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value));
+      if (app?.cwd && comparable(app.cwd) === comparable(root)) {
+        return `pm2 restart "${ecosystemPath}" --only ${appName} --update-env`;
+      }
+    }
+  } catch (error) {
+    log(`ecosystem file unreadable, using plain restart: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return `pm2 restart ${appName}`;
 }
 
 function promoteClientBuild() {
