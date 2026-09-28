@@ -3,6 +3,7 @@ import { providerModelsService } from '@/modules/providers/services/provider-mod
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type { IProvider } from '@/shared/interfaces.js';
 import type {
+  ActiveBackgroundTask,
   AnyRecord,
   LLMProvider,
   ProviderPermissionDecision,
@@ -103,6 +104,12 @@ export function createProviderRuntimeService(
     getPendingApprovalsForSession(sessionId: string): unknown[] {
       return dependencies.listProviders().flatMap(
         (provider) => provider.runtime.permissions?.listPending(sessionId) ?? [],
+      );
+    },
+
+    getBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
+      return dependencies.listProviders().flatMap(
+        (provider) => provider.runtime.backgroundTasks?.list(sessionId) ?? [],
       );
     },
   };

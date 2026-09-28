@@ -1,4 +1,5 @@
 import type {
+  ActiveBackgroundTask,
   AnyRecord,
   FetchHistoryOptions,
   FetchHistoryResult,
@@ -44,6 +45,9 @@ export interface IProviderRuntime {
   ): Promise<unknown>;
   abort(sessionId: string): boolean | Promise<boolean>;
   permissions?: ProviderRuntimePermissionGateway;
+  backgroundTasks?: {
+    list(sessionId: string): ActiveBackgroundTask[];
+  };
 }
 
 /**

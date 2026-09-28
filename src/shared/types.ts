@@ -46,6 +46,7 @@ export type {
 } from '@shared/protocol/quota';
 
 export type {
+  ActiveBackgroundTask,
   GatewayEventKind,
   LLMProvider,
   MemoryCitation,

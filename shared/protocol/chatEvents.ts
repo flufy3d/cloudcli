@@ -140,6 +140,14 @@ export type SubagentInfo = {
   activityCount?: number;
 };
 
+export type ActiveBackgroundTask = {
+  id: string;
+  toolName: string;
+  command?: string;
+  description?: string;
+  startedAt: number;
+};
+
 /** The owning project as it appears inside a `session_upserted` delta. */
 export type SessionUpsertedProject = {
   projectId: string;
@@ -301,6 +309,7 @@ export type NormalizedMessage = {
    */
   summaryKey?: string;
   tokenBudget?: unknown;
+  backgroundTasks?: ActiveBackgroundTask[];
   /**
    * Timeline of everything a subagent did, attached to the `tool_use` that
    * spawned it. Present for Claude `Agent`/`Task` calls and Codex

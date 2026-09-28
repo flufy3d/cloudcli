@@ -13,6 +13,7 @@ import {
   type ChatAttachmentDescriptor,
 } from '@/shared/image-attachments.js';
 import type {
+  ActiveBackgroundTask,
   AnyRecord,
   AuthenticatedWebSocketRequest,
   LLMProvider,
@@ -76,6 +77,7 @@ export type ProviderRuntimeGateway = {
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
+  getBackgroundTasksForSession?(sessionId: string): ActiveBackgroundTask[];
 };
 
 type ChatWebSocketDependencies = {
@@ -525,6 +527,7 @@ function handleChatSubscribe(
     // Pending approvals are tracked under the app session id inside the
     // Claude runtime, so they can be looked up directly.
     const pendingPermissions = dependencies.runtime.getPendingApprovalsForSession(sessionId);
+    const backgroundTasks = dependencies.runtime.getBackgroundTasksForSession?.(sessionId) || [];
 
     // `lastSeq` is the session's authoritative watermark (clients realign to
     // it); `stale` tells the client its `lastSeq` predates the replay buffer
@@ -538,6 +541,7 @@ function handleChatSubscribe(
       lastSeq: replay.lastSeq,
       stale: replay.stale,
       pendingPermissions,
+      backgroundTasks,
       timestamp: new Date().toISOString(),
     });
 

@@ -72,6 +72,7 @@ import type {
   ProviderQuotaGroup as QuotaGroupShape,
 } from '../../shared/protocol/quota.js';
 import type {
+  ActiveBackgroundTask,
   GatewayEventKind,
   LLMProvider,
   MemoryCitation,
@@ -86,6 +87,7 @@ import type {
 } from '../../shared/protocol/chatEvents.js';
 
 export type {
+  ActiveBackgroundTask,
   GatewayEventKind,
   LLMProvider,
   MemoryCitation,

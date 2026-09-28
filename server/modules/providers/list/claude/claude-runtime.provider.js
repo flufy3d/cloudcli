@@ -331,7 +331,8 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
     status: 'active',
     writer,
     // Re-registered mid-run once the provider session id lands; keep the closer.
-    releaseInput: releaseInput || carried?.releaseInput || null
+    releaseInput: releaseInput || carried?.releaseInput || null,
+    backgroundTasks: carried?.backgroundTasks || []
   });
 }
 
@@ -607,6 +608,47 @@ export function shouldResendPromptForIdleTurn({ hasPrompt, sawTaskNotification, 
 const DEFERRED_WORK_TOOLS = new Set(['Monitor', 'ScheduleWakeup', 'CronCreate', 'TaskCreate']);
 
 /**
+ * Extracts tool calls that keep working after the turn's `result` arrives.
+ *
+ * @param {any} sdkMessage - SDK stream message
+ * @returns {Array<import('../../../../shared/types.js').ActiveBackgroundTask>} Extracted active background task records
+ */
+export function extractBackgroundTasks(sdkMessage) {
+  const content = sdkMessage?.message?.content;
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  const tasks = [];
+  for (const block of content) {
+    if (block?.type !== 'tool_use') {
+      continue;
+    }
+    if (block.name === 'Bash' && block.input?.run_in_background === true) {
+      tasks.push({
+        id: block.id,
+        toolName: 'Bash',
+        command: typeof block.input?.command === 'string' ? block.input.command : undefined,
+        startedAt: Date.now()
+      });
+    } else if (DEFERRED_WORK_TOOLS.has(block.name)) {
+      const command = typeof block.input?.description === 'string'
+        ? block.input.description
+        : (typeof block.input?.prompt === 'string'
+          ? block.input.prompt
+          : (typeof block.input?.command === 'string' ? block.input.command : undefined));
+      tasks.push({
+        id: block.id,
+        toolName: block.name,
+        command,
+        startedAt: Date.now()
+      });
+    }
+  }
+  return tasks;
+}
+
+/**
  * Detects tool calls that keep working after the turn's `result` arrives.
  *
  * Only turns that start background work need their CLI process held open; every
@@ -616,20 +658,7 @@ const DEFERRED_WORK_TOOLS = new Set(['Monitor', 'ScheduleWakeup', 'CronCreate', 
  * @returns {boolean} True when the message launches work that outlives the turn
  */
 function startsBackgroundWork(sdkMessage) {
-  const content = sdkMessage?.message?.content;
-  if (!Array.isArray(content)) {
-    return false;
-  }
-
-  return content.some((block) => {
-    if (block?.type !== 'tool_use') {
-      return false;
-    }
-    if (block.name === 'Bash') {
-      return block.input?.run_in_background === true;
-    }
-    return DEFERRED_WORK_TOOLS.has(block.name);
-  });
+  return extractBackgroundTasks(sdkMessage).length > 0;
 }
 
 /**
@@ -808,6 +837,24 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   if (sessionKey()) {
     getSession(sessionKey())?.releaseInput?.();
   }
+
+  const activeBackgroundTasks = new Map();
+  const broadcastBackgroundTasks = () => {
+    const list = Array.from(activeBackgroundTasks.values());
+    if (sessionKey()) {
+      const sess = getSession(sessionKey());
+      if (sess) {
+        sess.backgroundTasks = list;
+      }
+    }
+    ws?.send?.(createNormalizedMessage({
+      kind: 'status',
+      text: 'background_tasks',
+      backgroundTasks: list,
+      sessionId: capturedSessionId || sessionId || null,
+      provider: 'claude'
+    }));
+  };
 
   // Arms (or re-arms) the idle countdown that eventually closes stdin.
   const scheduleRelease = () => {
@@ -1060,8 +1107,13 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         }
       }
 
-      if (startsBackgroundWork(message)) {
+      const startedTasks = extractBackgroundTasks(message);
+      if (startedTasks.length > 0) {
         backgroundWorkPending = true;
+        for (const t of startedTasks) {
+          activeBackgroundTasks.set(t.id, t);
+        }
+        broadcastBackgroundTasks();
       }
 
       if (message.type === 'result') {
@@ -1106,6 +1158,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
           // Either nothing was backgrounded, or the background work just
           // reported in — let the CLI exit now, as it always has.
           heldForBackgroundWork = false;
+          if (activeBackgroundTasks.size > 0) {
+            activeBackgroundTasks.clear();
+            broadcastBackgroundTasks();
+          }
           releasePromptStream();
         }
       } else if (idleReleaseTimer) {
@@ -1217,6 +1273,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       clearTimeout(idleReleaseTimer);
       idleReleaseTimer = null;
     }
+    if (activeBackgroundTasks.size > 0) {
+      activeBackgroundTasks.clear();
+      broadcastBackgroundTasks();
+    }
     releasePromptStream();
   }
 }
@@ -1318,12 +1378,25 @@ function reconnectSessionWriter(sessionId, newRawWs) {
   return true;
 }
 
+/**
+ * Gets currently active background tasks for a session.
+ * @param {string} sessionId - Session identifier
+ * @returns {Array<import('../../../../shared/types.js').ActiveBackgroundTask>} Active background task records
+ */
+function getBackgroundTasksForSession(sessionId) {
+  const session = getSession(sessionId);
+  return session?.backgroundTasks || [];
+}
+
 export const claudeRuntime = {
   run: queryClaudeSDK,
   abort: abortClaudeSDKSession,
   permissions: {
     resolve: resolveToolApproval,
     listPending: getPendingApprovalsForSession,
+  },
+  backgroundTasks: {
+    list: getBackgroundTasksForSession,
   },
 };
 
@@ -1335,6 +1408,7 @@ export {
   getActiveClaudeSDKSessions,
   resolveToolApproval,
   getPendingApprovalsForSession,
+  getBackgroundTasksForSession,
   reconnectSessionWriter,
   extractTokenBudget,
   extractCumulativeTokenBudget

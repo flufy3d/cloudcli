@@ -40,6 +40,7 @@ export type ChatSubscribedEvent = {
    * dismiss.
    */
   pendingPermissions: unknown[];
+  backgroundTasks?: import('./chatEvents.js').ActiveBackgroundTask[];
   timestamp: string;
 };
 

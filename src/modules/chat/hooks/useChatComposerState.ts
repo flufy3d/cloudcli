@@ -23,6 +23,7 @@ import {
   type QueuedSendOptions,
 } from '@/modules/chat/utils/chatStorage';
 import type {
+  ActiveBackgroundTask,
   ChatAttachment,
   ChatMessage,
   PendingPermissionRequest,
@@ -52,6 +53,8 @@ type UseChatComposerStateArgs = {
   currentProviderModel: string;
   currentProviderEffort: string;
   isLoading: boolean;
+  backgroundTasks?: ActiveBackgroundTask[];
+  hasActiveBackgroundTasks?: boolean;
   processingSessions?: SessionActivityMap;
   canAbortSession: boolean;
   tokenBudget: Record<string, unknown> | null;
@@ -288,6 +291,8 @@ export function useChatComposerState({
   currentProviderModel,
   currentProviderEffort,
   isLoading,
+  backgroundTasks = [],
+  hasActiveBackgroundTasks = false,
   processingSessions,
   canAbortSession,
   tokenBudget,
@@ -326,6 +331,7 @@ export function useChatComposerState({
     ((
       event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
       queuedSubmission?: QueuedDraft,
+      isForced?: boolean,
     ) => Promise<boolean>) | null
   >(null);
   const inputValueRef = useRef(input);
@@ -775,6 +781,7 @@ export function useChatComposerState({
     async (
       event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
       queuedSubmission?: QueuedDraft,
+      isForced?: boolean,
     ): Promise<boolean> => {
       event.preventDefault();
       const currentInput = queuedSubmission?.content ?? inputValueRef.current;
@@ -813,10 +820,38 @@ export function useChatComposerState({
       }
 
       try {
-        // A turn is already in flight: stash this message instead of sending it.
+        // Intercept slash commands only when "/" is the first input character.
+        // Also accept exact "help" as a convenience alias for users who expect CLI-style help.
+        // Pure local commands (built-in modals, help, etc.) execute immediately without queueing.
+        const commandInput = currentInput.trimEnd();
+        const isHelpAlias = commandInput.trim().toLowerCase() === 'help';
+        if (commandInput.startsWith('/') || isHelpAlias) {
+          const firstSpace = commandInput.indexOf(' ');
+          const commandName = isHelpAlias
+            ? '/help'
+            : firstSpace > 0 ? commandInput.slice(0, firstSpace) : commandInput;
+          const matchedCommand =
+            slashCommands.find((cmd: SlashCommand) => cmd.name === commandName) ||
+            (commandName === '/help'
+              ? ({
+                  name: '/help',
+                  description: 'Show help documentation for Claude Code',
+                  namespace: 'builtin',
+                  metadata: { type: 'builtin' },
+                } as SlashCommand)
+              : undefined);
+          if (matchedCommand && matchedCommand.type !== 'skill') {
+            executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput);
+            recordSentMessage(currentInput);
+            return true;
+          }
+        }
+
+        // A turn or background work is already in flight: stash this message instead of sending it.
         // Upload attached files now so the queued record contains durable image
         // descriptors that can be sent even if another session is open later.
-        if (isLoading) {
+        const isBusy = isLoading || Boolean(hasActiveBackgroundTasks);
+        if (isBusy && !isForced) {
           // A run can restart in the tiny gap between scheduling and flushing a
           // queued submission. Put the same durable draft back without uploading
           // its files again.
@@ -837,10 +872,22 @@ export function useChatComposerState({
             throw new ComposerSubmitError(`Failed to upload files: ${message}`);
           }
 
+          // If there is already a queued draft, append new content rather than silently overwriting it
+          const existingDraft = queuedDraft;
+          const mergedContent = existingDraft?.content
+            ? `${existingDraft.content}\n\n${currentInput}`
+            : currentInput;
+          const mergedAttachments = existingDraft?.attachments
+            ? [...existingDraft.attachments, ...currentAttachments]
+            : currentAttachments;
+          const mergedUploadedAttachments = existingDraft?.uploadedAttachments
+            ? [...existingDraft.uploadedAttachments, ...uploadedAttachments]
+            : uploadedAttachments;
+
           const durableDraft: QueuedDraft = {
-            content: currentInput,
-            attachments: currentAttachments,
-            uploadedAttachments,
+            content: mergedContent,
+            attachments: mergedAttachments,
+            uploadedAttachments: mergedUploadedAttachments,
             options: queuedOptions,
           };
           if (queuedSessionKey) {
@@ -884,32 +931,6 @@ export function useChatComposerState({
           queuedDraftSessionRef.current = queuedSessionKey;
           setQueuedDraft(durableDraft);
           return true;
-        }
-
-        // Intercept slash commands only when "/" is the first input character.
-        // Also accept exact "help" as a convenience alias for users who expect CLI-style help.
-        const commandInput = currentInput.trimEnd();
-        const isHelpAlias = commandInput.trim().toLowerCase() === 'help';
-        if (commandInput.startsWith('/') || isHelpAlias) {
-          const firstSpace = commandInput.indexOf(' ');
-          const commandName = isHelpAlias
-            ? '/help'
-            : firstSpace > 0 ? commandInput.slice(0, firstSpace) : commandInput;
-          const matchedCommand =
-            slashCommands.find((cmd: SlashCommand) => cmd.name === commandName) ||
-            (commandName === '/help'
-              ? ({
-                  name: '/help',
-                  description: 'Show help documentation for Claude Code',
-                  namespace: 'builtin',
-                  metadata: { type: 'builtin' },
-                } as SlashCommand)
-              : undefined);
-          if (matchedCommand && matchedCommand.type !== 'skill') {
-            executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput);
-            recordSentMessage(currentInput);
-            return true;
-          }
         }
 
         const messageContent = currentInput;
@@ -1011,6 +1032,7 @@ export function useChatComposerState({
           content: messageContent,
           options: {
             ...(queuedSubmission?.options ?? buildSendOptions(messageContent)),
+            ...(isForced ? { forceInterrupt: true } : {}),
             attachments: uploadedAttachments,
           },
         });
@@ -1052,6 +1074,7 @@ export function useChatComposerState({
       currentSessionId,
       executeCommand,
       isLoading,
+      hasActiveBackgroundTasks,
       onSessionProcessing,
       onSessionEstablished,
       provider,
@@ -1074,11 +1097,12 @@ export function useChatComposerState({
   // Once the in-flight turn ends, replay the queued draft through the normal
   // submit path. The draft itself is passed directly so submission never
   // depends on React committing restored attachment state first.
-  const wasLoadingRef = useRef(isLoading);
+  const isBusy = isLoading || Boolean(hasActiveBackgroundTasks);
+  const wasBusyRef = useRef(isBusy);
   const flushSessionKeyRef = useRef(sessionKey);
   useEffect(() => {
-    const wasLoading = wasLoadingRef.current;
-    wasLoadingRef.current = isLoading;
+    const wasBusy = wasBusyRef.current;
+    wasBusyRef.current = isBusy;
 
     // A session switch changes which session `isLoading` describes, so this
     // transition says nothing about the queued draft's own session. Never
@@ -1091,7 +1115,7 @@ export function useChatComposerState({
 
     // A manual submit in flight owns the latch; flushing now would be refused.
     // This effect re-runs when it finishes, which is the retry.
-    if (isLoading || isSubmitting || !queuedDraft) {
+    if (isBusy || isSubmitting || !queuedDraft) {
       return;
     }
 
@@ -1099,7 +1123,7 @@ export function useChatComposerState({
     // saved draft restored into an apparently idle session — hold it briefly
     // so the `chat_subscribed` ack can flip `isLoading` if a run is actually
     // still live (the cleanup below cancels the send in that case).
-    const delay = wasLoading ? 0 : 750;
+    const delay = wasBusy ? 0 : 750;
     const timer = setTimeout(() => {
       // The saved key is the claim ticket shared with the app-level auto-send
       // (which handles sessions that finish while not viewed). If it's gone,
@@ -1122,7 +1146,7 @@ export function useChatComposerState({
       });
     }, delay);
     return () => clearTimeout(timer);
-  }, [isLoading, isSubmitting, queuedDraft, sessionKey]);
+  }, [isBusy, isSubmitting, queuedDraft, sessionKey]);
 
   const editQueuedDraft = useCallback(() => {
     if (!queuedDraft) {
@@ -1137,6 +1161,24 @@ export function useChatComposerState({
   const deleteQueuedDraft = useCallback(() => {
     setQueuedDraft(null);
   }, []);
+
+  const forceSendQueuedDraft = useCallback(() => {
+    if (!queuedDraft) {
+      return;
+    }
+    const draft = queuedDraft;
+    setQueuedDraft(null);
+    if (sessionKey) {
+      clearQueuedMessage(sessionKey);
+    }
+    const submitted = handleSubmitRef.current?.(createFakeSubmitEvent(), draft, true);
+    void submitted?.then((accepted) => {
+      if (!accepted) {
+        queuedDraftSessionRef.current = sessionKey;
+        setQueuedDraft(draft);
+      }
+    });
+  }, [queuedDraft, sessionKey]);
 
   // A voice transcript either fills the input (to edit before sending) or, when the
   // user tapped "stop and send", is submitted straight away. updateInput mirrors
@@ -1441,6 +1483,9 @@ export function useChatComposerState({
     queuedDraft,
     editQueuedDraft,
     deleteQueuedDraft,
+    forceSendQueuedDraft,
+    backgroundTasks,
+    hasActiveBackgroundTasks,
     handleVoiceTranscript,
     handleInputChange,
     handleKeyDown,

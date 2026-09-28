@@ -32,6 +32,7 @@ const NORMALIZED_MESSAGE_KEYS = [
   'aborted',
   'actualSessionId',
   'anchorId',
+  'backgroundTasks',
   'canInterrupt',
   'commandArgs',
   'commandMessage',

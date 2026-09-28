@@ -1491,3 +1491,30 @@ test('a full reload that already holds the prompt still retires it', async () =>
     1,
   );
 });
+
+test('updates backgroundTasks when chat_subscribed or status frame carries backgroundTasks', () => {
+  const store = new SessionTimelineStore();
+  assert.deepEqual(store.getBackgroundTasks(SESSION_ID), []);
+
+  emit(store, {
+    kind: 'chat_subscribed',
+    sessionId: SESSION_ID,
+    isProcessing: false,
+    lastSeq: 0,
+    stale: false,
+    pendingPermissions: [],
+    backgroundTasks: [
+      { id: 'task-1', toolName: 'Bash', command: 'npm test', startedAt: 12345 },
+    ],
+  });
+  assert.equal(store.getBackgroundTasks(SESSION_ID).length, 1);
+  assert.equal(store.getBackgroundTasks(SESSION_ID)[0]?.command, 'npm test');
+
+  emit(store, {
+    kind: 'status',
+    sessionId: SESSION_ID,
+    text: 'background_tasks',
+    backgroundTasks: [],
+  });
+  assert.deepEqual(store.getBackgroundTasks(SESSION_ID), []);
+});

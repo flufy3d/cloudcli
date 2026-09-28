@@ -117,6 +117,8 @@ function ChatInterface({
     handleScroll,
     stickToBottom,
     requestLatestMessages,
+    backgroundTasks,
+    hasActiveBackgroundTasks,
   } = useChatSessionState({
     isActive,
     selectedProject,
@@ -200,6 +202,7 @@ function ChatInterface({
     commandModalPayload,
     closeCommandModal,
     showCostModal,
+    forceSendQueuedDraft,
   } = useChatComposerState({
     selectedProject,
     selectedSession,
@@ -225,6 +228,8 @@ function ChatInterface({
     addMessage,
     setPendingPermissionRequests,
     resolvePermissionModeForProvider,
+    backgroundTasks,
+    hasActiveBackgroundTasks,
   });
 
   // On WebSocket reconnect, request a bounded persisted-tail sync (deferred
@@ -523,6 +528,9 @@ function ChatInterface({
           placeholder={t('input.placeholder', { provider: selectedProviderLabel })}
           isTextareaExpanded={isTextareaExpanded}
           sendByCtrlEnter={sendByCtrlEnter}
+          backgroundTasks={backgroundTasks}
+          hasActiveBackgroundTasks={hasActiveBackgroundTasks}
+          onForceSendQueuedDraft={forceSendQueuedDraft}
         />
         </div>
       </div>
