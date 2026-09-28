@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs, { promises as fsPromises } from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 
 import mime from 'mime-types';
 import multer from 'multer';
@@ -43,6 +44,30 @@ function readFileSystemConcurrency(): number {
  */
 function getExternalTempRoots(): string[] {
   return Array.from(new Set([os.tmpdir(), '/tmp']));
+}
+
+/**
+ * Operator-configured extra read-only roots from `CLOUDCLI_EXTRA_READ_ROOTS`,
+ * separated by the platform path delimiter (`;` on Windows, `:` elsewhere).
+ * Lets chat links to tool caches outside the workspace (for example a
+ * screenshot cache under the home directory) open in the editor. Relative
+ * entries are dropped because they would silently resolve against the server
+ * cwd; list narrow directories, never the whole home, since every file under
+ * a root becomes readable.
+ */
+function getConfiguredExtraReadRoots(): string[] {
+  const configuredRoots = (process.env.CLOUDCLI_EXTRA_READ_ROOTS ?? '')
+    .split(path.delimiter)
+    .map((rootPath) => rootPath.trim())
+    .filter(Boolean);
+
+  return configuredRoots.filter((rootPath) => {
+    if (path.isAbsolute(rootPath)) {
+      return true;
+    }
+    console.warn(`[file-tree] Ignoring non-absolute CLOUDCLI_EXTRA_READ_ROOTS entry: ${rootPath}`);
+    return false;
+  });
 }
 
 /**
@@ -109,14 +134,16 @@ const fileTreeServices = createFileTreeService({
   // Antigravity uses brain directories, Claude uses its per-project tree, and
   // ZCode uses narrow memory/skill/instruction paths. Attachments live in
   // ~/.cloudcli/assets, while provider runtimes stage temporary reports under
-  // OS temp directories. The editor may open these roots read-only without
-  // widening project-scoped write access.
+  // OS temp directories; operators may add more via CLOUDCLI_EXTRA_READ_ROOTS.
+  // The editor may open these roots read-only without widening project-scoped
+  // write access.
   externalReadOnlyRoots: [
     ...getAntigravityBrainRoots(),
     ...getClaudeExternalReadOnlyRoots(),
     getGlobalImageAssetsDir(),
     ...getExternalTempRoots(),
     ...getZcodeExternalReadOnlyRoots(),
+    ...getConfiguredExtraReadRoots(),
   ],
 });
 
