@@ -55,6 +55,7 @@
   - **自动释放**：后台任务结束且无新状态阻塞时，composer 的 flush 效应自动解冻排队草稿并发出。
   - **强制中断逃生通道**：排队卡片提供 `forceSendQueuedDraft`（`isForced: true`），允许用户在需要时显式跳过等待，以 `forceInterrupt: true` 打断后台任务并立即发送。
   - **可视化呈现**：输入框上方通过 `BackgroundTaskIndicator` 实时展示运行中的后台任务（工具名、命令、动态已用时间）。
+  - **完工庆祝防误报**：`useChatRealtimeHandlers` 在收到 `complete` 时，若会话仍有活跃后台任务，则暂不触发完工音效（`playChatCompletionSound`）与窗口标题提示（`showCompletionTitleIndicator`）；待后台任务全部清空（通过 `status(background_tasks: [])`）时统一触发，防止用户误以为全部工作已结束。
 
 ## run 的结束原因（诊断契约）
 

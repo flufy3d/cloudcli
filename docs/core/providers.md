@@ -260,6 +260,8 @@ id 必须字节相同。** 这条有两道闸门守着：
 
 - **一次性 CLI 的异步任务会被静默掐死**：`agy` 的一次性 print 模式（`agy -p "<prompt>"`）在 root agent 转入 idle 后只等几秒就关停整个 CLI，日志为 `root agent idle; waiting up to 5s for N background task(s)` → `terminating N background task(s) on exit`。子代理和被放到后台执行的 `run_command` 都在这里死掉，而 CLI 仍然吐出 `status: SUCCESS`，于是前端收到 complete、任务看着「做完了」，真正的结果永远不会回来。antigravity runtime 因此把这一轮的 prompt 作为一行 NDJSON（`{"event":"user","message":{"content":"…"}}`）写进 stdin 并用 `--input-format stream-json` 启动：stdin 保持打开 → CLI 不自行关停 → 异步任务跑完，结果照常从 stream 回流；收到 `result` 事件后再关闭 stdin 让进程退出。**prompt 一旦退回 argv，这个保护就没了。**
 
+  更进一步，当 root agent 产生子代理（`invoke_subagent`）或启动后台命令（`run_command`）时，`agy` 在主 turn 结束时仍会先吐出一个 `event: result`。若此时直接关闭 stdin 发送 `complete`，子代理与后台进程同样会被杀，且前端会误报任务已完成。antigravity runtime 通过 `extractAntigravityBackgroundTasks` 从 `step_update` 识别活跃任务；在 `event: result` 时若仍有任务在跑，则标记 `heldForBackgroundWork = true` 暂不关 stdin 且抑制 `complete`；直到检测到任务完成通知（`<SYSTEM_MESSAGE> sender=<taskId>` 或 `Task id ... finished`）且活跃任务清空后，才释放 stdin 并发出真正的 `complete`。同时 runtime 暴露 `backgroundTasks.list(sessionId)` 切面供状态查询与输入排队使用。
+
   代价是超时责任转移到了服务端：`--print-timeout` 在该模式下不生效（实测一轮带 `20s` 上限的 run 在 result 之后依然存活，直到 stdin 关闭才退出），而 stdin 又由我们持有，所以 result 事件一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住。runtime 因此自带一个**以 stdout 活动续期的看门狗**，取值就是 `printTimeout`，到期 SIGTERM 并按失败收尾。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 等于又一次把异步工作掐死，所以只有真正的 result 才关。
 
   接新的 CLI 引擎时先问两句：它的非交互模式在主循环 idle 之后如何处置未完成的后台任务；以及谁为「进程永远不退」兜底。

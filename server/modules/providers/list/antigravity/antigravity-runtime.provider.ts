@@ -22,6 +22,7 @@ import {
 } from '@/shared/image-attachments.js';
 import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type {
+  ActiveBackgroundTask,
   AnyRecord,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
@@ -117,6 +118,80 @@ let keylessRunCounter = 0;
 const abortedProcessKeys = new Set<string>();
 
 /**
+ * Tracks currently active background tasks (subagents, background run_command) per session.
+ */
+const activeSessionBackgroundTasks = new Map<string, Map<string, ActiveBackgroundTask>>();
+
+export function getAntigravityBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
+  const tasks = activeSessionBackgroundTasks.get(sessionId);
+  return tasks ? Array.from(tasks.values()) : [];
+}
+
+/**
+ * Extracts active background tasks from an Antigravity step update.
+ */
+export function extractAntigravityBackgroundTasks(step: AnyRecord): ActiveBackgroundTask[] {
+  if (!step || typeof step !== 'object') return [];
+  const stepType = readOptionalString(step.step_type);
+  if (stepType !== 'tool') return [];
+
+  const toolName = readOptionalString(step.tool_name);
+  const toolInfo = readObjectRecord(step.tool_info);
+  const output = readOptionalString(toolInfo?.output) ?? '';
+  const parameters = readObjectRecord(toolInfo?.parameters) ?? {};
+  const tasks: ActiveBackgroundTask[] = [];
+
+  if (toolName === 'invoke_subagent') {
+    // Look for all conversationIds in the output
+    const subagents = Array.isArray(parameters.Subagents) ? parameters.Subagents : [];
+    const conversationMatches = Array.from(output.matchAll(/"conversationId":\s*"([^"]+)"/g));
+    conversationMatches.forEach((match, index) => {
+      const conversationId = match[1];
+      const subagentData = readObjectRecord(subagents[index]) ?? readObjectRecord(subagents[0]);
+      const role = readOptionalString(subagentData?.Role) ?? 'Subagent';
+      tasks.push({
+        id: conversationId,
+        toolName: 'Subagent',
+        command: role,
+        description: role,
+        startedAt: Date.now(),
+      });
+    });
+  } else if (toolName === 'run_command') {
+    // Look for task id in the output
+    const match = output.match(/Tool is running as a background task with task id:\s*([^\s\n]+)/);
+    if (match && match[1]) {
+      const taskId = match[1].trim();
+      const commandLine = readOptionalString(parameters.CommandLine) ?? taskId;
+      tasks.push({
+        id: taskId,
+        toolName: 'Command',
+        command: commandLine,
+        startedAt: Date.now(),
+      });
+    }
+  }
+
+  return tasks;
+}
+
+/**
+ * Detects whether an incoming message announces the completion or cancellation of a tracked task.
+ */
+export function isAntigravityTaskCompletionMessage(message: string, taskId: string): boolean {
+  if (typeof message !== 'string' || !taskId) return false;
+  const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Standard Antigravity system message header: sender=<taskId>
+  const senderRegex = new RegExp(`sender=${escaped}(?:\\s|$)`);
+  if (senderRegex.test(message)) return true;
+
+  // Explicit completion or cancellation messages
+  const finishedRegex = new RegExp(`Task id "${escaped}" finished`);
+  const canceledRegex = new RegExp(`Task id "${escaped}" was canceled`);
+  return finishedRegex.test(message) || canceledRegex.test(message);
+}
+
+/**
  * How much of the child's stderr is retained for failure reporting. agy
  * writes actionable errors (auth failures, bad flags, quota) to stderr only;
  * the tail is what the user sees when the run fails.
@@ -157,6 +232,10 @@ const isStreamInterruptedNotice = (message: string | null | undefined): boolean 
 };
 
 export class AntigravityRuntimeProvider implements IProviderRuntime {
+  readonly backgroundTasks = {
+    list: (sessionId: string) => getAntigravityBackgroundTasksForSession(sessionId),
+  };
+
   /**
    * Executes a command using the Antigravity CLI.
    */
@@ -218,6 +297,26 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       let watchdogExpired = false;
 
       const processKey = sessionId || capturedSessionId || `agy_${Date.now()}_${keylessRunCounter += 1}`;
+      const sessionKey = sessionId || capturedSessionId || processKey;
+      let sessionTasks = activeSessionBackgroundTasks.get(sessionKey);
+      if (!sessionTasks) {
+        sessionTasks = new Map<string, ActiveBackgroundTask>();
+        activeSessionBackgroundTasks.set(sessionKey, sessionTasks);
+      }
+      let heldForBackgroundWork = false;
+
+      const broadcastBackgroundTasks = () => {
+        const tasksArray = Array.from(sessionTasks?.values() ?? []);
+        writer.send(createNormalizedMessage({
+          id: generateMessageId(PROVIDER),
+          kind: 'status',
+          text: 'background_tasks',
+          backgroundTasks: tasksArray,
+          sessionId: capturedSessionId || sessionId || null,
+          provider: PROVIDER,
+        }));
+      };
+
       // Numbers the interrupted-stream notices of this run so two of them
       // cannot collide on one id.
       let streamInterruptedNoticeCount = 0;
@@ -272,10 +371,23 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
                 : describeFailure(code)),
           });
         }
+        if (sessionTasks) {
+          sessionTasks.clear();
+        }
+        activeSessionBackgroundTasks.delete(finalSessionId);
+        if (sessionId) activeSessionBackgroundTasks.delete(sessionId);
+        if (capturedSessionId) activeSessionBackgroundTasks.delete(capturedSessionId);
       };
 
       const enginePath = tryResolveEnginePath();
       if (!enginePath) {
+        if (sessionTasks) {
+          sessionTasks.clear();
+        }
+        activeSessionBackgroundTasks.delete(sessionKey);
+        if (sessionId) activeSessionBackgroundTasks.delete(sessionId);
+        if (capturedSessionId) activeSessionBackgroundTasks.delete(capturedSessionId);
+
         const notInstalledMsg = createNormalizedMessage({
           id: generateMessageId(PROVIDER),
           kind: 'error',
@@ -397,6 +509,22 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       const processLine = (line: string) => {
         if (!line || !line.trim()) return;
 
+        // Check for task completion against line content first, before JSON parsing,
+        // because task completion notices (e.g. <SYSTEM_MESSAGE> or task finished text)
+        // are emitted as plain text lines by agy.
+        if (sessionTasks.size > 0) {
+          let tasksChanged = false;
+          for (const [taskId] of Array.from(sessionTasks.entries())) {
+            if (isAntigravityTaskCompletionMessage(line, taskId)) {
+              sessionTasks.delete(taskId);
+              tasksChanged = true;
+            }
+          }
+          if (tasksChanged) {
+            broadcastBackgroundTasks();
+          }
+        }
+
         let raw: unknown;
         try {
           raw = JSON.parse(line);
@@ -426,6 +554,9 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             const convId = readOptionalString(rawRecord.conversation_id);
             if (convId && !capturedSessionId) {
               capturedSessionId = convId;
+              if (sessionTasks) {
+                activeSessionBackgroundTasks.set(capturedSessionId, sessionTasks);
+              }
               writer.setSessionId?.(capturedSessionId);
 
               if (!providerSessionId && !sessionCreatedSent) {
@@ -445,6 +576,16 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
 
           // Extract and broadcast token budget from step_update or result
           const stepUpdateRecord = readObjectRecord(rawRecord?.step_update);
+          if (stepUpdateRecord) {
+            const startedTasks = extractAntigravityBackgroundTasks(stepUpdateRecord);
+            if (startedTasks.length > 0) {
+              for (const task of startedTasks) {
+                sessionTasks.set(task.id, task);
+              }
+              broadcastBackgroundTasks();
+            }
+          }
+
           const resultRecord = readObjectRecord(rawRecord?.result);
           const usageRecord = readObjectRecord(resultRecord?.usage ?? stepUpdateRecord?.usage ?? rawRecord?.usage);
 
@@ -513,18 +654,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             const isError = resultData?.status === 'ERROR' || Boolean(resultData?.error);
             const errorMessage = readOptionalString(resultData?.error);
 
-            // A finished turn releases the stdin that was holding the CLI
-            // open: agy exits on EOF and `close` settles the run. An
-            // interrupted-stream result is deliberately excluded — agy has
-            // injected its own continuation prompt and is still working, so
-            // closing stdin here would EOF the CLI mid-task and resurrect the
-            // very "async work silently killed" bug stdin ownership exists to
-            // prevent. Its eventual real result closes stdin instead, and the
-            // watchdog bounds the wait if that result never comes.
-            if (!(isError && isStreamInterruptedNotice(errorMessage))) {
-              closeStdinTurn();
-            }
-
             if (isError && isStreamInterruptedNotice(errorMessage)) {
               // agy reports a broken backend stream with this canned error and
               // simultaneously injects a continuation prompt into the
@@ -554,6 +683,28 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
                 provider: PROVIDER,
                 isError: true,
               }));
+            }
+
+            // If background tasks (subagents, run_command) are actively running,
+            // hold stdin open so agy does not terminate them, and defer the terminal
+            // complete event until all background work completes.
+            if (sessionTasks.size > 0) {
+              heldForBackgroundWork = true;
+              return;
+            }
+
+            heldForBackgroundWork = false;
+
+            // A finished turn releases the stdin that was holding the CLI
+            // open: agy exits on EOF and `close` settles the run. An
+            // interrupted-stream result is deliberately excluded — agy has
+            // injected its own continuation prompt and is still working, so
+            // closing stdin here would EOF the CLI mid-task and resurrect the
+            // very "async work silently killed" bug stdin ownership exists to
+            // prevent. Its eventual real result closes stdin instead, and the
+            // watchdog bounds the wait if that result never comes.
+            if (!(isError && isStreamInterruptedNotice(errorMessage))) {
+              closeStdinTurn();
             }
 
             if (!completeSent) {
@@ -784,6 +935,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
    * Aborts an active Antigravity session.
    */
   async abort(sessionId: string): Promise<boolean> {
+    activeSessionBackgroundTasks.delete(sessionId);
     const process = activeProcesses.get(sessionId);
     if (process) {
       console.info(`[AntigravityRuntime] Aborting session: ${sessionId}`);

@@ -15,6 +15,7 @@
  */
 
 import type {
+  ActiveBackgroundTask,
   LLMProvider,
   MemoryCitation,
   MessageKind,
@@ -107,11 +108,13 @@ export type MessageFieldsByKind = {
     success?: boolean;
     aborted?: boolean;
     tokens?: number;
+    backgroundTasks?: ActiveBackgroundTask[];
   };
   status: {
     text?: string;
     status?: string;
     tokenBudget?: unknown;
+    backgroundTasks?: ActiveBackgroundTask[];
   };
   permission_request: {
     requestId?: string;

@@ -78,6 +78,7 @@ export function useChatRealtimeHandlers({
   // listener so back-to-back permission events can dedupe and re-arm the
   // notification sound before React finishes a rerender.
   const pendingPermissionRequestsRef = useRef(pendingPermissionRequests);
+  const sessionHadBackgroundTasksRef = useRef<Map<string, boolean>>(new Map());
 
   useEffect(() => {
     pendingPermissionRequestsRef.current = pendingPermissionRequests;
@@ -177,14 +178,29 @@ export function useChatRealtimeHandlers({
             setPendingPermissionRequests([]);
           }
 
-          if (aborted) {
-            // Abort was requested — the complete event confirms it. No
-            // further UI action is needed beyond clearing the entry above.
-            return;
+          if (aborted || !success) {
+            if (sessionId) {
+              sessionHadBackgroundTasksRef.current.delete(sessionId);
+            }
+            if (aborted) {
+              // Abort was requested — the complete event confirms it. No
+              // further UI action is needed beyond clearing the entry above.
+              return;
+            }
           }
 
           // Celebrate only successful runs (failed runs end with success: false).
-          if (success) {
+          // If background tasks are still running, defer celebration until they complete.
+          const hasRunningBgTasks = Boolean(
+            sessionId && (sessionStore.getBackgroundTasks(sessionId)?.length ?? 0) > 0,
+          );
+          if (sessionId && hasRunningBgTasks) {
+            sessionHadBackgroundTasksRef.current.set(sessionId, true);
+          }
+          if (success && !hasRunningBgTasks) {
+            if (sessionId) {
+              sessionHadBackgroundTasksRef.current.delete(sessionId);
+            }
             showCompletionTitleIndicator();
             void playChatCompletionSound();
           }
@@ -201,6 +217,15 @@ export function useChatRealtimeHandlers({
         case 'status': {
           if (directive.text === 'token_budget' && directive.tokenBudget) {
             setTokenBudget(directive.tokenBudget as Record<string, unknown>);
+          } else if (directive.text === 'background_tasks' && directive.sessionId) {
+            const currentTasks = directive.backgroundTasks ?? [];
+            if (currentTasks.length > 0) {
+              sessionHadBackgroundTasksRef.current.set(directive.sessionId, true);
+            } else if (sessionHadBackgroundTasksRef.current.get(directive.sessionId)) {
+              sessionHadBackgroundTasksRef.current.delete(directive.sessionId);
+              showCompletionTitleIndicator();
+              void playChatCompletionSound();
+            }
           } else if (directive.text && directive.sessionId) {
             onSessionProcessing?.(directive.sessionId, {
               statusText: directive.text,
