@@ -17,14 +17,14 @@ type FlatFile = {
 
 // `diffInfo` is intentionally `any` so this resolver can wrap editor handlers
 // that expect a concrete diff payload type as well as generic callers.
-type OnFileOpen = (filePath: string, diffInfo?: any) => void;
+type OnFileOpen = (filePath: string, diffInfo?: any, line?: number | null) => void;
 
 const normalize = (value: string): string => value.replace(/\\/g, '/');
 
-// True for POSIX absolute paths and Windows drive-letter paths. Avoids Node's
-// `path` module, which the browser bundle does not provide.
-const isAbsolutePath = (value: string): boolean =>
-  value.startsWith('/') || /^[a-z]:\//i.test(value);
+// Backslashes are already normalized above, so a Windows path arrives as
+// `C:/…`; counting it as absolute lets a Windows server resolve it as-is and a
+// POSIX one answer an honest 404 instead of opening some other file.
+const isAbsoluteRef = (value: string): boolean => /^(\/|[A-Za-z]:\/)/.test(value);
 
 const flatten = (nodes: FileNode[], out: FlatFile[]): void => {
   for (const node of nodes) {
@@ -101,18 +101,23 @@ export function useFileOpenResolver(
   }, [projectId]);
 
   return useCallback(
-    (filePath: string, diffInfo?: any) => {
+    (filePath: string, diffInfo?: any, line?: number | null) => {
+      // Normalized once and used for every outcome: a reference picked up from
+      // link text can carry surrounding whitespace, which the API would take as
+      // part of the filename and answer with a 404.
       const ref = normalize(filePath).trim();
-      // Absolute paths (e.g. file:// links to workspace-external documents)
-      // name a concrete file the project tree cannot match; pass them through
-      // untouched so the editor can open them via the external read path.
-      if (isAbsolutePath(ref)) {
-        onFileOpen(filePath, diffInfo);
+      // An absolute path already names one exact file: matching it against the
+      // tree can only send it somewhere else — `/home/user/.config/NOTES.md`
+      // used to fall through to the filename match and silently open the
+      // project's own `NOTES.md`. A path that exists is unaffected; one that no
+      // longer does now reports that instead of opening a same-named file.
+      if (isAbsoluteRef(ref)) {
+        onFileOpen(ref, diffInfo, line);
         return;
       }
       void loadFiles().then((files) => {
         const match = findBestMatch(files, ref);
-        onFileOpen(match ?? filePath, diffInfo);
+        onFileOpen(match ?? ref, diffInfo, line);
       });
     },
     [loadFiles, onFileOpen],

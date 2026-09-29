@@ -5,16 +5,18 @@ import { useTranslation } from 'react-i18next';
 import LLMProviderLogo from '@/shared/ui/LLMProviderLogo';
 import { getProviderDisplayName } from '@/shared/providerDisplay';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/shared/ui/Collapsible';
-import type {DiffLine, 
+import type {
   ChatMessage,
   ClaudePermissionSuggestion,
+  DiffLine,
+  LLMProvider,
   PermissionGrantResult,
+  Project,
   Provider,
 } from '@/shared/types';
 import { formatUsageLimitText } from '@/modules/chat/utils/chatFormatting';
 import { parseErrorCardContent } from '@/modules/chat/utils/errorCardContent';
-import type { Project } from '@/shared/types';
-import { getToolConfig, isCommandTool, ToolRenderer, ToolErrorDisplay, shouldHideToolResult } from '@/modules/chat/tools';
+import { getToolConfig, isCommandTool, SubagentPanel, ToolRenderer, ToolErrorDisplay, WorkflowPanel, shouldHideToolResult } from '@/modules/chat/tools';
 import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRenderContext';
 import { Reasoning, ReasoningTrigger, ReasoningContent } from '@/shared/ui/ReasoningFork';
 
@@ -24,6 +26,7 @@ import { Markdown } from '@/modules/chat/transcript/Markdown';
 import { StreamingMarkdown } from '@/modules/chat/transcript/StreamingMarkdown';
 import { MemoryCitations } from '@/modules/chat/transcript/MemoryCitations';
 import MessageCopyControl from '@/modules/chat/transcript/MessageCopyControl';
+import MessageModelLabel from '@/modules/chat/transcript/MessageModelLabel';
 import MessageSpeakControl from '@/modules/chat/transcript/MessageSpeakControl';
 
 type ForkDiffLine = {
@@ -173,11 +176,41 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
             </div>
           )}
         </div>
+      ) : message.compact ? (
+        /* A compaction: one row, its numbers, and its summary folded into it */
+        <div className="w-full">
+          <div className="flex items-center gap-2 py-0.5">
+            <span
+              className={`inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${
+                message.compact.phase === 'running'
+                  ? 'animate-pulse bg-amber-400 dark:bg-amber-500'
+                  : message.compact.phase === 'failed'
+                    ? 'bg-red-400 dark:bg-red-500'
+                    : 'bg-gray-400 dark:bg-gray-500'
+              }`}
+            />
+            <span className="text-xs text-gray-500 dark:text-gray-400">
+              {message.content || t('chat:misc.compacted', 'Compacted')}
+            </span>
+          </div>
+          {message.compactSummary && (
+            <details className="ml-3.5 mt-0.5">
+              <summary className="cursor-pointer text-xs text-gray-500 hover:text-foreground dark:text-gray-400">
+                {t('chat:misc.compactionSummary', 'full summary')}
+              </summary>
+              <div className="mt-1">
+                <Markdown className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">
+                  {message.compactSummary}
+                </Markdown>
+              </div>
+            </details>
+          )}
+        </div>
       ) : message.isTaskNotification ? (
         /* Compact task notification on the left */
         <div className="w-full">
           <div className="flex items-center gap-2 py-0.5">
-            <span className={`inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${message.taskStatus === 'completed' ? 'bg-green-400 dark:bg-green-500' : 'bg-amber-400 dark:bg-amber-500'}`} />
+            <span className={`inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${message.taskNotificationStatus === 'completed' ? 'bg-green-400 dark:bg-green-500' : 'bg-amber-400 dark:bg-amber-500'}`} />
             <span className="text-xs text-gray-500 dark:text-gray-400">{message.summaryKey ? t(message.summaryKey) : message.content}</span>
           </div>
         </div>
@@ -221,7 +254,36 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
 
           <div className="w-full">
 
-            {message.isToolUse ? (
+            {message.isToolUse && message.toolName === 'Workflow' ? (
+              /* A workflow launch owns its whole card too. The anchor is what
+                 the background-tasks strip scrolls to. */
+              <div id={`tool-result-${message.toolId}`} className="scroll-mt-4">
+                <WorkflowPanel
+                  toolInput={message.toolInput}
+                  toolResult={message.toolResult}
+                  workflow={message.workflow}
+                  taskStatus={message.taskStatus}
+                  onFileOpen={onFileOpen}
+                  createDiff={createDiff}
+                  selectedProject={selectedProject}
+                />
+              </div>
+            ) : message.isSubagentContainer ? (
+              /* A spawned agent owns its whole card — header, timeline and
+                 result — so it never goes through the tool input/result pair. */
+              <div id={`tool-result-${message.toolId}`} className="scroll-mt-4">
+                <SubagentPanel
+                  toolInput={message.toolInput}
+                  toolResult={message.toolResult}
+                  subagent={message.subagent}
+                  taskStatus={message.taskStatus}
+                  activity={message.subagentActivity}
+                  onFileOpen={onFileOpen}
+                  createDiff={createDiff}
+                  selectedProject={selectedProject}
+                />
+              </div>
+            ) : message.isToolUse ? (
               <>
                 <div className="flex flex-col">
                   <div className="flex flex-col">
@@ -232,18 +294,24 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
                 </div>
 
                 {message.toolInput && (
-                  <ToolRenderer
-                    toolName={message.toolName || 'UnknownTool'}
-                    toolInput={message.toolInput}
-                    toolResult={message.toolResult}
-                    toolId={message.toolId}
-                    mode="input"
-                    onFileOpen={onFileOpen}
-                    createDiff={createDiff}
-                    selectedProject={selectedProject}
-                    showRawParameters={showRawParameters}
-                    rawToolInput={typeof message.toolInput === 'string' ? message.toolInput : undefined}
-                  />
+                  // Bash draws its output inside this row rather than in the
+                  // result section below, so for a backgrounded command this is
+                  // the row the background-tasks strip scrolls to.
+                  <div id={message.toolName === 'Bash' ? `tool-result-${message.toolId}` : undefined} className="scroll-mt-4">
+                    <ToolRenderer
+                      toolName={message.toolName || 'UnknownTool'}
+                      toolInput={message.toolInput}
+                      toolResult={message.toolResult}
+                      toolId={message.toolId}
+                      mode="input"
+                      onFileOpen={onFileOpen}
+                      createDiff={createDiff}
+                      selectedProject={selectedProject}
+                      showRawParameters={showRawParameters}
+                      rawToolInput={typeof message.toolInput === 'string' ? message.toolInput : undefined}
+                      toolStatus={message.toolStatus}
+                    />
+                  </div>
                 )}
 
                 {/* Tool Result Section — Bash/run_command/exec renders its output inside the command row above, and
@@ -469,6 +537,11 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
                 {shouldShowAssistantCopyControl && (
                   <MessageSpeakControl content={assistantCopyContent} />
                 )}
+                {/* Which model actually answered, as the provider recorded it
+                    on this row. Provenance rather than an affordance, so unlike
+                    copy and speak it is not gated on the copy control, and an
+                    exported transcript keeps it wherever the footer renders. */}
+                <MessageModelLabel model={message.model} />
                 {onForkFromMessage && turnAnchorMessage?.transcriptAnchorId && isTurnFinalAssistant && (
                   <button
                     type="button"

@@ -38,6 +38,21 @@ test('a Cursor session title comes from the same field as every other provider',
   assert.equal(getPageTitle(project, session), 'Cursor session name');
 });
 
+test('prefers the persisted summary of a Cursor session, as the sessions API returns it', () => {
+  // The sessions API carries every provider's custom name as `summary` and never
+  // sets `name`, so a renamed Cursor session must not fall through to the placeholder.
+  const session: ProjectSession = {
+    id: 'session-1',
+    summary: 'Cursor session renamed',
+    __provider: 'cursor',
+  };
+
+  assert.equal(getPageTitle(project, session), 'Cursor session renamed');
+  // This fork's title helper uses one placeholder for every provider: the
+  // Cursor `name` field no endpoint sends was dropped, not re-spelled.
+  assert.equal(getPageTitle(project, { id: 'session-2', summary: '', __provider: 'cursor' }), 'New Session');
+});
+
 test('falls back to the project title when no session is selected', () => {
   assert.equal(getPageTitle(project, null), 'My Project - CloudCLI UI');
 });

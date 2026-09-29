@@ -7,7 +7,9 @@ import type { ServerEvent,
   LLMProvider,
   LoadingProgress,
   Project,
-  ProjectSession,IsSessionProcessing } from '@/shared/types';
+  ProjectSession,
+  IsSessionProcessing,
+} from '@/shared/types';
 import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
 import {
   countLoadedProjectSessions,
@@ -15,7 +17,6 @@ import {
   mergeExpandedSessionPages,
   mergeSessionProviderLists,
   projectsHaveChanges,
-  removeSessionFromProject,
   serialize,
 } from '@/modules/project-workspace/utils/projectsMerge';
 import { readSelectedProvider } from '@/shared/selectedProvider';
@@ -97,6 +98,41 @@ type SessionDetailsApiPayload = {
 };
 
 type ProjectSessionPage = Pick<Project, 'sessions' | 'sessionMeta'>;
+
+const removeSessionFromProject = (project: Project, sessionIdToDelete: string): Project => {
+  const sessions = project.sessions ?? [];
+  const nextSessions = sessions.filter((session) => session.id !== sessionIdToDelete);
+  if (nextSessions.length === sessions.length) {
+    return project;
+  }
+  const updatedProject: Project = { ...project, sessions: nextSessions };
+  const totalSessions = Math.max(0, Number(project.sessionMeta?.total ?? 0) - 1);
+  updatedProject.sessionMeta = {
+    ...project.sessionMeta,
+    total: totalSessions,
+    hasMore: countLoadedProjectSessions(updatedProject) < totalSessions,
+  };
+  return updatedProject;
+};
+
+// Writes a confirmed rename onto the matching sidebar row. Returns the same
+// project when it holds no such row, or the row already carries that title, so
+// the sidebar list does not re-render for projects the rename did not touch.
+const renameSessionInProject = (project: Project, sessionIdToRename: string, summary: string): Project => {
+  const sessions = project.sessions ?? [];
+  let changed = false;
+  const nextSessions = sessions.map((session) => {
+    if (session.id !== sessionIdToRename || session.summary === summary) {
+      return session;
+    }
+    changed = true;
+    return { ...session, summary };
+  });
+  if (!changed) {
+    return project;
+  }
+  return { ...project, sessions: nextSessions };
+};
 
 const DEFAULT_PROVIDER: LLMProvider = 'claude';
 
@@ -1080,6 +1116,57 @@ export function useProjectsState({
     }
   }, [projects, selectedProject, selectedSession]);
 
+  /**
+   * Persists a new title for one session and writes it onto both local copies
+   * — the sidebar row in `projects` and the workspace header's `selectedSession`
+   * — the moment the backend confirms. The rename route only updates the DB; it
+   * does not broadcast a `session_upserted`, so nothing else would refresh the
+   * header. Patching in place rather than refetching also keeps every session
+   * page the sidebar has loaded past the first. The sidebar's Conversations
+   * list folds the new title in from `projects` itself.
+   *
+   * Resolves `false` when the backend refused the rename; transport errors
+   * propagate so the caller can tell the two apart, as the sidebar does.
+   */
+  const renameSession = useCallback(async (sessionIdToRename: string, summary: string): Promise<boolean> => {
+    const trimmed = summary.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    const response = await api.renameSession(sessionIdToRename, trimmed);
+    if (!response.ok) {
+      console.error('[Workspace] Failed to rename session:', response.status);
+      return false;
+    }
+
+    setProjects((previousProjects) => {
+      let changed = false;
+      const nextProjects = previousProjects.map((project) => {
+        const renamedProject = renameSessionInProject(project, sessionIdToRename, trimmed);
+        if (renamedProject !== project) {
+          changed = true;
+        }
+        return renamedProject;
+      });
+      return changed ? nextProjects : previousProjects;
+    });
+
+    setSelectedSession((previousSession) => {
+      if (previousSession?.id !== sessionIdToRename || previousSession.summary === trimmed) {
+        return previousSession;
+      }
+      // A session opened from a Conversations search hit carries the one-shot
+      // jump target the chat reads off every new `selectedSession` identity.
+      // Leave it behind, or the rename would scroll the transcript back to the
+      // matched message and flash the search highlight again.
+      const { __searchTargetSnippet: _snippet, __searchTargetTimestamp: _timestamp, ...session } = previousSession;
+      return { ...session, summary: trimmed };
+    });
+
+    return true;
+  }, []);
+
   const loadMoreProjectSessions = useCallback(async (projectId: string) => {
     const project = projects.find((candidate) => candidate.projectId === projectId);
     if (!project) {
@@ -1205,5 +1292,6 @@ export function useProjectsState({
     loadMoreProjectSessions,
     handleProjectDelete,
     handleSidebarRefresh,
+    renameSession,
   };
 }

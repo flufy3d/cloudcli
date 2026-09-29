@@ -622,11 +622,17 @@ async function queryCodex(
     }
 
     // Turns with image attachments send structured input items so Codex reads
-    // the images from their local asset paths.
+    // the images from their local asset paths. The CLI requires non-empty
+    // prompt text even when images carry the whole message, so an
+    // attachment-only turn gets a small text instruction.
     const promptWithFiles = appendFilesInputTag(command, files);
-    const inputItems = normalizeImageDescriptors(images).length > 0
-      ? buildCodexInputItems(promptWithFiles, images, workingDirectory)
-      : [{ type: 'text', text: promptWithFiles }];
+    const normalizedImages = normalizeImageDescriptors(images);
+    const promptForTurn = !promptWithFiles.trim() && normalizedImages.length > 0
+      ? 'Please analyze the attached image(s).'
+      : promptWithFiles;
+    const inputItems = normalizedImages.length > 0
+      ? buildCodexInputItems(promptForTurn, images, workingDirectory)
+      : [{ type: 'text', text: promptForTurn }];
 
     if (!capturedSessionId) {
       throw new Error('Codex app-server opened no thread to run the turn in.');

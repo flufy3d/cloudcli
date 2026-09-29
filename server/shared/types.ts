@@ -73,6 +73,8 @@ import type {
 } from '../../shared/protocol/quota.js';
 import type {
   ActiveBackgroundTask,
+  BackgroundTaskSummary,
+  CompactionInfo,
   GatewayEventKind,
   LLMProvider,
   MemoryCitation,
@@ -84,10 +86,17 @@ import type {
   SessionUpsertedProject,
   SubagentActivity,
   SubagentInfo,
+  TaskUsage,
+  WorkflowAgentActivity,
+  WorkflowAgentInfo,
+  WorkflowAgentProgress,
+  WorkflowInfo,
 } from '../../shared/protocol/chatEvents.js';
 
 export type {
   ActiveBackgroundTask,
+  BackgroundTaskSummary,
+  CompactionInfo,
   GatewayEventKind,
   LLMProvider,
   MemoryCitation,
@@ -99,6 +108,11 @@ export type {
   SessionUpsertedProject,
   SubagentActivity,
   SubagentInfo,
+  TaskUsage,
+  WorkflowAgentActivity,
+  WorkflowAgentInfo,
+  WorkflowAgentProgress,
+  WorkflowInfo,
 };
 
 
@@ -334,7 +348,6 @@ export type ProviderRuntimeWriter = {
   setSessionId?(sessionId: string): void;
   userId?: string | number | null;
   isWebSocketWriter?: boolean;
-  isSSEStreamWriter?: boolean;
 };
 
 export type ProviderPermissionDecision = {
@@ -366,6 +379,15 @@ export type ProviderRuntimeContext = {
   /** Optional provider hook for clearing incomplete real-time state at a terminal run outcome. */
   resetLiveMessageState?(sessionId: string): void;
   isProviderInstalled(): Promise<boolean>;
+  /**
+   * Builds the SDK query for a run. Production leaves this unset and the
+   * runtime uses the SDK's own; tests supply a scripted stream so the hold
+   * and background-work paths can be driven without a CLI process.
+   */
+  createQuery?: (input: { prompt: AsyncIterable<unknown>; options: AnyRecord }) => AsyncIterable<unknown> & {
+    interrupt(): Promise<void>;
+    stopTask?(taskId: string): Promise<void>;
+  };
 };
 
 export type ProviderRunFunction = (
@@ -580,6 +602,29 @@ export type UpsertProviderMcpServerInput = {
 // ---------------------------
 //----------------- PROVIDER AUTH TYPES ------------
 /**
+ * Records that an API-key style credential is taking precedence over a
+ * still-valid subscription login in `~/.claude/.credentials.json`.
+ *
+ * Claude Code always prefers `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` over
+ * the OAuth login written by `claude /login`, so when both exist every request
+ * is billed to the key (pay-as-you-go) rather than the subscription — usually
+ * without the user realising it. The Claude auth provider fills this in so the
+ * settings UI can say which variable won and where it was found; the fix
+ * differs per source (unset the variable and restart the server for
+ * `process_env`, edit the `env` block of `~/.claude/settings.json` for
+ * `settings_file`). It is never set when the login in the credentials file is
+ * missing or expired, because then nothing is being bypassed.
+ */
+export type ProviderAuthSubscriptionOverride = {
+  /** The environment variable Claude Code is using instead of the login. */
+  variable: 'ANTHROPIC_API_KEY' | 'ANTHROPIC_AUTH_TOKEN';
+  /** Where that variable was found: the server process env or the settings.json env block. */
+  source: 'process_env' | 'settings_file';
+  /** Email recorded in the credentials file for the bypassed login, when known. */
+  subscriptionEmail: string | null;
+};
+
+/**
  * Authentication status result returned by provider health checks.
  *
  * This shape is consumed by settings/status endpoints to report installation and
@@ -600,6 +645,12 @@ export type ProviderAuthStatus = {
    * to its own static per-provider command when absent.
    */
   loginCommand?: string | null;
+  /**
+   * Present only when `method` is `api_key` and a valid subscription login is
+   * being bypassed; see ProviderAuthSubscriptionOverride. Omitted otherwise so
+   * existing consumers that never look for it are unaffected.
+   */
+  subscriptionOverride?: ProviderAuthSubscriptionOverride;
 };
 
 // ---------------------------
@@ -683,12 +734,13 @@ export type WorkspacePathValidationResult = {
 };
 
 // ---------------------------
-//----------------- GIT WORKTREE MANAGEMENT ------------
+//----------------- GIT COMMAND EXECUTION AND WORKTREE MANAGEMENT ------------
 /**
  * Captured output of one completed `git` invocation.
  *
- * Returned by `GitCommandRunner` implementations so worktree services can read
- * both streams without caring about process plumbing.
+ * Returned by `GitCommandRunner` and `GitProcessRunner` implementations so the
+ * git and worktree services can read both streams without caring about
+ * process plumbing.
  */
 export type GitCommandResult = {
   stdout: string;
@@ -704,6 +756,20 @@ export type GitCommandResult = {
  * exit code.
  */
 export type GitCommandRunner = (args: string[], cwd: string) => Promise<GitCommandResult>;
+
+/**
+ * Executes `command args...` inside `options.cwd` and resolves with the captured output.
+ *
+ * This is the `spawnAsync` shape the Git routes module injects into its typed
+ * services (branch deletion, branch compare) so their tests can substitute a
+ * fake runner. Like `GitCommandRunner`, the promise must reject on a non-zero
+ * exit code, with `stderr` attached to the error when available.
+ */
+export type GitProcessRunner = (
+  command: string,
+  args: string[],
+  options: { cwd: string },
+) => Promise<GitCommandResult>;
 
 /**
  * One entry parsed from `git worktree list --porcelain`.
@@ -1028,6 +1094,13 @@ export type FileTreeProjectGateway = {
 export type FileTreeWorkspaceGateway = {
   rootPath: string;
   validatePath(candidatePath: string): Promise<WorkspacePathValidationResult>;
+  /**
+   * Resolves a path readable outside the workspace root — the system temp
+   * directory and the Claude projects directory — or `null` when it is not
+   * one. Read-only: the write policy is `validatePath` and it does not consult
+   * this.
+   */
+  resolveReadOnlyRootPath(candidatePath: string): Promise<string | null>;
 };
 
 /**

@@ -18,7 +18,7 @@ import {
     sessionsAutoArchiveService,
     shutdownZCodeRuntime,
 } from '@/modules/providers/index.js';
-import { createWebSocketServer } from '@/modules/websocket/index.js';
+import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/index.js';
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
@@ -106,6 +106,10 @@ const agentRoutes = createAgentModule({
 });
 
 // Single WebSocket server that handles chat, shell, and plugin proxy paths.
+// A completed run stays subscribable while its session's background work
+// (agents, workflows, backgrounded commands) is still reporting through it.
+chatRunRegistry.setRetentionGuard((sessionId) => providerRuntimeService.hasBackgroundWork(sessionId));
+
 createWebSocketServer(server, {
     verifyClient: {
         isPlatform: IS_PLATFORM,

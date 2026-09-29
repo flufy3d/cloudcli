@@ -1,7 +1,7 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
-import type { Project, ProjectSession } from '@/shared/types';
+import type { Project, ProjectSession, QuickSettingsTab, SlashCommand } from '@/shared/types';
 
 //----------------- DEPLOYMENT MODE ------------
 
@@ -205,6 +205,15 @@ const DEFAULT_PAGE_TITLE = 'CloudCLI UI';
  * there is nothing here to tell providers apart, and the Cursor branch that
  * used to read a `name` field no endpoint sends only hid the real label.
  */
+/** DOM id of a quick settings tab button; pairs with `getQuickSettingsTabPanelId`. */
+export const getQuickSettingsTabId = (tab: QuickSettingsTab): string => `quick-settings-tab-${tab}`;
+
+/** DOM id of the tabpanel a quick settings tab controls; pairs with `getQuickSettingsTabId`. */
+export const getQuickSettingsTabPanelId = (tab: QuickSettingsTab): string => `quick-settings-tabpanel-${tab}`;
+
+export const isSkillCommand = (command: SlashCommand): boolean =>
+  command.type === 'skill' || command.metadata?.type === 'skill';
+
 export const getSessionTitle = (session: ProjectSession): string =>
   (session.summary as string) || 'New Session';
 

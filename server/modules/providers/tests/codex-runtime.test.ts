@@ -7,6 +7,8 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -133,6 +135,33 @@ for (const resumed of [false, true]) {
     });
   }
 }
+
+test('an image-only turn sends a fallback prompt with the attachment', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  // Image sources must sit inside the run's working directory (the trust
+  // boundary buildCodexInputItems enforces), so the fixture lives under cwd.
+  const imageDirectory = await mkdtemp(path.join(process.cwd(), '.codex-image-test-'));
+  const imagePath = path.join(imageDirectory, 'shot.png');
+  await writeFile(imagePath, 'png');
+
+  try {
+    await codexRuntime.run('', {
+      cwd: process.cwd(),
+      images: [{ path: imagePath, mimeType: 'image/png' }],
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+
+    const turn = server.calls.find((call) => call.method === 'turn/start');
+    assert.ok(turn, 'the turn must start');
+    assert.deepEqual(turn.params.input, [
+      { type: 'text', text: 'Please analyze the attached image(s).', text_elements: [] },
+      { type: 'localImage', path: imagePath },
+    ]);
+    assert.ok(!messages.some((message) => message.kind === 'error'));
+  } finally {
+    await rm(imageDirectory, { recursive: true, force: true });
+  }
+});
 
 test('the live reply carries the item id the rollout will record', async (t) => {
   installFakeAppServer(t);

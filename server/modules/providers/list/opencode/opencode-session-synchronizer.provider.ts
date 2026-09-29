@@ -1,6 +1,7 @@
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 
 import { readJsonRecord, readOptionalString, unwrapJsonStringLiteral } from '@/shared/utils.js';
+import { sessionsDb } from '@/modules/database/index.js';
 
 import { SqliteSessionSynchronizer } from '../../shared/sessions/sqlite-session-synchronizer.provider.js';
 
@@ -15,6 +16,9 @@ type OpenCodeSessionRow = {
   worktree: string | null;
 };
 
+type OpenCodeChildSessionRow = {
+  id: string;
+};
 /**
  * Session indexer for OpenCode's SQLite-backed session store.
  *
@@ -28,8 +32,35 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
   protected readonly logTag = '[OpenCodeProvider]';
   protected readonly watchedFileBasenames = ['opencode.db', 'opencode.db-wal'];
 
+  /** Cleared once: rows a pre-`parent_id`-aware version indexed are deleted. */
+  private childSessionsPruned = false;
+
   constructor() {
     super('opencode');
+  }
+
+  async synchronize(since?: Date): Promise<number> {
+    // The first provider-wide scan also reconciles child rows indexed by
+    // older versions: subagent sessions must not surface in the sidebar.
+    // Best effort — no OpenCode database (or an unreadable one) simply means
+    // there are no child rows to prune, so the failure must not surface as a
+    // provider sync failure.
+    if (!this.childSessionsPruned) {
+      this.childSessionsPruned = true;
+      let db: Database.Database | null = null;
+      try {
+        db = new Database(this.getDatabasePath(), { readonly: true, fileMustExist: true });
+        const children = db.prepare('SELECT id FROM session WHERE parent_id IS NOT NULL').all() as OpenCodeChildSessionRow[];
+        for (const child of children) {
+          sessionsDb.deleteSessionByProviderSessionId(child.id, 'opencode');
+        }
+      } catch {
+        // No database, or one that cannot be opened: nothing to prune.
+      } finally {
+        db?.close();
+      }
+    }
+    return super.synchronize(since);
   }
 
   protected getDatabasePath(): string {
@@ -52,6 +83,7 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
       FROM session s
       LEFT JOIN project p ON p.id = s.project_id
       WHERE s.time_archived IS NULL
+        AND s.parent_id IS NULL
         AND (? IS NULL OR COALESCE(s.time_updated, s.time_created, 0) > ?)
       ORDER BY COALESCE(s.time_updated, s.time_created, 0) DESC, s.id DESC
       ${limit === null ? '' : 'LIMIT ?'}

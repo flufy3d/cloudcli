@@ -13,9 +13,9 @@ import {
   createCompleteMessage,
   createNormalizedMessage,
   flattenPromptForWindowsShell,
-  resolveModelEffort
+  resolveModelEffort,
+  stripAnsiSequences
 } from '@/shared/utils.js';
-
 import { getOpenCodeDatabasePath } from './opencode-data-root.js';
 
 // cross-spawn resolves .cmd shims/PATHEXT on Windows and delegates to
@@ -307,7 +307,10 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       });
 
       opencodeProcess.stderr.on('data', (data) => {
-        const stderrText = data.toString();
+        // opencode styles its stderr for a terminal; the chat renders plain
+        // text, so the escapes have to go before the text is surfaced. A chunk
+        // that was styling only cleans down to nothing and is not an error.
+        const stderrText = stripAnsiSequences(data.toString());
         if (!stderrText.trim()) {
           return;
         }

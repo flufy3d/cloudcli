@@ -4,7 +4,7 @@
  */
 
 import type { NormalizedMessage } from '@/modules/chat/hooks/useSessionStore';
-import type { ChatMessage } from '@/shared/types';
+import type { ChatMessage , LiveTaskStatus } from '@/shared/types';
 import { formatUsageLimitText } from '@/modules/chat/utils/chatFormatting';
 
 function formatToolResultContent(content: unknown): string {
@@ -72,10 +72,59 @@ function parseTaskNotification(content: string): ParsedTaskNotification | null {
 type ConversionCacheEntry = {
   /** Identity of whatever tool-result source fed this row's conversion. */
   attachedToolResult: unknown;
+  /** Newest live task-status row folded into this row's projection, when any. */
+  taskStatusSource: NormalizedMessage | null;
   outputs: ChatMessage[];
 };
 
 const conversionCache = new WeakMap<NormalizedMessage, ConversionCacheEntry>();
+
+/**
+ * Folds one live `task_status` event into the per-tool-call background-task
+ * state. Events arrive in order, so each one overwrites what it knows and
+ * keeps the rest: a `progress` event carries usage but not the workflow name
+ * the `started` event announced. `updated` names only the task id, so the id
+ * is remembered from the first event that paired it with its tool call; an
+ * event that cannot be tied to a call — an ambient task — has no card and is
+ * dropped.
+ */
+function foldTaskStatus(
+  msg: NormalizedMessage,
+  liveTasksByToolUseId: Map<string, LiveTaskStatus>,
+  toolUseIdByTaskId: Map<string, string>,
+  lastTaskSourceByToolUseId: Map<string, NormalizedMessage>,
+): void {
+  if (msg.taskId && msg.toolUseId) {
+    toolUseIdByTaskId.set(msg.taskId, msg.toolUseId);
+  }
+  const toolUseId = msg.toolUseId ?? (msg.taskId ? toolUseIdByTaskId.get(msg.taskId) : undefined);
+  if (!toolUseId) {
+    return;
+  }
+
+  const previous = liveTasksByToolUseId.get(toolUseId);
+  const settled = msg.status === 'completed' || msg.status === 'failed' || msg.status === 'stopped'
+    ? msg.status
+    : null;
+  // A workflow's first progress events report on no agents yet; an empty list
+  // must not wipe the last one that named them.
+  const agents = msg.agents?.length ? msg.agents : previous?.agents;
+  liveTasksByToolUseId.set(toolUseId, {
+    // A settled status is final. Short of one, `started` and `progress` mean
+    // the task is running, while an `updated` patch that does not change the
+    // status (an end time, say) leaves it where it was.
+    status: settled ?? (msg.event === 'started' || msg.event === 'progress' ? 'running' : previous?.status ?? 'running'),
+    taskId: msg.taskId ?? previous?.taskId,
+    taskType: msg.taskType ?? previous?.taskType,
+    workflowName: msg.workflowName ?? previous?.workflowName,
+    description: msg.description ?? previous?.description,
+    summary: msg.summary ?? previous?.summary,
+    usage: msg.usage ?? previous?.usage,
+    ...(agents ? { agents } : {}),
+  });
+  lastTaskSourceByToolUseId.set(toolUseId, msg);
+}
+
 
 /**
  * Convert NormalizedMessage[] from the session store into ChatMessage[]
@@ -88,11 +137,26 @@ const conversionCache = new WeakMap<NormalizedMessage, ConversionCacheEntry>();
 export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMessage[] {
   const converted: ChatMessage[] = [];
 
-  // First pass: collect tool results for attachment
+  // First pass: collect tool results for attachment, and fold the live word
+  // on each background task into the tool call that launched it. Both answer
+  // the same question — what has this call's work done since it launched —
+  // from different sides of a turn's end.
   const toolResultMap = new Map<string, NormalizedMessage>();
+  const liveTasksByToolUseId = new Map<string, LiveTaskStatus>();
+  const toolUseIdByTaskId = new Map<string, string>();
+  const lastTaskSourceByToolUseId = new Map<string, NormalizedMessage>();
   for (const msg of messages) {
     if (msg.kind === 'tool_result' && msg.toolId) {
       toolResultMap.set(msg.toolId, msg);
+      // A launch acknowledgement names its task, so an `updated` event for a
+      // task launched before this page loaded — which carries no tool-use id
+      // and follows no `started` event here — still finds its call.
+      const launchedTaskId = (msg.toolUseResult as { taskId?: unknown } | undefined)?.taskId;
+      if (typeof launchedTaskId === 'string' && launchedTaskId) {
+        toolUseIdByTaskId.set(launchedTaskId, msg.toolId);
+      }
+    } else if (msg.kind === 'task_status') {
+      foldTaskStatus(msg, liveTasksByToolUseId, toolUseIdByTaskId, lastTaskSourceByToolUseId);
     }
   }
 
@@ -100,15 +164,18 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
     const attachedToolResult: unknown = msg.kind === 'tool_use'
       ? (msg.toolResult || (msg.toolId ? toolResultMap.get(msg.toolId) ?? null : null))
       : null;
+    const taskStatusSource = msg.kind === 'tool_use' && msg.toolId
+      ? lastTaskSourceByToolUseId.get(msg.toolId) ?? null
+      : null;
 
     const cached = conversionCache.get(msg);
-    if (cached && Object.is(cached.attachedToolResult, attachedToolResult)) {
+    if (cached && Object.is(cached.attachedToolResult, attachedToolResult) && Object.is(cached.taskStatusSource, taskStatusSource)) {
       converted.push(...cached.outputs);
       continue;
     }
 
-    const outputs = convertRow(msg, toolResultMap);
-    conversionCache.set(msg, { attachedToolResult, outputs });
+    const outputs = convertRow(msg, toolResultMap, liveTasksByToolUseId);
+    conversionCache.set(msg, { attachedToolResult, taskStatusSource, outputs });
     converted.push(...outputs);
   }
 
@@ -118,6 +185,7 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
 function convertRow(
   msg: NormalizedMessage,
   toolResultMap: Map<string, NormalizedMessage>,
+  liveTasksByToolUseId: Map<string, LiveTaskStatus>,
 ): ChatMessage[] {
   const outputs: ChatMessage[] = [];
 
@@ -149,7 +217,7 @@ function convertRow(
               content: taskNotif.summary,
               timestamp: msg.timestamp,
               isTaskNotification: true,
-              taskStatus: taskNotif.status,
+              taskNotificationStatus: taskNotif.status,
               ...sharedMetadata,
             });
             // Render the agent's result as a normal assistant message so its
@@ -179,6 +247,7 @@ function convertRow(
             content: text,
             timestamp: msg.timestamp,
             memoryCitations: msg.memoryCitations,
+            model: msg.model,
             ...sharedMetadata,
           });
         }
@@ -207,6 +276,10 @@ function convertRow(
           toolId: msg.toolId,
           toolResult,
           isSubagentContainer,
+          // The latest live word on this call's background work, folded from
+          // the session's task_status events. Undefined once the transcript's
+          // own settled record (subagent / workflow) takes over.
+          taskStatus: msg.toolId ? liveTasksByToolUseId.get(msg.toolId) : undefined,
           ...sharedMetadata,
         });
         break;
@@ -252,7 +325,7 @@ function convertRow(
           summaryKey: msg.summaryKey,
           timestamp: msg.timestamp,
           isTaskNotification: true,
-          taskStatus: msg.status || 'completed',
+          taskNotificationStatus: msg.status || 'completed',
           ...sharedMetadata,
         });
         break;
