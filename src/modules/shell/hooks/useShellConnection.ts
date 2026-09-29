@@ -58,6 +58,18 @@ export function useShellConnection({
   const connectingRef = useRef(false);
   const forceRestartOnInitRef = useRef(false);
   const suppressAutoConnectRef = useRef(false);
+  // Tracks whether the one-time initial auto-connect has already fired for the
+  // current project/session target, preventing tight 0ms reconnect loops on failure.
+  const hasAttemptedAutoConnectRef = useRef(false);
+  const lastTargetKeyRef = useRef<string | null>(null);
+
+  const currentProjectKey = selectedProjectRef.current?.fullPath || selectedProjectRef.current?.path || '';
+  const currentSessionId = selectedSessionRef.current?.id || null;
+  const currentTargetKey = `${currentProjectKey}:${currentSessionId}`;
+  if (lastTargetKeyRef.current !== currentTargetKey) {
+    lastTargetKeyRef.current = currentTargetKey;
+    hasAttemptedAutoConnectRef.current = false;
+  }
 
   const handleProcessCompletion = useCallback(
     (output: string) => {
@@ -240,6 +252,7 @@ export function useShellConnection({
     if (
       !autoConnect ||
       suppressAutoConnectRef.current ||
+      hasAttemptedAutoConnectRef.current ||
       !isInitialized ||
       isConnecting ||
       isConnected
@@ -247,6 +260,7 @@ export function useShellConnection({
       return;
     }
 
+    hasAttemptedAutoConnectRef.current = true;
     connectToShell();
   }, [autoConnect, connectToShell, isConnected, isConnecting, isInitialized]);
 
