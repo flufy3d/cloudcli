@@ -42,7 +42,10 @@ const readline = require('readline');
 
 const modeFile = process.env.ZCODE_STUB_MODE_FILE;
 const logFile = process.env.ZCODE_STUB_LOG;
-const sessionId = 'sess_stub_1';
+// Resume-driven runs address a different engine session id than create does,
+// and every emitted event carries this id — so it must follow the id the
+// client resumed with or the runtime filters the turn events out.
+let sessionId = 'sess_stub_1';
 
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
 const log = (name, value) => {
@@ -175,6 +178,9 @@ rl.on('line', (line) => {
   }
 
   if (msg.method === 'session/create') {
+    // A create always starts a fresh engine session: reset the event session
+    // id a previous resume-driven test may have changed.
+    sessionId = 'sess_stub_1';
     // ZCode 0.16.9 validates create params strictly and no longer accepts the
     // runtimeModel catalog here. Keep this boundary aligned with the real
     // engine so a provider upgrade cannot silently reintroduce the breakage.
@@ -320,7 +326,24 @@ rl.on('line', (line) => {
       send({ id: msg.id, error: { code: -32004, message: 'Session is not active: ' + (msg.params?.sessionId ?? '') } });
       return;
     }
-    send({ id: msg.id, result: { messages: [] } });
+    // Real resume responses carry settings.model; "current" is present exactly
+    // when the engine kept a usable session model selection after its restore
+    // validation. The resume-no-selection modes mirror a session whose stored
+    // selection was silently dropped (cross-registry resume).
+    const noSelection = readMode() === 'resume-no-selection' || readMode() === 'resume-no-selection-setmodel-fail';
+    sessionId = (msg.params && msg.params.sessionId) || sessionId;
+    send({
+      id: msg.id,
+      result: {
+        messages: [],
+        settings: {
+          model: {
+            available: [],
+            ...(noSelection ? {} : { current: { providerId: 'bigmodel-coding-plan', modelId: 'GLM-5.3-Flash', options: { reasoningLevel: 'max' } } }),
+          },
+        },
+      },
+    });
     return;
   }
 
@@ -343,6 +366,10 @@ rl.on('line', (line) => {
 
   if (msg.method === 'session/setModel') {
     log('setModel', msg.params);
+    if (readMode() === 'resume-no-selection-setmodel-fail') {
+      send({ id: msg.id, error: { code: -32603, message: 'setModel refused' } });
+      return;
+    }
     send({ id: msg.id, result: {} });
     return;
   }
@@ -526,6 +553,79 @@ test('runtime configures model and reasoning effort variant', async () => {
   const acceptedSendPayload = acceptedSend?.value as { modelSelection?: unknown } | undefined;
   assert.ok(acceptedSendPayload, 'strict-schema session/send must be accepted');
   assert.deepEqual(acceptedSendPayload.modelSelection, latestSendAttempt.modelSelection);
+});
+
+test('runtime repairs a missing engine-side model selection after resume so subagent spawns can resolve a model', async () => {
+  fsSync.writeFileSync(modeFilePath, 'resume-no-selection\n');
+  fsSync.writeFileSync(logFilePath, '');
+  const runtime = new ZCodeRuntimeProvider();
+  const { writer } = createWriter();
+  // The stored provider mapping points at an engine session, so the run
+  // resumes instead of creating.
+  const resumeContext: ProviderRuntimeContext = {
+    ...context,
+    resolveProviderSessionId: () => 'sess_stub_resume',
+  };
+
+  const result = await runtime.run('hello', {
+    sessionId: 'app-sess-repair',
+    model: 'GLM-5.3',
+    effort: 'high',
+    cwd: stubDir,
+  }, writer, resumeContext);
+
+  assert.deepEqual(result, { sessionId: 'sess_stub_resume', success: true });
+
+  const setModelEntries = readStubLog().filter((entry) => entry.name === 'setModel');
+  assert.equal(setModelEntries.length, 1, 'a resume whose response lacks settings.model.current must be repaired via session/setModel');
+  assert.deepEqual(setModelEntries[0].value, {
+    sessionId: 'sess_stub_resume',
+    model: { providerId: 'bigmodel-coding-plan', modelId: 'GLM-5.3', options: { reasoningLevel: 'high' } },
+  });
+});
+
+test('runtime still completes a run when the post-resume model repair is refused', async () => {
+  fsSync.writeFileSync(modeFilePath, 'resume-no-selection-setmodel-fail\n');
+  fsSync.writeFileSync(logFilePath, '');
+  const runtime = new ZCodeRuntimeProvider();
+  const { writer } = createWriter();
+  const resumeContext: ProviderRuntimeContext = {
+    ...context,
+    resolveProviderSessionId: () => 'sess_stub_resume',
+  };
+
+  // The repair is best-effort: a refused session/setModel must not fail the
+  // send, whose per-turn modelSelection still drives the turn itself.
+  const result = await runtime.run('hello', {
+    sessionId: 'app-sess-repair-refused',
+    model: 'GLM-5.3',
+    effort: 'high',
+    cwd: stubDir,
+  }, writer, resumeContext);
+
+  assert.deepEqual(result, { sessionId: 'sess_stub_resume', success: true });
+  assert.equal(readStubLog().filter((entry) => entry.name === 'setModel').length, 1, 'the repair attempt must still have been made');
+});
+
+test('resume responses carrying a valid selection must not trigger a model repair', async () => {
+  fsSync.writeFileSync(modeFilePath, 'ok\n');
+  fsSync.writeFileSync(logFilePath, '');
+  const runtime = new ZCodeRuntimeProvider();
+  const { writer } = createWriter();
+  const resumeContext: ProviderRuntimeContext = {
+    ...context,
+    resolveProviderSessionId: () => 'sess_stub_resume',
+  };
+
+  const result = await runtime.run('hello', {
+    sessionId: 'app-sess-healthy',
+    model: 'GLM-5.3',
+    cwd: stubDir,
+  }, writer, resumeContext);
+
+  assert.deepEqual(result, { sessionId: 'sess_stub_resume', success: true });
+  const setModelEntry = readStubLog().find((entry) => entry.name === 'setModel');
+  assert.equal(setModelEntry, undefined, 'a session with a usable selection must not be re-modeled');
 });
 
 test('runtime bridges interaction/requestPermission to the chat stream and answers the engine', async () => {

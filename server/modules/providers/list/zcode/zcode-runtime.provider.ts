@@ -35,7 +35,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/types.js';
-import { createCompleteMessage, createNormalizedMessage, generateMessageId, readOptionalString } from '@/shared/utils.js';
+import { createCompleteMessage, createNormalizedMessage, generateMessageId, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 
@@ -493,6 +493,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       const resumed = await this.tryResumeSession(existingSessionId);
       if (resumed) {
         console.debug(`[ZCodeRuntime] Resumed existing session: ${existingSessionId}`);
+        await this.repairSessionModelSelection(existingSessionId, resumed, options, context);
         return { sessionId: existingSessionId, resumed: true };
       }
       console.info(
@@ -557,15 +558,19 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * `provider_session_id` can point at a session the current engine no longer
    * considers active. `session/resume` reloads it from ZCode's own database.
    *
+   * Returns the engine's resume response on success (its
+   * `settings.model.current` tells the caller whether the session kept a
+   * usable model selection), or null when the session is gone engine-side.
+   *
    * Only "session is gone" failures (-32004, method missing on older engines)
    * justify falling back to a replacement session: anything else (timeouts,
    * transport errors) must propagate so the run surfaces the real cause
    * instead of silently forking a fresh session on every send.
    */
-  private async tryResumeSession(sessionId: string): Promise<boolean> {
+  private async tryResumeSession(sessionId: string): Promise<AnyRecord | null> {
     try {
-      await protocolClient.sendRequest('session/resume', { sessionId });
-      return true;
+      const response = await protocolClient.sendRequest<AnyRecord>('session/resume', { sessionId });
+      return response ?? {};
     } catch (error) {
       const code = (error as AnyRecord | undefined)?.code;
       const message = error instanceof Error ? error.message : String(error);
@@ -576,7 +581,65 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
         throw error;
       }
       console.warn(`[ZCodeRuntime] Session ${sessionId} is gone engine-side (${message}); will create a replacement`);
-      return false;
+      return null;
+    }
+  }
+
+  /**
+   * Repairs the engine-side session model selection after a resume.
+   *
+   * The engine keeps a per-session model selection, and subagent spawns
+   * resolve their model from it: a spawn against a session without one fails
+   * with "Cannot start subagent: No model selected / 未选择模型
+   * [reason=selection-missing]" even though the main turn carries its own
+   * per-turn `modelSelection`. Resume restores that selection from the
+   * engine's database but silently drops it when the current engine's
+   * registry cannot validate the stored selection — a session last driven by
+   * the ZCode App (account-plan provider ids) being resumed by this engine,
+   * whose personal registry only knows the API-key provider ids, loses it
+   * every time — and a resumed session never receives the default selection
+   * a fresh create would.
+   *
+   * The resume response therefore carries `settings.model.current` exactly
+   * when the session still has a usable selection. When it does not,
+   * re-apply this run's resolved model through `session/setModel` so the
+   * next subagent spawn inherits it. Best-effort by design: a refused repair
+   * must not block the send — the turn itself still carries its per-turn
+   * selection; only subagent spawns would keep failing.
+   */
+  private async repairSessionModelSelection(
+    sessionId: string,
+    resumeResponse: AnyRecord | undefined,
+    options: AnyRecord,
+    context: ProviderRuntimeContext,
+  ): Promise<void> {
+    const settings = readObjectRecord(resumeResponse?.settings);
+    const model = readObjectRecord(settings?.model);
+    const current = readObjectRecord(model?.current);
+    if (readOptionalString(current?.providerId) && readOptionalString(current?.modelId)) {
+      return;
+    }
+
+    const modelParams = await this.resolveSendModelParams(options, context);
+    const selection = modelParams?.modelSelection;
+    if (!selection) {
+      console.debug(
+        `[ZCodeRuntime] Session ${sessionId} has no engine-side model selection and this run resolves no model; subagent spawns may fail with selection-missing until a modeled send.`
+      );
+      return;
+    }
+
+    try {
+      // A short timeout: the repair is an optimization, not a prerequisite —
+      // a wedged engine must not hold the send hostage for the default
+      // request timeout when the turn itself is ready to go.
+      await protocolClient.sendRequest('session/setModel', {
+        sessionId,
+        model: selection,
+      }, 5000);
+      console.info(`[ZCodeRuntime] Repaired session model selection for ${sessionId} -> ${selection.providerId}/${selection.modelId}`);
+    } catch (error) {
+      console.warn(`[ZCodeRuntime] Failed to repair model selection for session ${sessionId}:`, error);
     }
   }
 
