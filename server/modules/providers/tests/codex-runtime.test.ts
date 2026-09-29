@@ -537,3 +537,55 @@ test('subagent notifications with different threadId are ignored and do not sett
   assert.equal(completeMsg.exitCode, 0, 'parent turn finished successfully');
 });
 
+
+// ---------------------------------------------------------------------------
+// Background work tracking (collab agents that outlive their turn)
+// ---------------------------------------------------------------------------
+
+test('a collab agent spawned mid-turn is listed as background work once the turn ends', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    // The agent starts; no terminal event arrives before the turn settles —
+    // the agent outlives the turn, which is the whole point.
+    notify('item/started', {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', prompt: 'Audit the sidebar', status: 'inProgress' },
+    });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+
+  await codexRuntime.run('go', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+
+  const listed = codexRuntime.listBackgroundWork();
+  assert.equal(listed.length, 1, 'the session appears on the background-work list');
+  assert.equal(listed[0].sessionId, 'app-session');
+  assert.equal(listed[0].tasks.length, 1);
+  assert.equal(listed[0].tasks[0].taskId, 'item_agent_1');
+  assert.equal(listed[0].tasks[0].taskType, 'collab_agent');
+  assert.match(listed[0].tasks[0].description, /Audit the sidebar/);
+  assert.equal(typeof listed[0].tasks[0].startedAt, 'number');
+
+  // The terminal item event retires the entry.
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', status: 'completed' },
+    });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  await codexRuntime.run('again', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+  assert.deepEqual(codexRuntime.listBackgroundWork(), [], 'the completed agent is retired');
+});
