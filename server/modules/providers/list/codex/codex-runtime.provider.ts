@@ -411,6 +411,25 @@ async function queryCodex(
           return;
         }
 
+        const notificationRecord = readObjectRecord(params);
+        const turnRecord = readObjectRecord(notificationRecord?.turn);
+        const itemRecord = readObjectRecord(notificationRecord?.item);
+        const eventThreadId =
+          readNonEmptyString(notificationRecord?.threadId) ??
+          readNonEmptyString(notificationRecord?.thread_id) ??
+          readNonEmptyString(turnRecord?.threadId) ??
+          readNonEmptyString(turnRecord?.thread_id) ??
+          readNonEmptyString(itemRecord?.threadId) ??
+          readNonEmptyString(itemRecord?.thread_id) ??
+          null;
+
+        // Subagents in multi-agent mode emit their own lifecycle events on the same
+        // app-server connection. Only events for the target thread (the parent session)
+        // drive this turn's terminal state, live transcript, and token updates.
+        if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
+          return;
+        }
+
         switch (method) {
           case 'turn/started': {
             const turn = readObjectRecord(params.turn);
@@ -563,6 +582,9 @@ async function queryCodex(
       cwd: workingDirectory,
       sandbox,
       approvalPolicy,
+      config: {
+        'features.defer_mailbox_preemption': true,
+      },
       ...(resolvedModel ? { model: resolvedModel } : {}),
     };
     const thread = readObjectRecord(providerSessionId

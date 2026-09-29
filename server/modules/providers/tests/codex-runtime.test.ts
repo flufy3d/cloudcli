@@ -415,3 +415,96 @@ test('a request that is not an approval is reported as unimplemented', async (t)
 
   assert.equal(await answer, undefined);
 });
+
+test('thread/start and thread/resume supply defer_mailbox_preemption config', async (t) => {
+  const startServer = installFakeAppServer(t);
+  await codexRuntime.run('test start', {
+    sessionId: 'session-start',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(false));
+
+  const startCall = startServer.calls.find((c) => c.method === 'thread/start');
+  assert.ok(startCall, 'thread/start was called');
+  assert.equal(startCall.params?.config?.['features.defer_mailbox_preemption'], true);
+
+  const resumeServer = installFakeAppServer(t);
+  await codexRuntime.run('test resume', {
+    sessionId: 'session-resume',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+
+  const resumeCall = resumeServer.calls.find((c) => c.method === 'thread/resume');
+  assert.ok(resumeCall, 'thread/resume was called');
+  assert.equal(resumeCall.params?.config?.['features.defer_mailbox_preemption'], true);
+});
+
+test('subagent notifications with different threadId are ignored and do not settle parent turn', async (t) => {
+  const SUBAGENT_THREAD_ID = 'subagent-thread-123';
+  const SUBAGENT_TURN_ID = 'subagent-turn-456';
+  let parentTurnSettledEarly = false;
+  let parentTurnFinished = false;
+
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+
+    // 1. Parent turn starts
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+
+    // 2. Subagent starts its turn
+    notify('turn/started', { threadId: SUBAGENT_THREAD_ID, turn: { id: SUBAGENT_TURN_ID, status: 'inProgress' } });
+
+    // 3. Subagent emits deltas (both camelCase and snake_case), completed item, and token usage
+    notify('item/agentMessage/delta', { threadId: SUBAGENT_THREAD_ID, turnId: SUBAGENT_TURN_ID, delta: 'subagent typing...' });
+    notify('item/agentMessage/delta', { thread_id: SUBAGENT_THREAD_ID, turnId: SUBAGENT_TURN_ID, delta: 'subagent snake typing...' });
+    notify('item/completed', {
+      threadId: SUBAGENT_THREAD_ID,
+      item: {
+        id: 'msg_subagent_item_1',
+        type: 'agentMessage',
+        text: 'subagent private summary',
+      },
+    });
+    notify('thread/tokenUsage/updated', { threadId: SUBAGENT_THREAD_ID, turnId: SUBAGENT_TURN_ID, tokenUsage: { total: { totalTokens: 999 } } });
+
+    // 4. Subagent completes (with interrupted status, which previously killed the whole parent session!)
+    notify('turn/completed', { threadId: SUBAGENT_THREAD_ID, turn: { id: SUBAGENT_TURN_ID, status: 'interrupted', error: null } });
+
+    // Queue a check to ensure run hasn't prematurely settled
+    setTimeout(() => {
+      assert.equal(parentTurnSettledEarly, false, 'parent turn settled before parent completed');
+      parentTurnFinished = true;
+      // 5. Parent turn actually completes later
+      notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+    }, 50);
+  });
+
+  const messages: any[] = [];
+  const runPromise = codexRuntime.run('collab test', {
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+  }, {
+    isWebSocketWriter: true,
+    send: (message) => messages.push(message),
+  }, runtimeContext(true));
+
+  runPromise.then(() => {
+    if (!parentTurnFinished) {
+      parentTurnSettledEarly = true;
+    }
+  });
+
+  await runPromise;
+
+  // The subagent's stream deltas, completed item, and token budget must NOT have been sent to parent
+  assert.ok(!messages.some((m) => m.kind === 'stream_delta' && m.content === 'subagent typing...'), 'subagent stream delta leaked to parent');
+  assert.ok(!messages.some((m) => m.kind === 'stream_delta' && m.content === 'subagent snake typing...'), 'subagent snake stream delta leaked to parent');
+  assert.ok(!messages.some((m) => m.content === 'subagent private summary'), 'subagent completed item leaked to parent');
+  assert.ok(!messages.some((m) => m.kind === 'status' && m.tokenBudget?.totalTokens === 999), 'subagent token budget leaked to parent');
+  // Subagent interrupted status must NOT have triggered a terminal error
+  assert.ok(!messages.some((m) => m.kind === 'error' && String(m.content).includes('interrupted')), 'subagent interrupt surfaced as parent error');
+  // Final message should be clean exitCode 0
+  const completeMsg = messages.find((m) => m.kind === 'complete');
+  assert.ok(completeMsg, 'complete message was sent');
+  assert.equal(completeMsg.exitCode, 0, 'parent turn finished successfully');
+});
+
