@@ -273,6 +273,43 @@ test('OpenCode session synchronizer indexes sqlite sessions without deletable tr
   }
 });
 
+test('OpenCode session synchronizer skips sub-agent sessions and archives previously indexed ones', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-subagent-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await createOpenCodeDatabase(tempRoot, workspacePath);
+    const insertChild = (db: Database.Database, id: string) => db.prepare(`
+      INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+      VALUES (?, 'project-1', 'open-session-1', ?, ?, 'Sub-agent task', '0.0.0', 1_700_000_005_000, 1_700_000_006_000)
+    `).run(id, id, workspacePath);
+    const opencodeDb = new Database(path.join(tempRoot, '.local', 'share', 'opencode', 'opencode.db'));
+    try {
+      insertChild(opencodeDb, 'open-child-new');
+      insertChild(opencodeDb, 'open-child-legacy');
+    } finally {
+      opencodeDb.close();
+    }
+
+    await withIsolatedDatabase(async () => {
+      // Simulates a sub-agent row indexed before the parent_id filter existed.
+      sessionsDb.createSession('open-child-legacy', 'opencode', workspacePath, 'Sub-agent task');
+
+      const count = await new OpenCodeSessionSynchronizer().synchronize();
+
+      assert.equal(count, 1);
+      assert.equal(sessionsDb.getSessionById('open-child-new'), null);
+      assert.equal(sessionsDb.getSessionById('open-child-legacy')?.isArchived, 1);
+      assert.equal(sessionsDb.getSessionById('open-session-1')?.isArchived, 0);
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('OpenCode session synchronizer returns the app session id once provider mapping exists', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-mapped-'));
   const workspacePath = path.join(tempRoot, 'workspace');
@@ -582,6 +619,7 @@ const seedOpenCodeSession = async (
       CREATE TABLE session (
         id TEXT PRIMARY KEY,
         project_id TEXT,
+        parent_id TEXT,
         directory TEXT,
         title TEXT,
         time_created INTEGER,

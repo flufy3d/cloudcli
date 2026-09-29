@@ -1,5 +1,8 @@
-import type Database from 'better-sqlite3';
+import fsSync from 'node:fs';
 
+import Database from 'better-sqlite3';
+
+import { sessionsDb } from '@/modules/database/index.js';
 import { readJsonRecord, readOptionalString, unwrapJsonStringLiteral } from '@/shared/utils.js';
 
 import { SqliteSessionSynchronizer } from '../../shared/sessions/sqlite-session-synchronizer.provider.js';
@@ -19,7 +22,9 @@ type OpenCodeSessionRow = {
  * Session indexer for OpenCode's SQLite-backed session store.
  *
  * Contributes OpenCode's row mapping to the shared SQLite synchronizer
- * skeleton: active (non-archived) sessions joined with their project row,
+ * skeleton: active (non-archived) top-level sessions joined with their project
+ * row (sub-agent sessions spawned by the task tool carry a `parent_id` and are
+ * filtered out),
  * `directory` with `worktree` fallback as project path, and titles that fall
  * back to the session's first user text when OpenCode stored none.
  */
@@ -34,6 +39,11 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
 
   protected getDatabasePath(): string {
     return getOpenCodeDatabasePath();
+  }
+
+  async synchronize(since?: Date): Promise<number> {
+    this.archiveIndexedSubagentSessions();
+    return super.synchronize(since);
   }
 
   protected selectSessionRows(
@@ -52,6 +62,7 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
       FROM session s
       LEFT JOIN project p ON p.id = s.project_id
       WHERE s.time_archived IS NULL
+        AND s.parent_id IS NULL
         AND (? IS NULL OR COALESCE(s.time_updated, s.time_created, 0) > ?)
       ORDER BY COALESCE(s.time_updated, s.time_created, 0) DESC, s.id DESC
       ${limit === null ? '' : 'LIMIT ?'}
@@ -100,6 +111,39 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
       return text === undefined ? undefined : unwrapJsonStringLiteral(text);
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Archives sub-agent sessions indexed before the `parent_id` filter existed.
+   *
+   * Runs on full scans only: the row SQL already keeps new sub-agent sessions
+   * out, so watcher-triggered syncs have nothing left to clean up.
+   */
+  private archiveIndexedSubagentSessions(): void {
+    const dbPath = this.getDatabasePath();
+    if (!fsSync.existsSync(dbPath)) {
+      return;
+    }
+
+    let db: Database.Database | null = null;
+    try {
+      db = new Database(dbPath, { readonly: true, fileMustExist: true });
+      const childRows = db.prepare(`
+        SELECT id FROM session WHERE parent_id IS NOT NULL
+      `).all() as Array<{ id: string }>;
+
+      for (const childRow of childRows) {
+        const indexed = sessionsDb.getSessionByProviderSessionId(childRow.id);
+        if (indexed && indexed.provider === 'opencode' && !indexed.isArchived) {
+          sessionsDb.updateSessionIsArchived(indexed.session_id, true);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`${this.logTag} Failed to archive sub-agent sessions:`, message);
+    } finally {
+      db?.close();
     }
   }
 }
