@@ -105,6 +105,14 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         output: {
           manualChunks(id) {
+            // Rollup/Babel-generated helpers shared across vendor chunks must live in
+            // their own leaf chunk. If they land inside a vendor chunk, their
+            // consumers import that chunk, creating cycles (e.g. react ->
+            // highlight -> codemirror -> react) that evaluate before React is
+            // initialized and blank the app.
+            if (id.includes('@babel/runtime') || id.includes('commonjsHelpers')) {
+              return 'vendor-shared';
+            }
             if (id.includes('node_modules')) {
               if (id.includes('react/') || id.includes('react-dom/') || id.includes('react-router-dom/') || id.includes('react-error-boundary/')) {
                 return 'vendor-react';
