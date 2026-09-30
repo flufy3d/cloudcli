@@ -7,6 +7,8 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -134,6 +136,33 @@ for (const resumed of [false, true]) {
   }
 }
 
+test('an image-only turn sends a fallback prompt with the attachment', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  // Image sources must sit inside the run's working directory (the trust
+  // boundary buildCodexInputItems enforces), so the fixture lives under cwd.
+  const imageDirectory = await mkdtemp(path.join(process.cwd(), '.codex-image-test-'));
+  const imagePath = path.join(imageDirectory, 'shot.png');
+  await writeFile(imagePath, 'png');
+
+  try {
+    await codexRuntime.run('', {
+      cwd: process.cwd(),
+      images: [{ path: imagePath, mimeType: 'image/png' }],
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+
+    const turn = server.calls.find((call) => call.method === 'turn/start');
+    assert.ok(turn, 'the turn must start');
+    assert.deepEqual(turn.params.input, [
+      { type: 'text', text: 'Please analyze the attached image(s).', text_elements: [] },
+      { type: 'localImage', path: imagePath },
+    ]);
+    assert.ok(!messages.some((message) => message.kind === 'error'));
+  } finally {
+    await rm(imageDirectory, { recursive: true, force: true });
+  }
+});
+
 test('the live reply carries the item id the rollout will record', async (t) => {
   installFakeAppServer(t);
   const messages: any[] = [];
@@ -232,9 +261,11 @@ test('a failed turn surfaces the error and exits non-zero', async (t) => {
 });
 
 test('an interrupted turn surfaces as an error, not a silent success', async (t) => {
-  // Codex reports a usage-limit (or user) interrupt as status "interrupted"
-  // rather than "failed". Treating it as a normal completion hid the abort
-  // from the user and recorded the run as engine_completed.
+  // Codex reports a usage-limit, user, or engine-internal interrupt as status
+  // "interrupted" rather than "failed" — on codex 0.155 a spawned agent
+  // finishing mid-turn aborted the whole agent tree this way. Treating it as a
+  // normal completion hid the abort from the user and recorded the run as
+  // engine_completed.
   installFakeAppServer(t, (fake) => {
     fake.handlers.onNotification?.('turn/completed', {
       threadId: THREAD_ID,
@@ -412,4 +443,149 @@ test('a request that is not an approval is reported as unimplemented', async (t)
   }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
 
   assert.equal(await answer, undefined);
+});
+
+test('thread/start and thread/resume supply defer_mailbox_preemption config', async (t) => {
+  const startServer = installFakeAppServer(t);
+  await codexRuntime.run('test start', {
+    sessionId: 'session-start',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(false));
+
+  const startCall = startServer.calls.find((c) => c.method === 'thread/start');
+  assert.ok(startCall, 'thread/start was called');
+  assert.equal(startCall.params?.config?.['features.defer_mailbox_preemption'], true);
+
+  const resumeServer = installFakeAppServer(t);
+  await codexRuntime.run('test resume', {
+    sessionId: 'session-resume',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+
+  const resumeCall = resumeServer.calls.find((c) => c.method === 'thread/resume');
+  assert.ok(resumeCall, 'thread/resume was called');
+  assert.equal(resumeCall.params?.config?.['features.defer_mailbox_preemption'], true);
+});
+
+test('subagent notifications with different threadId are ignored and do not settle parent turn', async (t) => {
+  const SUBAGENT_THREAD_ID = 'subagent-thread-123';
+  const SUBAGENT_TURN_ID = 'subagent-turn-456';
+  let parentTurnSettledEarly = false;
+  let parentTurnFinished = false;
+
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+
+    // 1. Parent turn starts
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+
+    // 2. Subagent starts its turn
+    notify('turn/started', { threadId: SUBAGENT_THREAD_ID, turn: { id: SUBAGENT_TURN_ID, status: 'inProgress' } });
+
+    // 3. Subagent emits deltas (both camelCase and snake_case), completed item, and token usage
+    notify('item/agentMessage/delta', { threadId: SUBAGENT_THREAD_ID, turnId: SUBAGENT_TURN_ID, delta: 'subagent typing...' });
+    notify('item/agentMessage/delta', { thread_id: SUBAGENT_THREAD_ID, turnId: SUBAGENT_TURN_ID, delta: 'subagent snake typing...' });
+    notify('item/completed', {
+      threadId: SUBAGENT_THREAD_ID,
+      item: {
+        id: 'msg_subagent_item_1',
+        type: 'agentMessage',
+        text: 'subagent private summary',
+      },
+    });
+    notify('thread/tokenUsage/updated', { threadId: SUBAGENT_THREAD_ID, turnId: SUBAGENT_TURN_ID, tokenUsage: { total: { totalTokens: 999 } } });
+
+    // 4. Subagent completes (with interrupted status, which previously killed the whole parent session!)
+    notify('turn/completed', { threadId: SUBAGENT_THREAD_ID, turn: { id: SUBAGENT_TURN_ID, status: 'interrupted', error: null } });
+
+    // Queue a check to ensure run hasn't prematurely settled
+    setTimeout(() => {
+      assert.equal(parentTurnSettledEarly, false, 'parent turn settled before parent completed');
+      parentTurnFinished = true;
+      // 5. Parent turn actually completes later
+      notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+    }, 50);
+  });
+
+  const messages: any[] = [];
+  const runPromise = codexRuntime.run('collab test', {
+    sessionId: 'parent-session',
+    cwd: process.cwd(),
+  }, {
+    isWebSocketWriter: true,
+    send: (message) => messages.push(message),
+  }, runtimeContext(true));
+
+  runPromise.then(() => {
+    if (!parentTurnFinished) {
+      parentTurnSettledEarly = true;
+    }
+  });
+
+  await runPromise;
+
+  // The subagent's stream deltas, completed item, and token budget must NOT have been sent to parent
+  assert.ok(!messages.some((m) => m.kind === 'stream_delta' && m.content === 'subagent typing...'), 'subagent stream delta leaked to parent');
+  assert.ok(!messages.some((m) => m.kind === 'stream_delta' && m.content === 'subagent snake typing...'), 'subagent snake stream delta leaked to parent');
+  assert.ok(!messages.some((m) => m.content === 'subagent private summary'), 'subagent completed item leaked to parent');
+  assert.ok(!messages.some((m) => m.kind === 'status' && m.tokenBudget?.totalTokens === 999), 'subagent token budget leaked to parent');
+  // Subagent interrupted status must NOT have triggered a terminal error
+  assert.ok(!messages.some((m) => m.kind === 'error' && String(m.content).includes('interrupted')), 'subagent interrupt surfaced as parent error');
+  // Final message should be clean exitCode 0
+  const completeMsg = messages.find((m) => m.kind === 'complete');
+  assert.ok(completeMsg, 'complete message was sent');
+  assert.equal(completeMsg.exitCode, 0, 'parent turn finished successfully');
+});
+
+
+// ---------------------------------------------------------------------------
+// Background work tracking (collab agents that outlive their turn)
+// ---------------------------------------------------------------------------
+
+test('a collab agent spawned mid-turn is listed as background work once the turn ends', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    // The agent starts; no terminal event arrives before the turn settles —
+    // the agent outlives the turn, which is the whole point.
+    notify('item/started', {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', prompt: 'Audit the sidebar', status: 'inProgress' },
+    });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+
+  await codexRuntime.run('go', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+
+  const listed = codexRuntime.listBackgroundWork();
+  assert.equal(listed.length, 1, 'the session appears on the background-work list');
+  assert.equal(listed[0].sessionId, 'app-session');
+  assert.equal(listed[0].tasks.length, 1);
+  assert.equal(listed[0].tasks[0].taskId, 'item_agent_1');
+  assert.equal(listed[0].tasks[0].taskType, 'collab_agent');
+  assert.match(listed[0].tasks[0].description, /Audit the sidebar/);
+  assert.equal(typeof listed[0].tasks[0].startedAt, 'number');
+
+  // The terminal item event retires the entry.
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', status: 'completed' },
+    });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  await codexRuntime.run('again', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+  assert.deepEqual(codexRuntime.listBackgroundWork(), [], 'the completed agent is retired');
 });

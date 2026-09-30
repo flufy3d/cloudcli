@@ -1,6 +1,6 @@
 # 聊天链路（Chat Pipeline）
 
-> 基准：2.5.10 / 2026-09-22
+> 基准：2.7.2 / 2026-09-28
 > **核心文档**：改动 `server/modules/websocket/**` 或 `src/modules/chat/**` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -40,10 +40,24 @@
 ## 权限批准
 
 - 引擎运行时发 `permission_request` 帧 → 前端 `src/modules/chat/context/PermissionContext.tsx` → 用户应答 `chat.permission-response` → `chat-websocket.service.ts` `handlePermissionResponse` → `providerRuntimeService.resolveToolApproval` 广播到各引擎的 `permissions` 网关（`server/shared/types.ts` `ProviderRuntimePermissionGateway`）。
-- `chat.subscribe` 应答（`chat_subscribed`）携带处理中状态与挂起权限，多标签/重连后权限卡不丢（历史教训：挂起列表裸字符串契约破裂产生"僵尸权限卡"，已由形状校验 + `toolCallId` 缓存键收口）。
+- `chat.subscribe` 应答（`chat_subscribed`）携带处理中状态与挂起权限，多标签/重连后权限卡不丢（历史教训：挂起列表裸字符串契约破裂产生"僵尸权限卡"，已由形状校验 + `toolCallId` 缓存键收口）；已应答或撤回的请求通过 `permission_resolved` / `permission_cancelled` 实时及重放撤销，防止旧卡片死灰复燃。
 - 引擎侧：claude 走 SDK 的 `canUseTool` 回调；zcode 走引擎权限桥 + 四档权限模式映射（`chat.send` 的 `options.permissionMode` → 引擎 set_mode）；codex 走 app-server 的反向 JSON-RPC 请求（`item/{commandExecution,fileChange,permissions}/requestApproval`），该请求在被应答前整个 turn 都是阻塞的，因此**必须**应答——run 结束时仍挂着的一律发 `permission_cancelled` 并按拒绝收尾。能力有无由矩阵的 `supportsPermissionRequests` 表达。
 - 批准记忆（`rememberEntry`）各引擎语义不同：claude 往 `allowedTools` 追加一条规则，codex 改答 `acceptForSession`（由引擎自己记住本会话）。
 - **谁来复核由引擎配置决定，适配器不覆盖**：codex 的 `approvals_reviewer`（`user` / `auto_review` / `guardian_subagent`）决定请求是否在到达客户端前就被自动裁决；在 `thread/start` 里写死这个值等于悄悄推翻用户自己的设置。
+
+## 后台任务与输入排队
+
+- **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台任务（如 `Bash(run_in_background: true)` 或任务创建）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。
+- **状态同步与广播**：
+  - 契约类型 `ActiveBackgroundTask`（`id`, `toolName`, `command?`, `description?`, `startedAt`）。
+  - `chat_subscribed` 握手帧携带 `backgroundTasks`，供断线重连或新标签页恢复状态。
+  - 任务启动或清理时，服务端通过 `kind: 'status', text: 'background_tasks'` 广播最新列表；归一化网关在 `NORMALIZED_MESSAGE_KEYS` 放行 `backgroundTasks` 字段。
+- **输入防打断与智能排队**：
+  - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），用户发送新消息自动转入 `queuedDraft` 排队，阻止过早发送打断正在运行的后台子进程。仅当能力矩阵 `acceptsInputDuringBackgroundWork` 为 false 时排队（`backgroundWorkQueuesInput`）；claude 为 true，新消息直接注入持有任务的活进程，任务条照常显示但不排队。
+  - **自动释放**：后台任务结束且无新状态阻塞时，composer 的 flush 效应自动解冻排队草稿并发出。
+  - **强制中断逃生通道**：排队卡片提供 `forceSendQueuedDraft`（`isForced: true`），允许用户在需要时显式跳过等待立即发送；新 run 会顶替仍在保活的进程，后台任务随之结束（`forceInterrupt: true` 只是随消息带上的标记，服务端不读）。
+  - **可视化呈现**：输入框上方通过 `BackgroundTaskIndicator` 实时展示运行中的后台任务（工具名、命令、动态已用时间）。
+  - **完工庆祝防误报**：`useChatRealtimeHandlers` 在收到 `complete` 时，若会话仍有活跃后台任务，则暂不触发完工音效（`playChatCompletionSound`）与窗口标题提示（`showCompletionTitleIndicator`）；待后台任务全部清空（通过 `status(background_tasks: [])`）时统一触发，防止用户误以为全部工作已结束。
 
 ## run 的结束原因（诊断契约）
 

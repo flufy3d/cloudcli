@@ -219,7 +219,8 @@
       "showSidebar": "Seitenleiste anzeigen",
       "settings": "Einstellungen",
       "updateAvailable": "Update verfügbar",
-      "closeSidebar": "Seitenleiste schließen"
+      "closeSidebar": "Seitenleiste schließen",
+      "resizeSidebar": "Seitenleistenbreite ändern"
     }
   }
 }

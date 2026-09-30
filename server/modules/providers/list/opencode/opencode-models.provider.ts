@@ -814,8 +814,18 @@ const parseOpenCodeSessionModelValue = (rawModel: unknown): string | null => {
     return null;
   }
 
-  const providerId = readOptionalString(record.providerID) ?? readOptionalString(record.providerId);
-  return providerId ? `${providerId}/${modelId}` : modelId;
+  // OpenCode persists the provider and model id in separate fields (for
+  // example {"id":"z-ai/glm-5.3-flash","providerID":"openrouter"}), and its
+  // CLI's `--model` flag only accepts the composed `<providerID>/<modelID>`
+  // form. Compose it here so a resumed session resolves the same model
+  // instead of failing with an unknown-model error.
+  const providerId = readOptionalString(record.providerID)
+    ?? readOptionalString(record.providerId);
+  if (providerId && !modelId.startsWith(`${providerId}/`)) {
+    return `${providerId}/${modelId}`;
+  }
+
+  return modelId;
 };
 
 /** Provider registry model adapter for OpenCode predefined models and session metadata. */

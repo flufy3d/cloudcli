@@ -3,6 +3,7 @@ import { providerModelsService } from '@/modules/providers/services/provider-mod
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type { IProvider } from '@/shared/interfaces.js';
 import type {
+  ActiveBackgroundTask,
   AnyRecord,
   LLMProvider,
   ProviderPermissionDecision,
@@ -118,6 +119,17 @@ export function createProviderRuntimeService(
       return Boolean(await dependencies.resolveProvider(providerName).runtime.abort(sessionId));
     },
 
+    async stopBackgroundTask(providerName: LLMProvider, sessionId: string, taskId: string): Promise<boolean> {
+      // A runtime that never holds background work has no task to stop.
+      const { runtime } = dependencies.resolveProvider(providerName);
+      return Boolean(await runtime.stopBackgroundTask?.(sessionId, taskId));
+    },
+
+    hasBackgroundWork(sessionId: string): boolean {
+      return dependencies.listProviders().some((provider) =>
+        (provider.runtime.listBackgroundWork?.() ?? []).some((entry) => entry.sessionId === sessionId));
+    },
+
     resolveToolApproval(requestId: string, decision: ProviderPermissionDecision): void {
       for (const provider of dependencies.listProviders()) {
         provider.runtime.permissions?.resolve(requestId, decision);
@@ -127,6 +139,12 @@ export function createProviderRuntimeService(
     getPendingApprovalsForSession(sessionId: string): unknown[] {
       return dependencies.listProviders().flatMap(
         (provider) => provider.runtime.permissions?.listPending(sessionId) ?? [],
+      );
+    },
+
+    getBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
+      return dependencies.listProviders().flatMap(
+        (provider) => provider.runtime.backgroundTasks?.list(sessionId) ?? [],
       );
     },
   };

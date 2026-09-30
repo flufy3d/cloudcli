@@ -1,4 +1,4 @@
-import React, { memo, useEffect, useMemo, useState } from 'react';
+import React, { memo, useContext, useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
@@ -16,7 +16,9 @@ import {
   isFileUrl,
   markdownUrlTransform,
 } from '@/modules/chat/utils/fileLink';
+import { normalizeLatexDelimiters } from '@/modules/chat/utils/latexDelimiters';
 import { api, readApiJson, readExternalFileContent } from '@/shared/api';
+import { MarkdownWorkspaceContext } from '@/modules/chat/context/MarkdownWorkspaceContext';
 import { shouldProxyLocalHref } from '@/modules/chat/utils/localProxyLink';
 import { copyTextToClipboard, normalizeLatexMathDelimiters } from '@/shared/utils';
 import { UnifiedImageViewer } from '@/shared/ui';
@@ -65,6 +67,14 @@ async function openThroughLocalProxy(
 const isExternalHref = (href?: string): boolean =>
   !!href && (/^(https?:|mailto:|tel:|data:)/i.test(href) || href.startsWith('#'));
 
+// Read the trailing `:line` / `:line:col` suffix so the editor can reveal it.
+// Both this and stripLineSuffix are anchored at the end, so callers pass an
+// already-trimmed reference.
+const lineFromRef = (value: string): number | null => {
+  const match = value.match(/:(\d+)(?::\d+)?$/);
+  return match ? Number(match[1]) : null;
+};
+
 // Strip a trailing `:line` / `:line:col` suffix (e.g. `src/foo.ts:130`).
 const stripLineSuffix = (value: string): string => value.replace(/:\d+(?::\d+)?$/, '');
 
@@ -94,6 +104,13 @@ const childrenToText = (children: React.ReactNode): string => {
   }
   return '';
 };
+
+// The only delimiter `remark-math` recognizes with `singleDollarTextMath` off.
+// `\(…\)` and `\[…\]` are already rewritten to `$$` by normalizeLatexDelimiters,
+// so this one probe covers both notations.
+const MATH_DELIMITER = /\$\$/;
+
+const EMPTY_PLUGINS: never[] = [];
 
 type CodeBlockProps = {
   node?: any;
@@ -233,6 +250,30 @@ const isLikelyLocalFilesystemPath = (rawPath: string): boolean => {
   return segments.length >= 3;
 };
 
+// A workspace-relative image path ('imagenes/gato.png'): not a URL, not a
+// filesystem path — the project files route resolves it against the project
+// root. Absolute paths and file:// URLs go to the read-only external route
+// instead (localPathFromImageSrc).
+const RELATIVE_IMAGE_SRC = /^(?!https?:|data:|blob:|file:)(?!\/)[^\s]+$/;
+
+const BROWSER_LOADABLE_IMAGE_SRC = /^(https?:|data:|blob:)/i;
+
+const relativePathFromImageSrc = (src?: string): string | undefined => {
+  if (!src || !RELATIVE_IMAGE_SRC.test(src.trim())) {
+    return undefined;
+  }
+  let decoded = src.trim();
+  if (decoded.startsWith('./')) {
+    decoded = decoded.slice(2);
+  }
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+    // Keep raw src if decode fails
+  }
+  return decoded;
+};
+
 const localPathFromImageSrc = (src?: string): string | undefined => {
   if (!src) {
     return undefined;
@@ -264,7 +305,9 @@ type MarkdownImageProps = { node?: unknown } & React.ImgHTMLAttributes<HTMLImage
 // the auth header) and expand into the unified image viewer on click.
 function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) {
   const { t } = useTranslation('chat');
+  const { projectId } = useContext(MarkdownWorkspaceContext);
   const localPath = localPathFromImageSrc(src);
+  const workspaceRelative = localPath ? undefined : relativePathFromImageSrc(src);
   // Blob URL handed to <img> once the bytes arrive; null while loading.
   const [blobSrc, setBlobSrc] = useState<string | null>(null);
   // Set when the endpoint refuses the path (not allowlisted / deleted): fall
@@ -275,7 +318,7 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
-    if (!localPath) {
+    if (!localPath && !(workspaceRelative && projectId)) {
       setBlobSrc(null);
       setResolveFailed(false);
       return;
@@ -294,18 +337,28 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
     };
     const load = async () => {
       try {
-        const response = await readExternalFileContent(localPath, { signal: controller.signal });
-        if (!response.ok) {
-          throw new Error(`Image request failed with status ${response.status}`);
+        let blob: Blob;
+        if (localPath) {
+          const response = await readExternalFileContent(localPath, { signal: controller.signal });
+          if (!response.ok) {
+            throw new Error(`Image request failed with status ${response.status}`);
+          }
+          blob = await response.blob();
+        } else {
+          const response = await api.readFileBlob(projectId!, workspaceRelative!, { signal: controller.signal });
+          if (!response.ok) {
+            throw new Error(`Image request failed with status ${response.status}`);
+          }
+          blob = await response.blob();
         }
-        const blob = await response.blob();
         objectUrl = URL.createObjectURL(blob);
         if (controller.signal.aborted) {
           revokeObjectUrl();
           return;
         }
         setBlobSrc(objectUrl);
-      } catch {
+      } catch (caught) {
+        console.error('[MarkdownImage] load failed:', caught);
         if (!controller.signal.aborted) {
           setResolveFailed(true);
         }
@@ -316,24 +369,37 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
       controller.abort();
       revokeObjectUrl();
     };
-  }, [localPath]);
+  }, [localPath, workspaceRelative, projectId]);
 
-  if (!localPath || resolveFailed) {
-    return (
+  if (resolveFailed) {
+    // The read was refused. A workspace-relative path has no browser-loadable
+    // form at all, so the alt text replaces it; an external filesystem path
+    // falls back to the raw src — exactly the rendering this component shipped
+    // with before the read-only route existed.
+    if (workspaceRelative) {
+      return <span className="text-xs italic text-muted-foreground">{alt}</span>;
+    }
+    return <img src={src} alt={alt} loading="lazy" decoding="async" className="rounded-lg" {...props} />;
+  }
+
+  if (!localPath && !(workspaceRelative && projectId)) {
+    // Web URLs load directly, and so do origin-relative paths (/assets/…):
+    // the browser resolves those against the app's own origin.
+    if (src && (BROWSER_LOADABLE_IMAGE_SRC.test(src) || src.startsWith('/'))) {
       // Lazy decoding keeps late image loads from shifting scroll position
       // while the user reads (native anchoring absorbs what remains).
-      <img src={src} alt={alt} loading="lazy" decoding="async" className="rounded-lg" {...props} />
-    );
+      return <img src={src} alt={alt} loading="lazy" decoding="async" className="rounded-lg" {...props} />;
+    }
+    // A path no route can resolve (and no project to resolve it against).
+    return <span className="text-xs italic text-muted-foreground">{alt}</span>;
   }
 
   if (!blobSrc) {
-    // Placeholder holds the layout while the bytes load.
+    // Placeholder holds the layout while the bytes load. Deliberately not
+    // role="img": it is a skeleton, not an image, and claiming the role would
+    // satisfy img queries before the bytes arrive.
     return (
-      <div
-        role="img"
-        aria-label={alt || 'Image loading'}
-        className="my-1 h-28 max-w-sm animate-pulse rounded-lg bg-muted"
-      />
+      <div aria-hidden className="my-1 h-28 max-w-sm animate-pulse rounded-lg bg-muted" />
     );
   }
 
@@ -365,6 +431,9 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
 
 const markdownComponents = {
   code: CodeBlock,
+  // Workspace image paths are fetched through the authenticated files route;
+  // a bare <img src> would resolve against the web origin and 404.
+  img: MarkdownImage,
   // Fenced/indented code arrives as <pre><code>. Re-render the child CodeBlock
   // with `forceBlock` so it always gets the block treatment (react-markdown v9+
   // no longer passes an `inline` flag), and skip the outer <pre> so Tailwind
@@ -396,7 +465,6 @@ const markdownComponents = {
       <table className="my-0 min-w-full border-collapse text-sm">{children}</table>
     </div>
   ),
-  img: MarkdownImage,
   thead: ({ children }: { children?: React.ReactNode }) => <thead className="bg-muted/60">{children}</thead>,
   tr: ({ children }: { children?: React.ReactNode }) => (
     <tr className="[&:last-child>td]:border-b-0">{children}</tr>
@@ -425,17 +493,28 @@ type MarkdownBodyProps = {
 // single-document render.
 export const MarkdownBody = memo(function MarkdownBody({ children, breaks = false }: MarkdownBodyProps) {
   const content = useMemo(
-    () => normalizeLatexMathDelimiters(normalizeInlineCodeFences(children)),
+    // The LaTeX pass runs second because it reads the code spans the fence pass
+    // normalizes, and must leave the LaTeX inside them literal. The shared pass
+    // runs last and only promotes the single-dollar `$x$` pairs that read as
+    // LaTeX; bracket pairs are left to the code-aware pass before it.
+    () => normalizeLatexMathDelimiters(
+      normalizeLatexDelimiters(normalizeInlineCodeFences(children)),
+      { brackets: false },
+    ),
     [children],
   );
+  // Math support costs a remark tree pass plus a full KaTeX walk on every
+  // render, and almost no assistant message contains math. Only wire the two
+  // plugins up when the text has a delimiter they could act on.
+  const hasMath = useMemo(() => MATH_DELIMITER.test(content), [content]);
   const remarkPlugins = useMemo(
     () => (breaks
       ? [remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkBreaks]
       : [remarkGfm, [remarkMath, { singleDollarTextMath: false }]]) as any,
     [breaks],
   );
-  const rehypePlugins = useMemo(() => [rehypeKatex], []);
-  const { openFileInEditor } = usePaletteOps();
+  const rehypePlugins = useMemo(() => (hasMath ? [rehypeKatex] : EMPTY_PLUGINS), [hasMath]);
+  const { openFileInEditor, openDirectory } = usePaletteOps();
   const { t } = useTranslation('chat');
 
   const components = useMemo(
@@ -457,7 +536,16 @@ export const MarkdownBody = memo(function MarkdownBody({ children, breaks = fals
               className="cursor-pointer text-blue-600 hover:underline dark:text-blue-400"
               onClick={(event) => {
                 event.preventDefault();
-                openFileInEditor(stripLineSuffix(fileRef));
+                // Normalized once for every branch below: the href arrives
+                // trimmed from the parser, but the link-text fallback keeps a
+                // trailing space (``[`src/foo.ts:12` ]()``), and that space
+                // defeats the `$`-anchored suffix strip.
+                const reference = fileRef.trim();
+                if (reference.endsWith('/')) {
+                  openDirectory(reference);
+                  return;
+                }
+                openFileInEditor(stripLineSuffix(reference), lineFromRef(reference));
               }}
             >
               {linkChildren}

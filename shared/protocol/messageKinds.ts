@@ -15,12 +15,15 @@
  */
 
 import type {
+  ActiveBackgroundTask,
+  CompactionInfo,
   LLMProvider,
   MemoryCitation,
   MessageKind,
   NormalizedMessage,
   SubagentActivity,
   SubagentInfo,
+  WorkflowInfo,
 } from './chatEvents.js';
 
 /** Fields every kind carries, independent of what it says. */
@@ -61,6 +64,12 @@ export type MessageFieldsByKind = {
     isLocalCommand?: boolean;
     isLocalCommandStdout?: boolean;
     isCompactSummary?: boolean;
+    /** The model that produced this assistant row, as the provider recorded it. */
+    model?: string;
+    /** A compaction summary row, when `isCompactSummary` or a live boundary set it. */
+    compact?: CompactionInfo;
+    /** A live workflow launch/progress row. */
+    workflow?: WorkflowInfo;
   };
   thinking: {
     content?: string;
@@ -108,11 +117,13 @@ export type MessageFieldsByKind = {
     success?: boolean;
     aborted?: boolean;
     tokens?: number;
+    backgroundTasks?: ActiveBackgroundTask[];
   };
   status: {
     text?: string;
     status?: string;
     tokenBudget?: unknown;
+    backgroundTasks?: ActiveBackgroundTask[];
   };
   permission_request: {
     requestId?: string;
@@ -131,6 +142,21 @@ export type MessageFieldsByKind = {
     status?: string;
     summary?: string;
     summaryKey?: string;
+  };
+  /** A live background-work event: what a launched agent, workflow or
+   *  backgrounded command is doing after its turn has ended. */
+  task_status: {
+    event?: 'started' | 'progress' | 'updated' | 'notification';
+    taskId?: string;
+    toolUseId?: string;
+    taskType?: string;
+    workflowName?: string;
+    description?: string;
+    status?: string;
+    summary?: string;
+    usage?: NormalizedMessage['usage'];
+    outputFile?: string;
+    agents?: NormalizedMessage['agents'];
   };
 };
 

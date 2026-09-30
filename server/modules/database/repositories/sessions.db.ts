@@ -735,6 +735,14 @@ export const sessionsDb = {
     return db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId).changes > 0;
   },
 
+  /** Used by the OpenCode synchronizer to remove indexed child sessions by their native id. */
+  deleteSessionByProviderSessionId(providerSessionId: string, provider: string): boolean {
+    const db = getConnection();
+    return db
+      .prepare('DELETE FROM sessions WHERE provider_session_id = ? AND provider = ?')
+      .run(providerSessionId, provider).changes > 0;
+  },
+
   /**
    * Batch-archives unarchived sessions whose last activity (updated_at or created_at)
    * occurred before the specified cutoff timestamp string (or is null/invalid).

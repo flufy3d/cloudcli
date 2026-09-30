@@ -61,6 +61,14 @@ export type ProviderCatalogEntry = {
    * revert that restores the snapshot files along with the conversation.
    */
   editRevertsFiles: boolean;
+  /**
+   * Whether a message sent while the session's background work is still
+   * running reaches the engine without killing that work. Claude feeds the
+   * turn into the live CLI process that holds the work; engines without that
+   * reuse would restart the process, so the composer queues the message
+   * until the work settles instead.
+   */
+  acceptsInputDuringBackgroundWork: boolean;
 };
 
 export const PROVIDER_CATALOG = {
@@ -76,6 +84,7 @@ export const PROVIDER_CATALOG = {
     // process; CloudCLI holds that process open so the wake-ups can fire.
     supportsNativeScheduling: true,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: true,
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -87,6 +96,7 @@ export const PROVIDER_CATALOG = {
     supportsEffort: false,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -98,6 +108,7 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
   },
   opencode: {
     // Mapped by the runtime onto OpenCode's controls: the `plan` agent for plan,
@@ -113,6 +124,7 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: true,
+    acceptsInputDuringBackgroundWork: false,
   },
   zcode: {
     // Mapped by the runtime onto ZCode's session/setMode modes: build
@@ -131,6 +143,7 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -142,5 +155,6 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;

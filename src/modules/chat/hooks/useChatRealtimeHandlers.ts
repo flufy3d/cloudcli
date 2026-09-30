@@ -79,6 +79,7 @@ export function useChatRealtimeHandlers({
   // listener so back-to-back permission events can dedupe and re-arm the
   // notification sound before React finishes a rerender.
   const pendingPermissionRequestsRef = useRef(pendingPermissionRequests);
+  const sessionHadBackgroundTasksRef = useRef<Map<string, boolean>>(new Map());
 
   useEffect(() => {
     pendingPermissionRequestsRef.current = pendingPermissionRequests;
@@ -186,14 +187,29 @@ export function useChatRealtimeHandlers({
             setPendingPermissionRequests([]);
           }
 
-          if (aborted) {
-            // Abort was requested — the complete event confirms it. No
-            // further UI action is needed beyond clearing the entry above.
-            return;
+          if (aborted || !success) {
+            if (sessionId) {
+              sessionHadBackgroundTasksRef.current.delete(sessionId);
+            }
+            if (aborted) {
+              // Abort was requested — the complete event confirms it. No
+              // further UI action is needed beyond clearing the entry above.
+              return;
+            }
           }
 
           // Celebrate only successful runs (failed runs end with success: false).
-          if (success) {
+          // If background tasks are still running, defer celebration until they complete.
+          const hasRunningBgTasks = Boolean(
+            sessionId && (sessionStore.getBackgroundTasks(sessionId)?.length ?? 0) > 0,
+          );
+          if (sessionId && hasRunningBgTasks) {
+            sessionHadBackgroundTasksRef.current.set(sessionId, true);
+          }
+          if (success && !hasRunningBgTasks) {
+            if (sessionId) {
+              sessionHadBackgroundTasksRef.current.delete(sessionId);
+            }
             showCompletionTitleIndicator();
             void playChatCompletionSound();
           }
@@ -220,6 +236,15 @@ export function useChatRealtimeHandlers({
               // those numbers describe the context the user discarded, so the
               // badge falls back to the summary's size (see `toTokenBudget`).
               setTokenBudget(toTokenBudget(directive.tokenBudget));
+            }
+          } else if (directive.text === 'background_tasks' && directive.sessionId) {
+            const currentTasks = directive.backgroundTasks ?? [];
+            if (currentTasks.length > 0) {
+              sessionHadBackgroundTasksRef.current.set(directive.sessionId, true);
+            } else if (sessionHadBackgroundTasksRef.current.get(directive.sessionId)) {
+              sessionHadBackgroundTasksRef.current.delete(directive.sessionId);
+              showCompletionTitleIndicator();
+              void playChatCompletionSound();
             }
           } else if (directive.text && directive.sessionId) {
             onSessionProcessing?.(directive.sessionId, {
@@ -260,14 +285,18 @@ export function useChatRealtimeHandlers({
           return;
         }
 
+        case 'permission_resolved':
         case 'permission_cancelled': {
           if (directive.requestId && directive.sessionId === activeViewSessionIdRef.current) {
-            const nextPendingPermissionRequests = pendingPermissionRequestsRef.current.filter(
+            const current = pendingPermissionRequestsRef.current;
+            const nextPendingPermissionRequests = current.filter(
               (request: PendingPermissionRequest) => request.requestId !== directive.requestId,
             );
 
-            pendingPermissionRequestsRef.current = nextPendingPermissionRequests;
-            setPendingPermissionRequests(nextPendingPermissionRequests);
+            if (nextPendingPermissionRequests.length !== current.length) {
+              pendingPermissionRequestsRef.current = nextPendingPermissionRequests;
+              setPendingPermissionRequests(nextPendingPermissionRequests);
+            }
           }
           return;
         }

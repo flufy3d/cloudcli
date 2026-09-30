@@ -41,6 +41,8 @@ import { ContextUsageBar } from '@/modules/chat/composer/ContextUsageBar';
 import QueuedMessageCard from '@/modules/chat/composer/QueuedMessageCard';
 import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessagePopover';
 import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
+import BackgroundTaskIndicator from '@/modules/chat/composer/BackgroundTaskIndicator';
+import type { ActiveBackgroundTask } from '@/shared/types';
 import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
 import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
 
@@ -149,6 +151,11 @@ type ChatComposerProps = {
   placeholder: string;
   isTextareaExpanded: boolean;
   sendByCtrlEnter?: boolean;
+  backgroundTasks?: ActiveBackgroundTask[];
+  hasActiveBackgroundTasks?: boolean;
+  /** Running background work holds new messages in the queue (see `acceptsInputDuringBackgroundWork`). */
+  backgroundWorkQueuesInput?: boolean;
+  onForceSendQueuedDraft?: () => void;
 }
 
 function ChatComposer({
@@ -227,6 +234,10 @@ function ChatComposer({
   placeholder,
   isTextareaExpanded,
   sendByCtrlEnter,
+  backgroundTasks = [],
+  hasActiveBackgroundTasks = false,
+  backgroundWorkQueuesInput = false,
+  onForceSendQueuedDraft,
 }: ChatComposerProps) {
   const { t } = useTranslation('chat');
   const fileDropdownRef = useRef<HTMLDivElement | null>(null);
@@ -293,7 +304,8 @@ function ChatComposer({
   const hasActivityIndicator = Boolean(activity && !hasPendingPermissions);
 
   const hasQueuedDraft = Boolean(queuedDraft);
-  const canQueueDraft = isLoading && Boolean(input.trim() || attachedFiles.length > 0);
+  const isBusy = isLoading || backgroundWorkQueuesInput;
+  const canQueueDraft = isBusy && Boolean(input.trim() || attachedFiles.length > 0);
   const submitHint = canQueueDraft
     ? hasQueuedDraft
       ? t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' })
@@ -356,6 +368,10 @@ function ChatComposer({
         </div>
       )}
 
+      {hasActiveBackgroundTasks && backgroundTasks.length > 0 && (
+        <BackgroundTaskIndicator tasks={backgroundTasks} onAbort={onAbortSession} />
+      )}
+
       {queuedDraft && (
         <QueuedMessageCard
           content={queuedDraft.content}
@@ -364,6 +380,8 @@ function ChatComposer({
           }
           onEdit={onEditQueuedDraft}
           onDelete={onDeleteQueuedDraft}
+          onForceSend={backgroundWorkQueuesInput ? onForceSendQueuedDraft : undefined}
+          isWaitingForBackgroundTasks={backgroundWorkQueuesInput}
         />
       )}
 

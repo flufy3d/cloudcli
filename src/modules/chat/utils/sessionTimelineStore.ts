@@ -41,7 +41,7 @@
 
 import { isVolatileMessageId } from '@shared/protocol/messageKinds';
 import { authenticatedFetch } from '@/shared/api';
-import type { LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
+import type { ActiveBackgroundTask, LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
 import {
   isChatSubscribedEvent,
   isNormalizedMessageEvent,
@@ -137,6 +137,7 @@ export type SessionSlot = {
   hasMore: boolean;
   offset: number;
   tokenUsage: unknown;
+  backgroundTasks: ActiveBackgroundTask[];
 }
 
 const EMPTY: NormalizedMessage[] = [];
@@ -168,6 +169,7 @@ function createEmptySlot(): SessionSlot {
     offset: 0,
     tokenUsage: null,
     _historyMutationQueue: Promise.resolve(),
+    backgroundTasks: [],
   };
 }
 
@@ -713,9 +715,6 @@ const SERVER_EVENT_ROUTES: Record<string, { flushesStream: boolean; action: Serv
   interactive_prompt: { flushesStream: true, action: 'append' },
   task_notification: { flushesStream: true, action: 'append' },
   session_created: { flushesStream: true, action: 'append' },
-  // Preserved quirk: this frame persists a row that nothing renders. Kept so
-  // the timeline stays a lossless record until a decision retires it.
-  permission_resolved: { flushesStream: true, action: 'append' },
   thinking: { flushesStream: true, action: 'thinking' },
   tool_use: { flushesStream: true, action: 'toolUse' },
   stream_delta: { flushesStream: false, action: 'streamDelta' },
@@ -727,6 +726,7 @@ const SERVER_EVENT_ROUTES: Record<string, { flushesStream: boolean; action: Serv
   chat_subscribed: { flushesStream: false, action: 'ack' },
   status: { flushesStream: false, action: 'status' },
   permission_request: { flushesStream: false, action: 'permissionRequest' },
+  permission_resolved: { flushesStream: false, action: 'permissionResolved' },
   permission_cancelled: { flushesStream: false, action: 'permissionCancelled' },
   // Sidebar/global events — owned by useProjectsState. `session_removed` is a
   // batch frame with no id/sessionId; without this row the unknown-kind
@@ -760,6 +760,7 @@ type ServerEventAction =
   | 'ack'
   | 'status'
   | 'permissionRequest'
+  | 'permissionResolved'
   | 'permissionCancelled'
   | 'none';
 
@@ -776,6 +777,7 @@ export type ServerEventDirective =
       stale: boolean;
       isProcessing: boolean;
       pendingPermissions: unknown[] | null;
+      backgroundTasks?: ActiveBackgroundTask[];
     }
   | { effect: 'protocol_error'; sessionId: string; code: unknown; error: unknown }
   | { effect: 'complete'; sessionId: string | null; success: boolean; aborted: boolean }
@@ -785,6 +787,7 @@ export type ServerEventDirective =
       text: string | null;
       canInterrupt: boolean;
       tokenBudget: unknown;
+      backgroundTasks?: ActiveBackgroundTask[];
     }
   | {
       effect: 'permission_request';
@@ -794,6 +797,7 @@ export type ServerEventDirective =
       input: unknown;
       context: unknown;
     }
+  | { effect: 'permission_resolved'; sessionId: string | null; requestId: string | null }
   | { effect: 'permission_cancelled'; sessionId: string | null; requestId: string | null };
 
 export type ApplyServerEventOptions = {
@@ -931,6 +935,11 @@ export class SessionTimelineStore {
         if (msg.lastSeq > 0) {
           this.noteSeq(sid, msg.lastSeq);
         }
+        const ackBgTasks = Array.isArray(msg.backgroundTasks) ? msg.backgroundTasks : undefined;
+        if (ackBgTasks) {
+          this.getSlot(sid).backgroundTasks = ackBgTasks;
+          this.notify(sid);
+        }
         return {
           effect: 'chat_subscribed',
           sessionId: sid,
@@ -939,6 +948,7 @@ export class SessionTimelineStore {
           pendingPermissions: Array.isArray(msg.pendingPermissions)
             ? msg.pendingPermissions
             : null,
+          backgroundTasks: ackBgTasks,
         };
       }
 
@@ -990,14 +1000,21 @@ export class SessionTimelineStore {
         };
       }
 
-      case 'status':
+      case 'status': {
+        const statusBgTasks = Array.isArray(message?.backgroundTasks) ? message.backgroundTasks : undefined;
+        if (sid && statusBgTasks) {
+          this.getSlot(sid).backgroundTasks = statusBgTasks;
+          this.notify(sid);
+        }
         return {
           effect: 'status',
           sessionId: sid,
           text: message?.text || null,
           canInterrupt: message?.canInterrupt !== false,
           tokenBudget: message?.tokenBudget,
+          backgroundTasks: statusBgTasks,
         };
+      }
 
       case 'permissionRequest':
         return {
@@ -1009,9 +1026,10 @@ export class SessionTimelineStore {
           context: message?.context,
         };
 
+      case 'permissionResolved':
       case 'permissionCancelled':
         return {
-          effect: 'permission_cancelled',
+          effect: route.action === 'permissionResolved' ? 'permission_resolved' : 'permission_cancelled',
           sessionId: sid,
           requestId: message?.requestId || null,
         };
@@ -1781,5 +1799,10 @@ export class SessionTimelineStore {
   /** Session slot (for status, pagination info, etc.). */
   getSessionSlot(sessionId: string): SessionSlot | undefined {
     return this.slots.get(sessionId);
+  }
+
+  /** Active background tasks for a session. */
+  getBackgroundTasks(sessionId: string): ActiveBackgroundTask[] {
+    return this.slots.get(sessionId)?.backgroundTasks ?? [];
   }
 }

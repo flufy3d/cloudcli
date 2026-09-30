@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.5.10 / 2026-09-22
+> 基准：2.7.2 / 2026-09-28
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -46,7 +46,7 @@ composer 的定时卡片同样不走 Context，也不是实时状态：`useSched
 ### 消息类型的归属
 
 服务端↔客户端的消息形状**不在前端定义**，而在仓库根 `shared/protocol/chatEvents.ts`，`src/shared/types.ts` 从那里 re-export
-（细节见 [providers.md](./providers.md) 的「线上契约」）。前端曾另有一份自己的副本，与服务端悄悄漂移了七个字段。
+（细节见 [providers.md](./providers.md) 的「线上契约」），包含 `ActiveBackgroundTask`（后台活跃任务）等统一运行时契约。前端曾另有一份自己的副本，与服务端悄悄漂移了七个字段。
 
 前端在协议之上的本地扩展写在 `src/shared/types.ts`，必须显式列出：
 

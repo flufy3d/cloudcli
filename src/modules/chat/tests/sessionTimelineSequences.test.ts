@@ -17,7 +17,7 @@ import { afterEach, test, vi } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
 
 import type { ServerEvent } from '@/shared/context/WebSocketContext';
-import type { NormalizedMessage } from '@/shared/types';
+import type { NormalizedMessage, PendingPermissionRequest } from '@/shared/types';
 import { useChatRealtimeHandlers } from '@/modules/chat/hooks/useChatRealtimeHandlers';
 import { useSessionStore } from '@/modules/chat/hooks/useSessionStore';
 import { normalizedToChatMessages } from '@/modules/chat/hooks/useChatMessages';
@@ -73,6 +73,7 @@ type TimelineHarness = {
   onSessionProcessing: ReturnType<typeof vi.fn>;
   emit: (frame: ServerEvent) => void;
   cleanup: () => void;
+  getPendingRequests: () => PendingPermissionRequest[];
 };
 
 function mountTimeline(activeSessionId: string | null = SESSION_ID): TimelineHarness {
@@ -93,22 +94,33 @@ function mountTimeline(activeSessionId: string | null = SESSION_ID): TimelineHar
   const onSessionIdle = vi.fn();
   const onSessionProcessing = vi.fn();
 
-  const handlersRoot = renderHook(() => useChatRealtimeHandlers({
-    isActive: true,
-    subscribe,
-    provider: 'claude',
-    selectedSession: null,
-    currentSessionId: activeSessionId,
-    setTokenBudget: vi.fn(),
-    pendingPermissionRequests: [],
-    setPendingPermissionRequests: vi.fn(),
-    statusCheckSentAtRef,
-    onSessionProcessing,
-    onSessionIdle,
-    onWebSocketReconnect: vi.fn(),
-    requestLatestMessages,
-    sessionStore,
-  }));
+  let pendingRequests: PendingPermissionRequest[] = [];
+  let handlersRoot: any;
+  const setPendingPermissionRequests = vi.fn((update: React.SetStateAction<PendingPermissionRequest[]>) => {
+    pendingRequests = typeof update === 'function' ? update(pendingRequests) : update;
+    handlersRoot?.rerender?.({ pendingRequests });
+  });
+
+  handlersRoot = renderHook(
+    ({ pendingRequests: pr }: { pendingRequests: PendingPermissionRequest[] }) =>
+      useChatRealtimeHandlers({
+        isActive: true,
+        subscribe,
+        provider: 'claude',
+        selectedSession: null,
+        currentSessionId: activeSessionId,
+        setTokenBudget: vi.fn(),
+        pendingPermissionRequests: pr,
+        setPendingPermissionRequests,
+        statusCheckSentAtRef,
+        onSessionProcessing,
+        onSessionIdle,
+        onWebSocketReconnect: vi.fn(),
+        requestLatestMessages,
+        sessionStore,
+      }),
+    { initialProps: { pendingRequests } },
+  );
 
   const emit = (frame: ServerEvent) => {
     act(() => {
@@ -124,7 +136,15 @@ function mountTimeline(activeSessionId: string | null = SESSION_ID): TimelineHar
     storeRoot.unmount();
   };
 
-  return { sessionStore, requestLatestMessages, onSessionIdle, onSessionProcessing, emit, cleanup };
+  return {
+    sessionStore,
+    requestLatestMessages,
+    onSessionIdle,
+    onSessionProcessing,
+    emit,
+    cleanup,
+    getPendingRequests: () => pendingRequests,
+  };
 }
 
 /** Lets the 100ms stream throttle fire exactly once and apply the row. */
@@ -573,6 +593,7 @@ test('control frames surface as side effects without touching the timeline', () 
     toolName: 'Bash',
     input: { command: 'ls' },
   } as unknown as ServerEvent);
+  timeline.emit({ kind: 'permission_resolved', sessionId: SESSION_ID, requestId: 'req-1' } as unknown as ServerEvent);
   timeline.emit({ kind: 'permission_cancelled', sessionId: SESSION_ID, requestId: 'req-1' } as unknown as ServerEvent);
   timeline.emit({ kind: 'protocol_error', sessionId: SESSION_ID, code: -32000, error: 'rejected' } as unknown as ServerEvent);
 
@@ -599,6 +620,46 @@ test('control frames surface as side effects without touching the timeline', () 
   } as unknown as ServerEvent);
   assert.equal(timeline.sessionStore.getResumeSeq(SESSION_ID), 9, 'the ack watermark merges');
   assert.equal(timeline.requestLatestMessages.mock.calls.at(-1)?.[0], SESSION_ID, 'stale owes a refresh');
+
+  timeline.cleanup();
+});
+
+test('a replayed or live permission_request followed by permission_resolved clears the pending card', () => {
+  const timeline = mountTimeline();
+
+  // 1. Reconnect after a mid-run refresh or tab unlock: chat_subscribed sets baseline
+  timeline.emit({
+    kind: 'chat_subscribed',
+    sessionId: SESSION_ID,
+    isProcessing: true,
+    pendingPermissions: [],
+  } as unknown as ServerEvent);
+  assert.deepEqual(timeline.getPendingRequests(), []);
+
+  // 2. Replay delivers the previously asked question
+  timeline.emit({
+    kind: 'permission_request',
+    sessionId: SESSION_ID,
+    requestId: 'req-answered',
+    toolName: 'AskUserQuestion',
+    input: { questions: [{ question: 'Q1' }] },
+  } as unknown as ServerEvent);
+  assert.equal(timeline.getPendingRequests().length, 1);
+  assert.equal(timeline.getPendingRequests()[0].requestId, 'req-answered');
+
+  // 3. Replay delivers its resolution (or another tab answered it live)
+  timeline.emit({
+    kind: 'permission_resolved',
+    sessionId: SESSION_ID,
+    requestId: 'req-answered',
+  } as unknown as ServerEvent);
+
+  // Must be cleared — not left pending as a ghost card
+  assert.deepEqual(timeline.getPendingRequests(), []);
+
+  // Must not leave ghost messages in the timeline store
+  const rows = timeline.sessionStore.getMessages(SESSION_ID);
+  assert.equal(rows.filter((r) => r.kind === 'permission_resolved').length, 0);
 
   timeline.cleanup();
 });

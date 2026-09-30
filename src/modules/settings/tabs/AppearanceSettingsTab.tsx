@@ -35,17 +35,6 @@ export default function AppearanceSettingsTab({
 
   return (
     <div className="space-y-8">
-      <SettingsSection title={t('appearanceSettings.darkMode.label')}>
-        <SettingsCard>
-          <SettingsRow
-            label={t('appearanceSettings.darkMode.label')}
-            description={t('appearanceSettings.darkMode.description')}
-          >
-            <DarkModeToggle ariaLabel={t('appearanceSettings.darkMode.label')} />
-          </SettingsRow>
-        </SettingsCard>
-      </SettingsSection>
-
       <SettingsSection title={t('mainTabs.appearance')}>
         <SettingsCard>
           <LanguageSelector />

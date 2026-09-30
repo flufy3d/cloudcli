@@ -16,7 +16,6 @@
  * deliberately visible rather than blended into the wire shape.
  */
 
-
 /**
  * Providers supported by the unified server runtime.
  *
@@ -45,7 +44,8 @@ export type MessageKind =
   | 'permission_cancelled'
   | 'session_created'
   | 'history_truncated'
-  | 'task_notification';
+  | 'task_notification'
+  | 'task_status';
 
 /**
  * Event kinds added by the chat gateway layer on top of provider message kinds.
@@ -86,6 +86,162 @@ export type MemoryCitation = {
   source: string;
   /** What the reply took from that range, when the provider states it. */
   note?: string;
+};
+
+/**
+ * A compaction, as the transcript records it.
+ *
+ * `running` is the status the CLI sends when it starts compacting, `done` the
+ * boundary it sends when it has, `failed` a compaction that did not finish.
+ * The token counts and duration only come with a boundary.
+ */
+export type BackgroundTaskStatus = 'running' | 'completed' | 'failed' | 'stopped';
+
+/**
+ * The latest live word on a background task, folded from the session's
+ * `task_status` events onto the tool call that launched it. It is what a card
+ * reads while the run is in flight; on a history reload the backend's
+ * `subagent` or `workflow` carries the settled outcome instead.
+ */
+export type LiveTaskStatus = {
+  status: BackgroundTaskStatus;
+  /** The id the events name the task by, which is what stopping it addresses. */
+  taskId?: string;
+  taskType?: string;
+  workflowName?: string;
+  description?: string;
+  summary?: string;
+  usage?: TaskUsage;
+  /** A workflow's only: where each agent the run spawned stands, from its latest progress event. */
+  agents?: WorkflowAgentProgress[];
+};
+
+export type CompactionInfo = {
+  phase: 'running' | 'done' | 'failed';
+  /** Whether the user asked for it or the context window did. */
+  trigger?: 'manual' | 'auto';
+  /** Tokens the conversation held before and after, when the boundary reports them. */
+  preTokens?: number;
+  postTokens?: number;
+  durationMs?: number;
+  error?: string | null;
+};
+
+/**
+ * What a background task has spent so far, as the CLI reports it on
+ * `task_progress` and `task_notification`.
+ */
+export type TaskUsage = {
+  totalTokens: number;
+  toolUses: number;
+  durationMs: number;
+};
+
+/**
+ * One background task a live session still has outstanding — a spawned
+ * agent, a workflow run or a backgrounded command — as the runtime tracks it
+ * from the stream's `task_started` until the event that settles it.
+ *
+ * `taskId` is the handle a stop request names; `toolUseId` is the call that
+ * launched it, which is how the client pairs the task with its card.
+ * `startedAt` is the server clock at `task_started`, so a session whose turn
+ * has ended can still report how long its work has been going.
+ */
+export type BackgroundTaskSummary = {
+  taskId: string;
+  toolUseId: string;
+  taskType: string;
+  description: string;
+  workflowName?: string;
+  startedAt: number;
+  /**
+   * The task was launched by a subagent or workflow agent, not by the
+   * session's own turn: its `toolUseId` names a call in that agent's
+   * transcript, so no card in this session's transcript matches it. Listed so
+   * it can still be stopped; not counted as the session's own work.
+   */
+  nested?: boolean;
+};
+
+/**
+ * Where one agent of a running workflow stands, as the SDK reports it on the
+ * run's `task_progress` events.
+ *
+ * An entry the script has queued but not yet started has no `agentId` and is
+ * identified by `index` alone; once the agent runs, `agentId` names the
+ * transcript it writes. `lastToolName` and `lastToolSummary` are the agent's
+ * own latest tool call — unlike the event's task-level `last_tool_name`, which
+ * for a workflow is the current agent's label.
+ */
+export type WorkflowAgentProgress = {
+  index: number;
+  label?: string;
+  /** The title of the script phase the agent runs under, when it has one. */
+  phase?: string;
+  agentId?: string;
+  model?: string;
+  state: 'queued' | 'running' | 'done' | 'failed';
+  startedAt?: number;
+  lastToolName?: string;
+  lastToolSummary?: string;
+  promptPreview?: string;
+  tokens?: number;
+  toolCalls?: number;
+  durationMs?: number;
+  resultPreview?: string;
+};
+
+/**
+ * One workflow agent's recorded timeline, read from its transcript on demand
+ * when the card is opened — the SDK never streams an agent's own rows to the
+ * parent session, so this is the only way to see what it did.
+ *
+ * `activityCount` is the full length of the timeline; `activity` is capped
+ * for transport like a subagent's `subagentTools`.
+ */
+export type WorkflowAgentActivity = {
+  agent: {
+    id: string;
+    label?: string;
+    model?: string;
+    status: 'running' | 'completed' | 'failed' | 'stopped';
+  };
+  activity: SubagentActivity[];
+  activityCount: number;
+};
+
+/**
+ * One agent a workflow run spawned, as its journal records it.
+ *
+ * `label` and `phase` are whatever the script passed when it spawned the
+ * agent; older scripts passed neither. An agent with a `started` record and no
+ * `result` or `failed` one is still running as far as the journal knows.
+ */
+export type WorkflowAgentInfo = {
+  id: string;
+  label?: string;
+  phase?: string;
+  /** `stopped` is an agent the journal never settled although the run itself has — abandoned by a stop or a resume that re-ran the step. */
+  status: 'running' | 'completed' | 'failed' | 'stopped';
+};
+
+/**
+ * A `Workflow` tool call's run, attached to the `tool_use` that launched it.
+ *
+ * `status` follows the same rule as a background agent's: the task
+ * notification's word when one exists, else `running` only while the process
+ * that launched it is still up, else `stopped`. The agent list and counts come
+ * from `<transcriptDir>/journal.jsonl`; both are empty when the run left no
+ * journal behind (a fork copies only the parent's transcript).
+ */
+export type WorkflowInfo = {
+  runId: string;
+  name: string;
+  description?: string;
+  status: 'running' | 'completed' | 'failed' | 'stopped';
+  agents: WorkflowAgentInfo[];
+  agentCounts: { total: number; completed: number; failed: number; running: number; stopped: number };
+  scriptPath?: string;
 };
 
 /**
@@ -130,7 +286,7 @@ export type SubagentInfo = {
   type?: string;
   /** One-line task summary shown in the collapsed header. */
   description?: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'stopped';
   /** Model the subagent ran on, when the provider records it. */
   model?: string;
   /**
@@ -139,6 +295,14 @@ export type SubagentInfo = {
    * lets the UI say so instead of silently showing a partial timeline.
    */
   activityCount?: number;
+};
+
+export type ActiveBackgroundTask = {
+  id: string;
+  toolName: string;
+  command?: string;
+  description?: string;
+  startedAt: number;
 };
 
 /** The owning project as it appears inside a `session_upserted` delta. */
@@ -266,6 +430,16 @@ export type NormalizedMessage = {
   isLocalCommand?: boolean;
   isLocalCommandStdout?: boolean;
   isCompactSummary?: boolean;
+  /**
+   * The model that produced this assistant message, as the provider reported
+   * it on the transcript row. Absent on user turns and when the provider
+   * named a placeholder such as `<synthetic>`.
+   */
+  model?: string;
+  /** A compaction row, when the message is a compaction summary. */
+  compact?: CompactionInfo;
+  /** A live workflow, when the message reports workflow/agent progress. */
+  workflow?: WorkflowInfo;
   /** Image attachments on a user turn after provider history normalization. */
   images?: Array<{ path?: string; data?: string; name?: string }>;
   /** Non-image files attached to a user turn after provider history normalization. */
@@ -312,6 +486,24 @@ export type NormalizedMessage = {
    */
   summaryKey?: string;
   tokenBudget?: unknown;
+  backgroundTasks?: ActiveBackgroundTask[];
+  /**
+   * Live background-work events (`task_status` rows): what a launched agent,
+   * workflow or backgrounded command is doing while its turn has ended. The
+   * run is tracking. `taskId` is the provider's task handle; `toolUseId` names
+   * the call that launched it and is absent on `updated`, which the SDK keys by
+   * task id alone. `status` and `summary` above carry the event's own.
+   */
+  event?: 'started' | 'progress' | 'updated' | 'notification';
+  taskId?: string;
+  toolUseId?: string;
+  taskType?: string;
+  workflowName?: string;
+  description?: string;
+  usage?: TaskUsage;
+  outputFile?: string;
+  /** A workflow's `progress` only: where each agent the run spawned stands. */
+  agents?: WorkflowAgentProgress[];
   /**
    * Timeline of everything a subagent did, attached to the `tool_use` that
    * spawned it. Present for Claude `Agent`/`Task` calls and Codex

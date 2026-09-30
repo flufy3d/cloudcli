@@ -741,6 +741,11 @@ export function useChatSessionState({
     }
   }, [currentSessionId, isActive, isLoadingAllMessages, selectedProject, selectedSession, sessionStore]);
 
+  const backgroundTasks = useMemo(() => {
+    return currentSessionId ? sessionStore.getBackgroundTasks(currentSessionId) : [];
+  }, [currentSessionId, sessionStore]);
+  const hasActiveBackgroundTasks = backgroundTasks.length > 0;
+
   return {
     chatMessages,
     addMessage,
@@ -748,6 +753,8 @@ export function useChatSessionState({
     sessionActivity,
     isProcessing,
     canAbortSession,
+    backgroundTasks,
+    hasActiveBackgroundTasks,
     currentSessionId,
     setCurrentSessionId,
     isLoadingSessionMessages,

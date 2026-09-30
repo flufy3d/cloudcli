@@ -84,6 +84,27 @@
       "openPanel": "打开设置面板",
       "draggingStatus": "正在拖拽...",
       "toggleAndMove": "点击切换，拖拽移动"
+    },
+    "tabs": {
+      "settings": "设置",
+      "commands": "命令"
+    },
+    "pin": "固定面板",
+    "unpin": "取消固定面板",
+    "close": "关闭面板",
+    "commands": {
+      "searchPlaceholder": "搜索命令…",
+      "noProject": "选择一个项目以查看其命令。",
+      "loading": "正在加载命令…",
+      "empty": "此项目没有可用的命令。",
+      "noMatches": "没有与搜索匹配的命令。",
+      "loadError": "无法加载命令。",
+      "groups": {
+        "builtIn": "内置",
+        "custom": "自定义",
+        "skills": "技能"
+      },
+      "insertTitle": "将 {{command}} 插入聊天"
     }
   },
   "terminalShortcuts": {
@@ -243,6 +264,13 @@
         "label": "字体大小",
         "description": "编辑器字体大小（px）"
       }
+    },
+    "theme": {
+      "label": "主题",
+      "description": "选择浅色或深色外观，或跟随操作系统设置",
+      "light": "浅色",
+      "dark": "深色",
+      "system": "跟随系统外观"
     }
   },
   "mcpForm": {
@@ -429,7 +457,8 @@
     "title": "权限设置",
     "skipPermissions": {
       "label": "跳过权限提示（请谨慎使用）",
-      "cursorDescription": "等同于 Cursor CLI 中的 -f 标志"
+      "cursorDescription": "等同于 Cursor CLI 中的 -f 标志",
+      "claudeDescription": "等同于 --dangerously-skip-permissions 标志"
     },
     "allowedTools": {
       "title": "允许的工具",

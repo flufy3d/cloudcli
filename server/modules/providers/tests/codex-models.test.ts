@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import { test } from 'node:test';
 
 import {
   CODEX_PREDEFINED_MODELS,
   CodexProviderModels,
 } from '../list/codex/codex-models.provider.js';
+
+const require = createRequire(import.meta.url);
 
 test('CODEX_PREDEFINED_MODELS sets gpt-6-sol as default model', () => {
   assert.equal(CODEX_PREDEFINED_MODELS.DEFAULT, 'gpt-6-sol');
@@ -38,4 +41,13 @@ test('CodexProviderModels getSupportedModels returns predefined catalog', async 
   assert.equal(models.DEFAULT, 'gpt-6-sol');
   assert.ok(models.OPTIONS.some((o) => o.value === 'gpt-6-sol'));
   assert.ok(models.OPTIONS.some((o) => o.value === 'gpt-6-luna'));
+});
+
+test('bundles a Codex CLI new enough to know the GPT-6 Sol and Luna models', () => {
+  // Codex only ships metadata for gpt-6-sol / gpt-6-luna from 0.155.0 on. An
+  // older CLI still sends the request, but on fallback metadata: it warns
+  // "Model metadata ... not found" and quietly drops `ultra` to `medium`.
+  const { version } = require('@openai/codex/package.json') as { version: string };
+  const [major, minor] = version.split('.').map(Number);
+  assert.ok(major > 0 || minor >= 155, `bundled @openai/codex ${version} predates 0.155.0`);
 });

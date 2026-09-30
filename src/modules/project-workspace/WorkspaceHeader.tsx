@@ -19,6 +19,8 @@ type WorkspaceHeaderProps = {
   shouldShowShellTab: boolean;
   isMobile: boolean;
   onMenuClick: () => void;
+  /** Persists a new title for a session; resolves false when the backend refuses it. */
+  onRenameSession: (sessionId: string, summary: string) => Promise<boolean>;
 };
 
 /** Rendered by WorkspaceMain to show the workspace title alongside the scrollable tab bar. */
@@ -33,6 +35,7 @@ export default function WorkspaceHeader({
   shouldShowShellTab,
   isMobile,
   onMenuClick,
+  onRenameSession,
 }: WorkspaceHeaderProps) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -105,6 +108,7 @@ export default function WorkspaceHeader({
             selectedProject={selectedProject}
             selectedSession={selectedSession}
             shouldShowTasksTab={shouldShowTasksTab}
+            onRenameSession={onRenameSession}
           />
         </div>
 

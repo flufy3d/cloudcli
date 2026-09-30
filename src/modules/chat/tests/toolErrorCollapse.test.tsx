@@ -43,6 +43,7 @@ describe('failed tool collapse defaults', () => {
     const { container } = render(
       <ToolGroupContainer
         group={{
+          preview: '',
           _isGroup: true,
           toolName: 'Bash',
           messages: [

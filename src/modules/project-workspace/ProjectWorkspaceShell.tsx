@@ -1,12 +1,12 @@
 import { memo } from 'react';
 
 import { useQueuedMessageAutoSend } from '@/modules/chat';
-import { QuickSettingsPanel } from '@/modules/quick-settings-panel';
 import ProjectEffects from '@/modules/project-workspace/controllers/ProjectEffects';
 import type { ProjectWorkspaceShellProps } from '@/shared/types';
 import ProjectCommandPalette from '@/modules/project-workspace/ProjectCommandPalette';
 import ProjectMainRegion from '@/modules/project-workspace/ProjectMainRegion';
 import { useProjectActiveSessionState } from '@/modules/project-workspace/context/ProjectsStateContext';
+import ProjectQuickSettingsRegion from '@/modules/project-workspace/ProjectQuickSettingsRegion';
 import ProjectSidebarRegion from '@/modules/project-workspace/ProjectSidebarRegion';
 import { useWebSocket } from '@/shared/context/WebSocketContext';
 
@@ -48,7 +48,8 @@ function ProjectWorkspaceShell({
       </div>
 
       <ProjectCommandPalette />
-      <QuickSettingsPanel />
+      {/* Last flex child on purpose: when pinned it docks to the right of the main region. */}
+      <ProjectQuickSettingsRegion />
     </div>
   );
 }

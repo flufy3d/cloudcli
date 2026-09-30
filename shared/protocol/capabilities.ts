@@ -93,5 +93,11 @@ export type ProviderCapabilities = {
    * does not (Claude's resume, Codex's fork).
    */
   editRevertsFiles: boolean;
+  /**
+   * Whether a message sent while background work is still running goes
+   * straight to the engine (the work survives it). When false the composer
+   * holds the message in its queue until the work settles.
+   */
+  acceptsInputDuringBackgroundWork: boolean;
   mcp: ProviderMcpCapabilities;
 };

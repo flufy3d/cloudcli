@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.5.1 / 2026-09-22
+> 基准：2.7.2 / 2026-09-28
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -19,7 +19,7 @@
 
 | 切面 | 职责 | 关键成员 / 消费服务 |
 | --- | --- | --- |
-| `runtime` | 拉起/中止引擎执行 | `run(command, options, writer, context)`、`abort(sessionId)`；可选 `compact(options, writer, context)`（按需压缩，前端 `/compact` 的唯一开关）；可选 `permissions`（权限批准网关）→ `providerRuntimeService` |
+| `runtime` | 拉起/中止引擎执行 | `run(command, options, writer, context)`、`abort(sessionId)`；可选 `compact(options, writer, context)`（按需压缩，前端 `/compact` 的唯一开关）；可选 `permissions`（权限批准网关）、`backgroundTasks`（后台活跃任务列表）→ `providerRuntimeService` |
 | `models` | 模型目录 | `getSupportedModels()`（预置目录）、`getCurrentActiveModel()`（只读兜底）→ `providerModelsService` |
 | `auth` | 安装/登录状态 | `getStatus()`（"未安装/未登录"是数据不是异常）；可选 `getQuota()`（配额）→ `providerAuthService` |
 | `mcp` | 引擎原生 MCP 配置读写 | `McpProvider` 基类（scope/transport 校验）→ `providerMcpService` |
@@ -39,7 +39,8 @@
 `server/modules/providers/services/provider-capabilities.service.ts`：
 
 - `deriveCapabilities` 从注册表里的切面**推导**能力——`runtime.permissions` 存在 ⇒ `supportsPermissionRequests`；`sessions.resolveEditAnchor` 存在 ⇒ `supportsMessageEditing`；`fork` 存在 ⇒ `supportsSessionForking`；`sessions.getTokenUsage` 存在 ⇒ `supportsTokenUsage`；`runtime.compact` 存在 ⇒ `supportsCompaction`。
-- 静态部分（权限模式列表、图片/文件/中止/effort、编辑是否回滚文件 `editRevertsFiles`、引擎是否自带会话内调度 `supportsNativeScheduling`）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
+- 静态部分（权限模式列表、图片/文件/中止/effort、编辑是否回滚文件 `editRevertsFiles`、引擎是否自带会话内调度 `supportsNativeScheduling`、后台任务期间能否直接收新消息 `acceptsInputDuringBackgroundWork`）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
+- **`acceptsInputDuringBackgroundWork`**：目前仅 claude 为 true——新消息注入持有后台任务的活进程（见下文「保活与复用」），任务不受影响；其余引擎发送会重启进程杀掉任务，composer 因此在后台任务期间把消息转入排队。
 - `provider-capabilities.test.ts` 把推导结果钉在显式基线上：切面增删会以"评审过的测试差异"呈现，而不是静默改能力。
 - **`supportsNativeScheduling` 只是提示位，不参与启停**：CloudCLI 的循环定时任务（`scheduled-jobs`）对所有引擎可用；该位为 true（目前仅 claude 的 CronCreate/ScheduleWakeup）时，任务表单与 composer 重复入口提示"引擎自身也有会话内定时、冲突回合会被跳过"，行为不变。
 - **前端零 provider 分支**：composer/设置页完全按 `GET /api/providers/capabilities` 渲染。首屏与请求失败时的回退镜像在 `src/shared/providerCatalogFallback.ts`（`PROVIDER_FALLBACK_CATALOG`），由跨树 parity 测试（`server/modules/providers/tests/provider-catalog-parity.test.ts`）钉住与后端目录一致；**其 key 顺序就是全应用的引擎规范顺序**。
@@ -90,7 +91,9 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启
 
 **回合归属**：每条 prompt 都带客户端 `uuid`，CLI 在回合首帧与 `result` 上回显（`user_message_uuid(_uuids)`）。runtime 用它把 `result` 绑到正确的 turn，从而区分"用户回合的 result"（发 `complete`、结算提交者）与"CLI 自己推的后台 follow-up 回合的 result"（只做 `notifyBackgroundWorkCompleted`，不得结束用户正在跑的 run）。CLI 是否回显由 `system/init` 的 `claude_code_version` 判定（≥ 2.1.259，`readClaudeInitUuidStampingSupport`），**不能**靠"进程第一个 result 没 uuid"去猜：resume 时 CLI 常先推一轮"后台任务已停止"的 task-notification 回合，它的 result 本就不带 uuid，误判会把它当成用户回合的结束 → 关 stdin → 真正的回合跑完时 wind-down 杀掉它启动的后台任务。只有版本读不出/更老时才退回"首个 result 定性 + 按到达顺序归属"的旧读法。
 
-**后台工作判定**：以 CLI 的任务生命周期帧为准——`background_tasks_changed`（全量替换语义）与 `task_started`（`is_backgrounded`）维护存活任务集合、`task_notification` 移除，`ambient` 任务（内部看护进程）不计；集合跨回合存活，所以"上一回合启动的任务"在新回合结束时仍然撑住保活。保活条件是"集合非空 **或** 本回合工具检测命中"：集合管跨回合的旧任务，每回合的 `Bash(run_in_background)`/延迟工具检测（`startsBackgroundWork`）兜住 CLI 还没来得及报帧的新任务，也兼容不报任务帧的旧 CLI。完成通知只在集合确实清空时发（旧 CLI 保持"follow-up result 即完成"的旧读法）。
+**后台工作判定**：以 CLI 的任务生命周期帧为准——`background_tasks_changed`（全量替换语义）与 `task_started`（`is_backgrounded`）维护存活任务集合、`task_notification` 移除，`ambient` 任务（内部看护进程）不计；集合跨回合存活，所以"上一回合启动的任务"在新回合结束时仍然撑住保活。保活条件是"集合非空 **或** 本回合工具检测命中"：集合管跨回合的旧任务，每回合的 `Bash(run_in_background)`/延迟工具检测（`startsBackgroundWork`）兜住 CLI 还没来得及报帧的新任务，也兼容不报任务帧的旧 CLI。完成通知只在集合确实清空时发（旧 CLI 保持"follow-up result 即完成"的旧读法）。本回合只要出现过 `task_started`，就只看任务集合（进程内集合或下述会话级任务表任一非空），不再信工具检测——未显式 `run_in_background: false` 的 Agent 会被工具检测算作后台，而 CLI 实际在前台跑完，否则会白白保活到上限。
+
+**会话级任务表**：模块级 `createBackgroundWorkTracker()` 按会话键记录每个 `task_started`（带 `tool_use_id`，嵌套在子代理里的标 `nested`）直到 `task_notification`/终态 `task_updated`，供 running 列表（`listBackgroundWork`）与单任务停止（`stopBackgroundTask` → SDK `stopTask`）使用；被停止的任务 CLI 不会再推 follow-up 回合，所以最后一个任务以 `stopped` 结束且当前没有回合在跑时直接释放保活。composer 的任务条则来自按工具调用提取的 `backgroundTasks` 列表（`status: background_tasks` 广播，`chat_subscribed` 回放）。
 
 契约的实测探针：`scripts/probe/claude-bg-reuse-probe.mjs`（真实 CLI 验证三件事：第二条消息不杀后台任务、result 回显客户端 uuid、任务帧存在）。
 
@@ -103,7 +106,7 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启
 - `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
 - `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类；受管技能写入目标由各引擎覆盖 `getGlobalSkillSource()` 决定（claude → `~/.claude/skills`；codex / cursor / zcode / antigravity → `~/.agents/skills`；opencode → `~/.config/opencode/skills`），不覆盖即拒绝写入。
-- 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，这些请求产生的 item 通知流，以及反向的审批请求）。zcode supervisor 拉起 `app-server` 时先剥离环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留指向 App 自己的运行期文件），再注入 `zcode-provider-config.ts` 解析出的 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` / `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` / `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`——桌面端本来会传这三个变量，裸 spawn 缺了它引擎定位不到 provider 目录，`session/create` 会一直挂到超时（模型一个都用不了）。
+- 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，这些请求产生的 item 通知流，以及反向的审批请求）。zcode supervisor 拉起 `app-server` 时先剥离环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留指向 App 自己的运行期文件），再注入 `zcode-provider-config.ts` 解析出的 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` / `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` / `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`——桌面端本来会传这三个变量，裸 spawn 缺了它引擎定位不到 provider 目录，`session/create` 会一直挂到超时（模型一个都用不了）。Codex 运行时开启 `features.defer_mailbox_preemption = true` 延缓 mailbox 抢占，避免子代理并发消息打断父会话推理；并在 `onNotification` 强制过滤非主会话 `threadId`，防止子代理事件流串线。
 - zcode 附件通道：上传描述符在 runtime 内映射为 `session/send` 的原生 `attachments` 项（`{kind, filename, mimeType, sizeBytes, localPath}`，localPath 必须绝对；引擎静默丢弃无法映射的形状），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
 - zcode 发送链路（引擎 0.16.9）：引擎对 `session/create` / `session/resume` / `session/send` 做严格 schema 校验，多一个键就报 -32602（`runtimeModel` 正是被拒的那个），所以请求只带 schema 声明的字段——resume 只发 `sessionId`，create 只发 workspace 描述符；模型选择经 `session/setModel` 设在会话上（reasoning 档位必须放 `model.options.reasoningLevel`，缺省取引擎目录里的 `defaultLevel`，恢复会话时强制重选以清掉 "model unavailable"（-32031）警告）。会话工作区必须由 `workspacePath` / `cwd` 显式给出：runtime 不再回退 `process.cwd()`，否则部署目录会被同步器登记成项目。
 - 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession`）。
@@ -319,6 +322,8 @@ id 必须字节相同。** 这条有两道闸门守着：
 
 - **一次性 CLI 的异步任务会被静默掐死**：`agy` 的一次性 print 模式（`agy -p "<prompt>"`）在 root agent 转入 idle 后只等几秒就关停整个 CLI，日志为 `root agent idle; waiting up to 5s for N background task(s)` → `terminating N background task(s) on exit`。子代理和被放到后台执行的 `run_command` 都在这里死掉，而 CLI 仍然吐出 `status: SUCCESS`，于是前端收到 complete、任务看着「做完了」，真正的结果永远不会回来。antigravity runtime 因此把这一轮的 prompt 作为一行 NDJSON（`{"event":"user","message":{"content":"…"}}`）写进 stdin 并用 `--input-format stream-json` 启动：stdin 保持打开 → CLI 不自行关停 → 异步任务跑完，结果照常从 stream 回流；收到 `result` 事件后再关闭 stdin 让进程退出。**prompt 一旦退回 argv，这个保护就没了。**
 
+  更进一步，当 root agent 产生子代理（`invoke_subagent`）或启动后台命令（`run_command`）时，`agy` 在主 turn 结束时仍会先吐出一个 `event: result`。若此时直接关闭 stdin 发送 `complete`，子代理与后台进程同样会被杀，且前端会误报任务已完成。antigravity runtime 通过 `extractAntigravityBackgroundTasks` 从 `step_update` 识别活跃任务；在 `event: result` 时若仍有任务在跑，则标记 `heldForBackgroundWork = true` 暂不关 stdin 且抑制 `complete`；直到检测到任务完成通知（`<SYSTEM_MESSAGE> sender=<taskId>` 或 `Task id ... finished`）且活跃任务清空后，才释放 stdin 并发出真正的 `complete`。同时 runtime 暴露 `backgroundTasks.list(sessionId)` 切面供状态查询与输入排队使用。
+
   代价是超时责任转移到了服务端：`--print-timeout` 在该模式下不生效（实测一轮带 `20s` 上限的 run 在 result 之后依然存活，直到 stdin 关闭才退出），而 stdin 又由我们持有，所以 result 事件一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住。runtime 因此自带一个**以 stdout 活动续期的看门狗**，取值就是 `printTimeout`，到期 SIGTERM 并按失败收尾。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 等于又一次把异步工作掐死，所以只有真正的 result 才关。
 
   接新的 CLI 引擎时先问两句：它的非交互模式在主循环 idle 之后如何处置未完成的后台任务；以及谁为「进程永远不退」兜底。
@@ -326,6 +331,9 @@ id 必须字节相同。** 这条有两道闸门守着：
 - **会话内的权限模式归引擎所有**：app-server 形态的引擎把权限模式持久化在会话上（zcode 写 `session.permission`），而模型会在一轮里自行切进计划模式。因此设置里的权限模式是**变更时下发**，不是每轮重申：`zcode-runtime.provider.ts` 记住每个引擎会话最后下发的模式，值没变就不发 `session/setMode`。每轮重申会在两轮之间把计划模式抹掉，模型下一次调 `ExitPlanMode` 直接拿到「can only be used while plan mode is active」，审批卡片根本不会出现，而模型可以把这句报错读成「已获批准」继续动手。进程内缓存意味着服务重启后的第一条消息仍会下发一次——这是为了让重启期间改过的设置必定生效而留的取舍。
 
 - **常驻引擎的 stderr**：app-server 形态的引擎（zcode/codex）stderr 常驻嘈杂，别逐行转发日志——supervisor/客户端保留尾部环形缓冲（zcode 4000 字符），崩溃/crash-loop/session-lost 的错误全部附带尾部；engine 崩溃的真实死因只在 stderr 里。
+
+- **Codex 多代理下的事件流隔离与 mailbox 抢占**：
+  app-server 单连接在派生子代理时，子代理通知（含 `turn/completed`、`item/completed`）会混入父会话所在的同一事件流，但带自己的 `threadId`。若 `codex-runtime.provider.ts` 的 `onNotification` 未校验通知 `threadId`，子代理的 `turn/completed` 会提前触发主 turn 的 `settle()`，导致会话被误关中断。此外，子代理投递 mailbox 邮件时，引擎默认机制（`preempt_for_mailbox_mail`）会在 reasoning/commentary 边界抢占 sampling 导致中断。CloudCLI 在 `threadSettings.config` 中显式开启 `features.defer_mailbox_preemption = true` 将抢占推迟到安全边界，并在 runtime 强制丢弃非当前会话的通知，彻底实现多代理会话解耦。
 
 - **全仓散落的引擎清单**：除上述契约点外，历史上有过 6 处硬编码 6 家列表/能力表的地方（MCP scopes、公开 API 文档 `public/api-docs.html` 的 `PROVIDER_ORDER` 等）。新增引擎后 `grep -rn "antigravity" src server public --include='*.ts' --include='*.tsx' --include='*.html' -l` 扫一遍清单类常量，防止新引擎被隐藏。
 - `sessions`（运行时事件归一化/历史分页）与 `sessionSynchronizer`（落盘索引）是两个关注点，别混在一个类里。

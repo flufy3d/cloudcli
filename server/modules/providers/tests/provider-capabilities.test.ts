@@ -52,6 +52,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // process; CloudCLI holds that process open so the wake-ups can fire.
     supportsNativeScheduling: true,
     editRevertsFiles: false,
+    // Claude injects the turn into the live CLI process that holds the work.
+    acceptsInputDuringBackgroundWork: true,
     mcp: {
       scopes: ['user', 'local', 'project'],
       transports: ['stdio', 'http', 'sse'],
@@ -75,6 +77,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: false,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -104,6 +107,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -136,6 +140,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: true,
+    acceptsInputDuringBackgroundWork: false,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -169,6 +174,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -195,6 +201,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: false,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
+    acceptsInputDuringBackgroundWork: false,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http', 'sse'],

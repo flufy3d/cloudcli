@@ -1,22 +1,26 @@
 import { useTranslation } from 'react-i18next';
-import { PencilIcon, XIcon } from 'lucide-react';
+import { PencilIcon, XIcon, Zap } from 'lucide-react';
 
 type QueuedMessageCardProps = {
   content: string;
   attachmentCount?: number;
   onEdit: () => void;
   onDelete: () => void;
+  onForceSend?: () => void;
+  isWaitingForBackgroundTasks?: boolean;
 };
 
 /**
  * Rendered by chat's ChatComposer to show the message queued for a busy
- * session, with edit and delete actions before it is auto-sent.
+ * session, with edit, delete, and force-send actions before it is auto-sent.
  */
 export default function QueuedMessageCard({
   content,
   attachmentCount = 0,
   onEdit,
   onDelete,
+  onForceSend,
+  isWaitingForBackgroundTasks = false,
 }: QueuedMessageCardProps) {
   const { t } = useTranslation('chat');
 
@@ -29,7 +33,12 @@ export default function QueuedMessageCard({
           <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-primary/70">
             <span>{t('input.queue.label', { defaultValue: 'Queued' })}</span>
             <span className="normal-case text-muted-foreground/60">
-              · {t('input.queue.willSend', { defaultValue: 'Will send when this finishes' })}
+              ·{' '}
+              {isWaitingForBackgroundTasks
+                ? t('input.queue.willSendAfterBackground', {
+                    defaultValue: '后台任务完成后将自动发送',
+                  })
+                : t('input.queue.willSend', { defaultValue: 'Will send when this finishes' })}
             </span>
           </div>
           <p className="mt-0.5 line-clamp-2 break-words text-sm text-foreground/90">{content}</p>
@@ -40,7 +49,19 @@ export default function QueuedMessageCard({
           )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-1">
+          {onForceSend && (
+            <button
+              type="button"
+              onClick={onForceSend}
+              aria-label={t('input.queue.forceSend', { defaultValue: '立即发送并中断后台任务' })}
+              title={t('input.queue.forceSend', { defaultValue: '立即发送并中断后台任务' })}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-amber-600 bg-amber-500/10 hover:bg-amber-500/20 dark:text-amber-400 transition-colors"
+            >
+              <Zap className="h-3.5 w-3.5" />
+              <span>{t('input.queue.forceSendButton', { defaultValue: '立即发送' })}</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={onEdit}

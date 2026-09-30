@@ -7,6 +7,7 @@ import { useShellRuntime } from '@/modules/shell/hooks/useShellRuntime';
 import { sendSocketMessage } from '@/modules/shell/utils/socket';
 import { getSessionTitle } from '@/shared/utils';
 import { readSelectedProvider } from '@/shared/selectedProvider';
+import { getProviderDisplayName } from '@/shared/providerDisplay';
 import { getClaudeSettings } from '@/modules/chat';
 import ShellConnectionOverlay from '@/modules/shell/ShellConnectionOverlay';
 import ShellEmptyState from '@/modules/shell/ShellEmptyState';
@@ -218,6 +219,7 @@ export default function Shell({
   const shellProvider = isPlainShell
     ? 'plain-shell'
     : selectedSession?.__provider || readSelectedProvider();
+  const providerLabel = getProviderDisplayName(shellProvider);
 
   const handleToggleBypassPermissions = useCallback(() => {
     setBypassPermissions((enabled) => !enabled);
@@ -282,14 +284,17 @@ export default function Shell({
       })
     : selectedSession
       ? t('shell.resumeSession', { displayName: sessionDisplayNameLong })
-      : t('shell.startSession');
+      : t('shell.startSession', { provider: providerLabel });
 
   const connectingDescription = isPlainShell
     ? t('shell.runCommand', {
         command: initialCommand || t('shell.defaultCommand'),
         projectName: selectedProject.displayName,
       })
-    : t('shell.startCli', { projectName: selectedProject.displayName });
+    : t('shell.startCli', {
+        projectName: selectedProject.displayName,
+        provider: providerLabel,
+      });
 
   const overlayMode = !isInitialized ? 'loading' : isConnecting ? 'connecting' : !isConnected ? 'connect' : null;
   const overlayDescription = overlayMode === 'connecting' ? connectingDescription : readyDescription;

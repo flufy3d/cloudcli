@@ -26,6 +26,13 @@ import type { FetchHistoryResult } from '@/shared/types.js';
  * and without this the stale total then outlived every later read, leaving the
  * composer badge flipping between the cached page's window and the live one.
  *
+ * The other thing the file cannot tell: whether the CLI process behind the
+ * session is still running. Claude's history reader answers a background
+ * agent's status from that, so a session's entry is also dropped explicitly
+ * when its process starts or ends (`invalidate`) — otherwise a page read while
+ * the process was up would keep reporting `running` after it had gone, until
+ * the next row happened to land in the file.
+ *
  * Only history readers that read `jsonl_path` itself may use this cache —
  * callers pass `transcriptPath: null` for providers whose messages live
  * elsewhere (Cursor's store.db, OpenCode's shared SQLite), which bypasses
@@ -154,6 +161,11 @@ export function createSessionHistoryCache(
       } finally {
         pendingLoads.delete(sessionId);
       }
+    },
+
+    /** Forgets a session's entry so the next read re-parses its transcript. */
+    invalidate(sessionId: string): void {
+      entries.delete(sessionId);
     },
   };
 }

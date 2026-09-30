@@ -3,7 +3,8 @@
 // 生产实例与开发目录彻底脱钩（见 ~/.pm2/ecosystem.config.cjs），
 // 改代码、跑 dev 都不影响正在干活的线上服务。
 //
-// 用法：pnpm run deploy
+// 用法：pnpm run deploy [--bump]
+// 默认沿用 package.json 当前版本号；--bump 才自增 patch 版本并单独提交。
 // 脚本会先把自己拉起成 detached 后台进程（日志 ~/.cloudcli/deploy.log），当前终端
 // 只跟读日志，所以终端关闭、或 pm2 切换把托管本会话的服务重启，都不会打断部署。
 // 在 cloudcli 托管的会话里执行时，切换那一刻自身连接仍会断，后续进度看日志。
@@ -24,6 +25,7 @@ const NEXT_RUNTIME_DIR = path.join(CLOUDCLI_HOME, `runtime-next-${process.pid}`)
 const PREVIOUS_RUNTIME_DIR = path.join(CLOUDCLI_HOME, 'runtime-previous');
 const DEPLOY_LOCK = path.join(CLOUDCLI_HOME, 'deploy.lock');
 const DEPLOY_LOG = path.join(CLOUDCLI_HOME, 'deploy.log');
+const shouldBump = process.argv.includes('--bump');
 let cutoverInProgress = false;
 let deployCompleted = false;
 
@@ -158,8 +160,8 @@ process.on('exit', (code) => {
   // 中断和失败都走这里：把"线上没变"说清楚，别让人以为构建成功就等于部署成功。
   if (!deployCompleted) {
     console.error(
-      `\n[deploy] ✗ 部署未完成（退出码 ${code}）。固定运行目录未切换，线上仍是本次部署前的版本。\n` +
-      '[deploy]   若版本号已自增并提交，该版本号作废，下次部署会在它之上继续自增。',
+      `\n[deploy] ✗ 部署未完成（退出码 ${code}）。固定运行目录未切换，线上仍是本次部署前的版本。` +
+      (shouldBump ? '\n[deploy]   版本号若已自增并提交，该版本号作废，下次 --bump 会在它之上继续自增。' : ''),
     );
   }
 });
@@ -175,13 +177,10 @@ process.on('SIGINT', () => handleTerminationSignal('SIGINT'));
 process.on('SIGTERM', () => handleTerminationSignal('SIGTERM'));
 process.on('SIGHUP', () => handleTerminationSignal('SIGHUP'));
 
-// ── 0. 更新版本号（自增第三位 patch；--no-bump 沿用当前版本号） ──
+// ── 0. 版本号（默认沿用 package.json；--bump 自增第三位 patch 并提交） ──
 const pkgJsonPath = path.join(REPO_ROOT, 'package.json');
 const pkgData = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-if (process.argv.includes('--no-bump')) {
-  // 发版流水线已提交版本号并打 tag，再自增会让线上版本串偏离 release 版本号。
-  console.log(`\n[deploy] --no-bump：沿用版本号 v${pkgData.version}`);
-} else {
+if (shouldBump) {
   const semverParts = (pkgData.version || '1.0.0').split('.');
   if (semverParts.length >= 3) {
     semverParts[2] = String(parseInt(semverParts[2], 10) + 1);
@@ -204,6 +203,9 @@ if (process.argv.includes('--no-bump')) {
   } else {
     console.log(`[deploy] 已提交版本号变更：chore(release): v${pkgData.version}`);
   }
+} else {
+  // 版本号交给发版流水线管理，日常部署不消耗 patch 号。
+  console.log(`\n[deploy] 沿用版本号 v${pkgData.version}`);
 }
 
 // ── 1. 编译 ────────────────────────────────────────────────

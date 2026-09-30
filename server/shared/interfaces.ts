@@ -1,5 +1,7 @@
 import type {
+  ActiveBackgroundTask,
   AnyRecord,
+  BackgroundTaskSummary,
   FetchHistoryOptions,
   FetchHistoryResult,
   LLMProvider,
@@ -25,6 +27,7 @@ import type {
   ProviderSkillRemoveInput,
   ProviderTokenUsageResult,
   UpsertProviderMcpServerInput,
+  WorkflowAgentActivity,
 } from '@/shared/types.js';
 
 //----------------- PROVIDER CONTRACT INTERFACES ------------
@@ -57,6 +60,22 @@ export interface IProviderRuntime {
     context: ProviderRuntimeContext,
   ): Promise<unknown>;
   permissions?: ProviderRuntimePermissionGateway;
+  backgroundTasks?: {
+    list(sessionId: string): ActiveBackgroundTask[];
+  };
+  /**
+   * Sessions with background tasks still outstanding, whether or not their
+   * turn has ended. Only a runtime that keeps its process open past a turn for
+   * such work has anything to report; the others leave this undefined and the
+   * running-sessions list falls back to chat runs alone.
+   */
+  listBackgroundWork?(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }>;
+  /**
+   * Stops one outstanding background task. Resolves false when the session has
+   * no live process or that process is not tracking the task — it already
+   * settled, or the id was never one of its own.
+   */
+  stopBackgroundTask?(sessionId: string, taskId: string): Promise<boolean>;
 }
 
 /**
@@ -290,6 +309,20 @@ export interface IProviderSessions {
    * gateway branches on.
    */
   rewindSession?(sessionId: string, keepThroughId: string | null): Promise<void>;
+
+  /**
+   * Reads what one agent of a workflow run did, from the transcript the run
+   * wrote for it, with the status its journal gives it. Returns `null` when the
+   * run left no transcript for that agent.
+   *
+   * Implemented only by providers whose runtime spawns workflow agents; its
+   * absence is what makes an agent's timeline unavailable in the card.
+   */
+  readWorkflowAgentActivity?(
+    sessionId: string,
+    runId: string,
+    agentId: string,
+  ): Promise<WorkflowAgentActivity | null>;
 }
 
 // ---------------------------

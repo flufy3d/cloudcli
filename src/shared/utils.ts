@@ -1,7 +1,7 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
-import type { Project, ProjectSession } from '@/shared/types';
+import type { Project, ProjectSession, QuickSettingsTab, SlashCommand } from '@/shared/types';
 
 //----------------- DEPLOYMENT MODE ------------
 
@@ -205,6 +205,15 @@ const DEFAULT_PAGE_TITLE = 'CloudCLI UI';
  * there is nothing here to tell providers apart, and the Cursor branch that
  * used to read a `name` field no endpoint sends only hid the real label.
  */
+/** DOM id of a quick settings tab button; pairs with `getQuickSettingsTabPanelId`. */
+export const getQuickSettingsTabId = (tab: QuickSettingsTab): string => `quick-settings-tab-${tab}`;
+
+/** DOM id of the tabpanel a quick settings tab controls; pairs with `getQuickSettingsTabId`. */
+export const getQuickSettingsTabPanelId = (tab: QuickSettingsTab): string => `quick-settings-tabpanel-${tab}`;
+
+export const isSkillCommand = (command: SlashCommand): boolean =>
+  command.type === 'skill' || command.metadata?.type === 'skill';
+
 export const getSessionTitle = (session: ProjectSession): string =>
   (session.summary as string) || 'New Session';
 
@@ -343,15 +352,18 @@ function closesFence(open: OpenFence, candidate: OpenFence, line: string): boole
  * spans so LaTeX samples inside them survive. The run is converted as a whole
  * so a display formula can open on one line and close on another.
  */
-function convertMathDelimiters(source: string): string {
+function convertMathDelimiters(source: string, brackets: boolean): string {
   if (!source.includes('\\[') && !source.includes('\\(') && !source.includes('$')) {
     return source;
   }
 
-  const convert = (value: string) =>
-    value
+  const convertBrackets = (value: string) => (brackets
+    ? value
       .replace(DISPLAY_MATH_PATTERN, (_match, body: string) => '$$' + body + '$$')
       .replace(INLINE_MATH_PATTERN, (_match, body: string) => '$$' + body + '$$')
+    : value);
+  const convert = (value: string) =>
+    convertBrackets(value)
       .replace(SINGLE_DOLLAR_MATH_PATTERN, (match, body: string) =>
         looksLikeInlineMath(body) ? '$$' + body + '$$' : match,
       );
@@ -375,9 +387,14 @@ function convertMathDelimiters(source: string): string {
  * because remark-math runs with `singleDollarTextMath: false`. Currency stays
  * untouched. Fenced code blocks and inline code spans pass through untouched.
  * Apply it to every Markdown string before handing it to react-markdown; the
- * chat transcript and MarkdownPreview both do.
+ * chat transcript and MarkdownPreview both do. The chat transcript passes
+ * `brackets: false` because its own code-aware pass (`normalizeLatexDelimiters`)
+ * already rewrote every bracket pair it reads as math.
  */
-export function normalizeLatexMathDelimiters(text: string): string {
+export function normalizeLatexMathDelimiters(
+  text: string,
+  { brackets = true }: { brackets?: boolean } = {},
+): string {
   if (!text.includes('\\[') && !text.includes('\\(') && !text.includes('$')) {
     return text;
   }
@@ -391,7 +408,7 @@ export function normalizeLatexMathDelimiters(text: string): string {
 
   const flushRun = () => {
     if (run.length > 0) {
-      output.push(...convertMathDelimiters(run.join('\n')).split('\n'));
+      output.push(...convertMathDelimiters(run.join('\n'), brackets).split('\n'));
       run = [];
     }
   };

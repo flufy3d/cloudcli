@@ -49,6 +49,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
+import type { BackgroundTaskSummary } from '@/shared/types.js';
 import { readObjectRecord } from '@/shared/utils.js';
 
 type ActiveCodexSession = {
@@ -61,6 +62,44 @@ type ActiveCodexSession = {
 };
 
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
+
+/**
+ * Collab agents still running, keyed by app session id, then by the collab
+ * item id that spawned the agent.
+ *
+ * Unlike Claude — where one CLI process owns a turn and dies with it — the
+ * codex engine outlives turns, so an agent spawned mid-turn keeps working
+ * after the turn's `result`. This map is what the running-sessions poll reads
+ * (through `listBackgroundWork`) so the composer's background-work strip can
+ * show and name that work while it runs. A terminal item event (completed,
+ * failed, declined, interrupted) retires the entry; a session the cleanup
+ * timer removes takes its entries with it.
+ */
+const codexBackgroundWork = new Map<string, Map<string, BackgroundTaskSummary>>();
+
+const CODEX_BACKGROUND_TASK_TYPE = 'collab_agent';
+
+function recordCodexBackgroundStart(appSessionId: string, item: { id: string; label: string; prompt?: string }): void {
+  let tasks = codexBackgroundWork.get(appSessionId);
+  if (!tasks) {
+    tasks = new Map();
+    codexBackgroundWork.set(appSessionId, tasks);
+  }
+  // Re-recorded starts refresh the entry in place; the original startedAt
+  // survives so the strip's elapsed time does not jump.
+  const previous = tasks.get(item.id);
+  tasks.set(item.id, {
+    taskId: item.id,
+    toolUseId: item.id,
+    taskType: CODEX_BACKGROUND_TASK_TYPE,
+    description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
+    startedAt: previous?.startedAt ?? Date.now(),
+  });
+}
+
+function recordCodexBackgroundEnd(appSessionId: string, itemId: string): void {
+  codexBackgroundWork.get(appSessionId)?.delete(itemId);
+}
 
 /**
  * One approval Codex is blocked on, waiting for a human.
@@ -287,10 +326,28 @@ async function queryCodex(
    */
   const approvalSubjects = new Map<string, { toolName: string; input: unknown }>();
 
-  const emitItem = (rawItem: unknown, timestamp: string): void => {
+  const emitItem = (rawItem: unknown, timestamp: string, source: 'started' | 'completed'): void => {
     const item = readCodexAppServerItem(rawItem);
     if (!item) {
       return;
+    }
+    // A collab agent's lifecycle feeds the background-work tracker: the agent
+    // outlives the turn, and the running-sessions poll needs to know it is
+    // still going after the composer's own indicator has handed the session
+    // over from "responding" to "background work". Keyed like Claude's
+    // tracker: the app session id when the run knows one, the native thread
+    // id as the fallback for a brand-new session's first turn. Which event
+    // announced the item — not the item's own status field, which `started`
+    // events may omit — decides between tracked and retired: an unrecognized
+    // status parses as `completed`, and trusting it on `started` would drop
+    // the agent before its first tick.
+    const backgroundWorkKey = sessionId || capturedSessionId;
+    if (item.kind === 'collab_spawn' && backgroundWorkKey) {
+      if (source === 'started') {
+        recordCodexBackgroundStart(backgroundWorkKey, item);
+      } else {
+        recordCodexBackgroundEnd(backgroundWorkKey, item.id);
+      }
     }
     for (const row of codexThreadItemToRows(item, timestamp)) {
       if (row.type === 'tool_use' && !approvalSubjects.has(item.id)) {
@@ -411,6 +468,25 @@ async function queryCodex(
           return;
         }
 
+        const notificationRecord = readObjectRecord(params);
+        const turnRecord = readObjectRecord(notificationRecord?.turn);
+        const itemRecord = readObjectRecord(notificationRecord?.item);
+        const eventThreadId =
+          readNonEmptyString(notificationRecord?.threadId) ??
+          readNonEmptyString(notificationRecord?.thread_id) ??
+          readNonEmptyString(turnRecord?.threadId) ??
+          readNonEmptyString(turnRecord?.thread_id) ??
+          readNonEmptyString(itemRecord?.threadId) ??
+          readNonEmptyString(itemRecord?.thread_id) ??
+          null;
+
+        // Subagents in multi-agent mode emit their own lifecycle events on the same
+        // app-server connection. Only events for the target thread (the parent session)
+        // drive this turn's terminal state, live transcript, and token updates.
+        if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
+          return;
+        }
+
         switch (method) {
           case 'turn/started': {
             const turn = readObjectRecord(params.turn);
@@ -430,13 +506,13 @@ async function queryCodex(
             // and only reconciled against *history* by id.
             const startedType = readObjectRecord(params.item)?.type;
             if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
-              emitItem(params.item, new Date().toISOString());
+              emitItem(params.item, new Date().toISOString(), 'started');
             }
             return;
           }
 
           case 'item/completed':
-            emitItem(params.item, new Date().toISOString());
+            emitItem(params.item, new Date().toISOString(), 'completed');
             return;
 
           case 'item/agentMessage/delta': {
@@ -505,14 +581,16 @@ async function queryCodex(
               });
             }
             if (turn?.status === 'interrupted' && currentSession()?.status !== 'aborted') {
-              // Codex ends a usage-limit or shutdown interrupt here rather than
-              // at `failed`. Treating the status as a normal completion sent the
-              // client a clean `complete` while the rollout recorded
-              // `turn_aborted`, so the abort was invisible until history re-read
-              // it and diagnostics logged the run as a success. A stop the user
-              // asked for (`abort` already flagged the session) arrives as the
-              // same status and must stay silent.
-              const message = 'Codex interrupted this turn before it finished. This usually means the account hit a usage limit.';
+              // Codex ends a usage-limit, shutdown, or engine-internal interrupt
+              // here rather than at `failed` — on codex 0.155 a spawned agent
+              // finishing mid-turn aborted the whole agent tree as `interrupted`
+              // (fixed upstream in 0.156/#45549 and 0.157/#47340). Treating the
+              // status as a normal completion sent the client a clean `complete`
+              // while the rollout recorded `turn_aborted`, so the abort was
+              // invisible until history re-read it and diagnostics logged the run
+              // as a success. A stop the user asked for (`abort` already flagged
+              // the session) arrives as the same status and must stay silent.
+              const message = 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
               terminalFailure = terminalFailure ?? { message };
               errorSurfaced = true;
               sendMessage(ws, createNormalizedMessage({
@@ -561,6 +639,9 @@ async function queryCodex(
       cwd: workingDirectory,
       sandbox,
       approvalPolicy,
+      config: {
+        'features.defer_mailbox_preemption': true,
+      },
       ...(resolvedModel ? { model: resolvedModel } : {}),
     };
     const thread = readObjectRecord(providerSessionId
@@ -598,11 +679,17 @@ async function queryCodex(
     }
 
     // Turns with image attachments send structured input items so Codex reads
-    // the images from their local asset paths.
+    // the images from their local asset paths. The CLI requires non-empty
+    // prompt text even when images carry the whole message, so an
+    // attachment-only turn gets a small text instruction.
     const promptWithFiles = appendFilesInputTag(command, files);
-    const inputItems = normalizeImageDescriptors(images).length > 0
-      ? buildCodexInputItems(promptWithFiles, images, workingDirectory)
-      : [{ type: 'text', text: promptWithFiles }];
+    const normalizedImages = normalizeImageDescriptors(images);
+    const promptForTurn = !promptWithFiles.trim() && normalizedImages.length > 0
+      ? 'Please analyze the attached image(s).'
+      : promptWithFiles;
+    const inputItems = normalizedImages.length > 0
+      ? buildCodexInputItems(promptForTurn, images, workingDirectory)
+      : [{ type: 'text', text: promptForTurn }];
 
     if (!capturedSessionId) {
       throw new Error('Codex app-server opened no thread to run the turn in.');
@@ -787,6 +874,20 @@ export const codexRuntime = {
       return pending;
     },
   },
+  /**
+   * Sessions with collab agents still running, for the running-sessions poll.
+   * The engine outlives turns, so an agent spawned mid-turn keeps working
+   * after the turn's `result` — this is how the UI learns it is still going.
+   */
+  listBackgroundWork(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
+    const entries: Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> = [];
+    for (const [sessionId, tasks] of codexBackgroundWork) {
+      if (tasks.size > 0) {
+        entries.push({ sessionId, tasks: Array.from(tasks.values()) });
+      }
+    }
+    return entries;
+  },
 };
 
 /** Kept so `thread/fork` stays reachable through this module's usual import site. */
@@ -802,6 +903,9 @@ const completedSessionCleanupTimer = setInterval(() => {
       const startedAt = new Date(session.startedAt).getTime();
       if (now - startedAt > maxAge) {
         activeCodexSessions.delete(id);
+        // The session's tracked agents went with its connection; entries left
+        // here would keep a dead task on the background-work strip forever.
+        codexBackgroundWork.delete(id);
       }
     }
   }
