@@ -385,7 +385,7 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
   if (!localPath && !(workspaceRelative && projectId)) {
     // Web URLs load directly, and so do origin-relative paths (/assets/…):
     // the browser resolves those against the app's own origin.
-    if (BROWSER_LOADABLE_IMAGE_SRC.test(src) || src.startsWith('/')) {
+    if (src && (BROWSER_LOADABLE_IMAGE_SRC.test(src) || src.startsWith('/'))) {
       // Lazy decoding keeps late image loads from shifting scroll position
       // while the user reads (native anchoring absorbs what remains).
       return <img src={src} alt={alt} loading="lazy" decoding="async" className="rounded-lg" {...props} />;
