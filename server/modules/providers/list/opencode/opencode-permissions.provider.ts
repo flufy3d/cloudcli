@@ -7,6 +7,7 @@ import { createNormalizedMessage, generateMessageId, readObjectRecord, readOptio
 
 import type { OpenCodeServerEvent, OpenCodeServerHandle } from './opencode-server.client.js';
 import {
+  readOpenCodeSessionParentId,
   rejectOpenCodeQuestion,
   replyOpenCodePermission,
   replyOpenCodeQuestion,
@@ -63,6 +64,14 @@ type OpenCodeQuestionInfo = {
 const runs = new Map<string, OpenCodeBridgeRun>();
 const pending = new Map<string, OpenCodePendingEntry>();
 
+/**
+ * Ownership verdicts for approval events announced by sessions other than the
+ * run's own — subagent (task child) sessions. Keyed by run id, then by the
+ * announcing session id; values are promises so simultaneous events from the
+ * same session share one parent-chain lookup. Cleared with the run.
+ */
+const foreignSessionVerdicts = new Map<string, Map<string, Promise<boolean>>>();
+
 function readToolCallId(event: OpenCodeServerEvent): string | null {
   return readOptionalString(readObjectRecord(event.properties.tool)?.callID) ?? null;
 }
@@ -106,6 +115,7 @@ export function registerOpenCodeRun(run: OpenCodeBridgeRun): void {
  */
 export function unregisterOpenCodeRun(runId: string): void {
   runs.delete(runId);
+  foreignSessionVerdicts.delete(runId);
 
   for (const [requestId, entry] of pending) {
     if (entry.run.runId !== runId) {
@@ -128,6 +138,110 @@ function retractPending(requestId: string, entry: OpenCodePendingEntry): void {
   } catch {
     // The run's transport may already be gone; there is nobody to retract to.
   }
+}
+
+/**
+ * Event types the bridge owns. The runtime must route them here before its own
+ * switch: doing so is what lets subagent approvals be re-attributed to the run
+ * instead of being dropped with the rest of the child stream.
+ */
+const APPROVAL_EVENT_TYPES = new Set([
+  'permission.asked',
+  'permission.replied',
+  'question.asked',
+  'question.replied',
+  'question.rejected',
+]);
+
+/**
+ * Whether the runtime must route this event through the approval bridge
+ * instead of its own stream switch. Consumers: `opencode-runtime.provider.js`.
+ */
+export function isOpenCodeApprovalEvent(type: string): boolean {
+  return APPROVAL_EVENT_TYPES.has(type);
+}
+
+/** Fans one owned approval event to the card flow it belongs to. */
+function dispatchApprovalEvent(run: OpenCodeBridgeRun, event: OpenCodeServerEvent): void {
+  switch (event.type) {
+    case 'permission.asked':
+      announceOpenCodePermission(run, event);
+      return;
+    case 'question.asked':
+      announceOpenCodeQuestion(run, event);
+      return;
+    case 'permission.replied':
+    case 'question.replied':
+    case 'question.rejected':
+      settleOpenCodeEvent(event);
+      return;
+    default:
+      return;
+  }
+}
+
+/**
+ * Routes one approval event for a run. Events from the run's own session are
+ * dispatched synchronously; events from other sessions are bridged only after
+ * their `parentID` chain proves they came from a subagent of this run. Child
+ * sessions run their own approval flow, and their cards must render on the
+ * parent chat — the runtime never sees their events otherwise. Unrelated
+ * sessions on the shared server are ignored. Consumers:
+ * `opencode-runtime.provider.js`.
+ */
+export function handleOpenCodeApprovalEvent(run: OpenCodeBridgeRun, event: OpenCodeServerEvent): void {
+  const eventSessionId = readOptionalString(event.properties.sessionID);
+  if (!eventSessionId || !run.providerSessionId) {
+    return;
+  }
+
+  if (eventSessionId === run.providerSessionId) {
+    dispatchApprovalEvent(run, event);
+    return;
+  }
+
+  void isForeignSessionOwned(run, eventSessionId).then((owned) => {
+    if (owned) {
+      dispatchApprovalEvent(run, event);
+    }
+  }).catch(() => {
+    // A failed ownership lookup drops the event, exactly as the session filter
+    // did before subagent routing existed; the run's own stream is unaffected.
+  });
+}
+
+/**
+ * Walks a session's `parentID` chain up to the run's own session. Each step is
+ * one cheap GET; `seen` guards against a malformed chain.
+ */
+async function sessionBelongsToRun(run: OpenCodeBridgeRun, sessionId: string): Promise<boolean> {
+  let current: string | null = sessionId;
+  const seen = new Set<string>();
+
+  while (current && !seen.has(current)) {
+    if (current === run.providerSessionId) {
+      return true;
+    }
+    seen.add(current);
+    current = await readOpenCodeSessionParentId(run.handle, run.directory, current);
+  }
+  return false;
+}
+
+/** Caches one ownership verdict per (run, session); failed lookups retry. */
+function isForeignSessionOwned(run: OpenCodeBridgeRun, sessionId: string): Promise<boolean> {
+  const verdicts = foreignSessionVerdicts.get(run.runId) ?? new Map<string, Promise<boolean>>();
+  foreignSessionVerdicts.set(run.runId, verdicts);
+
+  const cached = verdicts.get(sessionId);
+  if (cached) {
+    return cached;
+  }
+
+  const verdict = sessionBelongsToRun(run, sessionId);
+  verdict.catch(() => verdicts.delete(sessionId));
+  verdicts.set(sessionId, verdict);
+  return verdict;
 }
 
 /**

@@ -35,11 +35,10 @@ import {
   waitForOpenCodeSessionIdle,
 } from './opencode-server.client.js';
 import {
-  announceOpenCodePermission,
-  announceOpenCodeQuestion,
+  handleOpenCodeApprovalEvent,
+  isOpenCodeApprovalEvent,
   openCodePermissions,
   registerOpenCodeRun,
-  settleOpenCodeEvent,
   unregisterOpenCodeRun,
 } from './opencode-permissions.provider.js';
 
@@ -444,19 +443,11 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     }
   };
 
+  // Approval events never reach this switch: they are routed through the
+  // permissions bridge first, which also re-attributes subagent (child
+  // session) requests to this run.
   const handleRunEvent = (event) => {
     switch (event.type) {
-      case 'permission.asked':
-        announceOpenCodePermission(run, event);
-        return;
-      case 'permission.replied':
-      case 'question.replied':
-      case 'question.rejected':
-        settleOpenCodeEvent(event);
-        return;
-      case 'question.asked':
-        announceOpenCodeQuestion(run, event);
-        return;
       case 'message.part.updated':
         handlePartUpdated(event);
         return;
@@ -484,6 +475,16 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     if (!run.providerSessionId) {
       return;
     }
+
+    if (isOpenCodeApprovalEvent(event.type)) {
+      try {
+        handleOpenCodeApprovalEvent(run, event);
+      } catch (error) {
+        console.error('[OpenCode] Failed to handle approval event:', error);
+      }
+      return;
+    }
+
     if (readEventSessionId(event) !== run.providerSessionId) {
       return;
     }

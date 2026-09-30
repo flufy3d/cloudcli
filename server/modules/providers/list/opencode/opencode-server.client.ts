@@ -586,6 +586,40 @@ export async function createOpenCodeSession(
 }
 
 /**
+ * Reads one session's `parentID`, or null when it has no parent (or the
+ * session is gone).
+ *
+ * Subagent (task-tool) sessions record the session that spawned them in
+ * `parentID`, which the permissions bridge walks to decide whether an approval
+ * raised inside a child session belongs to a run. Consumers:
+ * `opencode-permissions.provider.ts`.
+ */
+export async function readOpenCodeSessionParentId(
+  handle: OpenCodeServerHandle,
+  directory: string,
+  sessionId: string,
+): Promise<string | null> {
+  let payload: unknown;
+  try {
+    payload = await requestJson(
+      handle,
+      'GET',
+      `/session/${encodeURIComponent(sessionId)}`,
+      directory,
+      undefined,
+      SESSION_STATUS_TIMEOUT_MS,
+    );
+  } catch (error) {
+    // A vanished session is a fact about ownership, not a transport failure.
+    if ((error as { status?: number }).status === 404) {
+      return null;
+    }
+    throw error;
+  }
+  return readOptionalString(readObjectRecord(payload)?.parentID) ?? null;
+}
+
+/**
  * Forks one session, returning the new provider-native session id.
  *
  * The endpoint's cut is exclusive: it copies the messages that precede

@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -18,6 +18,7 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
+import { openCodePermissions } from '@/modules/providers/list/opencode/opencode-permissions.provider.js';
 import { spawnOpenCode } from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
 import { shutdownOpenCodeServer } from '@/modules/providers/list/opencode/opencode-server.client.js';
 import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
@@ -28,6 +29,7 @@ import type {
 } from '@/shared/types.js';
 
 const stubSessionId = 'ses_stub_live';
+const stubChildSessionId = 'ses_stub_child';
 
 /**
  * Minimal OpenCode server: health probe, event stream, session create, and one
@@ -107,6 +109,120 @@ const server = http.createServer((request, response) => {
 server.listen(port, '127.0.0.1');
 `;
 
+/**
+ * Stub for the subagent-approval scenario: the blocking message POST emits a
+ * `permission.asked` raised by a child session (not the run's own), serves that
+ * child's `parentID` on `GET /session/:id`, and only answers once the runtime
+ * posts the approval reply — so the run cannot finish unless the child ask was
+ * bridged to the parent chat and answered. The reply body is logged to
+ * `STUB_REPLY_LOG` for the test to assert.
+ */
+const openCodeSubagentStubScript = `const http = require('node:http');
+const fs = require('node:fs');
+
+const portIndex = process.argv.indexOf('--port');
+const port = Number(process.argv[portIndex + 1]);
+const parentSessionId = '${stubSessionId}';
+const childSessionId = '${stubChildSessionId}';
+const replyLogPath = process.env.STUB_REPLY_LOG;
+
+let streamResponse = null;
+let markStreamReady = null;
+const streamReady = new Promise((resolve) => {
+  markStreamReady = resolve;
+});
+
+let markPermissionReplied = null;
+const permissionReplied = new Promise((resolve) => {
+  markPermissionReplied = resolve;
+});
+
+const writeEvent = (payload) => {
+  if (!streamResponse) {
+    return;
+  }
+  streamResponse.write('data: ' + JSON.stringify({ directory: null, payload }) + '\\n\\n');
+};
+
+const server = http.createServer((request, response) => {
+  const url = new URL(request.url, 'http://127.0.0.1');
+
+  if (url.pathname === '/global/health') {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ healthy: true }));
+    return;
+  }
+
+  if (url.pathname === '/global/event') {
+    response.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    });
+    streamResponse = response;
+    markStreamReady();
+    return;
+  }
+
+  if (url.pathname === '/session' && request.method === 'POST') {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ id: parentSessionId }));
+    return;
+  }
+
+  if (url.pathname === '/session/' + childSessionId && request.method === 'GET') {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ id: childSessionId, parentID: parentSessionId }));
+    return;
+  }
+
+  if (url.pathname === '/session/' + parentSessionId + '/message' && request.method === 'POST') {
+    request.resume();
+    void streamReady.then(() => {
+      writeEvent({
+        type: 'permission.asked',
+        properties: {
+          id: 'per_stub_child_1',
+          sessionID: childSessionId,
+          permission: 'external_directory',
+          patterns: ['C:\\\\Temp\\\\*'],
+          metadata: { filepath: 'C:\\\\Temp\\\\stub.mjs' },
+          tool: { messageID: 'msg_stub_child', callID: 'call_stub_child' },
+        },
+      });
+    });
+    void permissionReplied.then(() => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ info: { id: 'msg-stub-done' } }));
+    });
+    return;
+  }
+
+  if (url.pathname === '/permission/per_stub_child_1/reply' && request.method === 'POST') {
+    let body = '';
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      if (replyLogPath) {
+        fs.writeFileSync(replyLogPath, body);
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('true');
+      markPermissionReplied();
+    });
+    return;
+  }
+
+  response.writeHead(404, { 'content-type': 'application/json' });
+  response.end('{}');
+});
+
+server.listen(port, '127.0.0.1');
+`;
+
 /** Writes a PATH entry that resolves the `opencode` command to the stub. */
 async function writeOpenCodeShim(binDir: string, stubPath: string): Promise<void> {
   if (process.platform === 'win32') {
@@ -117,6 +233,18 @@ async function writeOpenCodeShim(binDir: string, stubPath: string): Promise<void
   const shimPath = path.join(binDir, 'opencode');
   await writeFile(shimPath, `#!/bin/sh\nexec node "${stubPath}" "$@"\n`);
   await chmod(shimPath, 0o755);
+}
+
+/** Polls until `condition` holds; fails the test after the deadline. */
+async function waitForCondition(condition: () => boolean, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('condition was not met in time');
 }
 
 /**
@@ -264,6 +392,97 @@ test('a running OpenCode turn publishes its context budget before it completes',
       delete process.env.DATABASE_PATH;
     } else {
       process.env.DATABASE_PATH = previousDatabasePath;
+    }
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('a subagent approval surfaces on the parent run and its reply reaches the engine', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-subagent-approval-'));
+  const binDir = path.join(tempRoot, 'bin');
+  const previousPath = process.env.PATH;
+  const previousDatabasePath = process.env.DATABASE_PATH;
+  const previousReplyLog = process.env.STUB_REPLY_LOG;
+  const previousHomeDir = os.homedir;
+
+  closeConnection();
+  process.env.DATABASE_PATH = path.join(tempRoot, 'auth.db');
+  process.env.STUB_REPLY_LOG = path.join(tempRoot, 'reply.json');
+  await initializeDatabase();
+  (os as unknown as { homedir: () => string }).homedir = () => tempRoot;
+
+  try {
+    await mkdir(binDir, { recursive: true });
+    const stubPath = path.join(tempRoot, 'opencode-subagent-stub.cjs');
+    await writeFile(stubPath, openCodeSubagentStubScript);
+    await writeOpenCodeShim(binDir, stubPath);
+
+    process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ''}`;
+
+    const messages: NormalizedMessage[] = [];
+    const writer: ProviderRuntimeWriter = {
+      userId: null,
+      send: (message) => {
+        messages.push(message as NormalizedMessage);
+      },
+    };
+    const sessionsProvider = new OpenCodeSessionsProvider();
+    const context = {
+      resolveProviderSessionId: () => null,
+      resolveResumeModel: async (_sessionId: string | undefined, model?: string | null) =>
+        model ?? 'opencode-go/deepseek-v4.1-flash',
+      getProviderModels: async () => ({}),
+      normalizeMessage: (raw: unknown, sessionId: string | null) =>
+        sessionsProvider.normalizeMessage(raw, sessionId),
+      isProviderInstalled: async () => true,
+    } as unknown as ProviderRuntimeContext;
+
+    const runPromise = spawnOpenCode(
+      'hello',
+      { sessionId: 'app-sess-child-approval', cwd: tempRoot },
+      writer,
+      context,
+    );
+    // The awaited promise below reports failures; keep a rejected run from
+    // surfacing as an unhandled rejection when shutdown races it.
+    runPromise.catch(() => {});
+
+    await waitForCondition(() =>
+      messages.some((message) => message.kind === 'permission_request'));
+    const card = messages.find((message) => message.kind === 'permission_request');
+    assert.ok(card, 'the child ask must bridge into a card on the parent run');
+    assert.equal(card.requestId, 'per_stub_child_1');
+    assert.equal(card.sessionId, 'app-sess-child-approval');
+    assert.equal(card.toolName, 'external_directory');
+
+    openCodePermissions.resolve('per_stub_child_1', { allow: true });
+
+    await runPromise;
+    assert.ok(
+      messages.some((message) => message.kind === 'complete'),
+      'the run must finish once the child approval was answered',
+    );
+
+    const replyBody = JSON.parse(await readFile(process.env.STUB_REPLY_LOG as string, 'utf8'));
+    assert.deepEqual(replyBody, { reply: 'once' });
+  } finally {
+    shutdownOpenCodeServer();
+    (os as unknown as { homedir: () => string }).homedir = previousHomeDir;
+    if (previousPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = previousPath;
+    }
+    closeConnection();
+    if (previousDatabasePath === undefined) {
+      delete process.env.DATABASE_PATH;
+    } else {
+      process.env.DATABASE_PATH = previousDatabasePath;
+    }
+    if (previousReplyLog === undefined) {
+      delete process.env.STUB_REPLY_LOG;
+    } else {
+      process.env.STUB_REPLY_LOG = previousReplyLog;
     }
     await rm(tempRoot, { recursive: true, force: true });
   }
