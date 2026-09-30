@@ -44,8 +44,12 @@ const COMPLETION_POLL_INTERVAL_MS = 100;
  * no matter how long it runs. Override for tests via
  * `CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS` (positive integer milliseconds).
  */
-const DEFAULT_SILENCE_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_SILENCE_TIMEOUT_MS = 60 * 60 * 1000;
 
+/**
+ * Resolves the silence timeout for a ZCode run or watcher.
+ * Used by `zcode-runtime.provider` and lifecycle tests to bound silent turns.
+ */
 export function resolveSilenceTimeoutMs(): number {
   const raw = Number(process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SILENCE_TIMEOUT_MS;

@@ -14,7 +14,7 @@ import { test } from 'node:test';
 
 import type { NormalizedMessage, ProviderRuntimeWriter } from '@/shared/types.js';
 
-import { EngineSilenceTimeoutError, ZCodeRunLifecycle } from '../list/zcode/zcode-run-lifecycle.js';
+import { EngineSilenceTimeoutError, ZCodeRunLifecycle, resolveSilenceTimeoutMs } from '../list/zcode/zcode-run-lifecycle.js';
 import type { ProtocolServerRequest } from '../list/zcode/zcode-codec.js';
 
 const createWriter = (): { messages: NormalizedMessage[]; writer: ProviderRuntimeWriter } => {
@@ -438,4 +438,27 @@ test('a late plan re-announcement replays the approve token from the record', as
   assert.equal(messages.filter((msg) => msg.kind === 'permission_request').length, 1);
 
   lifecycle.dispose(handle);
+});
+
+test('resolveSilenceTimeoutMs defaults to 1 hour and respects environment override', () => {
+  const originalEnv = process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS;
+  try {
+    delete process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS;
+    assert.equal(resolveSilenceTimeoutMs(), 60 * 60 * 1000);
+
+    process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS = '1800000';
+    assert.equal(resolveSilenceTimeoutMs(), 1800000);
+
+    process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS = '-10';
+    assert.equal(resolveSilenceTimeoutMs(), 60 * 60 * 1000);
+
+    process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS = 'invalid';
+    assert.equal(resolveSilenceTimeoutMs(), 60 * 60 * 1000);
+  } finally {
+    if (originalEnv !== undefined) {
+      process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS = originalEnv;
+    } else {
+      delete process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS;
+    }
+  }
 });
