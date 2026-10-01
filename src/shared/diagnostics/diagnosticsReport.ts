@@ -24,6 +24,7 @@ import type { ScrollScreening } from '@/shared/diagnostics/scrollScreening';
 import { createStartupDiagnosticsSection } from '@/shared/diagnostics/startupDiagnostics';
 import type { StartupDiagnosticsSection } from '@/shared/diagnostics/startupDiagnostics';
 import type { NormalizedMessage, RunOutcomeRecord, TimelineSnapshot } from '@/shared/types';
+import { saveOrShareBlob } from '@/shared/utils';
 
 /** How many finished runs to ask the server for. */
 const REQUESTED_SERVER_RUNS = 50;
@@ -175,12 +176,6 @@ export async function createDiagnosticsReport(sessionId: string | null): Promise
 export async function downloadDiagnosticsReport(sessionId: string | null): Promise<void> {
   const report = await createDiagnosticsReport(sessionId);
   const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `cloudcli-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+  // The share hand-off keeps iOS PWAs from navigating to the blob URL.
+  await saveOrShareBlob(blob, `cloudcli-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
 }

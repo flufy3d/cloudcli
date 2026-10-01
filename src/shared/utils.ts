@@ -296,3 +296,40 @@ export function formatBuildVersion(version: string, commit: string): string {
   }
   return `v${version}(${commit})`;
 }
+
+// ---------------------------
+
+//----------------- FILE DOWNLOAD HAND-OFF ------------
+
+/**
+ * Hands a finished blob to the user as a saved file. On iOS — the installed
+ * PWA especially — an `<a download>` click navigates the webview to the blob
+ * URL instead of downloading, and coming back reloads the whole app; the Web
+ * Share API is the platform answer there (Save to Files, AirDrop, …) and
+ * never navigates away. Environments that cannot share files keep the
+ * classic download link. Used by the chat file cards and transcript export,
+ * the file tree, the code editor, the PRD editor, and the diagnostics report.
+ */
+export async function saveOrShareBlob(blob: Blob, filename: string): Promise<void> {
+  const file = new File([blob], filename, { type: blob.type });
+
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file] });
+      return;
+    } catch (error) {
+      // Dismissing the sheet is a normal outcome, not a failure.
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      // Anything else (e.g. a stale user gesture) falls through to the link.
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}

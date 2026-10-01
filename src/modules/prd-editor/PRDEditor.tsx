@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 
 import type { Project,PrdEditorFile } from '@/shared/types';
+import { saveOrShareBlob } from '@/shared/utils';
 import { usePrdDocument } from '@/modules/prd-editor/hooks/usePrdDocument';
 import { usePrdKeyboardShortcuts } from '@/modules/prd-editor/hooks/usePrdKeyboardShortcuts';
 import { usePrdRegistry } from '@/modules/prd-editor/hooks/usePrdRegistry';
@@ -59,17 +60,8 @@ export default function PRDEditor({
   });
 
   const handleDownload = useCallback(() => {
-    const blob = new Blob([content], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    const downloadedFileName = ensurePrdExtension(fileName || 'prd');
-
-    anchor.href = url;
-    anchor.download = downloadedFileName;
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-    URL.revokeObjectURL(url);
+    // The share hand-off keeps iOS PWAs from navigating to the blob URL.
+    void saveOrShareBlob(new Blob([content], { type: 'text/markdown' }), ensurePrdExtension(fileName || 'prd'));
   }, [content, fileName]);
 
   const handleSave = useCallback(

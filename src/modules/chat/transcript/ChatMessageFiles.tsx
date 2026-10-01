@@ -3,6 +3,7 @@ import { useState } from 'react';
 
 import { api } from '@/shared/api';
 import type { ChatAttachment } from '@/shared/types';
+import { saveOrShareBlob } from '@/shared/utils';
 
 type ChatMessageFilesProps = {
   files: ChatAttachment[];
@@ -39,12 +40,9 @@ function ChatMessageFile({ file }: { file: ChatAttachment }) {
     try {
       const response = await api.assets.file(storedName);
       if (!response.ok) return;
-      const blobUrl = URL.createObjectURL(await response.blob());
-      const anchor = document.createElement('a');
-      anchor.href = blobUrl;
-      anchor.download = name;
-      anchor.click();
-      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 0);
+      // The share hand-off keeps iOS PWAs from navigating to the blob URL;
+      // desktops without file sharing still get the plain download link.
+      await saveOrShareBlob(await response.blob(), name);
     } catch (error) {
       console.error(`Failed to download attachment "${name}":`, error);
     } finally {
