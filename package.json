@@ -257,5 +257,35 @@
   "optionalDependencies": {
     "@nut-tree-fork/nut-js": "^4.2.6",
     "screenshot-desktop": "^1.15.4"
+  },
+  "overrides": {
+    "mdast-util-gfm-autolink-literal": "2.0.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "mdast-util-gfm-autolink-literal": "2.0.0"
+    },
+    "onlyBuiltDependencies": [
+      ",",
+      "a",
+      "b",
+      "bcrypt",
+      "better-sqlite3",
+      "electron-winstaller",
+      "esbuild",
+      "f",
+      "h",
+      "i",
+      "j",
+      "k",
+      "node-pty",
+      "o",
+      "p",
+      "r",
+      "s",
+      "t",
+      "u",
+      "unrs-resolver"
+    ]
   }
 }
