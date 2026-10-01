@@ -4,7 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { resolveZCodeProviderConfigEnv } from '@/modules/providers/list/zcode/zcode-provider-config.js';
+import {
+  buildZCodeAccountSyncPayload,
+  resolveZCodeBuiltinRevision,
+  resolveZCodeProviderConfigEnv,
+} from '@/modules/providers/list/zcode/zcode-provider-config.js';
 
 const BUILTIN_ENV = 'ZCODE_BUILTIN_PROVIDER_CONFIG_FILE';
 const PERSONAL_ENV = 'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE';
@@ -148,5 +152,91 @@ test('returns no overrides when no built-in config exists, leaving the engine it
     const env = resolveZCodeProviderConfigEnv(enginePath);
 
     assert.deepEqual(env, {});
+  });
+});
+
+test('resolveZCodeBuiltinRevision computes the exact sha256-tagged revision format', async () => {
+  await withEngineLayout(path.join('provider', 'zcode-builtin.json'), async (_enginePath, configPath) => {
+    assert.ok(configPath);
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+
+    const result = resolveZCodeBuiltinRevision(configPath);
+    const expectedHash = (await import('node:crypto')).createHash('sha256').update(path.resolve(configPath)).digest('hex');
+    assert.equal(result, `zcode-builtin:30:${expectedHash}`);
+  });
+});
+
+test('resolveZCodeBuiltinRevision returns null for missing or invalid config', async () => {
+  assert.equal(resolveZCodeBuiltinRevision('/non/existent/path.json'), null);
+
+  const tmpInvalid = path.join(os.tmpdir(), `zcode-invalid-${Date.now()}.json`);
+  await writeFile(tmpInvalid, JSON.stringify({ noRevision: true }), 'utf8');
+  try {
+    assert.equal(resolveZCodeBuiltinRevision(tmpInvalid), null);
+  } finally {
+    const { unlink } = await import('node:fs/promises');
+    await unlink(tmpInvalid).catch(() => {});
+  }
+});
+
+test('buildZCodeAccountSyncPayload produces the exact payload when token and builtin config are available', async () => {
+  await withEngineLayout(path.join('provider', 'zcode-builtin.json'), async (_enginePath, configPath) => {
+    assert.ok(configPath);
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+
+    const previousStorage = process.env.ZCODE_STORAGE_DIR;
+    const storageDir = await mkdtemp(path.join(os.tmpdir(), 'zcode-payload-storage-'));
+    process.env.ZCODE_STORAGE_DIR = storageDir;
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    // Write unencrypted plain jwtToken for test
+    await writeFile(path.join(v2Dir, 'credentials.json'), JSON.stringify({ zcodejwttoken: 'test-jwt-token' }), 'utf8');
+
+    try {
+      const payload = buildZCodeAccountSyncPayload(configPath);
+      assert.ok(payload);
+      assert.equal(payload.revision, '1');
+      assert.ok((payload.basedOnZCodeBuiltinRevision as string).startsWith('zcode-builtin:30:'));
+      assert.deepEqual(payload.providers, {
+        'account:bigmodel-start-plan': {
+          access: {
+            type: 'zhipu-account',
+            entitled: true,
+          },
+        },
+      });
+      assert.deepEqual(payload.states, {
+        'account:bigmodel-start-plan': {
+          availability: 'available',
+          entitled: true,
+          current: true,
+        },
+      });
+    } finally {
+      if (previousStorage === undefined) delete process.env.ZCODE_STORAGE_DIR;
+      else process.env.ZCODE_STORAGE_DIR = previousStorage;
+    }
+  });
+});
+
+test('buildZCodeAccountSyncPayload returns null when credentials have no jwtToken', async () => {
+  await withEngineLayout(path.join('provider', 'zcode-builtin.json'), async (_enginePath, configPath) => {
+    assert.ok(configPath);
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+
+    const previousStorage = process.env.ZCODE_STORAGE_DIR;
+    const storageDir = await mkdtemp(path.join(os.tmpdir(), 'zcode-payload-storage-'));
+    process.env.ZCODE_STORAGE_DIR = storageDir;
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(path.join(v2Dir, 'credentials.json'), JSON.stringify({ other: 'val' }), 'utf8');
+
+    try {
+      const payload = buildZCodeAccountSyncPayload(configPath);
+      assert.equal(payload, null);
+    } finally {
+      if (previousStorage === undefined) delete process.env.ZCODE_STORAGE_DIR;
+      else process.env.ZCODE_STORAGE_DIR = previousStorage;
+    }
   });
 });

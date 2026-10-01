@@ -69,6 +69,7 @@ export class EngineSupervisor {
   private readonly dependencies: Required<EngineSupervisorDependencies>;
 
   private process: ChildProcess | null = null;
+  private currentEnginePath: string | null = null;
   private startupPromise: Promise<void> | null = null;
   private restartTimer: NodeJS.Timeout | null = null;
   private stabilityTimer: NodeJS.Timeout | null = null;
@@ -203,6 +204,29 @@ export class EngineSupervisor {
   }
 
   /**
+   * Returns the PID of the currently running engine subprocess, or null if not running.
+   */
+  getProcessId(): number | null {
+    if (!this.process || this.process.killed) return null;
+    return this.process.pid ?? null;
+  }
+
+  /**
+   * Resolves the configured engine path without spawning.
+   */
+  resolveEnginePath(): string | null {
+    return this.dependencies.resolveEnginePath();
+  }
+
+  /**
+   * Returns the engine path of the currently spawned process, or null if not running.
+   */
+  getEnginePath(): string | null {
+    if (!this.process || this.process.killed) return null;
+    return this.currentEnginePath;
+  }
+
+  /**
    * Graceful shutdown: cancels any scheduled restart, closes stdin to signal
    * EOF, force-kills after the timeout, and resets state so the supervisor
    * can be reused.
@@ -272,6 +296,7 @@ export class EngineSupervisor {
     console.info('[ZCode Protocol] Starting app-server subprocess...');
     console.debug(`[ZCode Protocol] Engine path: ${enginePath}`);
 
+    this.currentEnginePath = enginePath;
     this.process = this.dependencies.spawnProcess(enginePath);
     this.stderrTail = '';
     this.setupProcessHandlers();
@@ -365,6 +390,7 @@ export class EngineSupervisor {
       + this.describeStderrTail(),
     );
     this.process = null;
+    this.currentEnginePath = null;
 
     if (this.stabilityTimer) {
       clearTimeoutFn(this.stabilityTimer);
