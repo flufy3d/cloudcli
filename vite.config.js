@@ -86,8 +86,15 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         output: {
           manualChunks(id) {
+            // Rollup synthetic helpers and common runtime helpers must stay with the foundational vendor
+            // chunk to prevent circular dependencies caused by helpers being placed into downstream chunks.
+            if (id.includes('commonjsHelpers') || id.includes('@babel/runtime') || id.includes('tslib')) {
+              return 'vendor-react';
+            }
+
             if (id.includes('node_modules')) {
-              if (id.includes('react/') || id.includes('react-dom/') || id.includes('react-router-dom/') || id.includes('react-error-boundary/')) {
+              // Exact package boundaries to prevent matching 'lucide-react' or other packages ending in '-react/'
+              if (/\/node_modules\/(?:react|react-dom|react-router|react-router-dom|react-error-boundary|scheduler)\//.test(id)) {
                 return 'vendor-react';
               }
               if (id.includes('@codemirror') || id.includes('@uiw/react-codemirror') || id.includes('@replit/codemirror-minimap')) {
@@ -140,11 +147,9 @@ export default defineConfig(({ mode }) => {
             if (id.includes('/src/modules/i18n/locales/')) {
               return 'i18n-locales';
             }
-            if (id.includes('/src/modules/settings/')) {
+            // settings and task-master cross-import each other; keep them in the same chunk to prevent cycle
+            if (id.includes('/src/modules/settings/') || id.includes('/src/modules/task-master/')) {
               return 'module-settings';
-            }
-            if (id.includes('/src/modules/task-master/')) {
-              return 'module-task-master';
             }
             if (id.includes('/src/modules/git-panel/')) {
               return 'module-git';
