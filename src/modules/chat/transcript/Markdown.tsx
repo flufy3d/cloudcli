@@ -226,7 +226,7 @@ const CodeBlock = memo(function CodeBlock({ node: _node, className, children, fo
         // Fence language without a registered grammar: plain monospace block
         // instead of refractor's "Unknown language" throw.
         <pre className="overflow-x-auto whitespace-pre px-4 pb-4 pt-1 font-mono text-[0.8125rem] leading-[1.6]">
-          {raw}
+          <code>{raw}</code>
         </pre>
       )}
     </div>
