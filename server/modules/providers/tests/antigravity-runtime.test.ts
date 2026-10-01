@@ -395,6 +395,28 @@ test('runtime resolves model selection and reasoning effort into agy arguments',
       expectModel: 'gpt-oss-120b-medium',
     },
     {
+      // agy's own picker writes display labels into settings.json, and a
+      // session row poisoned with one must resolve back onto the family —
+      // never spawn the label verbatim with --effort, which the CLI rejects.
+      name: 'display label from a poisoned session row resolves to the family tier',
+      options: { model: 'Gemini 3.7 Flash (Medium)', effort: 'medium' },
+      expectModel: 'gemini-3.7-flash-medium',
+    },
+    {
+      // The label's own tier is the intent recorded by agy's picker; it
+      // applies when the session has no explicit effort choice.
+      name: 'display label without a recorded effort keeps its label tier',
+      options: { model: 'Gemini 3.7 Flash (Low)' },
+      expectModel: 'gemini-3.7-flash-low',
+    },
+    {
+      // Non-family rows (no effort config) must spawn their real catalog id
+      // too — agy knows no model by its display label.
+      name: 'non-family display label spawns its catalog id',
+      options: { model: 'Claude Sonnet 4.6 (Thinking)', effort: 'high' },
+      expectModel: 'claude-sonnet-4-6',
+    },
+    {
       name: 'unknown custom model keeps its id and uses --effort',
       options: { model: 'my-custom-gpt', effort: 'low' },
       expectModel: 'my-custom-gpt',

@@ -39,8 +39,8 @@ import {
 import { getAntigravityDataRoot } from './antigravity-data-root.js';
 import { tryResolveEnginePath } from './antigravity-engine-path.js';
 import {
+  findCatalogOptionForModelString,
   resolveAntigravityModelArgs,
-  splitModelEffortSuffix,
 } from './antigravity-model-effort.js';
 
 const PROVIDER = 'antigravity';
@@ -453,17 +453,22 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       }
 
       // Model configuration and reasoning effort share one resolution: the
-      // merged-catalog entry for the model's base id decides the channel —
-      // variant-family ids get their tier appended, cataloged models without
-      // effort support run with their id verbatim, and models missing from
-      // the catalog (custom ones) take the --effort flag. The lookup by base
-      // id also validates legacy suffixed ids from old session rows against
-      // the family's real tiers.
-      const requestedBase = model ? splitModelEffortSuffix(model).base : undefined;
+      // merged-catalog entry for the model decides the channel — variant
+      // families get their tier appended, cataloged models without effort
+      // support run with their catalog id, and models missing from the
+      // catalog (custom ones) take the --effort flag. The lookup also
+      // resolves display labels and legacy suffixed ids from old session rows
+      // onto the family's real tiers; agy's own picker writes labels into
+      // settings.json, and rows created under such a default store them
+      // verbatim. A label's own tier is the intent recorded by that picker,
+      // so it applies when the session has no explicit effort choice.
+      const resolvedModel = model && catalog
+        ? findCatalogOptionForModelString(model, catalog.OPTIONS)
+        : null;
       const modelArgs = resolveAntigravityModelArgs(
         model,
-        effort,
-        catalog?.OPTIONS.find((option) => option.value === requestedBase),
+        effort ?? resolvedModel?.labelTier ?? undefined,
+        resolvedModel?.option,
       );
 
       if (modelArgs.model) {

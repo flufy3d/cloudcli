@@ -29,6 +29,7 @@ import { getAntigravitySettingsPath } from './antigravity-data-root.js';
 import { tryResolveEnginePath } from './antigravity-engine-path.js';
 import {
   dedupeAntigravityVariantModels,
+  findCatalogOptionForModelString,
   splitModelEffortSuffix,
   type AntigravityRawModelEntry,
 } from './antigravity-model-effort.js';
@@ -173,18 +174,26 @@ export class AntigravityProviderModels implements IProviderModels {
    *
    * Session-scoped model memory is owned by providerModelsService
    * (setSessionModel / resolveResumeModel) on the chat path; this facet only
-   * reports the settings.json default or the catalog default. agy stores the
-   * full suffixed id in settings.json, so the tier is stripped to match the
-   * base-model catalog.
+   * reports the settings.json default or the catalog default. agy stores a
+   * suffixed id — or, when the model was picked in agy's own menu, a display
+   * label — in settings.json; both normalize onto the base-model catalog so a
+   * label never enters the session model chain (a label is invisible to the
+   * spawn-time catalog lookup and would combine with --effort into an
+   * argument pair the CLI rejects).
    */
   async getCurrentActiveModel(_sessionId?: string): Promise<ProviderCurrentActiveModel> {
+    const catalog = await this.getSupportedModels();
     const settingsModel = readDefaultModelFromSettings();
     if (settingsModel) {
-      const { base } = splitModelEffortSuffix(settingsModel);
-      return { model: base };
+      // A label's tier qualifier is dropped here on purpose: this value only
+      // seeds the composer's base-model picker, and the Reasoning menu owns
+      // the effort choice from there.
+      const normalized = findCatalogOptionForModelString(settingsModel, catalog.OPTIONS)?.option.value
+        ?? splitModelEffortSuffix(settingsModel).base;
+      return { model: normalized };
     }
 
-    return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+    return buildDefaultProviderCurrentActiveModel(catalog);
   }
 
   /**
