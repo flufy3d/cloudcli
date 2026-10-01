@@ -204,7 +204,9 @@ export function useChatSessionState({
   // open. Session ids are concrete before any send, so no pending
   // placeholder entry exists anymore.
   const sessionActivity = (activeSessionId && processingSessions?.get(activeSessionId)) || null;
-  const isProcessing = sessionActivity !== null;
+  // Background-only work is not a response in flight: whether it holds new
+  // input back is the provider's call (`backgroundWorkQueuesInput`).
+  const isProcessing = sessionActivity !== null && !sessionActivity.background;
   const canAbortSession = isProcessing && sessionActivity.canInterrupt;
 
   // Ref mirror so effects can read the latest map without re-running on
@@ -744,7 +746,7 @@ export function useChatSessionState({
   const backgroundTasks = useMemo(() => {
     return currentSessionId ? sessionStore.getBackgroundTasks(currentSessionId) : [];
   }, [currentSessionId, sessionStore]);
-  const hasActiveBackgroundTasks = backgroundTasks.length > 0;
+  const hasActiveBackgroundTasks = backgroundTasks.length > 0 || Boolean(sessionActivity?.background);
 
   return {
     chatMessages,
