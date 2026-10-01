@@ -1434,13 +1434,19 @@ export function useChatComposerState({
   }, [resetCommandMenuState, updateInput]);
 
   const handleAbortSession = useCallback(() => {
-    if (!canAbortSession) {
-      return;
-    }
-
     const targetSessionId = selectedSession?.id || currentSessionId || null;
     if (!targetSessionId) {
       console.warn('Abort requested but no session ID is available.');
+      return;
+    }
+
+    // The turn has ended but background tasks keep the session busy: there is
+    // no run to abort, so stop each task by id instead.
+    if (!canAbortSession) {
+      const tasks = processingSessions?.get(targetSessionId)?.tasks ?? [];
+      for (const task of tasks) {
+        sendMessage({ type: 'chat.stop-task', sessionId: targetSessionId, taskId: task.taskId });
+      }
       return;
     }
 
@@ -1450,7 +1456,7 @@ export function useChatComposerState({
       type: 'chat.abort',
       sessionId: targetSessionId,
     });
-  }, [canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
+  }, [canAbortSession, currentSessionId, processingSessions, selectedSession?.id, sendMessage]);
 
   const handleGrantToolPermission = useCallback(
     (suggestion: { entry: string; toolName: string }) => {
