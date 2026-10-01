@@ -19,7 +19,11 @@ import Database from 'better-sqlite3';
 
 import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
 import { openCodePermissions } from '@/modules/providers/list/opencode/opencode-permissions.provider.js';
-import { spawnOpenCode } from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
+import {
+  drainOpenCodeRun,
+  spawnOpenCode,
+  trackOpenCodeSessionIdle,
+} from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
 import { shutdownOpenCodeServer } from '@/modules/providers/list/opencode/opencode-server.client.js';
 import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
 import type {
@@ -212,6 +216,103 @@ const server = http.createServer((request, response) => {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end('true');
       markPermissionReplied();
+    });
+    return;
+  }
+
+  response.writeHead(404, { 'content-type': 'application/json' });
+  response.end('{}');
+});
+
+server.listen(port, '127.0.0.1');
+`;
+
+/**
+ * Stub for the stream-tail race: the blocking message POST answers right after
+ * the final reply's first delta, and only then does the stream carry the rest
+ * of that reply, its completed part and `session.idle` — the ordering the real
+ * engine produces (the response beats the stream tail by a few milliseconds).
+ */
+const openCodeTailStubScript = `const http = require('node:http');
+
+const portIndex = process.argv.indexOf('--port');
+const port = Number(process.argv[portIndex + 1]);
+const sessionId = '${stubSessionId}';
+const messageId = 'msg_stub_final';
+const partId = 'prt_stub_final_text';
+
+let streamResponse = null;
+let markStreamReady = null;
+const streamReady = new Promise((resolve) => {
+  markStreamReady = resolve;
+});
+
+const writeEvent = (payload) => {
+  if (!streamResponse) {
+    return;
+  }
+  streamResponse.write('data: ' + JSON.stringify({ directory: null, payload }) + '\\n\\n');
+};
+
+const server = http.createServer((request, response) => {
+  const url = new URL(request.url, 'http://127.0.0.1');
+
+  if (url.pathname === '/global/health') {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ healthy: true }));
+    return;
+  }
+
+  if (url.pathname === '/global/event') {
+    response.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    });
+    streamResponse = response;
+    markStreamReady();
+    return;
+  }
+
+  if (url.pathname === '/session' && request.method === 'POST') {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ id: sessionId }));
+    return;
+  }
+
+  if (url.pathname === '/session/' + sessionId + '/message' && request.method === 'POST') {
+    request.resume();
+    void streamReady.then(() => {
+      writeEvent({ type: 'session.status', properties: { sessionID: sessionId, status: { type: 'busy' } } });
+      writeEvent({ type: 'message.updated', properties: { sessionID: sessionId, info: { id: messageId, role: 'assistant' } } });
+      writeEvent({
+        type: 'message.part.updated',
+        properties: { sessionID: sessionId, part: { id: partId, messageID: messageId, type: 'text', text: '', time: { start: 1 } } },
+      });
+      writeEvent({
+        type: 'message.part.delta',
+        properties: { sessionID: sessionId, messageID: messageId, partID: partId, field: 'text', delta: 'A' },
+      });
+      setTimeout(() => {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ info: { id: messageId } }));
+        setTimeout(() => {
+          writeEvent({
+            type: 'message.part.delta',
+            properties: { sessionID: sessionId, messageID: messageId, partID: partId, field: 'text', delta: '-DONE B-SEEN' },
+          });
+          writeEvent({
+            type: 'message.part.updated',
+            properties: {
+              sessionID: sessionId,
+              part: { id: partId, messageID: messageId, type: 'text', text: 'A-DONE B-SEEN', time: { start: 1, end: 2 } },
+            },
+          });
+          writeEvent({ type: 'session.status', properties: { sessionID: sessionId, status: { type: 'idle' } } });
+          writeEvent({ type: 'session.idle', properties: { sessionID: sessionId } });
+        }, 100);
+      }, 100);
     });
     return;
   }
@@ -486,4 +587,167 @@ test('a subagent approval surfaces on the parent run and its reply reaches the e
     }
     await rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test('the final reply streams completely when the prompt request resolves before its stream tail', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-stream-tail-'));
+  const binDir = path.join(tempRoot, 'bin');
+  const previousPath = process.env.PATH;
+  const previousDatabasePath = process.env.DATABASE_PATH;
+  const previousHomeDir = os.homedir;
+
+  closeConnection();
+  process.env.DATABASE_PATH = path.join(tempRoot, 'auth.db');
+  await initializeDatabase();
+  (os as unknown as { homedir: () => string }).homedir = () => tempRoot;
+
+  try {
+    await mkdir(binDir, { recursive: true });
+    const stubPath = path.join(tempRoot, 'opencode-tail-stub.cjs');
+    await writeFile(stubPath, openCodeTailStubScript);
+    await writeOpenCodeShim(binDir, stubPath);
+
+    process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ''}`;
+
+    const messages: NormalizedMessage[] = [];
+    const writer: ProviderRuntimeWriter = {
+      userId: null,
+      send: (message) => {
+        messages.push(message as NormalizedMessage);
+      },
+    };
+    const sessionsProvider = new OpenCodeSessionsProvider();
+    const context = {
+      resolveProviderSessionId: () => null,
+      resolveResumeModel: async (_sessionId: string | undefined, model?: string | null) =>
+        model ?? 'opencode-go/deepseek-v4.1-flash',
+      getProviderModels: async () => ({}),
+      normalizeMessage: (raw: unknown, sessionId: string | null) =>
+        sessionsProvider.normalizeMessage(raw, sessionId),
+      isProviderInstalled: async () => true,
+    } as unknown as ProviderRuntimeContext;
+
+    await spawnOpenCode('hello', { sessionId: 'app-sess-tail', cwd: tempRoot }, writer, context);
+
+    const completeIndex = messages.findIndex((message) => message.kind === 'complete');
+    assert.ok(completeIndex !== -1, 'the run must end with a complete frame');
+    const streamed = messages
+      .slice(0, completeIndex)
+      .filter((message) => message.kind === 'stream_delta')
+      .map((message) => message.content)
+      .join('');
+    // Before the drain, the run unsubscribed on the response and only "A" streamed.
+    assert.equal(streamed, 'A-DONE B-SEEN');
+  } finally {
+    shutdownOpenCodeServer();
+    (os as unknown as { homedir: () => string }).homedir = previousHomeDir;
+    if (previousPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = previousPath;
+    }
+    closeConnection();
+    if (previousDatabasePath === undefined) {
+      delete process.env.DATABASE_PATH;
+    } else {
+      process.env.DATABASE_PATH = previousDatabasePath;
+    }
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+type DrainableRun = {
+  injections: Set<Promise<unknown>>;
+  engineIdle: boolean;
+  idleWaiters: Set<() => void>;
+  aborted: boolean;
+};
+
+function createDrainableRun(): DrainableRun {
+  return { injections: new Set(), engineIdle: false, idleWaiters: new Set(), aborted: false };
+}
+
+const sessionIdleEvent = { type: 'session.idle', properties: { sessionID: 'ses_x' }, directory: null };
+const sessionStatusEvent = (type: string) => ({
+  type: 'session.status',
+  properties: { sessionID: 'ses_x', status: { type } },
+  directory: null,
+});
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('session status events track whether the engine is idle', () => {
+  const run = createDrainableRun();
+  trackOpenCodeSessionIdle(run, sessionStatusEvent('idle'));
+  assert.equal(run.engineIdle, true);
+  trackOpenCodeSessionIdle(run, sessionStatusEvent('busy'));
+  assert.equal(run.engineIdle, false);
+  trackOpenCodeSessionIdle(run, sessionIdleEvent);
+  assert.equal(run.engineIdle, true);
+  trackOpenCodeSessionIdle(run, sessionStatusEvent('retry'));
+  assert.equal(run.engineIdle, false);
+  // Unrelated events and unknown statuses leave the state alone.
+  trackOpenCodeSessionIdle(run, sessionStatusEvent('mystery'));
+  trackOpenCodeSessionIdle(run, { type: 'message.updated', properties: {}, directory: null });
+  assert.equal(run.engineIdle, false);
+});
+
+test('draining a run waits for the idle event and ends as soon as it arrives', async () => {
+  const run = createDrainableRun();
+  let drained = false;
+  const drain = drainOpenCodeRun(run, 10_000).then(() => {
+    drained = true;
+  });
+
+  await sleep(30);
+  assert.equal(drained, false, 'the run must wait for its stream tail');
+  trackOpenCodeSessionIdle(run, sessionIdleEvent);
+  await drain;
+  assert.equal(run.idleWaiters.size, 0);
+});
+
+test('draining a run is bounded when the idle event never arrives', async () => {
+  const run = createDrainableRun();
+  const startedAt = Date.now();
+  await drainOpenCodeRun(run, 50);
+  assert.ok(Date.now() - startedAt >= 40);
+  assert.equal(run.idleWaiters.size, 0);
+
+  // An idle already seen, or a timeout of zero, does not wait at all.
+  run.engineIdle = true;
+  await drainOpenCodeRun(run, 10_000);
+  run.engineIdle = false;
+  await drainOpenCodeRun(run, 0);
+});
+
+test('a message injected while the run drains is answered and streamed before it ends', async () => {
+  const run = createDrainableRun();
+  let drained = false;
+  const drain = drainOpenCodeRun(run, 10_000).then(() => {
+    drained = true;
+  });
+  await sleep(10);
+
+  // Mirrors `injectOpenCodeInput`: track the request, forget any earlier idle.
+  let answer: () => void = () => {};
+  const tracked: Promise<void> = new Promise<void>((resolve) => {
+    answer = resolve;
+  }).finally(() => {
+    run.injections.delete(tracked);
+  });
+  run.injections.add(tracked);
+
+  // The original loop's idle wakes the drain, which must now settle the
+  // injection; the loop answering it starts busy again.
+  trackOpenCodeSessionIdle(run, sessionIdleEvent);
+  trackOpenCodeSessionIdle(run, sessionStatusEvent('busy'));
+  await sleep(20);
+  assert.equal(drained, false, 'the injected message is still pending');
+
+  answer();
+  await sleep(20);
+  assert.equal(drained, false, "the injected message's stream tail has not arrived yet");
+
+  trackOpenCodeSessionIdle(run, sessionStatusEvent('idle'));
+  await drain;
+  assert.equal(run.injections.size, 0);
 });

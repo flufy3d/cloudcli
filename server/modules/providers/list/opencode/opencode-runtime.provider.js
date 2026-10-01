@@ -63,6 +63,13 @@ const activeRuns = new Map();
 const LIVE_CONTEXT_MIN_INTERVAL_MS = 1_500;
 
 /**
+ * Longest wait, after a turn's prompt request resolved, for the session's idle
+ * event that ends its stream tail (see `drainOpenCodeRun`). The tail normally
+ * lands within milliseconds; this only bounds a lost event.
+ */
+const RUN_IDLE_EVENT_TIMEOUT_MS = 3_000;
+
+/**
  * Kills a spawned CLI process and everything it started.
  *
  * `cross-spawn` resolves `opencode` through the Windows `.cmd` shim, so the
@@ -200,6 +207,71 @@ async function settleOpenCodeInjections(run) {
 }
 
 /**
+ * Records the engine's busy/idle transitions for the run's own session.
+ *
+ * `session.idle` (and `session.status` idle) is the last event a prompt loop
+ * emits on the ordered `/global/event` stream, after its final deltas and
+ * completed parts. Consumers: `spawnOpenCode`'s event handler, and tests.
+ */
+export function trackOpenCodeSessionIdle(run, event) {
+  let idle;
+  if (event.type === 'session.idle') {
+    idle = true;
+  } else if (event.type === 'session.status') {
+    const status = readOptionalString(readObjectRecord(event.properties.status)?.type);
+    if (status !== 'idle' && status !== 'busy' && status !== 'retry') {
+      return;
+    }
+    idle = status === 'idle';
+  } else {
+    return;
+  }
+
+  run.engineIdle = idle;
+  if (idle) {
+    for (const wake of Array.from(run.idleWaiters)) {
+      wake();
+    }
+  }
+}
+
+/** Resolves once the run's session reports idle, or after `timeoutMs` at the latest. */
+function waitForOpenCodeIdleEvent(run, timeoutMs) {
+  if (run.engineIdle || run.aborted || timeoutMs <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const wake = () => {
+      clearTimeout(timer);
+      run.idleWaiters.delete(wake);
+      resolve();
+    };
+    const timer = setTimeout(wake, timeoutMs);
+    run.idleWaiters.add(wake);
+  });
+}
+
+/**
+ * Holds the run open until its turn has fully played out on the event stream.
+ *
+ * The blocking prompt request resolves when the prompt loop ends, but the
+ * stream delivers that loop's tail (the final reply's last deltas, its
+ * completed part, `session.idle`) a few milliseconds later; unsubscribing on
+ * the response dropped the final reply's text (verified against the engine).
+ * So after the injected messages settle, wait for the idle event — bounded, so
+ * a lost event (a stream reconnect gap) cannot hang the run — and repeat while
+ * an injection arrived meanwhile. The loop exits on a synchronous check, so the
+ * caller's cleanup runs with no await in between and no injection slips in
+ * unobserved. Consumers: `spawnOpenCode`'s `finally`, and tests.
+ */
+export async function drainOpenCodeRun(run, idleTimeoutMs = RUN_IDLE_EVENT_TIMEOUT_MS) {
+  do {
+    await settleOpenCodeInjections(run);
+    await waitForOpenCodeIdleEvent(run, idleTimeoutMs);
+  } while (run.injections.size > 0);
+}
+
+/**
  * Runs one OpenCode turn against the shared `opencode serve` instance.
  *
  * The CLI's `run` mode cannot surface tool approvals (it auto-rejects every
@@ -254,6 +326,9 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     variant: resolvedEffort || undefined,
     /** Pending requests of messages injected into this turn (see `injectOpenCodeInput`). */
     injections: new Set(),
+    /** Whether the stream last reported the session idle, and who waits for it (see `drainOpenCodeRun`). */
+    engineIdle: false,
+    idleWaiters: new Set(),
     aborted: false,
     completeSent: false,
     terminalNotified: false,
@@ -493,6 +568,10 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       case 'message.updated':
         handleMessageUpdated(event);
         return;
+      case 'session.idle':
+      case 'session.status':
+        trackOpenCodeSessionIdle(run, event);
+        return;
       case 'session.error': {
         const errorRecord = readObjectRecord(event.properties.error) ?? {};
         const message = readOptionalString(readObjectRecord(errorRecord.data)?.message)
@@ -560,11 +639,12 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       }
     }
   } finally {
-    // The turn is not over until messages injected into it are answered too:
-    // their output streams through this run, and its `complete` ends them.
-    // Nothing awaits between the last check and the cleanup below, so no
-    // injection can slip in unobserved.
-    await settleOpenCodeInjections(run);
+    // The turn is not over until messages injected into it are answered and
+    // its last events have streamed: their output goes through this run, and
+    // its `complete` ends them. Nothing awaits between the drain's last
+    // injection check and the cleanup below, so no injection can slip in
+    // unobserved. A failed turn has no tail left to wait for.
+    await drainOpenCodeRun(run, failure ? 0 : RUN_IDLE_EVENT_TIMEOUT_MS);
     unsubscribe();
     unregisterOpenCodeRun(runId);
     activeRuns.delete(runId);
@@ -659,6 +739,9 @@ async function injectOpenCodeInput(command, options = {}) {
       run.injections.delete(tracked);
     });
   run.injections.add(tracked);
+  // An idle seen earlier no longer ends the turn: the loop that answers this
+  // message reports its own idle once its output has streamed.
+  run.engineIdle = false;
   return true;
 }
 
