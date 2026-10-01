@@ -339,7 +339,9 @@ function MarkdownImage({ src, alt, node: _node, ...props }: MarkdownImageProps) 
       try {
         let blob: Blob;
         if (localPath) {
-          const response = await readExternalFileContent(localPath, { signal: controller.signal });
+          const response = projectId
+            ? await readExternalFileContent(localPath, { signal: controller.signal }, projectId)
+            : await readExternalFileContent(localPath, { signal: controller.signal });
           if (!response.ok) {
             throw new Error(`Image request failed with status ${response.status}`);
           }

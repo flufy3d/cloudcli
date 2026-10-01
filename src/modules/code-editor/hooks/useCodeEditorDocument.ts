@@ -102,7 +102,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
         // Workspace-external documents are served by the read-only external
         // endpoint and are not tied to a project.
         if (isReadOnlyExternal) {
-          const externalResponse = await readExternalFile(filePath);
+          const externalResponse = await readExternalFile(filePath, fileProjectId);
           if (!externalResponse.ok) {
             throw new Error(`Failed to load file: ${externalResponse.status} ${externalResponse.statusText}`);
           }

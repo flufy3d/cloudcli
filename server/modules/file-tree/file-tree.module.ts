@@ -13,6 +13,7 @@ import {
   getClaudeExternalReadOnlyRoots,
   getZcodeExternalReadOnlyRoots,
 } from '@/modules/providers/index.js';
+import { getProjectWorktreeRoots } from '@/modules/worktrees/index.js';
 import { getGlobalImageAssetsDir } from '@/shared/image-attachments.js';
 import type {
   FileTreeFileSystem,
@@ -118,6 +119,7 @@ const fileTreeServices = createFileTreeService({
     ...getExternalTempRoots(),
     ...getZcodeExternalReadOnlyRoots(),
   ],
+  resolveWorktreeRoots: (projectRoot) => getProjectWorktreeRoots(projectRoot),
 });
 
 const fileUploadMiddleware = multer({

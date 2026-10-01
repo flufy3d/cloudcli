@@ -228,3 +228,37 @@ test('external-file content route streams an external media file with proper con
 
   assert.deepEqual(inputs, ['/home/user/.cloudcli/assets/shot.png']);
 });
+
+test('external-file routes forward optional projectId to services', async () => {
+  const textCalls: Array<{ path: string; projectId?: string }> = [];
+  const contentCalls: Array<{ path: string; projectId?: string }> = [];
+
+  const services = createFakeServices({
+    readExternalTextFile: async (filePath, projectId) => {
+      textCalls.push({ path: filePath, projectId });
+      return { content: 'hello', path: filePath };
+    },
+    openExternalFile: async (filePath, projectId) => {
+      contentCalls.push({ path: filePath, projectId });
+      return {
+        contentType: 'image/png',
+        stream: Readable.from([]),
+      };
+    },
+  });
+
+  await withFileTreeServer(services, async (baseUrl) => {
+    const textRes = await fetch(
+      `${baseUrl}/api/file-tree/external-file?path=${encodeURIComponent('/worktrees/feat/file.txt')}&projectId=proj-123`,
+    );
+    assert.equal(textRes.status, 200);
+
+    const contentRes = await fetch(
+      `${baseUrl}/api/file-tree/external-file/content?path=${encodeURIComponent('/worktrees/feat/img.png')}&projectId=proj-123`,
+    );
+    assert.equal(contentRes.status, 200);
+  });
+
+  assert.deepEqual(textCalls, [{ path: '/worktrees/feat/file.txt', projectId: 'proj-123' }]);
+  assert.deepEqual(contentCalls, [{ path: '/worktrees/feat/img.png', projectId: 'proj-123' }]);
+});

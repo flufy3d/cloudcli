@@ -668,9 +668,18 @@ export function synthesizeVoice(text: string, signal: AbortSignal): Promise<Resp
 }
 
 /** Fork: fetches one external (outside-project) file's content for the code editor document. */
-export const readExternalFile = (filePath: string): Promise<Response> =>
-  authenticatedFetch(`/api/file-tree/external-file?path=${encodeURIComponent(filePath)}`);
+export const readExternalFile = (filePath: string, projectId?: string): Promise<Response> =>
+  authenticatedFetch(
+    `/api/file-tree/external-file?path=${encodeURIComponent(filePath)}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}`,
+  );
 
 /** Fork: streams one external (allowlisted) file's bytes — chat markdown resolves local-path images through this. */
-export const readExternalFileContent = (filePath: string, options: ApiRequestOptions = {}): Promise<Response> =>
-  authenticatedFetch(`/api/file-tree/external-file/content?path=${encodeURIComponent(filePath)}`, options);
+export const readExternalFileContent = (
+  filePath: string,
+  options: ApiRequestOptions = {},
+  projectId?: string,
+): Promise<Response> =>
+  authenticatedFetch(
+    `/api/file-tree/external-file/content?path=${encodeURIComponent(filePath)}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}`,
+    options,
+  );

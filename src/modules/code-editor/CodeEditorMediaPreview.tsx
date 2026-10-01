@@ -91,7 +91,7 @@ export default function CodeEditorMediaPreview({
         // ourselves and hand the media element a blob URL instead of a bare src.
         // Fetching a blob (rather than streaming) also lets <video>/<audio> seek.
         const contentUrl = isExternal
-          ? `/api/file-tree/external-file/content?path=${encodeURIComponent(file.path)}`
+          ? `/api/file-tree/external-file/content?path=${encodeURIComponent(file.path)}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}`
           : `/api/file-tree/projects/${projectId}/files/content?path=${encodeURIComponent(file.path)}`;
         const response = await authenticatedFetch(contentUrl, { signal: controller.signal });
 

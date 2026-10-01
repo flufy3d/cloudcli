@@ -131,17 +131,20 @@ export function createFileTreeRouter(
   }, logger));
 
   // Read-only access to allowlisted external files (Antigravity brain plan
-  // documents); the service enforces the allowlist, routes stay thin.
+  // documents or linked project worktrees); the service enforces the allowlist,
+  // routes stay thin.
   router.get('/external-file', createRouteHandler(async (request, response) => {
     const filePath = readRequiredString(request.query.path, 'path', 'Invalid file path');
-    response.json(await services.readExternalTextFile(filePath));
+    const projectId = readOptionalString(request.query.projectId);
+    response.json(await services.readExternalTextFile(filePath, projectId ?? undefined));
   }, logger));
 
-  // Streaming read-only access to allowlisted external files (media/attachments/artifacts);
-  // the service enforces the allowlist, routes stay thin.
+  // Streaming read-only access to allowlisted external files (media/attachments/artifacts
+  // or linked project worktrees); the service enforces the allowlist, routes stay thin.
   router.get('/external-file/content', createRouteHandler(async (request, response) => {
     const filePath = readRequiredString(request.query.path, 'path', 'Invalid file path');
-    const file = await services.openExternalFile(filePath);
+    const projectId = readOptionalString(request.query.projectId);
+    const file = await services.openExternalFile(filePath, projectId ?? undefined);
     response.setHeader('Content-Type', file.contentType);
     file.stream.pipe(response);
     file.stream.on('error', (error) => {
