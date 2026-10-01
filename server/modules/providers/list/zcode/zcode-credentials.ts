@@ -13,6 +13,7 @@
  */
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import * as fsSync from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -236,3 +237,33 @@ export async function readDecryptedZCodeCredentials(
     };
   }
 }
+
+/**
+ * Synchronously reads and decrypts the ZCode JWT token from credentials.json.
+ * Returns null if the file is missing, the token is absent, or decryption fails.
+ */
+export function readDecryptedZCodeJwtToken(
+  storageDir = getZCodeStorageDir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const credPath = path.join(storageDir, 'v2', 'credentials.json');
+  try {
+    const content = fsSync.readFileSync(credPath, 'utf8');
+    const rawMap = readObjectRecord(JSON.parse(content));
+    const rawToken = readOptionalString(rawMap?.zcodejwttoken);
+    if (!rawToken) {
+      return null;
+    }
+    if (rawToken.startsWith(CIPHER_PREFIX)) {
+      try {
+        return decryptZCodeCredentialValue(rawToken, env);
+      } catch {
+        return null;
+      }
+    }
+    return rawToken;
+  } catch {
+    return null;
+  }
+}
+

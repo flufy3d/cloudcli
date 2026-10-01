@@ -18,23 +18,23 @@ import {
   readTrimmedStringRecord,
 } from '@/shared/utils.js';
 
+import { readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
 import { resolveZCodeProviderApiType } from './zcode-provider-config.js';
 
-/**
- * ZCode builtin models definition as fallback when config read fails.
- * Based on integration plan §3.2.5 and spike findings (GLM-5.3 with 1M context, 128K output).
- */
-/**
- * Static fallback catalog used when the engine's model config cannot be read.
- * Exported for the capability tests: the capability catalog's defaultModel is
- * pinned to this definition's DEFAULT.
- */
+export const ZCODE_START_PLAN_PROVIDER_ID = 'account:bigmodel-start-plan';
+const ZCODE_START_PLAN_MODEL_ID = 'GLM-5.3-Flash';
+const ZCODE_START_PLAN_MODEL_VALUE = `${ZCODE_START_PLAN_PROVIDER_ID}/${ZCODE_START_PLAN_MODEL_ID}`;
+const ZCODE_GROUP_PERSONAL = 'BigModel (个人)';
+const ZCODE_GROUP_START_PLAN = 'BigModel (体验)';
+const ZCODE_PERSONAL_MODELS_WHITELIST = new Set(['GLM-5.3', 'GLM-5.3-Flash']);
+
 export const ZCODE_BUILTIN_MODELS: ProviderModelsDefinition = {
   OPTIONS: [
     {
       value: 'GLM-5.3',
       label: 'GLM-5.3',
+      group: ZCODE_GROUP_PERSONAL,
       description: 'ZCode default model with 1M context window and 128K output tokens',
       effort: {
         default: 'max',
@@ -55,12 +55,37 @@ const EFFORT_DESCRIPTIONS: Record<string, string> = {
   max: 'Maximum reasoning for complex tasks',
 };
 
+function appendStartPlanModelIfEligible(options: ProviderModelOption[]): ProviderModelOption[] {
+  const jwtToken = readDecryptedZCodeJwtToken();
+  if (!jwtToken || options.some((opt) => opt.value === ZCODE_START_PLAN_MODEL_VALUE)) {
+    return options;
+  }
+  return [
+    ...options,
+    {
+      value: ZCODE_START_PLAN_MODEL_VALUE,
+      label: ZCODE_START_PLAN_MODEL_ID,
+      group: ZCODE_GROUP_START_PLAN,
+      description: 'ZCode 体验套餐专享模型',
+      effort: {
+        default: 'max',
+        values: [
+          { value: 'low', description: EFFORT_DESCRIPTIONS.low },
+          { value: 'high', description: EFFORT_DESCRIPTIONS.high },
+          { value: 'max', description: EFFORT_DESCRIPTIONS.max },
+        ],
+      },
+    },
+  ];
+}
+
 /**
  * Reads ZCode's user-facing provider config to extract model definitions.
  * 0.16.9 stores the active catalog in `cli/config.json`; the older v2 path is
  * retained as a fallback for installations that have not rewritten it yet.
  */
 const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
+  let baseDefinition: ProviderModelsDefinition = ZCODE_BUILTIN_MODELS;
   try {
     let config: Record<string, unknown> | null = null;
     for (const configPath of [
@@ -75,93 +100,103 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
       }
     }
 
-    if (!config) {
-      return ZCODE_BUILTIN_MODELS;
-    }
+    const providers = readObjectRecord(config?.provider);
+    if (providers) {
+      const modelOptions: ProviderModelOption[] = [];
+      const seenModelKeys = new Set<string>();
 
-    const providers = readObjectRecord(config.provider);
-    if (!providers) {
-      return ZCODE_BUILTIN_MODELS;
-    }
+      for (const [providerId, providerConfig] of Object.entries(providers)) {
+        const providerRecord = readObjectRecord(providerConfig);
+        // Skip explicitly disabled providers
+        if (providerRecord?.enabled === false) continue;
 
-    const modelOptions: ProviderModelOption[] = [];
-    const seenModelKeys = new Set<string>();
+        const models = readObjectRecord(providerRecord?.models);
+        if (!models) continue;
 
-    for (const providerConfig of Object.values(providers)) {
-      const providerRecord = readObjectRecord(providerConfig);
-      // Skip explicitly disabled providers
-      if (providerRecord?.enabled === false) continue;
+        const isPersonalProvider = providerId === 'bigmodel-coding-plan'
+          || providerId.startsWith('builtin:bigmodel')
+          || providerId.startsWith('account:bigmodel-coding-plan')
+          || providerId.startsWith('account:bigmodel-individual');
 
-      const models = readObjectRecord(providerRecord?.models);
-      if (!models) continue;
+        for (const [modelKey, modelConfig] of Object.entries(models)) {
+          if (seenModelKeys.has(modelKey)) continue;
+          if (isPersonalProvider && !ZCODE_PERSONAL_MODELS_WHITELIST.has(modelKey)) {
+            continue;
+          }
 
-      for (const [modelKey, modelConfig] of Object.entries(models)) {
-        if (seenModelKeys.has(modelKey)) continue;
+          const modelRecord = readObjectRecord(modelConfig);
+          if (!modelRecord) continue;
 
-        const modelRecord = readObjectRecord(modelConfig);
-        if (!modelRecord) continue;
+          seenModelKeys.add(modelKey);
 
-        seenModelKeys.add(modelKey);
+          const reasoning = readObjectRecord(modelRecord.reasoning);
+          const variants = Array.isArray(reasoning?.levels) ? reasoning.levels : reasoning?.variants;
+          const hasReasoning = Array.isArray(variants) && variants.length > 0;
 
-        const reasoning = readObjectRecord(modelRecord.reasoning);
-        const variants = Array.isArray(reasoning?.levels) ? reasoning.levels : reasoning?.variants;
-        const hasReasoning = Array.isArray(variants) && variants.length > 0;
+          const limits = readObjectRecord(modelRecord.limit);
+          const contextLimit = limits?.context;
+          const outputLimit = limits?.output;
 
-        const limits = readObjectRecord(modelRecord.limit);
-        const contextLimit = limits?.context;
-        const outputLimit = limits?.output;
+          const limitDescriptions: string[] = [];
+          if (typeof contextLimit === 'number') {
+            limitDescriptions.push(`${(contextLimit / 1000).toFixed(0)}K context`);
+          }
+          if (typeof outputLimit === 'number') {
+            limitDescriptions.push(`${(outputLimit / 1000).toFixed(0)}K output`);
+          }
 
-        const limitDescriptions: string[] = [];
-        if (typeof contextLimit === 'number') {
-          limitDescriptions.push(`${(contextLimit / 1000).toFixed(0)}K context`);
+          const description = limitDescriptions.length > 0
+            ? `ZCode model with ${limitDescriptions.join(', ')}`
+            : `ZCode ${modelKey} model`;
+
+          let effort: ProviderModelOption['effort'] | undefined;
+          if (hasReasoning && Array.isArray(variants)) {
+            const sortedVariants = variants
+              .filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0)
+              .map((variant) => variant.trim().toLowerCase())
+              .sort();
+            effort = {
+              default: readOptionalString(reasoning?.defaultLevel)?.toLowerCase() ?? 'max',
+              values: sortedVariants.map((variant: string) => {
+                const normalized = variant.toLowerCase();
+                return {
+                  value: normalized,
+                  description: EFFORT_DESCRIPTIONS[normalized] || `${normalized} reasoning level`,
+                };
+              }),
+            };
+          }
+
+          const group = isPersonalProvider
+            ? ZCODE_GROUP_PERSONAL
+            : (readOptionalString(providerRecord?.name) || providerId);
+
+          modelOptions.push({
+            value: modelKey,
+            label: modelKey,
+            group,
+            description: readOptionalString(modelRecord.description) || description,
+            effort: hasReasoning ? effort : undefined,
+          });
         }
-        if (typeof outputLimit === 'number') {
-          limitDescriptions.push(`${(outputLimit / 1000).toFixed(0)}K output`);
-        }
+      }
 
-        const description = limitDescriptions.length > 0
-          ? `ZCode model with ${limitDescriptions.join(', ')}`
-          : `ZCode ${modelKey} model`;
-
-        let effort: ProviderModelOption['effort'] | undefined;
-        if (hasReasoning && Array.isArray(variants)) {
-          const sortedVariants = variants
-            .filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0)
-            .map((variant) => variant.trim().toLowerCase())
-            .sort();
-          effort = {
-            default: readOptionalString(reasoning?.defaultLevel)?.toLowerCase() ?? 'max',
-            values: sortedVariants.map((variant: string) => {
-              const normalized = variant.toLowerCase();
-              return {
-                value: normalized,
-                description: EFFORT_DESCRIPTIONS[normalized] || `${normalized} reasoning level`,
-              };
-            }),
-          };
-        }
-
-        modelOptions.push({
-          value: modelKey,
-          label: modelKey,
-          description: readOptionalString(modelRecord.description) || description,
-          effort: hasReasoning ? effort : undefined,
-        });
+      if (modelOptions.length > 0) {
+        baseDefinition = {
+          OPTIONS: modelOptions,
+          DEFAULT: modelOptions[0]?.value ?? 'GLM-5.3',
+        };
       }
     }
-
-    if (modelOptions.length === 0) {
-      return ZCODE_BUILTIN_MODELS;
-    }
-
-    return {
-      OPTIONS: modelOptions,
-      DEFAULT: modelOptions[0]?.value ?? 'GLM-5.3',
-    };
   } catch {
-    // Config read failed, return builtin models
-    return ZCODE_BUILTIN_MODELS;
+    baseDefinition = ZCODE_BUILTIN_MODELS;
   }
+
+  const optionsWithStartPlan = appendStartPlanModelIfEligible(baseDefinition.OPTIONS);
+  return {
+    OPTIONS: optionsWithStartPlan,
+    DEFAULT: optionsWithStartPlan[0]?.value ?? baseDefinition.DEFAULT,
+  };
 };
 
 /**
@@ -194,13 +229,23 @@ export function readZCodeSessionModelInfoFromDb(providerSessionId: string): { mo
 
     const messageData = readObjectRecord(JSON.parse(recentMessage.data));
     const modelRecord = readObjectRecord(messageData?.model);
-    const modelId = readOptionalString(messageData?.modelID)
+    const rawModelId = readOptionalString(messageData?.modelID)
+      || readOptionalString(messageData?.modelId)
       || readOptionalString(modelRecord?.modelID)
       || readOptionalString(modelRecord?.modelId);
 
-    if (!modelId) {
+    if (!rawModelId) {
       return null;
     }
+
+    const providerId = readOptionalString(messageData?.providerID)
+      || readOptionalString(messageData?.providerId)
+      || readOptionalString(modelRecord?.providerID)
+      || readOptionalString(modelRecord?.providerId);
+
+    const modelId = providerId === ZCODE_START_PLAN_PROVIDER_ID
+      ? `${providerId}/${rawModelId}`
+      : rawModelId;
 
     const variant = readOptionalString(messageData?.variant)
       || readOptionalString(modelRecord?.variant);
@@ -241,6 +286,15 @@ export function resolveZCodeModelRef(
   const slashIndex = trimmed.indexOf('/');
   const requestedProviderId = slashIndex >= 0 ? trimmed.slice(0, slashIndex).trim() : undefined;
   const requestedModelId = slashIndex >= 0 ? trimmed.slice(slashIndex + 1).trim() : trimmed;
+
+  if (requestedProviderId === ZCODE_START_PLAN_PROVIDER_ID) {
+    return {
+      providerId: requestedProviderId,
+      modelId: requestedModelId,
+      ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
+    };
+  }
+
   if (requestedProviderId && !requestedProviderId.startsWith('builtin:') && !requestedProviderId.startsWith('account:')) {
     return {
       providerId: requestedProviderId,
@@ -329,6 +383,27 @@ export function buildZCodeSendModelParams(
   };
 } | null {
   const explicitSelection = resolveZCodeModelRef(modelKey, reasoningLevel);
+
+  if (explicitSelection.providerId === ZCODE_START_PLAN_PROVIDER_ID) {
+    const jwtToken = readDecryptedZCodeJwtToken();
+    if (!jwtToken) {
+      return null;
+    }
+    const selectedReasoningLevel = explicitSelection.options?.reasoningLevel ?? 'max';
+    return {
+      modelSelection: {
+        providerId: explicitSelection.providerId,
+        modelId: explicitSelection.modelId,
+        options: { reasoningLevel: selectedReasoningLevel },
+      },
+      modelExecution: {
+        selectionScope: 'execution',
+        requestAuth: {
+          apiKey: jwtToken,
+        },
+      },
+    };
+  }
   const configPath = path.join(getZCodeStorageDir(), 'cli', 'config.json');
   let providerRecord: Record<string, unknown> | null = null;
   let modelRecord: Record<string, unknown> | null = null;

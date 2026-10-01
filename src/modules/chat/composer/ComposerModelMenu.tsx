@@ -66,11 +66,52 @@ function ComposerModelMenu({
   );
   const effortLabel = effort === DEFAULT_EFFORT_VALUE ? defaultEffortLabel : effort;
 
+  const fallbackModelLabel = useMemo(() => {
+    if (!model) return '';
+    const slashIdx = model.indexOf('/');
+    return slashIdx >= 0 ? model.slice(slashIdx + 1) : model;
+  }, [model]);
+
   const selectedModelOption = useMemo(
     () => modelOptions.find((option) => option.value === model) ?? null,
     [model, modelOptions],
   );
-  const modelLabel = selectedModelOption?.label || model;
+  const modelLabel = selectedModelOption?.label || fallbackModelLabel;
+
+  const groupedModelSections = useMemo(() => {
+    const hasAnyGroup = modelOptions.some((opt) => Boolean(opt.group));
+    if (!hasAnyGroup) {
+      return null;
+    }
+    const groups: { title: string; options: ProviderModelOption[] }[] = [];
+    const groupMap = new Map<string, ProviderModelOption[]>();
+    for (const option of modelOptions) {
+      const title = option.group || '';
+      let list = groupMap.get(title);
+      if (!list) {
+        list = [];
+        groupMap.set(title, list);
+        groups.push({ title, options: list });
+      }
+      list.push(option);
+    }
+    return groups;
+  }, [modelOptions]);
+
+  const renderModelOption = useCallback(
+    (option: ProviderModelOption) => (
+      <ComposerMenuItem
+        key={option.value}
+        label={option.label || option.value}
+        isSelected={option.value === model}
+        onSelect={() => {
+          onSelectModel(option.value);
+          setIsOpen(false);
+        }}
+      />
+    ),
+    [model, onSelectModel],
+  );
 
   const hasEffortSection = resolvedEffortOptions.length > 0;
   const hasModelSection = modelOptions.length > 0 || modelsLoading || modelsError;
@@ -132,7 +173,7 @@ function ComposerModelMenu({
               {hasEffortSection && <ComposerMenuSeparator />}
               <ComposerMenuItem
                 role="menuitem"
-                label={modelLabel}
+                label={selectedModelOption?.group ? `${modelLabel} · ${selectedModelOption.group}` : modelLabel}
                 isSelected={false}
                 onSelect={() => setIsModelSectionOpen((current) => !current)}
                 trailing={
@@ -145,36 +186,51 @@ function ComposerModelMenu({
 
               {isModelSectionOpen && (
                 <>
-                  <ComposerMenuHeading>
-                    {t('composer.model', { defaultValue: 'Model' })}
-                  </ComposerMenuHeading>
                   {modelOptions.length === 0 && modelsLoading && (
-                    <p className="px-2.5 py-1.5 text-sm text-muted-foreground">
-                      {t('composer.loadingModels', { defaultValue: 'Loading models…' })}
-                    </p>
+                    <>
+                      <ComposerMenuHeading>
+                        {t('composer.model', { defaultValue: 'Model' })}
+                      </ComposerMenuHeading>
+                      <p className="px-2.5 py-1.5 text-sm text-muted-foreground">
+                        {t('composer.loadingModels', { defaultValue: 'Loading models…' })}
+                      </p>
+                    </>
                   )}
                   {modelOptions.length === 0 && !modelsLoading && modelsError && (
-                    <button
-                      type="button"
-                      onClick={onReloadModels}
-                      className="w-full px-2.5 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
-                    >
-                      {t('composer.loadModelsFailed', {
-                        defaultValue: 'Failed to load models — click to retry',
-                      })}
-                    </button>
+                    <>
+                      <ComposerMenuHeading>
+                        {t('composer.model', { defaultValue: 'Model' })}
+                      </ComposerMenuHeading>
+                      <button
+                        type="button"
+                        onClick={onReloadModels}
+                        className="w-full px-2.5 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                      >
+                        {t('composer.loadModelsFailed', {
+                          defaultValue: 'Failed to load models — click to retry',
+                        })}
+                      </button>
+                    </>
                   )}
-                  {modelOptions.map((option) => (
-                    <ComposerMenuItem
-                      key={option.value}
-                      label={option.label || option.value}
-                      isSelected={option.value === model}
-                      onSelect={() => {
-                        onSelectModel(option.value);
-                        setIsOpen(false);
-                      }}
-                    />
-                  ))}
+                  {groupedModelSections ? (
+                    groupedModelSections.map((section, idx) => (
+                      <div key={section.title || idx}>
+                        <ComposerMenuHeading>
+                          {section.title || t('composer.model', { defaultValue: 'Model' })}
+                        </ComposerMenuHeading>
+                        {section.options.map(renderModelOption)}
+                      </div>
+                    ))
+                  ) : (
+                    <>
+                      {modelOptions.length > 0 && (
+                        <ComposerMenuHeading>
+                          {t('composer.model', { defaultValue: 'Model' })}
+                        </ComposerMenuHeading>
+                      )}
+                      {modelOptions.map(renderModelOption)}
+                    </>
+                  )}
                 </>
               )}
             </>

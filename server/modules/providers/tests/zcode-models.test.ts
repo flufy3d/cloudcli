@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import Database from 'better-sqlite3';
 
+import { encryptZCodeCredentialValue } from '@/modules/providers/list/zcode/zcode-credentials.js';
 import {
   ZCodeProviderModels,
   buildZCodeSendModelParams,
@@ -286,3 +287,175 @@ test('readZCodeSessionModelInfoFromDb returns model and variant from latest mess
     });
   });
 });
+
+test('getSupportedModels includes BigModel (体验) start-plan model when zcodejwttoken is present', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const cliDir = path.join(storageDir, 'cli');
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(cliDir, { recursive: true });
+    await mkdir(v2Dir, { recursive: true });
+
+    await writeFile(
+      path.join(cliDir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'bigmodel-coding-plan': {
+            kind: 'anthropic',
+            models: {
+              'GLM-5.3': { reasoning: { variants: ['low', 'high', 'max'], defaultLevel: 'max' } },
+              'GLM-5.3-Flash': { reasoning: { variants: ['low', 'high', 'max'], defaultLevel: 'max' } },
+            },
+          },
+        },
+      }),
+      'utf8'
+    );
+
+    await writeFile(
+      path.join(v2Dir, 'credentials.json'),
+      JSON.stringify({ zcodejwttoken: 'mock-jwt-token' }),
+      'utf8'
+    );
+
+    const models = new ZCodeProviderModels();
+    const definition = await models.getSupportedModels();
+
+    // Must strictly have exactly 3 models: 2 personal + 1 start-plan, no duplicates
+    assert.equal(definition.OPTIONS.length, 3);
+    assert.equal(definition.OPTIONS[0].value, 'GLM-5.3');
+    assert.equal(definition.OPTIONS[0].group, 'BigModel (个人)');
+
+    assert.equal(definition.OPTIONS[1].value, 'GLM-5.3-Flash');
+    assert.equal(definition.OPTIONS[1].group, 'BigModel (个人)');
+
+    const startPlan = definition.OPTIONS[2];
+    assert.equal(startPlan.value, 'account:bigmodel-start-plan/GLM-5.3-Flash');
+    assert.equal(startPlan.label, 'GLM-5.3-Flash');
+    assert.equal(startPlan.group, 'BigModel (体验)');
+    assert.equal(startPlan.effort?.default, 'max');
+    assert.deepEqual(
+      startPlan.effort?.values.map((v) => v.value),
+      ['low', 'high', 'max']
+    );
+  });
+});
+
+test('buildZCodeSendModelParams resolves credentials for start-plan model from encrypted token', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    // Simulate real ZCode encrypted token format (enc:v1:...)
+    const encryptedToken = encryptZCodeCredentialValue('mock-jwt-token-abc');
+    assert.match(encryptedToken, /^enc:v1:/);
+
+    await writeFile(
+      path.join(v2Dir, 'credentials.json'),
+      JSON.stringify({ zcodejwttoken: encryptedToken }),
+      'utf8'
+    );
+
+    const params = buildZCodeSendModelParams('account:bigmodel-start-plan/GLM-5.3-Flash', 'high');
+    assert.ok(params);
+    assert.deepEqual(params.modelSelection, {
+      providerId: 'account:bigmodel-start-plan',
+      modelId: 'GLM-5.3-Flash',
+      options: { reasoningLevel: 'high' },
+    });
+    // Decrypted plain token must be passed, NEVER raw ciphertext
+    assert.deepEqual(params.modelExecution, {
+      selectionScope: 'execution',
+      requestAuth: {
+        apiKey: 'mock-jwt-token-abc',
+      },
+    });
+  });
+});
+
+test('readZCodeSessionModelInfoFromDb preserves providerId when session ran on start-plan with providerID', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const dbDir = path.join(storageDir, 'cli', 'db');
+    await mkdir(dbDir, { recursive: true });
+
+    const db = new Database(path.join(dbDir, 'db.sqlite'));
+    try {
+      db.exec(`
+        CREATE TABLE message (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          time_created INTEGER NOT NULL,
+          time_updated INTEGER NOT NULL,
+          data TEXT NOT NULL,
+          sequence INTEGER
+        );
+      `);
+      const insert = db.prepare(
+        'INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      // Real engine writes providerID and modelID (uppercase ID)
+      insert.run('m_start', 'sess_start_plan', 2000, 2000, JSON.stringify({
+        role: 'user',
+        model: {
+          providerID: 'account:bigmodel-start-plan',
+          modelID: 'GLM-5.3-Flash',
+          variant: 'max',
+        },
+      }), 0);
+    } finally {
+      db.close();
+    }
+
+    const { readZCodeSessionModelInfoFromDb } = await import('@/modules/providers/list/zcode/zcode-models.provider.js');
+    assert.deepEqual(readZCodeSessionModelInfoFromDb('sess_start_plan'), {
+      modelId: 'account:bigmodel-start-plan/GLM-5.3-Flash',
+      variant: 'max',
+    });
+  });
+});
+
+test('getSupportedModels enforces personal whitelist and keeps custom provider groups distinct', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const cliDir = path.join(storageDir, 'cli');
+    await mkdir(cliDir, { recursive: true });
+
+    await writeFile(
+      path.join(cliDir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'bigmodel-coding-plan': {
+            kind: 'anthropic',
+            models: {
+              'GLM-5.3': {},
+              'GLM-5.3-Flash': {},
+              'GLM-4.7': {},
+              'OBSOLETE-MODEL': {},
+            },
+          },
+          'custom-provider-id': {
+            name: 'Custom Provider',
+            kind: 'openai',
+            models: {
+              'custom-model-x': {},
+            },
+          },
+        },
+      }),
+      'utf8'
+    );
+
+    const models = new ZCodeProviderModels();
+    const definition = await models.getSupportedModels();
+
+    // Whitelist blocks GLM-4.7 and OBSOLETE-MODEL from personal provider
+    const personalModels = definition.OPTIONS.filter((opt) => opt.group === 'BigModel (个人)');
+    assert.deepEqual(
+      personalModels.map((opt) => opt.value),
+      ['GLM-5.3', 'GLM-5.3-Flash']
+    );
+
+    // Custom provider keeps its own group name, NEVER labeled BigModel (个人)
+    const customModel = definition.OPTIONS.find((opt) => opt.value === 'custom-model-x');
+    assert.ok(customModel);
+    assert.equal(customModel.group, 'Custom Provider');
+  });
+});
+

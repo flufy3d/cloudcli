@@ -10,10 +10,14 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 
 import type { NormalizedMessage, ProviderRuntimeWriter } from '@/shared/types.js';
 
+import { encryptZCodeCredentialValue } from '../list/zcode/zcode-credentials.js';
 import { EngineSilenceTimeoutError, ZCodeRunLifecycle, resolveSilenceTimeoutMs } from '../list/zcode/zcode-run-lifecycle.js';
 import type { ProtocolServerRequest } from '../list/zcode/zcode-codec.js';
 
@@ -460,5 +464,41 @@ test('resolveSilenceTimeoutMs defaults to 1 hour and respects environment overri
     } else {
       delete process.env.CLOUDCLI_ZCODE_SILENCE_TIMEOUT_MS;
     }
+  }
+});
+
+test('requestProviderRuntimeHeaders returns jwt token for start-plan provider', async () => {
+  const previous = process.env.ZCODE_STORAGE_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'zcode-runtime-headers-'));
+  process.env.ZCODE_STORAGE_DIR = tempDir;
+  try {
+    const v2Dir = path.join(tempDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    const encryptedToken = encryptZCodeCredentialValue('jwt-header-token-123');
+    assert.match(encryptedToken, /^enc:v1:/);
+    await writeFile(
+      path.join(v2Dir, 'credentials.json'),
+      JSON.stringify({ zcodejwttoken: encryptedToken }),
+      'utf8'
+    );
+    const lifecycle = new ZCodeRunLifecycle();
+    const answer = lifecycle.handleServerRequest({
+      id: 'req-header-1',
+      method: 'interaction/requestProviderRuntimeHeaders',
+      params: { providerId: 'account:bigmodel-start-plan' },
+    });
+    // Decrypted plain token must be returned, NEVER raw ciphertext
+    assert.deepEqual(answer, {
+      result: {
+        headersApplied: true,
+        requestAuth: {
+          apiKey: 'jwt-header-token-123',
+        },
+      },
+    });
+  } finally {
+    if (previous === undefined) delete process.env.ZCODE_STORAGE_DIR;
+    else process.env.ZCODE_STORAGE_DIR = previous;
+    await rm(tempDir, { recursive: true, force: true });
   }
 });

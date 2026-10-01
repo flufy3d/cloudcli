@@ -31,6 +31,8 @@ import type { ProviderPermissionDecision, ProviderRuntimeWriter } from '@/shared
 import { createNormalizedMessage, generateMessageId, readJsonRecord, readOptionalString } from '@/shared/utils.js';
 
 import type { ProtocolServerRequest } from './zcode-codec.js';
+import { readDecryptedZCodeJwtToken } from './zcode-credentials.js';
+import { ZCODE_START_PLAN_PROVIDER_ID } from './zcode-models.provider.js';
 import { defaultServerRequestHandler } from './zcode-request-router.js';
 import type { ServerRequestAnswer } from './zcode-request-router.js';
 
@@ -380,6 +382,24 @@ export class ZCodeRunLifecycle {
   handleServerRequest(request: ProtocolServerRequest): ServerRequestAnswer | Promise<ServerRequestAnswer> {
     if (request.method === 'interaction/requestUserInput') {
       return this.handleUserInputRequest(request);
+    }
+    if (request.method === 'interaction/requestProviderRuntimeHeaders') {
+      const params = request.params ?? {};
+      const providerId = readOptionalString(params.providerId);
+      if (providerId === ZCODE_START_PLAN_PROVIDER_ID) {
+        const jwtToken = readDecryptedZCodeJwtToken();
+        if (jwtToken) {
+          return {
+            result: {
+              headersApplied: true,
+              requestAuth: {
+                apiKey: jwtToken,
+              },
+            },
+          };
+        }
+      }
+      return defaultServerRequestHandler(request);
     }
     if (request.method !== 'interaction/requestPermission') {
       return defaultServerRequestHandler(request);
