@@ -328,11 +328,13 @@ export function useChatComposerState({
   // loading the `/compact` entry simply stays hidden.
   const { capabilities: providerCapabilities } = useProviderCapabilitiesMap();
   const supportsCompaction = providerCapabilities?.[provider]?.supportsCompaction ?? false;
-  // Running background work only holds a new message back when sending would
-  // kill it; a provider that feeds the turn into the live process takes it now.
-  const acceptsInputDuringBackgroundWork =
-    providerCapabilities?.[provider]?.acceptsInputDuringBackgroundWork ?? false;
-  const backgroundWorkQueuesInput = Boolean(hasActiveBackgroundTasks) && !acceptsInputDuringBackgroundWork;
+  // A busy session only holds a new message back when sending would kill the
+  // work in flight; how far the engine takes input is its own capability.
+  // Until the matrix loads, everything queues.
+  const inputWhileBusy = providerCapabilities?.[provider]?.inputWhileBusy ?? 'queue';
+  const backgroundWorkQueuesInput = Boolean(hasActiveBackgroundTasks) && inputWhileBusy === 'queue';
+  const turnQueuesInput = isLoading && inputWhileBusy !== 'always';
+  const queuesInput = turnQueuesInput || backgroundWorkQueuesInput;
   const [input, setInput] = useState(() => {
     if (typeof window !== 'undefined' && selectedProject) {
       // Draft inputs are keyed by the DB projectId so per-project drafts
@@ -915,11 +917,11 @@ export function useChatComposerState({
           }
         }
 
-        // A turn or background work is already in flight: stash this message instead of sending it.
+        // The session is busy with work this engine cannot take a message during:
+        // stash it instead of sending it.
         // Upload attached files now so the queued record contains durable image
         // descriptors that can be sent even if another session is open later.
-        const isBusy = isLoading || backgroundWorkQueuesInput;
-        if (isBusy && !isForced) {
+        if (queuesInput && !isForced) {
           // A run can restart in the tiny gap between scheduling and flushing a
           // queued submission. Put the same durable draft back without uploading
           // its files again.
@@ -1141,8 +1143,7 @@ export function useChatComposerState({
       buildSendOptions,
       currentSessionId,
       executeCommand,
-      isLoading,
-      backgroundWorkQueuesInput,
+      queuesInput,
       onSessionProcessing,
       onSessionEstablished,
       provider,
@@ -1165,12 +1166,11 @@ export function useChatComposerState({
   // Once the in-flight turn ends, replay the queued draft through the normal
   // submit path. The draft itself is passed directly so submission never
   // depends on React committing restored attachment state first.
-  const isBusy = isLoading || backgroundWorkQueuesInput;
-  const wasBusyRef = useRef(isBusy);
+  const wasBusyRef = useRef(queuesInput);
   const flushSessionKeyRef = useRef(sessionKey);
   useEffect(() => {
     const wasBusy = wasBusyRef.current;
-    wasBusyRef.current = isBusy;
+    wasBusyRef.current = queuesInput;
 
     // A session switch changes which session `isLoading` describes, so this
     // transition says nothing about the queued draft's own session. Never
@@ -1183,7 +1183,7 @@ export function useChatComposerState({
 
     // A manual submit in flight owns the latch; flushing now would be refused.
     // This effect re-runs when it finishes, which is the retry.
-    if (isBusy || isSubmitting || !queuedDraft) {
+    if (queuesInput || isSubmitting || !queuedDraft) {
       return;
     }
 
@@ -1214,7 +1214,7 @@ export function useChatComposerState({
       });
     }, delay);
     return () => clearTimeout(timer);
-  }, [isBusy, isSubmitting, queuedDraft, sessionKey]);
+  }, [queuesInput, isSubmitting, queuedDraft, sessionKey]);
 
   const editQueuedDraft = useCallback(() => {
     if (!queuedDraft) {
@@ -1561,6 +1561,8 @@ export function useChatComposerState({
     backgroundTasks,
     hasActiveBackgroundTasks,
     backgroundWorkQueuesInput,
+    /** True while the session is busy with work a new message would have to wait for. */
+    queuesInput,
     handleVoiceTranscript,
     handleInputChange,
     handleKeyDown,

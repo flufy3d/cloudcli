@@ -1,4 +1,4 @@
-import type { LLMProvider } from '@/shared/types.js';
+import type { LLMProvider, ProviderInputWhileBusy } from '@/shared/types.js';
 
 /**
  * Static provider capability catalog: the declaration point for everything
@@ -62,13 +62,15 @@ export type ProviderCatalogEntry = {
    */
   editRevertsFiles: boolean;
   /**
-   * Whether a message sent while the session's background work is still
-   * running reaches the engine without killing that work. Claude feeds the
-   * turn into the live CLI process that holds the work; engines without that
-   * reuse would restart the process, so the composer queues the message
-   * until the work settles instead.
+   * How far into a busy session a new message reaches the engine without
+   * killing the work in flight (see `ProviderInputWhileBusy`). Claude feeds a
+   * turn into the live CLI process that holds background work; OpenCode's
+   * server absorbs a message into the running turn at its next step; the
+   * others would restart their process, so the composer queues instead.
+   * `always` must be backed by the runtime's `injectInput` primitive (pinned
+   * by the capability tests).
    */
-  acceptsInputDuringBackgroundWork: boolean;
+  inputWhileBusy: ProviderInputWhileBusy;
 };
 
 export const PROVIDER_CATALOG = {
@@ -84,7 +86,7 @@ export const PROVIDER_CATALOG = {
     // process; CloudCLI holds that process open so the wake-ups can fire.
     supportsNativeScheduling: true,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: true,
+    inputWhileBusy: 'background',
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -96,7 +98,7 @@ export const PROVIDER_CATALOG = {
     supportsEffort: false,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -108,7 +110,7 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
   },
   opencode: {
     // Mapped by the runtime onto OpenCode's controls: the `plan` agent for plan,
@@ -124,7 +126,9 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: true,
-    acceptsInputDuringBackgroundWork: false,
+    // The server's prompt loop picks a message posted mid-turn up at its next
+    // step; a running tool or subagent is not interrupted.
+    inputWhileBusy: 'always',
   },
   zcode: {
     // Mapped by the runtime onto ZCode's session/setMode modes: build
@@ -143,7 +147,7 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -155,6 +159,6 @@ export const PROVIDER_CATALOG = {
     supportsEffort: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;

@@ -170,6 +170,36 @@ async function resumeOpenCodeRun(run, workingDir) {
 }
 
 /**
+ * Builds the text part for one user message. Attachments ride along as
+ * <images_input>/<files_input> path lists appended to the prompt; the session
+ * history reader strips the tags back out. The text must stay newline-free for
+ * the Windows shim.
+ */
+function buildOpenCodePrompt(command, images, files) {
+  const hasAttachments =
+    normalizeAttachmentDescriptors(images).length > 0
+    || normalizeAttachmentDescriptors(files).length > 0;
+  const prompt = (command && command.trim()) || hasAttachments
+    ? appendFilesInputTag(appendImagesInputTag(command?.trim() || '', images), files)
+    : '';
+  return flattenPromptForWindowsShell(prompt);
+}
+
+/**
+ * Waits until every message injected into the run has been answered.
+ *
+ * Each injected `POST /session/:id/message` resolves only when the prompt loop
+ * that absorbed it goes idle, so this also covers a message that landed just
+ * after the original turn's loop finished and started a loop of its own. More
+ * injections can arrive while waiting, hence the loop.
+ */
+async function settleOpenCodeInjections(run) {
+  while (run.injections.size > 0) {
+    await Promise.allSettled(Array.from(run.injections));
+  }
+}
+
+/**
  * Runs one OpenCode turn against the shared `opencode serve` instance.
  *
  * The CLI's `run` mode cannot surface tool approvals (it auto-rejects every
@@ -218,6 +248,12 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     handle,
     writer: ws,
     permissionMode,
+    /** What this turn runs with; a message injected mid-turn reuses it. */
+    model: parsedModel,
+    agent,
+    variant: resolvedEffort || undefined,
+    /** Pending requests of messages injected into this turn (see `injectOpenCodeInput`). */
+    injections: new Set(),
     aborted: false,
     completeSent: false,
     terminalNotified: false,
@@ -503,21 +539,11 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       registerProviderSession(createdSessionId);
     }
 
-    const hasAttachments =
-      normalizeAttachmentDescriptors(images).length > 0
-      || normalizeAttachmentDescriptors(files).length > 0;
-    // Image attachments ride along as an <images_input> path list appended to the
-    // prompt; the session history reader strips the tag back out. The server's
-    // text part must stay newline-free-free for the Windows shim.
-    const prompt = (command && command.trim()) || hasAttachments
-      ? appendFilesInputTag(appendImagesInputTag(command?.trim() || '', images), files)
-      : '';
-
     await sendOpenCodeMessage(handle, workingDir, run.providerSessionId, {
-      text: flattenPromptForWindowsShell(prompt),
-      model: parsedModel,
-      agent,
-      variant: resolvedEffort || undefined,
+      text: buildOpenCodePrompt(command, images, files),
+      model: run.model,
+      agent: run.agent,
+      variant: run.variant,
     });
   } catch (error) {
     if (!run.aborted) {
@@ -534,6 +560,11 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       }
     }
   } finally {
+    // The turn is not over until messages injected into it are answered too:
+    // their output streams through this run, and its `complete` ends them.
+    // Nothing awaits between the last check and the cleanup below, so no
+    // injection can slip in unobserved.
+    await settleOpenCodeInjections(run);
     unsubscribe();
     unregisterOpenCodeRun(runId);
     activeRuns.delete(runId);
@@ -578,6 +609,56 @@ async function abortOpenCodeSession(sessionId) {
   if (run.providerSessionId) {
     await abortOpenCodeServerSession(run.handle, run.directory, run.providerSessionId);
   }
+  return true;
+}
+
+/**
+ * Feeds a user message into the session's running turn.
+ *
+ * OpenCode's prompt loop re-reads the conversation after every step, so a
+ * message posted while the session is busy is answered once the current step
+ * ends — a running tool or subagent is not interrupted (verified with
+ * scripts/probe/opencode-midturn-probe.mjs). The message reuses the turn's
+ * model, agent and effort, its output streams through the run's writer, and
+ * the run does not complete before it is answered (`settleOpenCodeInjections`).
+ * Resolves false when there is no live turn left to take it.
+ */
+async function injectOpenCodeInput(command, options = {}) {
+  const run = activeRuns.get(options.sessionId);
+  if (!run || run.aborted || run.completeSent || !run.providerSessionId) {
+    return false;
+  }
+
+  // Registered synchronously after the check above: the run's cleanup only
+  // starts once `injections` is empty, so this message cannot be orphaned.
+  const tracked = sendOpenCodeMessage(run.handle, run.directory, run.providerSessionId, {
+    text: buildOpenCodePrompt(command, options.images, options.files),
+    model: run.model,
+    agent: run.agent,
+    variant: run.variant,
+  })
+    .catch(async (error) => {
+      if (run.aborted) {
+        return;
+      }
+      // As with the turn's own prompt, a dropped socket does not mean the
+      // engine lost the message; only report it when the session stopped.
+      if (await resumeOpenCodeRun(run, run.directory)) {
+        return;
+      }
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error('[OpenCode] Mid-turn message was not delivered:', reason);
+      run.writer.send(createNormalizedMessage({
+        kind: 'error',
+        content: `OpenCode did not take the message sent during the turn: ${reason}`,
+        sessionId: run.providerSessionId || run.appSessionId || null,
+        provider: 'opencode',
+      }));
+    })
+    .finally(() => {
+      run.injections.delete(tracked);
+    });
+  run.injections.add(tracked);
   return true;
 }
 
@@ -757,12 +838,14 @@ export const opencodeRuntime = {
   run: spawnOpenCode,
   abort: abortOpenCodeSession,
   compact: compactOpenCodeSession,
+  injectInput: injectOpenCodeInput,
   permissions: openCodePermissions,
 };
 
 export {
   spawnOpenCode,
   abortOpenCodeSession,
+  injectOpenCodeInput,
   compactOpenCodeSession,
   isOpenCodeSessionActive,
   getActiveOpenCodeSessions,

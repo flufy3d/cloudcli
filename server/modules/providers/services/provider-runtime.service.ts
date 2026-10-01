@@ -91,9 +91,27 @@ export function createProviderRuntimeService(
     return compactFacet.call(provider.runtime, options, writer, createRuntimeContext(provider));
   };
 
+  /**
+   * Feeds a message into the session's running turn. Resolves false for a
+   * provider without the primitive, so the caller falls back to a new run.
+   */
+  const injectInput = async (
+    providerName: LLMProvider,
+    command: string,
+    options: AnyRecord,
+  ): Promise<boolean> => {
+    const provider = dependencies.resolveProvider(providerName);
+    const injectFacet = provider.runtime.injectInput;
+    if (typeof injectFacet !== 'function') {
+      return false;
+    }
+    return Boolean(await injectFacet.call(provider.runtime, command, options, createRuntimeContext(provider)));
+  };
+
   return {
     run,
     compact,
+    injectInput,
 
     hasRuntime(providerName: string): boolean {
       try {

@@ -80,6 +80,8 @@ export type ProviderRuntimeGateway = {
     writer: ProviderRuntimeWriter,
   ): Promise<unknown>;
   supportsCompaction(provider: string): boolean;
+  /** Feeds a message into the session's running turn; false when the runtime cannot take it. */
+  injectInput(provider: LLMProvider, command: string, options: AnyRecord): Promise<boolean>;
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
   stopBackgroundTask(provider: LLMProvider, sessionId: string, taskId: string): Promise<boolean>;
   /** Whether a provider runtime still holds background work for the session after its turn ended. */
@@ -201,6 +203,15 @@ async function handleChatSend(
     return;
   }
 
+  // A turn already running may take the message itself; when it cannot, the
+  // send starts a run, which the registry refuses while that turn lasts.
+  if (
+    chatRunRegistry.isProcessing(resolved.sessionId)
+    && await injectIntoRunningTurn(ws, resolved, data, dependencies)
+  ) {
+    return;
+  }
+
   await dispatchRun(ws, userId, resolved.sessionId, resolved.session, data, dependencies);
 }
 
@@ -291,6 +302,88 @@ function resolveSendTarget(
 }
 
 /**
+ * The options a provider runtime receives with one message: the client's
+ * composer preferences, the session's working directory, and attachments
+ * re-validated against the upload store.
+ */
+function buildRuntimeOptions(
+  sessionId: string,
+  session: NonNullable<ReturnType<typeof sessionsDb.getSessionById>>,
+  clientOptions: AnyRecord,
+  extraRuntimeOptions: AnyRecord = {},
+): AnyRecord {
+  const attachmentCandidates = [
+    ...normalizeAttachmentDescriptors(clientOptions.images),
+    ...normalizeAttachmentDescriptors(clientOptions.files),
+    ...normalizeAttachmentDescriptors(clientOptions.attachments),
+  ];
+  const verifiedAttachments = filterAttachmentsToUploadStore(attachmentCandidates);
+  const uniqueAttachments = verifiedAttachments.filter(
+    (descriptor, index, all) => all.findIndex((candidate) => candidate.path === descriptor.path) === index,
+  );
+
+  // The provider runtimes receive the stable app session id. When their
+  // CLI/SDK needs the provider-native id for resume, they resolve it from the
+  // session row themselves (sessionsService.resolveProviderSessionId).
+  // Brand-new sessions have no provider id yet, so the runtime starts fresh
+  // and announces one, which the gateway writer captures and maps back to the
+  // app session id.
+  return {
+    ...clientOptions,
+    ...extraRuntimeOptions,
+    // Attachments are re-validated server-side: only direct children of the
+    // global upload store may reach provider runtimes or their file tools.
+    attachments: uniqueAttachments,
+    images: uniqueAttachments.filter(isImageAttachmentDescriptor),
+    files: uniqueAttachments.filter((descriptor) => !isImageAttachmentDescriptor(descriptor)),
+    sessionId,
+    cwd: clientOptions.cwd ?? session.project_path ?? undefined,
+    projectPath: session.project_path ?? clientOptions.projectPath,
+  };
+}
+
+/**
+ * Hands a `chat.send` to the session's running turn when its engine absorbs
+ * mid-turn input (`inputWhileBusy: 'always'`). The message rides the existing
+ * run — its writer streams the answer and its `complete` ends both — so no
+ * run is registered for it. Returns false when the runtime cannot take it
+ * (no primitive, or the turn already ended), leaving the caller to start a
+ * run as usual.
+ */
+async function injectIntoRunningTurn(
+  ws: WebSocket,
+  target: ResolvedSendTarget,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies,
+): Promise<boolean> {
+  const clientOptions = (data.options ?? {}) as AnyRecord;
+  const command = typeof data.content === 'string' ? data.content : '';
+
+  let injected = false;
+  try {
+    injected = await dependencies.runtime.injectInput(
+      target.provider,
+      command,
+      buildRuntimeOptions(target.sessionId, target.session, clientOptions),
+    );
+  } catch (error) {
+    console.error(`[Chat] Provider runtime "${target.provider}" could not take mid-turn input`, {
+      sessionId: target.sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+
+  if (injected) {
+    // The sender may not have been attached to the run yet (a second tab, or
+    // a socket that reconnected mid-turn); it should see the answer stream.
+    chatRunRegistry.attachConnection(target.sessionId, ws);
+    sessionsDb.touchSession(target.sessionId);
+  }
+  return injected;
+}
+
+/**
  * Registers the run and hands the turn to the provider runtime.
  *
  * `extraRuntimeOptions` is how an edited message asks the provider to resume
@@ -344,34 +437,7 @@ async function dispatchRun(
     providerModelsService.setSessionEffort(provider, sessionId, clientOptions.effort);
   }
 
-  const attachmentCandidates = [
-    ...normalizeAttachmentDescriptors(clientOptions.images),
-    ...normalizeAttachmentDescriptors(clientOptions.files),
-    ...normalizeAttachmentDescriptors(clientOptions.attachments),
-  ];
-  const verifiedAttachments = filterAttachmentsToUploadStore(attachmentCandidates);
-  const uniqueAttachments = verifiedAttachments.filter(
-    (descriptor, index, all) => all.findIndex((candidate) => candidate.path === descriptor.path) === index,
-  );
-
-  // The provider runtimes receive the stable app session id. When their
-  // CLI/SDK needs the provider-native id for resume, they resolve it from the
-  // session row themselves (sessionsService.resolveProviderSessionId).
-  // Brand-new sessions have no provider id yet, so the runtime starts fresh
-  // and announces one, which the gateway writer captures and maps back to the
-  // app session id.
-  const runtimeOptions: AnyRecord = {
-    ...clientOptions,
-    ...extraRuntimeOptions,
-    // Attachments are re-validated server-side: only direct children of the
-    // global upload store may reach provider runtimes or their file tools.
-    attachments: uniqueAttachments,
-    images: uniqueAttachments.filter(isImageAttachmentDescriptor),
-    files: uniqueAttachments.filter((descriptor) => !isImageAttachmentDescriptor(descriptor)),
-    sessionId,
-    cwd: clientOptions.cwd ?? session.project_path ?? undefined,
-    projectPath: session.project_path ?? clientOptions.projectPath,
-  };
+  const runtimeOptions = buildRuntimeOptions(sessionId, session, clientOptions, extraRuntimeOptions);
 
   let failure: string | null = null;
   try {

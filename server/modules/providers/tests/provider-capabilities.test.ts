@@ -10,7 +10,9 @@
  *    default permission mode;
  * 3. the catalog's static default model equals each provider's predefined
  *    models definition's DEFAULT — the fallback default shown before the
- *    model catalog loads must never drift from the catalog's own answer.
+ *    model catalog loads must never drift from the catalog's own answer;
+ * 4. `inputWhileBusy: 'always'` is declared exactly where the runtime has the
+ *    `injectInput` primitive the gateway needs to honour it.
  */
 
 import assert from 'node:assert/strict';
@@ -52,8 +54,9 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // process; CloudCLI holds that process open so the wake-ups can fire.
     supportsNativeScheduling: true,
     editRevertsFiles: false,
-    // Claude injects the turn into the live CLI process that holds the work.
-    acceptsInputDuringBackgroundWork: true,
+    // Claude injects the turn into the live CLI process that holds the work;
+    // a running turn still queues.
+    inputWhileBusy: 'background',
     mcp: {
       scopes: ['user', 'local', 'project'],
       transports: ['stdio', 'http', 'sse'],
@@ -77,7 +80,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: false,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -107,7 +110,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -140,7 +143,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: true,
-    acceptsInputDuringBackgroundWork: false,
+    // The server absorbs a mid-turn message at the running turn's next step.
+    inputWhileBusy: 'always',
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -174,7 +178,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -201,7 +205,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: false,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
-    acceptsInputDuringBackgroundWork: false,
+    inputWhileBusy: 'queue',
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http', 'sse'],
@@ -231,6 +235,18 @@ test('the catalog covers exactly the registered providers with valid mode tables
     );
     assert.ok(entry.permissionModes.length > 0, `${provider}: permissionModes must not be empty`);
     assert.ok(entry.defaultModel.length > 0, `${provider}: defaultModel must be declared`);
+  }
+});
+
+test('only providers whose runtime can inject input mid-turn declare inputWhileBusy always', () => {
+  for (const provider of providerRegistry.listProviders()) {
+    const declaresAlways = PROVIDER_CATALOG[provider.id].inputWhileBusy === 'always';
+    const canInject = typeof provider.runtime.injectInput === 'function';
+    assert.equal(
+      declaresAlways,
+      canInject,
+      `${provider.id}: inputWhileBusy 'always' and runtime.injectInput must go together`,
+    );
   }
 });
 

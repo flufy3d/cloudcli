@@ -60,7 +60,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     supportsCompaction: typeof provider.runtime?.compact === 'function',
     supportsNativeScheduling: catalog.supportsNativeScheduling,
     editRevertsFiles: catalog.editRevertsFiles,
-    acceptsInputDuringBackgroundWork: catalog.acceptsInputDuringBackgroundWork,
+    inputWhileBusy: catalog.inputWhileBusy,
     mcp: provider.mcp.capabilities,
   };
 }

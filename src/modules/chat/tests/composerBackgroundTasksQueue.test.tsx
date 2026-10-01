@@ -17,8 +17,8 @@ vi.mock('@/shared/api', () => ({
   },
 }));
 
-// The capability matrix the composer reads. Null (still loading) means no
-// provider takes input over background work, which is what most cases need.
+// The capability matrix the composer reads. Null (still loading) means every
+// provider queues while busy, which is what most cases need.
 let providerCapabilities: Record<string, Record<string, unknown>> | null = null;
 
 vi.mock('@/shared/hooks/useProviderCapabilities', () => ({
@@ -206,7 +206,7 @@ test('appends subsequent inputs into existing queued draft without overwriting',
 });
 
 test('sends immediately over background work when the provider accepts input during it', async () => {
-  providerCapabilities = { claude: { acceptsInputDuringBackgroundWork: true } };
+  providerCapabilities = { claude: { inputWhileBusy: 'background' } };
   const { useChatComposerState } = await import('@/modules/chat/hooks/useChatComposerState');
 
   const sent: Array<Record<string, unknown>> = [];
@@ -249,4 +249,71 @@ test('sends immediately over background work when the provider accepts input dur
   assert.equal(result.current.queuedDraft, null);
   assert.equal(sent.length, 1);
   assert.equal(sent[0]?.content, 'while it runs');
+});
+
+/**
+ * Renders the composer for a session whose turn is still running, with the
+ * given provider's `inputWhileBusy`, and submits one message.
+ */
+async function submitDuringRunningTurn(provider: string, inputWhileBusy: string, sessionId: string) {
+  providerCapabilities = { [provider]: { inputWhileBusy } };
+  const { useChatComposerState } = await import('@/modules/chat/hooks/useChatComposerState');
+  const sent: Array<Record<string, unknown>> = [];
+
+  const { result } = renderHook(() =>
+    useChatComposerState({
+      selectedProject,
+      // Its own session: queued drafts persist per session across cases.
+      selectedSession: { id: sessionId, summary: sessionId } as unknown as ProjectSession,
+      currentSessionId: sessionId,
+      provider: provider as never,
+      permissionMode: 'default',
+      cyclePermissionMode: () => undefined,
+      resolvePermissionModeForProvider: () => 'default',
+      currentProviderModel: 'some-model',
+      currentProviderEffort: 'default',
+      isLoading: true,
+      canAbortSession: true,
+      tokenBudget: null,
+      sendMessage: (payload) => sent.push(payload as Record<string, unknown>),
+      stickToBottomAfterSend: () => undefined,
+      addMessage: () => undefined,
+      setPendingPermissionRequests: () => undefined,
+    }),
+  );
+
+  act(() => {
+    result.current.handleInputChange({ target: { value: 'mid-turn note' } } as never);
+  });
+  await act(async () => {
+    await result.current.handleSubmit(submitEvent);
+  });
+
+  return { result, sent };
+}
+
+test('sends during a running turn when the provider absorbs mid-turn input', async () => {
+  const { result, sent } = await submitDuringRunningTurn('opencode', 'always', 'session-midturn-always');
+
+  assert.equal(result.current.queuesInput, false);
+  assert.equal(result.current.queuedDraft, null);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.type, 'chat.send');
+  assert.equal(sent[0]?.content, 'mid-turn note');
+});
+
+test('queues during a running turn when the provider only takes input over background work', async () => {
+  const { result, sent } = await submitDuringRunningTurn('claude', 'background', 'session-midturn-background');
+
+  assert.equal(result.current.queuesInput, true);
+  assert.equal(sent.length, 0);
+  assert.equal(result.current.queuedDraft?.content, 'mid-turn note');
+});
+
+test('queues during a running turn when the provider declares queue', async () => {
+  const { result, sent } = await submitDuringRunningTurn('codex', 'queue', 'session-midturn-queue');
+
+  assert.equal(result.current.queuesInput, true);
+  assert.equal(sent.length, 0);
+  assert.equal(result.current.queuedDraft?.content, 'mid-turn note');
 });

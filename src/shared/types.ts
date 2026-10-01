@@ -53,6 +53,7 @@ export type {
   McpScope,
   McpTransport,
   ProviderCapabilities,
+  ProviderInputWhileBusy,
   ProviderMcpCapabilities,
 } from '@shared/protocol/capabilities';
 

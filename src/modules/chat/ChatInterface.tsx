@@ -208,6 +208,7 @@ function ChatInterface({
     showCostModal,
     forceSendQueuedDraft,
     backgroundWorkQueuesInput,
+    queuesInput,
   } = useChatComposerState({
     selectedProject,
     selectedSession,
@@ -612,6 +613,7 @@ function ChatInterface({
           backgroundTasks={backgroundTasks}
           hasActiveBackgroundTasks={hasActiveBackgroundTasks}
           backgroundWorkQueuesInput={backgroundWorkQueuesInput}
+          queuesInput={queuesInput}
           onForceSendQueuedDraft={forceSendQueuedDraft}
         />
         </div>

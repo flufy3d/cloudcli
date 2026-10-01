@@ -59,6 +59,22 @@ export interface IProviderRuntime {
     writer: ProviderRuntimeWriter,
     context: ProviderRuntimeContext,
   ): Promise<unknown>;
+  /**
+   * Hands a new user message to the turn already running for the session,
+   * instead of starting a run of its own.
+   *
+   * Present only for engines that absorb a mid-turn message without
+   * interrupting the work in flight (the provider declares
+   * `inputWhileBusy: 'always'`). The running turn's writer carries the
+   * output, and that run does not complete until the injected message has
+   * been answered too. Resolves false when the session has no live turn that
+   * can still take input — the gateway then treats the send as a new run.
+   */
+  injectInput?(
+    command: string,
+    options: AnyRecord,
+    context: ProviderRuntimeContext,
+  ): Promise<boolean>;
   permissions?: ProviderRuntimePermissionGateway;
   backgroundTasks?: {
     list(sessionId: string): ActiveBackgroundTask[];

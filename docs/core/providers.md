@@ -39,8 +39,8 @@
 `server/modules/providers/services/provider-capabilities.service.ts`：
 
 - `deriveCapabilities` 从注册表里的切面**推导**能力——`runtime.permissions` 存在 ⇒ `supportsPermissionRequests`；`sessions.resolveEditAnchor` 存在 ⇒ `supportsMessageEditing`；`fork` 存在 ⇒ `supportsSessionForking`；`sessions.getTokenUsage` 存在 ⇒ `supportsTokenUsage`；`runtime.compact` 存在 ⇒ `supportsCompaction`。
-- 静态部分（权限模式列表、图片/文件/中止/effort、编辑是否回滚文件 `editRevertsFiles`、引擎是否自带会话内调度 `supportsNativeScheduling`、后台任务期间能否直接收新消息 `acceptsInputDuringBackgroundWork`）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
-- **`acceptsInputDuringBackgroundWork`**：目前仅 claude 为 true——新消息注入持有后台任务的活进程（见下文「保活与复用」），任务不受影响；其余引擎发送会重启进程杀掉任务，composer 因此在后台任务期间把消息转入排队。
+- 静态部分（权限模式列表、图片/文件/中止/effort、编辑是否回滚文件 `editRevertsFiles`、引擎是否自带会话内调度 `supportsNativeScheduling`、会话忙时新消息能走多远 `inputWhileBusy`）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
+- **`inputWhileBusy: 'queue' | 'background' | 'always'`**（类型 `ProviderInputWhileBusy`）：会话忙时新消息能否直达引擎而不杀掉在跑的工作。`background`（claude）——回合结束、只剩后台任务时注入持有任务的活进程（见下文「保活与复用」），回合进行中仍排队；`always`（opencode）——回合进行中也直接发，引擎在下一步吸收（见下文 opencode 节「回合中途插话」）；`queue`（其余）——发送会重启进程杀掉工作，composer 一律排队。`always` 必须配 runtime 可选切面 `injectInput`，`provider-capabilities.test.ts` 钉住两者同在同缺。
 - `provider-capabilities.test.ts` 把推导结果钉在显式基线上：切面增删会以"评审过的测试差异"呈现，而不是静默改能力。
 - **`supportsNativeScheduling` 只是提示位，不参与启停**：CloudCLI 的循环定时任务（`scheduled-jobs`）对所有引擎可用；该位为 true（目前仅 claude 的 CronCreate/ScheduleWakeup）时，任务表单与 composer 重复入口提示"引擎自身也有会话内定时、冲突回合会被跳过"，行为不变。
 - **前端零 provider 分支**：composer/设置页完全按 `GET /api/providers/capabilities` 渲染。首屏与请求失败时的回退镜像在 `src/shared/providerCatalogFallback.ts`（`PROVIDER_FALLBACK_CATALOG`），由跨树 parity 测试（`server/modules/providers/tests/provider-catalog-parity.test.ts`）钉住与后端目录一致；**其 key 顺序就是全应用的引擎规范顺序**。
@@ -74,6 +74,8 @@
 **传输层（`list/opencode/opencode-http.client.ts`）**：所有对 `opencode serve` 的请求（含 compact 的 summarize、事件流、健康探测）必须走 `openCodeFetch`——共享一个 undici `Agent`，`headersTimeout`/`bodyTimeout` 抬到 2.5h，高于 2h 的请求期限（`OPENCODE_SERVER_RESPONSE_TIMEOUT_MS`），per-request `AbortSignal` 才是唯一截止时间。Node 全局 `fetch` 的默认 5 分钟 headers/body 超时独立于 `AbortSignal`：阻塞式 prompt 要等整轮结束才回响应头，超过 5 分钟的正常长回合会被误杀成 `UND_ERR_HEADERS_TIMEOUT`（此前被恢复逻辑等满 1h 后原样抛给 UI），静默 5 分钟的事件流也会被掐断丢事件。
 
 审批桥 `list/opencode/opencode-permissions.provider.ts` 就是 runtime 的 `permissions` 切面（`supportsPermissionRequests` 因此为 `true`）：`permission.asked` → `permission_request` 卡片 → `POST /permission/:id/reply`（`once/always/reject`）；`question.asked` → `AskUserQuestion` 卡片（`multiple → multiSelect`、`options` 原样映射）→ `POST /question/:id/reply`（跳过/拒绝走 `/reject`）。**子代理（task 子会话）的审批属于父 run**：子会话事件带的是自己的 session id，runtime 不再按 id 直接丢弃，而是先经 `parentID` 链（`GET /session/:id`）确认其为本 run 的后代再交给桥接（查询按 run+会话缓存，链查询失败不缓存、其余外来会话忽略）；否则子代理的审批卡片会因会话过滤永远不出现、整轮死等——`bypassPermissions` 下同样如此。权限模式映射：`plan` → `plan` agent、`bypassPermissions` → 静默回 `once`（等价 `--auto`）、`default` → 由用户 opencode 配置决定（`ask` 才出卡片）。`/compact` 仍走独立的短生命周期 server（`POST /session/:id/summarize`）。
+
+**回合中途插话**（`inputWhileBusy: 'always'`）：opencode server 的 prompt 循环每走完一步都重读会话，所以会话 busy 时再 `POST /session/:id/message` 不会打断在跑的工具或子代理，而是在当前步结束后被同一循环吸收；该请求与原请求都在循环 idle 时一起返回（`scripts/probe/opencode-midturn-probe.mjs` 实测，含 `--task` 子代理场景）。runtime 的 `injectInput`（`injectOpenCodeInput`）据此把消息投进正在跑的 run：沿用该 run 的 model/agent/effort（中途切换的设置下一轮才生效），输出走原 run 的 writer；run 在 `finally` 里先等所有注入请求落定（`settleOpenCodeInjections`）才收尾发 `complete`，等待与清理之间没有 await，注入不会落在已结束的 run 外。run 已中止/已收尾时返回 false，网关按新 run 处理。
 
 **编辑历史消息**：归一化消息把 provider 的 `msg_…` 暴露为 `transcriptAnchorId`；`sessions.resolveEditAnchor` 返回被编辑消息的前一条，`sessions.rewindSession` 对 server 调 `POST /session/:id/revert`（命名要丢弃的首条消息，即被编辑消息），所以 `supportsMessageEditing` 为 `true`。opencode 的 revert 是「丢弃该消息及其之后、下一条 prompt 时生效」，因此编辑是替换而非保留旧分支。该 revert 会按 snapshot **连同文件一起还原**（与 claude 的部分 resume、codex 的 fork 都不同——那两者不碰文件），所以能力矩阵给 opencode 标 `editRevertsFiles: true`，composer 据此把编辑横幅的「已修改的文件不会被还原」换成「会一并还原」。
 

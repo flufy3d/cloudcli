@@ -14,6 +14,21 @@
 
 import type { LLMProvider } from './chatEvents.js';
 
+/**
+ * How far into a busy session a new message can reach the engine without
+ * killing the work in flight. Anything the engine cannot take is held in the
+ * composer's queue until the session settles.
+ *
+ * - `queue`: neither a running turn nor background work takes input; sending
+ *   would restart the engine process.
+ * - `background`: once the turn has ended, a message goes straight into the
+ *   live process that still holds background work (Claude). A running turn
+ *   still queues.
+ * - `always`: a running turn absorbs the message at its next step, so it is
+ *   sent at once (OpenCode). Requires the runtime's `injectInput` primitive.
+ */
+export type ProviderInputWhileBusy = 'queue' | 'background' | 'always';
+
 /** Where a provider can install an MCP server. */
 export type McpScope = 'user' | 'local' | 'project';
 
@@ -93,11 +108,7 @@ export type ProviderCapabilities = {
    * does not (Claude's resume, Codex's fork).
    */
   editRevertsFiles: boolean;
-  /**
-   * Whether a message sent while background work is still running goes
-   * straight to the engine (the work survives it). When false the composer
-   * holds the message in its queue until the work settles.
-   */
-  acceptsInputDuringBackgroundWork: boolean;
+  /** What happens to a message sent while the session is busy; see `ProviderInputWhileBusy`. */
+  inputWhileBusy: ProviderInputWhileBusy;
   mcp: ProviderMcpCapabilities;
 };

@@ -153,8 +153,10 @@ type ChatComposerProps = {
   sendByCtrlEnter?: boolean;
   backgroundTasks?: ActiveBackgroundTask[];
   hasActiveBackgroundTasks?: boolean;
-  /** Running background work holds new messages in the queue (see `acceptsInputDuringBackgroundWork`). */
+  /** Running background work holds new messages in the queue (see `inputWhileBusy`). */
   backgroundWorkQueuesInput?: boolean;
+  /** The session is busy with work a new message must wait for, so sending queues it. */
+  queuesInput?: boolean;
   onForceSendQueuedDraft?: () => void;
 }
 
@@ -237,6 +239,7 @@ function ChatComposer({
   backgroundTasks = [],
   hasActiveBackgroundTasks = false,
   backgroundWorkQueuesInput = false,
+  queuesInput = false,
   onForceSendQueuedDraft,
 }: ChatComposerProps) {
   const { t } = useTranslation('chat');
@@ -304,8 +307,11 @@ function ChatComposer({
   const hasActivityIndicator = Boolean(activity && !hasPendingPermissions);
 
   const hasQueuedDraft = Boolean(queuedDraft);
-  const isBusy = isLoading || backgroundWorkQueuesInput;
-  const canQueueDraft = isBusy && Boolean(input.trim() || attachedFiles.length > 0);
+  const hasDraftContent = Boolean(input.trim() || attachedFiles.length > 0);
+  const canQueueDraft = queuesInput && hasDraftContent;
+  // The engine takes a message mid-turn: typed content is sent now, and the
+  // button only turns back into stop once the input is empty.
+  const canSendDuringTurn = isLoading && !queuesInput && hasDraftContent;
   const submitHint = canQueueDraft
     ? hasQueuedDraft
       ? t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' })
@@ -319,7 +325,7 @@ function ChatComposer({
     ? hasQueuedDraft
       ? t('input.queue.update', { defaultValue: 'Update queued message' })
       : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
-    : isLoading
+    : isLoading && !canSendDuringTurn
       ? t('input.stop')
       : t('input.send');
 
@@ -589,7 +595,7 @@ function ChatComposer({
 
             <PromptInputSubmit
               onClick={
-                canQueueDraft
+                canQueueDraft || canSendDuringTurn
                   ? (e: MouseEvent<HTMLButtonElement>) => {
                       e.preventDefault();
                       onSubmit(e);
@@ -620,7 +626,7 @@ function ChatComposer({
             >
               {isSubmitting || isTranscribing ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
-              ) : canQueueDraft ? (
+              ) : canQueueDraft || canSendDuringTurn ? (
                 <ArrowUpIcon className="h-4 w-4" />
               ) : undefined}
             </PromptInputSubmit>
