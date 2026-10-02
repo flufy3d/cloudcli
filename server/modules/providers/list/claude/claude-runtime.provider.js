@@ -299,6 +299,12 @@ function mapCliOptionsToSDK(options = {}) {
 
   sdkOptions.settingSources = ['project', 'user', 'local'];
 
+  // The composer's task strip stops tasks one at a time (`stop_task`), so an
+  // interrupt only aborts the turn and spares background agents — the same
+  // split Claude Code's own Esc makes. Without it the CLI fails closed and
+  // the interrupt kills every background task.
+  sdkOptions.perTaskStopAffordance = true;
+
   // The SDK resumes with the provider-native session id, never the app id.
   // `resumeFromScratch` is set when the very first prompt of a conversation was
   // edited: there is nothing before it to resume through, so the turn has to
@@ -1074,6 +1080,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       assistantText: '',
       toolUseCount: 0,
       pendingIdleResend: false,
+      // Set when a stopped turn ended in a background-work hold and its abort
+      // flag was consumed at the `result` (see the hold branch below).
+      aborted: false,
       // Resolved when the turn's `result` arrives (or the process dies), so an
       // adopted turn's submitter knows its turn ended without owning the process.
       resolveDone: () => {},
@@ -1560,6 +1569,17 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       }
       sessionTaskTracker.apply(sessionKey(), message);
 
+      // A task stopped from the strip (or one that finished) leaves the strip
+      // at once instead of lingering until the whole hold ends.
+      if (
+        message.type === 'system'
+        && message.subtype === 'task_notification'
+        && typeof message.tool_use_id === 'string'
+        && activeBackgroundTasks.delete(message.tool_use_id)
+      ) {
+        broadcastBackgroundTasks();
+      }
+
       // A task the user stopped gets no follow-up turn from the CLI — only its
       // `stopped` notification — so when that was the last outstanding task
       // nothing will ever push the `result` the release below waits for, and
@@ -1681,6 +1701,14 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
             // turn; the ceiling is only a backstop for work that never reports.
             heldForBackgroundWork = true;
             scheduleRelease();
+            // A stop spares background work, so an aborted turn can end in a
+            // hold. Its complete was already sent by the abort handler; the
+            // flag is consumed here, or the process's next turn would be
+            // mistaken for the aborted one and never report complete.
+            if (abortPending && turn.explicit) {
+              turn.aborted = true;
+              abortedSessionIds.delete(sessionKey());
+            }
           } else {
             // Either nothing was backgrounded, or the background work just
             // reported in — let the CLI exit now, as it always has.
@@ -1718,7 +1746,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session, and
     // for runs that already reported completion when their `result` arrived.
-    const wasAborted = !superseded && sessionKey() ? abortedSessionIds.delete(sessionKey()) : false;
+    const wasAborted = (!superseded && sessionKey() ? abortedSessionIds.delete(sessionKey()) : false)
+      || Boolean(firstTurn.aborted);
 
     // The turn only acknowledged the injected task-notification and swallowed
     // the user's prompt. Re-run the prompt once on a fresh CLI process: the
@@ -1839,12 +1868,28 @@ async function abortClaudeSDKSession(sessionId) {
   try {
     console.log(`Aborting SDK session: ${sessionId}`);
 
+    // Stop means "stop the turn", as Esc does in Claude Code: background
+    // tasks keep running and are stopped one by one from the task strip. A
+    // follow-up turn the CLI pushed for a finished task is interrupted the
+    // same way. With work outstanding the process must outlive the abort, so
+    // the run loop's own hold decision at the interrupted `result` takes over.
+    const keepProcess = sessionTaskTracker.hasOutstanding(sessionId);
+    // Only a submitted turn owns a client-facing complete to suppress; before
+    // the turn slot is published the turn in flight is the run's own.
+    const explicitTurnActive = !session.turn || session.turn.active;
+
     // Mark before interrupting so the run loop knows not to emit its own
     // terminal complete (the abort handler sends the aborted one).
-    abortedSessionIds.add(sessionId);
+    if (explicitTurnActive) {
+      abortedSessionIds.add(sessionId);
+    }
 
     // Call interrupt() on the query instance
     await session.instance.interrupt();
+
+    if (keepProcess) {
+      return true;
+    }
 
     // Release the held stdin stream; without this the CLI stays up for the rest
     // of the post-turn hold even though the user cancelled.

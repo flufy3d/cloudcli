@@ -591,6 +591,19 @@ async function handleChatAbort(
 
   const run = chatRunRegistry.getRun(sessionId);
   if (!run || run.status !== 'running') {
+    // The turn has ended but its process is held open for background work,
+    // and a finished task wakes the model with a follow-up turn of its own.
+    // The provider interrupts that turn; the tasks themselves are stopped one
+    // by one through `chat.stop-task`.
+    const session = dependencies.runtime.hasBackgroundWork(sessionId)
+      ? sessionsDb.getSessionById(sessionId)
+      : null;
+    if (session) {
+      console.log(`[ChatWebSocket] chat.abort received for session ${sessionId} (${session.provider}) with only background work running`);
+      if (await dependencies.runtime.abort(session.provider as LLMProvider, sessionId)) {
+        return;
+      }
+    }
     sendProtocolError(ws, 'NO_ACTIVE_RUN', `Session "${sessionId}" has no active run.`, sessionId);
     return;
   }

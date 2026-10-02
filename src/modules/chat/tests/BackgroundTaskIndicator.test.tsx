@@ -51,8 +51,8 @@ describe('BackgroundTaskIndicator', () => {
     expect(screen.getByText(/Task/)).toBeTruthy();
   });
 
-  it('triggers onAbort when abort button is clicked', () => {
-    const onAbort = vi.fn();
+  it('stops every task from the header and one task from its row', () => {
+    const onStopTasks = vi.fn();
     const tasks: ActiveBackgroundTask[] = [
       {
         id: 'task-1',
@@ -62,11 +62,12 @@ describe('BackgroundTaskIndicator', () => {
       },
     ];
 
-    render(<BackgroundTaskIndicator tasks={tasks} onAbort={onAbort} />);
+    render(<BackgroundTaskIndicator tasks={tasks} onStopTasks={onStopTasks} />);
 
-    const abortButton = screen.getByTitle('中止后台任务');
-    expect(abortButton).toBeTruthy();
-    abortButton.click();
-    expect(onAbort).toHaveBeenCalledTimes(1);
+    screen.getByTitle('中止后台任务').click();
+    expect(onStopTasks).toHaveBeenLastCalledWith();
+
+    screen.getByTitle('停止此任务').click();
+    expect(onStopTasks).toHaveBeenLastCalledWith('task-1');
   });
 });

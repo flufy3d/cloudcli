@@ -7,6 +7,7 @@ import test from 'node:test';
 import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
 import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude-models.provider.js';
 import {
+  abortClaudeSDKSession,
   listClaudeSDKBackgroundWork,
   queryClaudeSDK,
   stopClaudeSDKTask,
@@ -29,6 +30,12 @@ type Scripted = {
   end: () => void;
   released: () => boolean;
   stopped: string[];
+  /** How many times the runtime called `interrupt()`. */
+  interrupts: () => number;
+  /** How many prompt messages the CLI has read off its stdin. */
+  prompts: () => number;
+  /** The options the runtime spawned the query with. */
+  options: () => Record<string, unknown> | null;
   /** Settles once the runtime has created its query, i.e. is reading the stream. */
   started: Promise<void>;
 };
@@ -38,6 +45,9 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
   const queue: Array<Record<string, unknown> | null> = [];
   let wake: (() => void) | null = null;
   let released = false;
+  let interrupts = 0;
+  let prompts = 0;
+  let spawnOptions: Record<string, unknown> | null = null;
   const stopped: string[] = [];
   let markStarted: () => void = () => {};
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
@@ -47,13 +57,17 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
     end: () => { queue.push(null); wake?.(); },
     released: () => released,
     stopped,
+    interrupts: () => interrupts,
+    prompts: () => prompts,
+    options: () => spawnOptions,
     started,
   };
 
-  const createQuery: NonNullable<ProviderRuntimeContext['createQuery']> = ({ prompt }) => {
+  const createQuery: NonNullable<ProviderRuntimeContext['createQuery']> = ({ prompt, options }) => {
+    spawnOptions = options as Record<string, unknown>;
     markStarted();
     void (async () => {
-      for await (const _message of prompt) { /* the CLI reads its stdin */ }
+      for await (const _message of prompt) { prompts += 1; /* the CLI reads its stdin */ }
       released = true;
     })();
 
@@ -73,7 +87,7 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
     })();
 
     return Object.assign(iterator, {
-      interrupt: async () => {},
+      interrupt: async () => { interrupts += 1; },
       stopTask: async (taskId: string) => { stopped.push(taskId); },
     });
   };
@@ -81,8 +95,16 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
   return { createQuery, script };
 }
 
+type RunContext = {
+  script: Scripted;
+  sent: NormalizedMessage[];
+  done: Promise<unknown>;
+  /** Submits another user turn for the same session, as a later chat.send does. */
+  send: (command: string) => Promise<unknown>;
+};
+
 async function withRun(
-  runTest: (context: { script: Scripted; sent: NormalizedMessage[]; done: Promise<unknown> }) => Promise<void>,
+  runTest: (context: RunContext) => Promise<void>,
 ): Promise<void> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'claude-runtime-hold-'));
   const { createQuery, script } = createScriptedQuery();
@@ -100,10 +122,11 @@ async function withRun(
 
   try {
     const done = queryClaudeSDK('hello', { sessionId: SESSION_ID, cwd }, writer as never, context);
+    const send = (command: string) => queryClaudeSDK(command, { sessionId: SESSION_ID, cwd }, writer as never, context);
     // Run setup (model and CLI path resolution) is asynchronous and can take
     // longer than a settle tick on a cold start, so script only once it reads.
     await script.started;
-    await runTest({ script, sent, done });
+    await runTest({ script, sent, done, send });
     script.end();
     await done;
   } finally {
@@ -206,5 +229,60 @@ test('a turn whose tool emits no task events still holds on the static rule', as
     await settle();
 
     assert.equal(script.released(), false, 'Monitor reports no task, so the launch rule decides');
+  });
+});
+
+test('the CLI is told the task strip stops tasks, so an interrupt spares them', async () => {
+  await withRun(async ({ script }) => {
+    assert.equal(script.options()?.perTaskStopAffordance, true);
+  });
+});
+
+test('stopping after the turn ended interrupts the follow-up turn and spares background tasks', async () => {
+  await withRun(async ({ script, sent }) => {
+    script.emit(init());
+    script.emit(toolUse('toolu_wf', 'Workflow', { script: 'export const meta = {}' }));
+    script.emit(taskStarted('wf1', 'toolu_wf', 'local_workflow'));
+    script.emit(ack('toolu_wf', 'Workflow launched in background. Task ID: wf1', { status: 'async_launched', taskId: 'wf1', taskType: 'local_workflow' }));
+    script.emit(result());
+    await settle();
+    const completes = sent.filter((message) => message.kind === 'complete').length;
+
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    await settle();
+
+    assert.equal(script.interrupts(), 1);
+    assert.deepEqual(script.stopped, [], 'Stop aborts the turn only; tasks are stopped from the strip');
+    assert.equal(script.released(), false, 'the process stays up for the workflow');
+    assert.deepEqual(listClaudeSDKBackgroundWork().map((entry) => entry.sessionId), [SESSION_ID]);
+    assert.equal(sent.filter((message) => message.kind === 'complete').length, completes);
+  });
+});
+
+test('a turn stopped while a task runs keeps the process, and the next turn still completes', async () => {
+  await withRun(async ({ script, sent, send }) => {
+    script.emit(init());
+    script.emit(toolUse('toolu_wf', 'Workflow', { script: 'export const meta = {}' }));
+    script.emit(taskStarted('wf1', 'toolu_wf', 'local_workflow'));
+    script.emit(ack('toolu_wf', 'Workflow launched in background. Task ID: wf1', { status: 'async_launched', taskId: 'wf1', taskType: 'local_workflow' }));
+    await settle();
+
+    // The user stops the turn mid-way; the abort handler owns its complete.
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    script.emit({ ...result(), subtype: 'error_during_execution', is_error: true });
+    await settle();
+
+    assert.equal(sent.filter((message) => message.kind === 'complete').length, 0);
+    assert.equal(script.released(), false, 'the workflow outlives the stopped turn');
+
+    // A later message is fed into the same process and reports complete as usual.
+    const next = send('next question');
+    // Wait until the turn is fed into the live process before answering it.
+    while (script.prompts() < 2) {
+      await settle();
+    }
+    script.emit(result());
+    await next;
+    assert.equal(sent.filter((message) => message.kind === 'complete').length, 1);
   });
 });

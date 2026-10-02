@@ -1440,13 +1440,11 @@ export function useChatComposerState({
       return;
     }
 
-    // The turn has ended but background tasks keep the session busy: there is
-    // no run to abort, so stop each task by id instead.
-    if (!canAbortSession) {
-      const tasks = processingSessions?.get(targetSessionId)?.tasks ?? [];
-      for (const task of tasks) {
-        sendMessage({ type: 'chat.stop-task', sessionId: targetSessionId, taskId: task.taskId });
-      }
+    // Stop aborts the turn only, as Esc does in Claude Code; background tasks
+    // are stopped from the task strip. Once the turn has ended there is no run
+    // to abort, but a finished task can still wake the model with a turn of
+    // its own, which `chat.abort` interrupts as well.
+    if (!canAbortSession && !processingSessions?.get(targetSessionId)?.background) {
       return;
     }
 
@@ -1457,6 +1455,24 @@ export function useChatComposerState({
       sessionId: targetSessionId,
     });
   }, [canAbortSession, currentSessionId, processingSessions, selectedSession?.id, sendMessage]);
+
+  /**
+   * Stops background tasks by id: the one launched by `toolUseId`, or every
+   * task the session still has running when it is omitted.
+   */
+  const handleStopBackgroundTasks = useCallback((toolUseId?: string) => {
+    const targetSessionId = selectedSession?.id || currentSessionId || null;
+    if (!targetSessionId) {
+      return;
+    }
+    const tasks = processingSessions?.get(targetSessionId)?.tasks ?? [];
+    for (const task of tasks) {
+      if (toolUseId && task.toolUseId !== toolUseId) {
+        continue;
+      }
+      sendMessage({ type: 'chat.stop-task', sessionId: targetSessionId, taskId: task.taskId });
+    }
+  }, [currentSessionId, processingSessions, selectedSession?.id, sendMessage]);
 
   const handleGrantToolPermission = useCallback(
     (suggestion: { entry: string; toolName: string }) => {
@@ -1572,6 +1588,7 @@ export function useChatComposerState({
     syncInputOverlayScroll,
     handleClearInput,
     handleAbortSession,
+    handleStopBackgroundTasks,
     handlePermissionDecision,
     handleGrantToolPermission,
     handleInputFocusChange,

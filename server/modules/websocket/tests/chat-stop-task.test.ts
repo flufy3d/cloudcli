@@ -36,6 +36,7 @@ async function withGateway(
   runTest: (context: {
     socket: ReturnType<typeof createFakeSocket>;
     stops: StopCall[];
+    aborts: Array<{ provider: string; sessionId: string }>;
   }) => Promise<void>,
 ): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
@@ -46,6 +47,7 @@ async function withGateway(
   await initializeDatabase();
 
   const stops: StopCall[] = [];
+  const aborts: Array<{ provider: string; sessionId: string }> = [];
   const socket = createFakeSocket();
 
   try {
@@ -60,11 +62,16 @@ async function withGateway(
             stops.push({ provider, sessionId, taskId });
             return taskId === knownTaskId;
           },
+          hasBackgroundWork: (sessionId: string) => sessionId === SESSION_ID,
+          abort: async (provider: string, sessionId: string) => {
+            aborts.push({ provider, sessionId });
+            return true;
+          },
         } as never,
       },
     );
 
-    await runTest({ socket, stops });
+    await runTest({ socket, stops, aborts });
   } finally {
     connectedClients.clear();
     chatRunRegistry.clearAll();
@@ -123,5 +130,16 @@ test('a stop for a session that does not exist is refused', async () => {
 
     assert.equal(stops.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'SESSION_NOT_FOUND');
+  });
+});
+
+test('chat.abort with only background work running still reaches the provider runtime', async () => {
+  await withGateway('task-1', async ({ socket, aborts }) => {
+    socket.emit('message', JSON.stringify({ type: 'chat.abort', sessionId: SESSION_ID }));
+    await settle();
+
+    // No chat run is registered, yet the stop still reaches the runtime.
+    assert.deepEqual(aborts, [{ provider: 'claude', sessionId: SESSION_ID }]);
+    assert.deepEqual(socket.frames, []);
   });
 });

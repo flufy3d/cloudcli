@@ -54,6 +54,7 @@
   - 任务启动或清理时，服务端通过 `kind: 'status', text: 'background_tasks'` 广播最新列表；归一化网关在 `NORMALIZED_MESSAGE_KEYS` 放行 `backgroundTasks` 字段。
 - **输入防打断与智能排队**：
   - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），用户发送新消息自动转入 `queuedDraft` 排队，阻止过早发送打断正在运行的后台子进程。是否排队由能力矩阵 `inputWhileBusy` 决定：`backgroundWorkQueuesInput` = 有后台任务且为 `queue`；`turnQueuesInput` = 回合进行中且不是 `always`；两者之或即 `queuesInput`，composer 的排队、flush 与按钮形态都只看它。claude（`background`）后台任务期间直接注入活进程、任务条照常显示但不排队；opencode（`always`）回合进行中有输入时按钮是发送而非停止，输入为空才回到停止。注意 `useChatSessionState` 的 `isProcessing`（即 composer 的 `isLoading`）只表示"正在产出回复"，只剩后台任务的 `background` 活动条目不算——否则 `background` 档永远被回合排队吞掉；`hasActiveBackgroundTasks` 同时认这种条目，保证 `queue` 档照旧排队。
+  - 停止语义对齐 Claude Code 的 Esc：停止按钮只打断回合，后台任务由任务条单独停（表头停全部、每行停一个，都走 `chat.stop-task`）。只剩后台工作（`background` 条目）时停止按钮也发 `chat.abort`：服务端没有 running 的 run 但 `hasBackgroundWork` 为真时仍转给 `runtime.abort`，用来打断任务完成后 CLI 自己推的 follow-up 回合。
   - **自动释放**：后台任务结束且无新状态阻塞时，composer 的 flush 效应自动解冻排队草稿并发出。
   - **强制中断逃生通道**：排队卡片提供 `forceSendQueuedDraft`（`isForced: true`），允许用户在需要时显式跳过等待立即发送；新 run 会顶替仍在保活的进程，后台任务随之结束（`forceInterrupt: true` 只是随消息带上的标记，服务端不读）。
   - **可视化呈现**：输入框上方通过 `BackgroundTaskIndicator` 实时展示运行中的后台任务（工具名、命令、动态已用时间）。

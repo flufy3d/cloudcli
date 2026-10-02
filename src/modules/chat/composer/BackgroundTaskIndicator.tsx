@@ -5,7 +5,8 @@ import type { ActiveBackgroundTask } from '@/shared/types';
 
 type BackgroundTaskIndicatorProps = {
   tasks: ActiveBackgroundTask[];
-  onAbort?: () => void;
+  /** Stops the task launched by `toolUseId`, or every task when omitted. */
+  onStopTasks?: (toolUseId?: string) => void;
 };
 
 function formatElapsed(elapsedSeconds: number): string {
@@ -18,7 +19,7 @@ function formatElapsed(elapsedSeconds: number): string {
 }
 
 /** Used by ChatComposer to display running background tasks. */
-export default function BackgroundTaskIndicator({ tasks, onAbort }: BackgroundTaskIndicatorProps) {
+export default function BackgroundTaskIndicator({ tasks, onStopTasks }: BackgroundTaskIndicatorProps) {
   const { t } = useTranslation('chat');
   const [, setTick] = useState(0);
 
@@ -67,10 +68,10 @@ export default function BackgroundTaskIndicator({ tasks, onAbort }: BackgroundTa
               })}
             </span>
           </span>
-          {onAbort && (
+          {onStopTasks && (
             <button
               type="button"
-              onClick={onAbort}
+              onClick={() => onStopTasks()}
               aria-label={t('composer.backgroundTasks.abort', { defaultValue: '中止后台任务' })}
               title={t('composer.backgroundTasks.abort', { defaultValue: '中止后台任务' })}
               className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-destructive hover:bg-destructive/10 transition-colors"
@@ -107,6 +108,17 @@ export default function BackgroundTaskIndicator({ tasks, onAbort }: BackgroundTa
               <span className="shrink-0 tabular-nums text-muted-foreground/70">
                 {formatElapsed(elapsedSeconds)}
               </span>
+              {onStopTasks && (
+                <button
+                  type="button"
+                  onClick={() => onStopTasks(task.id)}
+                  aria-label={t('composer.backgroundTasks.stopOne', { defaultValue: '停止此任务' })}
+                  title={t('composer.backgroundTasks.stopOne', { defaultValue: '停止此任务' })}
+                  className="shrink-0 rounded p-0.5 text-muted-foreground/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
+                >
+                  <Square className="h-2.5 w-2.5 fill-current" />
+                </button>
+              )}
             </div>
           );
         })}

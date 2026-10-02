@@ -95,7 +95,7 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启
 
 **后台工作判定**：以 CLI 的任务生命周期帧为准——`background_tasks_changed`（全量替换语义）与 `task_started`（`is_backgrounded`）维护存活任务集合、`task_notification` 移除，`ambient` 任务（内部看护进程）不计；集合跨回合存活，所以"上一回合启动的任务"在新回合结束时仍然撑住保活。保活条件是"集合非空 **或** 本回合工具检测命中"：集合管跨回合的旧任务，每回合的 `Bash(run_in_background)`/延迟工具检测（`startsBackgroundWork`）兜住 CLI 还没来得及报帧的新任务，也兼容不报任务帧的旧 CLI。完成通知只在集合确实清空时发（旧 CLI 保持"follow-up result 即完成"的旧读法）。本回合只要出现过 `task_started`，就只看任务集合（进程内集合或下述会话级任务表任一非空），不再信工具检测——未显式 `run_in_background: false` 的 Agent 会被工具检测算作后台，而 CLI 实际在前台跑完，否则会白白保活到上限。
 
-**会话级任务表**：模块级 `createBackgroundWorkTracker()` 按会话键记录每个 `task_started`（带 `tool_use_id`，嵌套在子代理里的标 `nested`）直到 `task_notification`/终态 `task_updated`，供 running 列表（`listBackgroundWork`）与单任务停止（`stopBackgroundTask` → SDK `stopTask`）使用；被停止的任务 CLI 不会再推 follow-up 回合，所以最后一个任务以 `stopped` 结束且当前没有回合在跑时直接释放保活。composer 的任务条则来自按工具调用提取的 `backgroundTasks` 列表（`status: background_tasks` 广播，`chat_subscribed` 回放）。
+**会话级任务表**：模块级 `createBackgroundWorkTracker()` 按会话键记录每个 `task_started`（带 `tool_use_id`，嵌套在子代理里的标 `nested`）直到 `task_notification`/终态 `task_updated`，供 running 列表（`listBackgroundWork`）与单任务停止（`stopBackgroundTask` → SDK `stopTask`）使用；被停止的任务 CLI 不会再推 follow-up 回合，所以最后一个任务以 `stopped` 结束且当前没有回合在跑时直接释放保活。spawn 时声明 `perTaskStopAffordance: true`（任务条提供逐个停止），CLI 的 interrupt 因此只停回合、放过后台 agent/workflow；不声明时 CLI 默认 interrupt 连后台任务一起杀。`abort` 只 `interrupt`：会话还有在跟任务时不关 stdin，由被打断回合的 `result` 走正常的保活判定，并在进入保活时消费 abort 标记（否则同进程下一回合的 `complete` 会被吞）；没有在跟任务时照旧关 stdin。composer 的任务条则来自按工具调用提取的 `backgroundTasks` 列表（`status: background_tasks` 广播，`chat_subscribed` 回放）。
 
 契约的实测探针：`scripts/probe/claude-bg-reuse-probe.mjs`（真实 CLI 验证三件事：第二条消息不杀后台任务、result 回显客户端 uuid、任务帧存在）。
 

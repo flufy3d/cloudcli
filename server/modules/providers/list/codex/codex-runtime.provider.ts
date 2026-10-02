@@ -788,6 +788,9 @@ function abortCodexSession(sessionId: string) {
   }
 
   session.status = 'aborted';
+  // Closing the connection takes its collab agents with it, and no terminal
+  // item event will arrive to retire their entries on the strip.
+  codexBackgroundWork.delete(sessionId);
   console.log(
     `[Codex] Aborting session ${sessionId} (thread ${session.threadId ?? 'unknown'}, `
     + `turn ${session.turnId ?? 'none'}) — started ${session.startedAt}`,

@@ -152,6 +152,8 @@ type ChatComposerProps = {
   isTextareaExpanded: boolean;
   sendByCtrlEnter?: boolean;
   backgroundTasks?: ActiveBackgroundTask[];
+  /** Stops the task launched by `toolUseId`, or all of them when omitted. */
+  onStopBackgroundTasks?: (toolUseId?: string) => void;
   hasActiveBackgroundTasks?: boolean;
   /** Running background work holds new messages in the queue (see `inputWhileBusy`). */
   backgroundWorkQueuesInput?: boolean;
@@ -237,6 +239,7 @@ function ChatComposer({
   isTextareaExpanded,
   sendByCtrlEnter,
   backgroundTasks = [],
+  onStopBackgroundTasks,
   hasActiveBackgroundTasks = false,
   backgroundWorkQueuesInput = false,
   queuesInput = false,
@@ -375,7 +378,7 @@ function ChatComposer({
       )}
 
       {hasActiveBackgroundTasks && backgroundTasks.length > 0 && (
-        <BackgroundTaskIndicator tasks={backgroundTasks} onAbort={onAbortSession} />
+        <BackgroundTaskIndicator tasks={backgroundTasks} onStopTasks={onStopBackgroundTasks} />
       )}
 
       {queuedDraft && (
