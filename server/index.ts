@@ -90,6 +90,11 @@ console.log('SERVER_PORT from env:', process.env.SERVER_PORT);
 
 const app = express();
 const server = http.createServer(app);
+// Ensure Node.js keepAliveTimeout is longer than reverse proxies (e.g. cloudflared,
+// nginx, caddy) which default to ~60s idle pools. This prevents race conditions where
+// the server closes an idle TCP connection right as the proxy forwards a request.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
 const queryClaude = providerRuntimeService.getRunner('claude');
 const queryCursor = providerRuntimeService.getRunner('cursor');
 const queryCodex = providerRuntimeService.getRunner('codex');
