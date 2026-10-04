@@ -55,6 +55,13 @@ const EFFORT_DESCRIPTIONS: Record<string, string> = {
   max: 'Maximum reasoning for complex tasks',
 };
 
+const REASONING_EFFORT_ORDER: Record<string, number> = {
+  low: 10,
+  medium: 20,
+  high: 30,
+  max: 40,
+};
+
 function appendStartPlanModelIfEligible(options: ProviderModelOption[]): ProviderModelOption[] {
   const jwtToken = readDecryptedZCodeJwtToken();
   if (!jwtToken || options.some((opt) => opt.value === ZCODE_START_PLAN_MODEL_VALUE)) {
@@ -154,7 +161,12 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
             const sortedVariants = variants
               .filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0)
               .map((variant) => variant.trim().toLowerCase())
-              .sort();
+              .sort((a, b) => {
+                const orderA = REASONING_EFFORT_ORDER[a] ?? 999;
+                const orderB = REASONING_EFFORT_ORDER[b] ?? 999;
+                if (orderA !== orderB) return orderA - orderB;
+                return a.localeCompare(b);
+              });
             effort = {
               default: readOptionalString(reasoning?.defaultLevel)?.toLowerCase() ?? 'max',
               values: sortedVariants.map((variant: string) => {
