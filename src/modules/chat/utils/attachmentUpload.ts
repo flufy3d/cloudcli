@@ -1,6 +1,7 @@
-import { authenticatedFetch } from '@/shared/api';
+import { authenticatedFetch, uploadChatAttachments } from '@/shared/api';
+import { createClientRequestId } from '@/shared/utils';
 
-export type UploadAttachmentOptions = {
+type UploadAttachmentOptions = {
   maxRetries?: number;
   retryDelayMs?: number;
   fetchFn?: typeof authenticatedFetch;
@@ -38,6 +39,7 @@ export async function uploadAttachmentFiles(
     fetchFn = authenticatedFetch,
   } = options;
 
+  const requestId = createClientRequestId();
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -45,70 +47,48 @@ export async function uploadAttachmentFiles(
       await sleep(retryDelayMs * Math.pow(2, attempt - 1));
     }
 
+    const formData = new FormData();
+    files.forEach((file) => formData.append('files', file));
+
+    let response: Response;
+    let result: unknown;
     try {
-      const formData = new FormData();
-      files.forEach((file) => {
-        formData.append('files', file);
-      });
-
-      const response = await fetchFn('/api/assets/files', {
-        method: 'POST',
-        headers: {},
-        body: formData,
-      });
-
-      if (!response.ok) {
-        let errorMessage: string | null = null;
-        try {
-          const body = (await response.json()) as { error?: string } | null;
-          if (body?.error && typeof body.error === 'string') {
-            errorMessage = body.error;
-          }
-        } catch {
-          // Response body is not JSON (e.g. Cloudflare / Nginx 502 HTML error page)
-        }
-
-        const isRetryable = RETRYABLE_STATUS_CODES.has(response.status);
-        const resolvedError = new Error(
-          errorMessage || formatHttpErrorMessage(response.status, response.statusText),
-        );
-
-        if (isRetryable && attempt < maxRetries) {
-          lastError = resolvedError;
-          continue;
-        }
-
-        throw resolvedError;
-      }
-
-      const result = (await response.json()) as { attachments?: unknown[] };
-      if (!Array.isArray(result.attachments) || result.attachments.length !== files.length) {
-        throw new Error('File upload returned an incomplete result');
-      }
-
-      return result.attachments;
+      response = await uploadChatAttachments(formData, requestId, fetchFn);
+      if (response.ok) result = await response.json();
     } catch (error) {
-      // Re-throw if already finalized or non-retryable
-      if (
-        error instanceof Error &&
-        !RETRYABLE_STATUS_CODES.has(502) // type guard placeholder
-      ) {
-        // Handled below
-      }
-
-      const isNetworkError =
-        error instanceof TypeError ||
-        (error instanceof Error &&
-          (error.message.includes('fetch') || error.message.includes('network')));
-
-      if (isNetworkError && attempt < maxRetries) {
+      // Only transport failures enter this branch; HTTP errors and invalid payloads are handled outside.
+      if (error instanceof TypeError && attempt < maxRetries) {
         lastError = error;
         continue;
       }
-
-      lastError = error;
-      throw lastError;
+      throw error;
     }
+
+    if (!response.ok) {
+      let errorMessage: string | null = null;
+      try {
+        const body: unknown = await response.json();
+        if (typeof body === 'object' && body !== null && 'error' in body && typeof body.error === 'string') {
+          errorMessage = body.error;
+        }
+      } catch {
+        // A proxy may return HTML; the HTTP status remains the failure signal.
+      }
+      const resolvedError = new Error(
+        errorMessage || formatHttpErrorMessage(response.status, response.statusText),
+      );
+      if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries) {
+        lastError = resolvedError;
+        continue;
+      }
+      throw resolvedError;
+    }
+
+    if (typeof result !== 'object' || result === null || !('attachments' in result)
+      || !Array.isArray(result.attachments) || result.attachments.length !== files.length) {
+      throw new Error('File upload returned an incomplete result');
+    }
+    return result.attachments;
   }
 
   throw lastError instanceof Error ? lastError : new Error('Failed to upload files after retries');

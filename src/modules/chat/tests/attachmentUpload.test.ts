@@ -1,10 +1,66 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { uploadAttachmentFiles } from './attachmentUpload';
+import { uploadAttachmentFiles } from '@/modules/chat/utils/attachmentUpload';
 
 describe('uploadAttachmentFiles', () => {
+  afterEach(() => vi.unstubAllGlobals());
   const createFile = (name: string, content = 'dummy') =>
     new File([content], name, { type: 'image/png' });
+
+  it.each([400, 401, 403])('does not retry HTTP %s when error text mentions fetch or network', async (status) => {
+    const fetchFn = vi.fn().mockResolvedValue({
+      ok: false, status, json: async () => ({ error: 'Failed to fetch network resource' }),
+    });
+    await expect(uploadAttachmentFiles([createFile('a.png')], { fetchFn, retryDelayMs: 0 }))
+      .rejects.toThrow('Failed to fetch network resource');
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses one upload identity across retries and creates a fresh identity for a new upload', async () => {
+    const fetchFn = vi.fn()
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ ok: true, status: 200, json: async () => ({ attachments: [{ path: '/assets/a.png' }] }) });
+    await uploadAttachmentFiles([createFile('a.png')], { fetchFn, retryDelayMs: 0 });
+    await uploadAttachmentFiles([createFile('a.png')], { fetchFn, retryDelayMs: 0 });
+    const ids = fetchFn.mock.calls.map(([, init]) => init.headers['X-Upload-Request-Id']);
+    expect(ids[0]).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).not.toBe(ids[0]);
+  });
+
+  it('retries a network failure while reading a successful response body', async () => {
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => { throw new TypeError('network body interrupted'); } })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ attachments: [{ path: '/assets/a.png' }] }) });
+    await expect(uploadAttachmentFiles([createFile('a.png')], { fetchFn, retryDelayMs: 0 }))
+      .resolves.toEqual([{ path: '/assets/a.png' }]);
+    expect(fetchFn.mock.calls[1][1].headers).toEqual(fetchFn.mock.calls[0][1].headers);
+  });
+
+  it('does not retry malformed successful responses', async () => {
+    for (const body of [null, {}, { attachments: null }]) {
+      const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => body });
+      await expect(uploadAttachmentFiles([createFile('a.png')], { fetchFn, retryDelayMs: 0 }))
+        .rejects.toThrow('File upload returned an incomplete result');
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('does not retry syntax errors, aborts or arbitrary request failures', async () => {
+    const errors = [new SyntaxError('bad json'), new DOMException('Aborted', 'AbortError'), new Error('network logic error')];
+    for (const error of errors) {
+      const fetchFn = vi.fn().mockRejectedValue(error);
+      await expect(uploadAttachmentFiles([createFile('a.png')], { fetchFn, retryDelayMs: 0 })).rejects.toBe(error);
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('uploads from plain HTTP contexts without crypto.randomUUID', async () => {
+    vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) });
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ attachments: [{ path: '/assets/a.png' }] }) });
+    await uploadAttachmentFiles([createFile('a.png')], { fetchFn });
+    expect(fetchFn.mock.calls[0][1].headers['X-Upload-Request-Id']).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+  });
 
   it('returns empty array when files is empty without making network calls', async () => {
     const fetchFn = vi.fn();

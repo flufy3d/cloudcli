@@ -333,3 +333,16 @@ export async function saveOrShareBlob(blob: Blob, filename: string): Promise<voi
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
 }
+
+// ---------------------------
+
+//----------------- REQUEST IDENTITY ------------
+
+/** Creates an identity for one user action; reuse it for retries of that action. */
+export function createClientRequestId(): string {
+  // Non-secure contexts (plain-HTTP LAN access) have no crypto.randomUUID.
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `submit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}

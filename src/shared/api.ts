@@ -49,6 +49,17 @@ export const authenticatedFetch = (
   });
 };
 
+/** Chat uses one upload identity across retries so a lost response cannot duplicate stored files. */
+export const uploadChatAttachments = (
+  body: FormData,
+  requestId: string,
+  fetchFn: typeof authenticatedFetch = authenticatedFetch,
+): Promise<Response> => fetchFn('/api/assets/files', {
+  method: 'POST',
+  headers: { 'X-Upload-Request-Id': requestId },
+  body,
+});
+
 // ─── Request helpers ────────────────────────────────────────────────────────
 // Every endpoint below goes through these so verb, JSON encoding and query
 // serialization stay consistent across the whole frontend.
