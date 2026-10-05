@@ -734,9 +734,9 @@ export function useChatSessionState({
     }
   }, [currentSessionId, isActive, isLoadingAllMessages, selectedProject, selectedSession, sessionStore]);
 
-  const backgroundTasks = useMemo(() => {
-    return currentSessionId ? sessionStore.getBackgroundTasks(currentSessionId) : [];
-  }, [currentSessionId, sessionStore]);
+  // Store notifications re-render this hook while the store identity stays
+  // fixed; read its current list so task starts and finishes update the gate.
+  const backgroundTasks = activeSessionId ? sessionStore.getBackgroundTasks(activeSessionId) : [];
   const hasActiveBackgroundTasks = backgroundTasks.length > 0;
 
   return {
