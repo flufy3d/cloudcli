@@ -21,6 +21,16 @@ const formatHttpErrorMessage = (status: number, statusText?: string): string => 
   return `Upload failed with status ${status}${text}`;
 };
 
+const isTransientStreamAbortMessage = (message?: string | null): boolean => {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('request aborted') ||
+    lower.includes('upload interrupted') ||
+    lower.includes('request closed')
+  );
+};
+
 /**
  * Uploads attached files to `/api/assets/files` with automatic retries for transient
  * gateway/network glitches (such as 502 Bad Gateway from reverse proxy keep-alive race conditions).
@@ -77,7 +87,10 @@ export async function uploadAttachmentFiles(
       const resolvedError = new Error(
         errorMessage || formatHttpErrorMessage(response.status, response.statusText),
       );
-      if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries) {
+      const isRetryable =
+        (RETRYABLE_STATUS_CODES.has(response.status) || isTransientStreamAbortMessage(errorMessage)) &&
+        attempt < maxRetries;
+      if (isRetryable) {
         lastError = resolvedError;
         continue;
       }
