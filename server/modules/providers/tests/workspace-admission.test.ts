@@ -48,6 +48,20 @@ test('an existing temp-root workspace is a real project', async () => {
   });
 });
 
+test('the operating-system temporary directory root is rejected even when it was registered before', async () => {
+  await withIsolatedDatabase(async (scratchDir) => {
+    const temporaryRoot = tmpdir();
+    const realProject = path.join(scratchDir, 'real-project');
+    projectsDb.ensureProjectPath(temporaryRoot);
+    await mkdir(realProject);
+
+    // Engine runtimes sometimes record their own staging root as cwd. Unlike a
+    // real project nested below it, the root itself must never be indexed.
+    assert.equal(admitsWorkspacePath(temporaryRoot), false);
+    assert.equal(admitsWorkspacePath(realProject), true);
+  });
+});
+
 test('a vanished workspace that is already a known project stays admitted', async () => {
   await withIsolatedDatabase((scratchDir) => {
     // An unmounted external volume or a detached network share must keep

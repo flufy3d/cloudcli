@@ -719,6 +719,26 @@ export const isInfrastructureWorkspacePath = (projectPath: string): boolean => {
   return segments.includes('node_modules') || segments.includes('.pnpm');
 };
 
+/**
+ * Identifies a system temporary-directory root, which is runtime staging space
+ * rather than a user workspace. The session admission and project-list modules
+ * use this exact-root check so a real project nested below a temporary
+ * directory remains valid while engine sessions recorded with cwd `/tmp` do
+ * not become sidebar projects.
+ */
+export function isSystemTemporaryDirectoryRoot(projectPath: string): boolean {
+  const normalizedProjectPath = normalizeProjectPath(projectPath);
+  if (!normalizedProjectPath) {
+    return false;
+  }
+
+  const roots = process.platform === 'win32'
+    ? [os.tmpdir()]
+    : [os.tmpdir(), '/tmp', '/private/tmp'];
+
+  return roots.some((root) => normalizeProjectPath(root) === normalizedProjectPath);
+}
+
 // ---------------------------
 //----------------- PROVIDER MODEL LOOKUP UTILITIES ------------
 /**

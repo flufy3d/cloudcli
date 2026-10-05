@@ -14,12 +14,12 @@
 import fsSync from 'node:fs';
 
 import { projectsDb } from '@/modules/database/index.js';
-import { isInfrastructureWorkspacePath } from '@/shared/utils.js';
+import { isInfrastructureWorkspacePath, isSystemTemporaryDirectoryRoot } from '@/shared/utils.js';
 
 /**
  * Decides whether sessions recorded against `projectPath` may be indexed.
  *
- * Two rejection rules, both aimed at directories that are runtime artifacts
+ * Three rejection rules, all aimed at directories that are runtime artifacts
  * rather than places the user works:
  *
  * 1. Package-manager and runtime internals (`node_modules`, pnpm's `.pnpm`
@@ -30,6 +30,9 @@ import { isInfrastructureWorkspacePath } from '@/shared/utils.js';
  *    engine's own session index still names it, so every restart used to
  *    resurrect the same ghost projects — including ones the user had just
  *    deleted.
+ * 3. The operating system's temporary-directory root itself. Engine runtimes
+ *    can report it as cwd while staging work, but it is never a project; only
+ *    the root is rejected, so a real project nested beneath it stays valid.
  *
  * The "and was never registered" half is what keeps this from repeating the
  * mistake 1ff5a900 fixed: a temp root is not disqualifying by itself (a
@@ -41,7 +44,7 @@ import { isInfrastructureWorkspacePath } from '@/shared/utils.js';
  * and cursor session synchronizers.
  */
 export function admitsWorkspacePath(projectPath: string): boolean {
-  if (isInfrastructureWorkspacePath(projectPath)) {
+  if (isInfrastructureWorkspacePath(projectPath) || isSystemTemporaryDirectoryRoot(projectPath)) {
     return false;
   }
 
