@@ -74,16 +74,16 @@ const PERMISSION_MODE_ARGS: Record<string, string[]> = {
 
 /**
  * How long a run may go without any stdout activity before it is considered
- * hung. 30 minutes leaves room for a deep subagent review to think between
- * events while still bounding a wedged process.
+ * hung and killed. 30 minutes leaves room for a deep subagent review: while
+ * the root agent waits on a subagent its own stream is completely silent.
  *
- * The value is passed to `agy --print-timeout` too, but that flag is inert
- * under `--input-format stream-json` (measured: a run with
- * `--print-timeout 20s` stayed alive long past its result event and only
- * exited when stdin closed). The CLI therefore offers no upper bound of its
- * own and the watchdog below is the real one.
+ * agy itself is never given a limit. Its `--print-timeout` caps the whole
+ * turn, and on expiry agy emits a SUCCESS result while subagents and
+ * background commands are still running; closing stdin on that result then
+ * makes agy kill them (measured on agy 1.3.1). Its default of 0 waits for the
+ * turn, so this watchdog is the only bound.
  */
-const DEFAULT_PRINT_TIMEOUT = '30m';
+const DEFAULT_IDLE_TIMEOUT = '30m';
 
 /**
  * Parses a Go duration string (`30m`, `90s`, `1h30m`, `500ms`) into
@@ -118,7 +118,7 @@ let keylessRunCounter = 0;
 const abortedProcessKeys = new Set<string>();
 
 /**
- * Tracks currently active background tasks (subagents, background run_command) per session.
+ * Subagents each live session is waiting on, shown as task cards.
  */
 const activeSessionBackgroundTasks = new Map<string, Map<string, ActiveBackgroundTask>>();
 
@@ -128,67 +128,26 @@ export function getAntigravityBackgroundTasksForSession(sessionId: string): Acti
 }
 
 /**
- * Extracts active background tasks from an Antigravity step update.
+ * Extracts the subagents an `invoke_subagent` step created.
+ *
+ * Only the step's DONE update carries each subagent's `conversation_id`. agy
+ * withholds the turn's result until every subagent reports back, and the
+ * report is a contentless `system_message` step that names no subagent, so
+ * the cards are cleared together when the result arrives. A backgrounded
+ * run_command needs no card: its `tool` step stays ACTIVE until the command
+ * exits and renders as a running tool row.
  */
 export function extractAntigravityBackgroundTasks(step: AnyRecord): ActiveBackgroundTask[] {
-  if (!step || typeof step !== 'object') return [];
-  const stepType = readOptionalString(step.step_type);
-  if (stepType !== 'tool') return [];
-
-  const toolName = readOptionalString(step.tool_name);
-  const toolInfo = readObjectRecord(step.tool_info);
-  const output = readOptionalString(toolInfo?.output) ?? '';
-  const parameters = readObjectRecord(toolInfo?.parameters) ?? {};
-  const tasks: ActiveBackgroundTask[] = [];
-
-  if (toolName === 'invoke_subagent') {
-    // Look for all conversationIds in the output
-    const subagents = Array.isArray(parameters.Subagents) ? parameters.Subagents : [];
-    const conversationMatches = Array.from(output.matchAll(/"conversationId":\s*"([^"]+)"/g));
-    conversationMatches.forEach((match, index) => {
-      const conversationId = match[1];
-      const subagentData = readObjectRecord(subagents[index]) ?? readObjectRecord(subagents[0]);
-      const role = readOptionalString(subagentData?.Role) ?? 'Subagent';
-      tasks.push({
-        id: conversationId,
-        toolName: 'Subagent',
-        command: role,
-        description: role,
-        startedAt: Date.now(),
-      });
-    });
-  } else if (toolName === 'run_command') {
-    // Look for task id in the output
-    const match = output.match(/Tool is running as a background task with task id:\s*([^\s\n]+)/);
-    if (match && match[1]) {
-      const taskId = match[1].trim();
-      const commandLine = readOptionalString(parameters.CommandLine) ?? taskId;
-      tasks.push({
-        id: taskId,
-        toolName: 'Command',
-        command: commandLine,
-        startedAt: Date.now(),
-      });
-    }
-  }
-
-  return tasks;
-}
-
-/**
- * Detects whether an incoming message announces the completion or cancellation of a tracked task.
- */
-export function isAntigravityTaskCompletionMessage(message: string, taskId: string): boolean {
-  if (typeof message !== 'string' || !taskId) return false;
-  const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Standard Antigravity system message header: sender=<taskId>
-  const senderRegex = new RegExp(`sender=${escaped}(?:\\s|$)`);
-  if (senderRegex.test(message)) return true;
-
-  // Explicit completion or cancellation messages
-  const finishedRegex = new RegExp(`Task id "${escaped}" finished`);
-  const canceledRegex = new RegExp(`Task id "${escaped}" was canceled`);
-  return finishedRegex.test(message) || canceledRegex.test(message);
+  if (readOptionalString(step?.step_type) !== 'subagent' || readOptionalString(step.state) !== 'DONE') return [];
+  const subagents = readObjectRecord(step.subagent_info)?.subagents;
+  if (!Array.isArray(subagents)) return [];
+  return subagents.flatMap((entry) => {
+    const subagent = readObjectRecord(entry);
+    const id = readOptionalString(subagent?.conversation_id);
+    if (!id) return [];
+    const role = readOptionalString(subagent?.role) ?? 'Subagent';
+    return [{ id, toolName: 'Subagent', command: role, description: role, startedAt: Date.now() }];
+  });
 }
 
 /**
@@ -303,7 +262,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         sessionTasks = new Map<string, ActiveBackgroundTask>();
         activeSessionBackgroundTasks.set(sessionKey, sessionTasks);
       }
-      let heldForBackgroundWork = false;
 
       const broadcastBackgroundTasks = () => {
         const tasksArray = Array.from(sessionTasks?.values() ?? []);
@@ -328,7 +286,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
        */
       const describeFailure = (code: number | null): string => {
         const base = watchdogExpired
-          ? `Antigravity CLI produced no output for ${printTimeout} and was terminated.`
+          ? `Antigravity CLI produced no output for ${idleTimeout} and was terminated.`
           : code === null
             ? 'Antigravity CLI terminated by signal.'
             : `Antigravity CLI exited with code ${code}`;
@@ -412,9 +370,9 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         args.push('--add-dir', cwd);
       }
 
-      const printTimeout = readOptionalString(options.printTimeout)
-        ?? process.env.CLOUDCLI_ANTIGRAVITY_PRINT_TIMEOUT
-        ?? DEFAULT_PRINT_TIMEOUT;
+      const idleTimeout = readOptionalString(options.idleTimeout)
+        ?? process.env.CLOUDCLI_ANTIGRAVITY_IDLE_TIMEOUT
+        ?? DEFAULT_IDLE_TIMEOUT;
 
       // Prompt with attachments
       const hasAttachments =
@@ -444,7 +402,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         args.push('-p=');
         args.push('--input-format', 'stream-json');
         args.push('--output-format', 'stream-json');
-        args.push('--print-timeout', printTimeout);
       }
 
       // Resume existing conversation
@@ -513,22 +470,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
 
       const processLine = (line: string) => {
         if (!line || !line.trim()) return;
-
-        // Check for task completion against line content first, before JSON parsing,
-        // because task completion notices (e.g. <SYSTEM_MESSAGE> or task finished text)
-        // are emitted as plain text lines by agy.
-        if (sessionTasks.size > 0) {
-          let tasksChanged = false;
-          for (const [taskId] of Array.from(sessionTasks.entries())) {
-            if (isAntigravityTaskCompletionMessage(line, taskId)) {
-              sessionTasks.delete(taskId);
-              tasksChanged = true;
-            }
-          }
-          if (tasksChanged) {
-            broadcastBackgroundTasks();
-          }
-        }
 
         let raw: unknown;
         try {
@@ -690,15 +631,14 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
               }));
             }
 
-            // If background tasks (subagents, run_command) are actively running,
-            // hold stdin open so agy does not terminate them, and defer the terminal
-            // complete event until all background work completes.
-            if (sessionTasks.size > 0) {
-              heldForBackgroundWork = true;
-              return;
+            // agy reports a turn only after its subagents are back, so their
+            // cards go before the client sees the turn complete. An
+            // interrupted-stream result is not the end of the turn (below).
+            const turnContinues = isError && isStreamInterruptedNotice(errorMessage);
+            if (sessionTasks.size > 0 && !turnContinues) {
+              sessionTasks.clear();
+              broadcastBackgroundTasks();
             }
-
-            heldForBackgroundWork = false;
 
             // A finished turn releases the stdin that was holding the CLI
             // open: agy exits on EOF and `close` settles the run. An
@@ -708,9 +648,11 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             // very "async work silently killed" bug stdin ownership exists to
             // prevent. Its eventual real result closes stdin instead, and the
             // watchdog bounds the wait if that result never comes.
-            if (!(isError && isStreamInterruptedNotice(errorMessage))) {
-              closeStdinTurn();
+            if (turnContinues) {
+              // The client keeps the turn busy too: agy is still working on it.
+              return;
             }
+            closeStdinTurn();
 
             if (!completeSent) {
               completeSent = true;
@@ -771,7 +713,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       // forever with the session stuck in "processing". The watchdog bounds
       // that: every stdout chunk re-arms it, and expiry terminates the child
       // so `close` can settle the run as a failure.
-      const watchdogMs = parseGoDurationMs(printTimeout) ?? parseGoDurationMs(DEFAULT_PRINT_TIMEOUT) ?? 0;
+      const watchdogMs = parseGoDurationMs(idleTimeout) ?? parseGoDurationMs(DEFAULT_IDLE_TIMEOUT) ?? 0;
       let watchdogTimer: NodeJS.Timeout | null = null;
       const clearWatchdog = () => {
         if (watchdogTimer) {
@@ -786,7 +728,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
           watchdogTimer = null;
           watchdogExpired = true;
           console.error(
-            `[AntigravityRuntime] No output for ${printTimeout}; terminating wedged run ${processKey}`,
+            `[AntigravityRuntime] No output for ${idleTimeout}; terminating wedged run ${processKey}`,
           );
           closeStdinTurn();
           agyProcess.kill('SIGTERM');
@@ -857,12 +799,15 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
           }));
         }
 
+        // An exit right after an interrupted-stream notice settles as a
+        // success below, so its complete must not report a failure either.
+        const succeeded = !watchdogExpired && (code === 0 || (streamInterruptedResult && !sawErrorResult));
         if (!completeSent) {
           completeSent = true;
           writer.send(createCompleteMessage({
             provider: PROVIDER,
             sessionId: capturedSessionId || sessionId || null,
-            exitCode: code ?? 0,
+            exitCode: succeeded ? 0 : code ?? 0,
           }));
         }
 
@@ -900,7 +845,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         }
 
         notifyTerminalState({ code });
-        if (!watchdogExpired && (code === 0 || (streamInterruptedResult && !sawErrorResult))) {
+        if (succeeded) {
           settleOnce(() => resolve({ sessionId: capturedSessionId || sessionId, success: true }));
         } else {
           settleOnce(() => reject(new Error(describeFailure(code))));

@@ -585,18 +585,17 @@ test('runtime reports normalization failures as errors instead of raw text', asy
 });
 
 test('a run that stops producing output is terminated by the watchdog', async () => {
-  // --print-timeout is inert under --input-format stream-json (a run outlives
-  // it and only exits on stdin EOF), and stdin is now held open until the
-  // result event. Without a server-side watchdog a CLI that never reports a
-  // result would hang this promise, the child process and the session's
-  // "processing" state forever.
+  // stdin is held open until the result event and agy is never given a turn
+  // limit of its own, so without a server-side watchdog a CLI that never
+  // reports a result would hang this promise, the child process and the
+  // session's "processing" state forever.
   const runtime = new AntigravityRuntimeProvider();
   const { messages, writer } = createWriter();
 
   process.env.AGY_STUB_MODE = 'silent';
   try {
     await assert.rejects(
-      runtime.run('hello', { sessionId: 'sess-watchdog', printTimeout: '300ms' }, writer, context),
+      runtime.run('hello', { sessionId: 'sess-watchdog', idleTimeout: '300ms' }, writer, context),
       /produced no output for 300ms/,
       'a silent run must be terminated and reported, not left hanging',
     );
@@ -623,7 +622,7 @@ test('an interrupted-stream result keeps stdin open so the resumed turn finishes
 
   process.env.AGY_STUB_MODE = 'interrupted-then-done';
   try {
-    await runtime.run('hello', { sessionId: 'sess-resume', printTimeout: '30s' }, writer, context);
+    await runtime.run('hello', { sessionId: 'sess-resume', idleTimeout: '30s' }, writer, context);
   } finally {
     delete process.env.AGY_STUB_MODE;
   }
@@ -636,31 +635,22 @@ test('an interrupted-stream result keeps stdin open so the resumed turn finishes
     messages.some((msg) => msg.kind === 'task_notification'),
     'the interruption itself is still reported as a quiet notice',
   );
+  const resumedAt = messages.findIndex((msg) => JSON.stringify(msg).includes('RESUMED_OK'));
+  const completes = messages.filter((msg) => msg.kind === 'complete');
+  assert.equal(completes.length, 1);
+  assert.ok(messages.indexOf(completes[0]) > resumedAt, 'the client must not see the turn end while agy resumes it');
 });
 
-test('runtime defaults print-timeout to 30m and allows option override', async () => {
+test('runtime never caps the turn with --print-timeout', async () => {
+  // agy's --print-timeout ends a long turn with a fake SUCCESS result while its
+  // subagents still run; the run then closes stdin and agy kills them. Its
+  // default (0) waits for the turn, and the idle watchdog bounds hangs instead.
   const runtime = new AntigravityRuntimeProvider();
-
-  // 1. Default timeout
-  await fs.rm(argsFilePath, { force: true });
-  const { writer: writer1 } = createWriter();
-  await runtime.run('hello', { sessionId: 'sess-timeout-default' }, writer1, context);
-  let args = await readRecordedArgs();
-  const timeoutIndex = args.indexOf('--print-timeout');
-  assert.notEqual(timeoutIndex, -1, `expected --print-timeout in ${JSON.stringify(args)}`);
-  assert.equal(args[timeoutIndex + 1], '30m', 'default timeout must be 30m');
-
-  // 2. Custom override via options
-  await fs.rm(argsFilePath, { force: true });
-  const { writer: writer2 } = createWriter();
-  await runtime.run(
-    'hello',
-    { sessionId: 'sess-timeout-override', printTimeout: '45m' },
-    writer2,
-    context,
-  );
-  args = await readRecordedArgs();
-  const customTimeoutIndex = args.indexOf('--print-timeout');
-  assert.notEqual(customTimeoutIndex, -1, `expected --print-timeout in ${JSON.stringify(args)}`);
-  assert.equal(args[customTimeoutIndex + 1], '45m', 'explicit printTimeout must be passed through');
+  for (const options of [{ sessionId: 'sess-timeout-default' }, { sessionId: 'sess-timeout-idle', idleTimeout: '45m' }]) {
+    await fs.rm(argsFilePath, { force: true });
+    const { writer } = createWriter();
+    await runtime.run('hello', options, writer, context);
+    const args = await readRecordedArgs();
+    assert.equal(args.includes('--print-timeout'), false, `unexpected --print-timeout in ${JSON.stringify(args)}`);
+  }
 });
