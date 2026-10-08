@@ -86,7 +86,7 @@ docs/
 
 ## 认证与安全边界
 
-- **JWT**：`server/modules/auth/auth.middleware.ts`。密钥取 env `JWT_SECRET`，否则自动生成入库（`app_config.jwt_secret`）。token 7 天有效，半衰期自动刷新（响应头 `X-Refreshed-Token`）。WS 走 query string 或 Authorization 头鉴权（`websocket-auth.service.ts`）。
+- **JWT**：`server/modules/auth/auth.middleware.ts`。密钥取 env `JWT_SECRET`，否则自动生成入库（`app_config.jwt_secret`）。token 7 天有效，半衰期自动刷新（响应头 `X-Refreshed-Token`）。`/api/*` 一律 `Cache-Control: no-store` 且关闭 ETag——304 会让浏览器把缓存里旧 200 的过期刷新 token 交回前端；前端对响应头 token 也只接受未过期且不早于当前 token 的（`storeRefreshedAuthToken`）。WS 走 query string 或 Authorization 头鉴权（`websocket-auth.service.ts`）。
 - **可选 API key**：`validateApiKey` 作用于全部 `/api`；agent 模块另走 API key / 平台双模鉴权。
 - **上传白名单**：`chat.send` 的附件只放行 `~/.cloudcli/assets` 直接子文件，防止任意路径读。
 - **`file:` 链接白名单**：会话里引擎产出的本地文件链接走只读端点，目录白名单含各引擎数据根与系统临时目录（`server/modules/file-tree/file-tree.module.ts` 的 `externalReadOnlyRoots`），防止越权读盘。运维可用环境变量 `CLOUDCLI_EXTRA_READ_ROOTS`（按 `path.delimiter` 分隔的绝对路径，Windows 为 `;`）追加只读根，只应列具体目录，勿放开整个 home。
