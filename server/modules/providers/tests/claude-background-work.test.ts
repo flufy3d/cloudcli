@@ -211,3 +211,178 @@ test('messages that are not task events leave the set untouched', () => {
 
   assert.equal(tracker.has('s1', 't1'), true);
 });
+
+const ownCall = (id: string, name: string, input: Record<string, unknown> = {}) => ({
+  type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] },
+});
+const toolResult = (id: string, output: Record<string, unknown>, isError = false) => ({
+  type: 'user',
+  message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content: 'Result' }] },
+  tool_use_result: output,
+});
+
+test('a successful wakeup replaces the previous one and expires only at its acknowledged time', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', ownCall('wake1', 'ScheduleWakeup', { delaySeconds: 1 }));
+  tracker.apply('s1', toolResult('wake1', { scheduledFor: 5000 }));
+  tracker.apply('s1', ownCall('wake2', 'ScheduleWakeup', { delaySeconds: 1 }));
+  tracker.apply('s1', toolResult('wake2', { scheduledFor: 9000 }));
+  assert.deepEqual(tracker.activeTasks('s1').map((task) => task.id), ['wake2']);
+  assert.equal(tracker.nextWakeupAt('s1'), 9000);
+  assert.equal(tracker.expireWakeups('s1', 4999), false);
+  assert.equal(tracker.expireWakeups('s1', 5000), false);
+  assert.deepEqual(tracker.activeTasks('s1').map((task) => task.id), ['wake2']);
+  assert.equal(tracker.nextWakeupAt('s1'), 9000);
+  assert.equal(tracker.hasPending('s1'), true);
+  assert.equal(tracker.expireWakeups('s1', 9000), true);
+  assert.equal(tracker.hasPending('s1'), false);
+  assert.equal(tracker.nextWakeupAt('s1'), undefined);
+  assert.equal(tracker.expireWakeups('missing', 9000), false);
+});
+
+test('a failed reschedule retains the pending wakeup, while stop and aged-out results clear it', () => {
+  const tracker = createBackgroundWorkTracker();
+  for (const stopped of [false, true]) {
+    tracker.apply('s1', ownCall('wake1', 'ScheduleWakeup'));
+    tracker.apply('s1', toolResult('wake1', { scheduledFor: 9000 }));
+    tracker.apply('s1', ownCall('failed', 'ScheduleWakeup'));
+    tracker.apply('s1', toolResult('failed', {}, true));
+    assert.deepEqual(tracker.activeTasks('s1').map((task) => task.id), ['wake1']);
+    tracker.apply('s1', ownCall('end', 'ScheduleWakeup', { stop: stopped }));
+    tracker.apply('s1', toolResult('end', { scheduledFor: 0, stopped }));
+    assert.deepEqual(tracker.activeTasks('s1'), []);
+    assert.equal(tracker.hasPending('s1'), false);
+    tracker.clear('s1');
+  }
+});
+
+test('a Monitor returning a task id can be settled without task_started', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', ownCall('monitor', 'Monitor'));
+  tracker.apply('s1', toolResult('monitor', { taskId: 'm1', timeoutMs: 5000 }));
+  assert.equal(tracker.has('s1', 'm1'), true);
+  assert.equal(tracker.hasPending('s1'), true);
+  assert.equal(tracker.apply('s1', { type: 'system', subtype: 'task_notification', task_id: 'm1', status: 'completed' }), true);
+  assert.deepEqual(tracker.activeTasks('s1'), []);
+  assert.equal(tracker.hasPending('s1'), false);
+});
+
+test('Bash backgroundTaskId links completion notices when task_started is missing', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', ownCall('bash', 'Bash', { run_in_background: true }));
+  tracker.apply('s1', toolResult('bash', { backgroundTaskId: 'b1' }));
+  tracker.apply('s1', { type: 'system', subtype: 'task_notification', task_id: 'b1', status: 'completed' });
+  assert.deepEqual(tracker.activeTasks('s1'), []);
+  assert.equal(tracker.hasPending('s1'), false);
+});
+
+test('successful CronDelete removes only the matching cron, and a failed deletion removes none', () => {
+  const tracker = createBackgroundWorkTracker();
+  for (const id of ['cron1', 'cron2']) {
+    tracker.apply('s1', ownCall(id, 'CronCreate'));
+    tracker.apply('s1', toolResult(id, { id: `${id}-job`, recurring: true }));
+  }
+  tracker.apply('s1', ownCall('delete1', 'CronDelete'));
+  tracker.apply('s1', toolResult('delete1', { id: 'cron1-job' }, true));
+  assert.equal(tracker.activeTasks('s1').length, 2);
+  assert.equal(tracker.apply('s1', toolResult('delete1', { id: 'cron1-job' })), true);
+  assert.deepEqual(tracker.activeTasks('s1').map((task) => task.id), ['cron2']);
+  assert.equal(tracker.hasPending('s1'), true);
+});
+
+test('completed tool results and errors retire provisional cards without task events', () => {
+  const tracker = createBackgroundWorkTracker();
+  for (const [name, output, isError] of [
+    ['Agent', { status: 'completed', agentId: 'a1' }, false],
+    ['Bash', { status: 'failed' }, false],
+    ['Workflow', {}, true],
+  ] as const) {
+    tracker.apply('s1', ownCall('call', name, { run_in_background: true }));
+    assert.equal(tracker.hasPending('s1'), true);
+    assert.equal(tracker.apply('s1', toolResult('call', output, isError)), true);
+    assert.deepEqual(tracker.activeTasks('s1'), []);
+    assert.equal(tracker.hasPending('s1'), false);
+    tracker.clear('s1');
+  }
+});
+
+test('duplicate assistant blocks do not resurrect settled calls or reset their start time', () => {
+  const tracker = createBackgroundWorkTracker();
+  const call = ownCall('toolu_t1', 'Agent');
+  tracker.apply('s1', call);
+  const first = tracker.activeTasks('s1')[0];
+  assert.equal(tracker.apply('s1', call), false);
+  assert.equal(tracker.activeTasks('s1')[0], first);
+  tracker.apply('s1', started('t1'));
+  tracker.apply('s1', notified('t1', 'completed'));
+  tracker.apply('s1', call);
+  tracker.apply('s1', started('t1'));
+  assert.deepEqual(tracker.activeTasks('s1'), []);
+  assert.equal(tracker.hasPending('s1'), false);
+});
+
+test('a task started before its own tool block is reclassified as main-thread work', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', started('t1'));
+  tracker.apply('s1', ownCall('toolu_t1', 'Agent'));
+  assert.equal(tracker.list()[0].tasks[0].nested, undefined);
+  assert.equal(tracker.activeTasks('s1').length, 1);
+});
+
+test('malformed and nested results do not expire or clear unrelated calls', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', ownCall('wake', 'ScheduleWakeup'));
+  for (const value of [null, '123', NaN, Infinity, -1]) {
+    tracker.apply('s1', toolResult('wake', { scheduledFor: value }));
+    assert.equal(tracker.nextWakeupAt('s1'), undefined);
+  }
+  tracker.apply('s1', { ...toolResult('wake', { status: 'completed' }), parent_tool_use_id: 'other' });
+  tracker.apply('s1', { type: 'system', subtype: 'task_notification', task_id: 'unrelated', status: 'completed' });
+  tracker.apply('s1', null);
+  tracker.apply('s1', { type: 'assistant', message: { content: [null, 1, 'x'] } });
+  tracker.apply('s1', { type: 'user', message: { content: [{ type: 'tool_result' }] } });
+  assert.deepEqual(tracker.activeTasks('s1').map((task) => task.id), ['wake']);
+  assert.deepEqual(tracker.activeTasks('missing'), []);
+});
+
+test('only a main-thread task that finishes on its own asks for a follow-up reply', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', ownCall('toolu_own', 'Agent'));
+  tracker.apply('s1', started('own'));
+  tracker.apply('s1', started('child', { tool_use_id: 'toolu_inside_agent' }));
+  assert.equal(tracker.settlesMainThreadWork('s1', notified('own', 'completed')), true);
+  assert.equal(tracker.settlesMainThreadWork('s1', updated('own', { status: 'failed' })), true);
+  assert.equal(tracker.settlesMainThreadWork('s1', notified('own', 'stopped')), false, 'a stop gets no reply turn');
+  assert.equal(tracker.settlesMainThreadWork('s1', notified('child', 'completed')), false, 'nested work reports to its agent');
+  assert.equal(tracker.settlesMainThreadWork('s1', {
+    type: 'system', subtype: 'task_notification', task_id: 'housekeeping', status: 'completed',
+  }), false, 'untracked CLI tasks have no reply in this transcript');
+  assert.equal(tracker.settlesMainThreadWork('s1', started('own')), false);
+});
+
+test('work with no completion event lapses at the end of the turn after the one that launched it', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', ownCall('cron', 'CronCreate'));
+  tracker.apply('s1', toolResult('cron', { id: 'job', recurring: false }));
+  tracker.apply('s1', ownCall('wake', 'ScheduleWakeup'));
+  tracker.apply('s1', toolResult('wake', { clampedDelaySeconds: 60 }));
+  tracker.apply('s1', ownCall('timed', 'ScheduleWakeup'));
+  tracker.apply('s1', toolResult('timed', { scheduledFor: Date.now() + 60_000 }));
+  tracker.apply('s1', ownCall('toolu_agent', 'Agent'));
+  assert.equal(tracker.endTurn('s1'), false, 'the launching turn keeps everything');
+  assert.deepEqual(tracker.activeTasks('s1').map((task) => task.id), ['cron', 'timed', 'toolu_agent']);
+  assert.equal(tracker.endTurn('s1'), true);
+  // The timed wakeup replaced the untimed one; it and the agent have their own endings.
+  assert.deepEqual(tracker.activeTasks('s1').map((task) => task.id), ['timed', 'toolu_agent']);
+  assert.equal(tracker.endTurn('missing'), false);
+});
+
+test('an untimed wakeup alone lapses after the turn it triggers', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', ownCall('wake', 'ScheduleWakeup'));
+  tracker.apply('s1', toolResult('wake', {}));
+  tracker.endTurn('s1');
+  assert.equal(tracker.hasPending('s1'), true);
+  assert.equal(tracker.endTurn('s1'), true);
+  assert.equal(tracker.hasPending('s1'), false);
+});

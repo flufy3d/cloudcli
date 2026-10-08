@@ -202,7 +202,22 @@ export function useChatSessionState({
   // being viewed — never stale local UI state from the last time it was
   // open. Session ids are concrete before any send, so no pending
   // placeholder entry exists anymore.
-  const sessionActivity = (activeSessionId && processingSessions?.get(activeSessionId)) || null;
+  const backgroundTasks = activeSessionId ? sessionStore.getBackgroundTasks(activeSessionId) : [];
+  const hasActiveBackgroundTasks = activeSessionId ? sessionStore.hasPendingBackgroundWork(activeSessionId) : false;
+  const processingActivity = (activeSessionId && processingSessions?.get(activeSessionId)) || null;
+  const backgroundStartedAt = activeSessionId ? sessionStore.getBackgroundWorkStartedAt(activeSessionId) : undefined;
+  // A response turn keeps its own activity. The background phase times from
+  // its tasks rather than from whenever this tab marked it busy, and stays
+  // cancellable even when an activity poll lists it as not interruptible;
+  // only Claude broadcasts the frames that make it pending here.
+  const sessionActivity = hasActiveBackgroundTasks && backgroundStartedAt !== undefined
+    && !(processingActivity && !processingActivity.background) ? {
+      statusText: null,
+      ...processingActivity,
+      startedAt: backgroundStartedAt,
+      background: backgroundTasks.length > 0,
+      canInterrupt: true,
+    } : processingActivity;
   const isProcessing = sessionActivity !== null;
   const canAbortSession = isProcessing && sessionActivity.canInterrupt;
 
@@ -733,11 +748,6 @@ export function useChatSessionState({
       setIsLoadingAllMessages(false);
     }
   }, [currentSessionId, isActive, isLoadingAllMessages, selectedProject, selectedSession, sessionStore]);
-
-  // Store notifications re-render this hook while the store identity stays
-  // fixed; read its current list so task starts and finishes update the gate.
-  const backgroundTasks = activeSessionId ? sessionStore.getBackgroundTasks(activeSessionId) : [];
-  const hasActiveBackgroundTasks = backgroundTasks.length > 0;
 
   return {
     chatMessages,

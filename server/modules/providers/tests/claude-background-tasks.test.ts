@@ -52,7 +52,7 @@ test('ignores Bash tool without run_in_background: true', () => {
   assert.equal(tasks.length, 0);
 });
 
-test('extracts background tasks from deferred work tools like TaskCreate or Monitor', () => {
+test('extracts background tasks from deferred work tools like Monitor', () => {
   const message = {
     type: 'assistant',
     message: {
@@ -60,7 +60,7 @@ test('extracts background tasks from deferred work tools like TaskCreate or Moni
         {
           type: 'tool_use',
           id: 'toolu_task_1',
-          name: 'TaskCreate',
+          name: 'Monitor',
           input: {
             description: 'Run background analysis',
           },
@@ -72,8 +72,15 @@ test('extracts background tasks from deferred work tools like TaskCreate or Moni
   const tasks = extractBackgroundTasks(message);
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].id, 'toolu_task_1');
-  assert.equal(tasks[0].toolName, 'TaskCreate');
+  assert.equal(tasks[0].toolName, 'Monitor');
   assert.equal(tasks[0].command, 'Run background analysis');
+});
+
+test('TaskCreate only writes a to-do item and creates no running-task card', () => {
+  assert.deepEqual(extractBackgroundTasks({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 'toolu_todo', name: 'TaskCreate', input: { subject: 'Plan work' } }] },
+  }), []);
 });
 
 test('returns empty array when content has no tool use or non-array content', () => {

@@ -11,8 +11,11 @@ vi.mock('@/shared/api', () => ({
   authenticatedFetch: (...args: unknown[]) => authenticatedFetch(...args),
   api: {
     getFiles: () => Promise.resolve({ ok: false }),
-    slashCommands: {
-      list: () => Promise.resolve({ ok: true, data: [] }),
+    commands: {
+      list: () => Promise.resolve(new Response(JSON.stringify({ commands: [] }))),
+    },
+    providers: {
+      skills: () => Promise.resolve(new Response(JSON.stringify({ data: { skills: [] } }))),
     },
   },
 }));
@@ -34,13 +37,21 @@ const submitEvent = { preventDefault: () => undefined } as never;
 
 test('queues message when hasActiveBackgroundTasks is true even if isLoading is false', async () => {
   const { useChatComposerState } = await import('@/modules/chat/hooks/useChatComposerState');
+  const { useSessionStore } = await import('@/modules/chat/hooks/useSessionStore');
 
   const sent: Array<Record<string, unknown>> = [];
 
-  let hasBgTasks = true;
-
-  const { result, rerender } = renderHook(() =>
-    useChatComposerState({
+  const { result } = renderHook(() => {
+    const sessionStore = useSessionStore();
+    sessionStore.setActiveSession('session-1');
+    if (!sessionStore.getSessionSlot('session-1')) {
+      sessionStore.applyServerEvent({
+        kind: 'status', sessionId: 'session-1', text: 'background_tasks',
+        id: 'bg-start', timestamp: '2026-10-07T00:00:00.000Z', provider: 'claude',
+        backgroundTasks: [{ id: 't1', toolName: 'Bash', startedAt: 1 }], backgroundWorkPending: true,
+      });
+    }
+    const composer = useChatComposerState({
       selectedProject,
       selectedSession,
       currentSessionId: 'session-1',
@@ -51,18 +62,17 @@ test('queues message when hasActiveBackgroundTasks is true even if isLoading is 
       currentProviderModel: 'claude-3-7-sonnet',
       currentProviderEffort: 'default',
       isLoading: false,
-      hasActiveBackgroundTasks: hasBgTasks,
-      backgroundTasks: [
-        { id: 't1', toolName: 'Bash', command: 'npm test', startedAt: Date.now() },
-      ],
+      hasActiveBackgroundTasks: sessionStore.hasPendingBackgroundWork('session-1'),
+      backgroundTasks: sessionStore.getBackgroundTasks('session-1'),
       canAbortSession: false,
       tokenBudget: null,
       sendMessage: (payload) => sent.push(payload as Record<string, unknown>),
       stickToBottomAfterSend: () => undefined,
       addMessage: () => undefined,
       setPendingPermissionRequests: () => undefined,
-    }),
-  );
+    });
+    return { ...composer, sessionStore };
+  });
 
   act(() => {
     result.current.handleInputChange({ target: { value: 'next command' } } as never);
@@ -77,9 +87,19 @@ test('queues message when hasActiveBackgroundTasks is true even if isLoading is 
   assert.ok(result.current.queuedDraft, 'message entered queued draft');
   assert.equal(result.current.queuedDraft?.content, 'next command');
 
-  // Now background task finishes
-  hasBgTasks = false;
-  rerender();
+  // Execution has finished, but its follow-up reply must finish before sending.
+  act(() => result.current.sessionStore.applyServerEvent({
+    kind: 'status', sessionId: 'session-1', text: 'background_tasks',
+    id: 'bg-reply', timestamp: '2026-10-07T00:00:01.000Z', provider: 'claude',
+    backgroundTasks: [], backgroundWorkPending: true,
+  }));
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+  assert.equal(sent.length, 0, 'card removal must not send over the background reply');
+  act(() => result.current.sessionStore.applyServerEvent({
+    kind: 'status', sessionId: 'session-1', text: 'background_tasks',
+    id: 'bg-finished', timestamp: '2026-10-07T00:00:02.000Z', provider: 'claude',
+    backgroundTasks: [], backgroundWorkPending: false,
+  }));
 
   // Once background task is no longer active, the queued draft should be flushed and sent
   await waitFor(() => {

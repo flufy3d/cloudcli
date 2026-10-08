@@ -78,6 +78,8 @@ export type ProviderRuntimeGateway = {
   stopBackgroundTask(provider: LLMProvider, sessionId: string, taskId: string): Promise<boolean>;
   /** Whether a provider runtime still holds background work for the session after its turn ended. */
   hasBackgroundWork(sessionId: string): boolean;
+  /** Narrower than `hasBackgroundWork`: only work whose end the runtime broadcasts, including the reply after it. */
+  isBackgroundWorkPending(sessionId: string): boolean;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
   getBackgroundTasksForSession?(sessionId: string): ActiveBackgroundTask[];
@@ -595,6 +597,7 @@ function handleChatSubscribe(
       stale: replay.stale,
       pendingPermissions,
       backgroundTasks,
+      backgroundWorkPending: dependencies.runtime.isBackgroundWorkPending(sessionId),
       timestamp: new Date().toISOString(),
     });
 

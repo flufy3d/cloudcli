@@ -41,6 +41,8 @@ export type ChatSubscribedEvent = {
    */
   pendingPermissions: unknown[];
   backgroundTasks?: import('./chatEvents.js').ActiveBackgroundTask[];
+  /** Includes a follow-up reply whose task card has already disappeared. */
+  backgroundWorkPending?: boolean;
   timestamp: string;
 };
 

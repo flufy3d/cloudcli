@@ -29,6 +29,7 @@ const TRANSCRIPT_ROW_KIND_SET: ReadonlySet<string> = new Set(TRANSCRIPT_ROW_KIND
  * mirror it exists to prevent.
  */
 const NORMALIZED_MESSAGE_KEYS = [
+  'backgroundWorkPending',
   'aborted',
   'agents',
   'actualSessionId',

@@ -124,8 +124,13 @@ export function useChatRealtimeHandlers({
             void requestLatestMessages(directive.sessionId, isActiveRef.current);
           }
 
-          if (directive.isProcessing) {
-            onSessionProcessing?.(directive.sessionId);
+          if (directive.isProcessing || sessionStore.hasPendingBackgroundWork(directive.sessionId)) {
+            onSessionProcessing?.(directive.sessionId, {
+              background: !directive.isProcessing,
+            });
+            if (sessionStore.hasPendingBackgroundWork(directive.sessionId)) {
+              sessionHadBackgroundTasksRef.current.set(directive.sessionId, true);
+            }
           } else {
             // Idle ack: ignore it if a newer request started after the
             // subscribe was sent — the ack describes the older state.
@@ -172,7 +177,15 @@ export function useChatRealtimeHandlers({
           // store settled unpaired tool cards before this ran). The indicator
           // derives from the processing map, so deleting the entry hides it
           // immediately and atomically.
-          onSessionIdle?.(sessionId);
+          const backgroundPending = Boolean(sessionId && sessionStore.hasPendingBackgroundWork(sessionId));
+          if (sessionId && backgroundPending && success && !aborted) {
+            onSessionProcessing?.(sessionId, { background: true });
+          } else {
+            onSessionIdle?.(sessionId);
+            if (aborted || !success) {
+              onSessionIdle?.(sessionId, { backgroundOnly: true });
+            }
+          }
           if (sessionId === activeViewSessionIdRef.current) {
             pendingPermissionRequestsRef.current = [];
             setPendingPermissionRequests([]);
@@ -192,7 +205,7 @@ export function useChatRealtimeHandlers({
           // Celebrate only successful runs (failed runs end with success: false).
           // If background tasks are still running, defer celebration until they complete.
           const hasRunningBgTasks = Boolean(
-            sessionId && (sessionStore.getBackgroundTasks(sessionId)?.length ?? 0) > 0,
+            sessionId && sessionStore.hasPendingBackgroundWork(sessionId),
           );
           if (sessionId && hasRunningBgTasks) {
             sessionHadBackgroundTasksRef.current.set(sessionId, true);
@@ -218,11 +231,14 @@ export function useChatRealtimeHandlers({
           if (directive.text === 'token_budget' && directive.tokenBudget) {
             setTokenBudget(directive.tokenBudget as Record<string, unknown>);
           } else if (directive.text === 'background_tasks' && directive.sessionId) {
-            const currentTasks = directive.backgroundTasks ?? [];
-            if (currentTasks.length > 0) {
+            if (sessionStore.hasPendingBackgroundWork(directive.sessionId)) {
               sessionHadBackgroundTasksRef.current.set(directive.sessionId, true);
+              onSessionProcessing?.(directive.sessionId, { background: true });
             } else if (sessionHadBackgroundTasksRef.current.get(directive.sessionId)) {
               sessionHadBackgroundTasksRef.current.delete(directive.sessionId);
+              onSessionIdle?.(directive.sessionId, {
+                backgroundOnly: true,
+              });
               showCompletionTitleIndicator();
               void playChatCompletionSound();
             }
@@ -230,6 +246,7 @@ export function useChatRealtimeHandlers({
             onSessionProcessing?.(directive.sessionId, {
               statusText: directive.text,
               canInterrupt: directive.canInterrupt,
+              background: sessionStore.hasPendingBackgroundWork(directive.sessionId),
             });
           }
           return;

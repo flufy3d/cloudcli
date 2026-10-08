@@ -138,3 +138,21 @@ test('routes permission decisions through provider-owned runtime capabilities', 
     { requestId: 'request-1', sessionId: 'session-1' },
   ]);
 });
+
+test('only runtimes that track the reply phase report background work as pending', () => {
+  const service = createService([
+    createProvider('claude', createRuntime({
+      backgroundTasks: { list: () => [], isPending: (sessionId) => sessionId === 'claude-session' },
+    })),
+    createProvider('codex', createRuntime({
+      listBackgroundWork: () => [{ sessionId: 'codex-session', tasks: [] }],
+    })),
+  ]);
+
+  assert.equal(service.isBackgroundWorkPending('claude-session'), true);
+  // Codex never sends the frame that would clear a pending flag on the client.
+  assert.equal(service.isBackgroundWorkPending('codex-session'), false);
+  assert.equal(service.hasBackgroundWork('codex-session'), true);
+  assert.equal(service.hasBackgroundWork('claude-session'), true);
+  assert.equal(service.hasBackgroundWork('idle-session'), false);
+});

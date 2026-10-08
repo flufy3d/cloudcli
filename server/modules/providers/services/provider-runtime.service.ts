@@ -76,6 +76,11 @@ export function createProviderRuntimeService(
     return provider.runtime.run(command, options, writer, createRuntimeContext(provider));
   };
 
+  // Only runtimes that broadcast `background_tasks` can later clear this on the
+  // client, so the others never report it.
+  const isBackgroundWorkPending = (sessionId: string): boolean => dependencies.listProviders()
+    .some((provider) => Boolean(provider.runtime.backgroundTasks?.isPending?.(sessionId)));
+
   return {
     run,
 
@@ -101,8 +106,10 @@ export function createProviderRuntimeService(
       return Boolean(await runtime.stopBackgroundTask?.(sessionId, taskId));
     },
 
+    isBackgroundWorkPending,
+
     hasBackgroundWork(sessionId: string): boolean {
-      return dependencies.listProviders().some((provider) =>
+      return isBackgroundWorkPending(sessionId) || dependencies.listProviders().some((provider) =>
         (provider.runtime.listBackgroundWork?.() ?? []).some((entry) => entry.sessionId === sessionId));
     },
 

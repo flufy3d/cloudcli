@@ -1,6 +1,6 @@
 # 聊天链路（Chat Pipeline）
 
-> 基准：2.9.0 / 2026-10-04
+> 基准：2.9.0 / 2026-10-07
 > **核心文档**：改动 `server/modules/websocket/**` 或 `src/modules/chat/**` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -73,17 +73,18 @@ flowchart TD
 
 ## 后台任务与输入排队
 
-- **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台任务（如 `Bash(run_in_background: true)` 或任务创建）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。
+- **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台执行（如后台 `Bash`、Agent 或定时唤醒）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。`TaskCreate` 只创建待办项，不属于后台执行。
 - **状态同步与广播**：
-  - 契约类型 `ActiveBackgroundTask`（`id`, `toolName`, `command?`, `description?`, `startedAt`）。
-  - `chat_subscribed` 握手帧携带 `backgroundTasks`，供断线重连或新标签页恢复状态。
-  - 任务启动或清理时，服务端通过 `kind: 'status', text: 'background_tasks'` 广播最新列表；归一化网关在 `NORMALIZED_MESSAGE_KEYS` 放行 `backgroundTasks` 字段。
+  - `ActiveBackgroundTask` 表示输入框需要展示的执行任务，具体字段以共享协议为准。
+  - `chat_subscribed` 握手帧与 `status(background_tasks)` 同时携带卡片列表 `backgroundTasks` 和后台等待状态 `backgroundWorkPending`，供实时更新与重连恢复；归一化网关放行两者。
+  - 卡片描述任务本身，等待状态还包括任务完成后的汇报回复。任务完成或唤醒到期时卡片立即消失，后续回复结束后才解除等待。未提供等待字段的引擎按卡片列表判断。
 - **输入防打断与智能排队**：
   - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），用户发送新消息自动转入 `queuedDraft` 排队，阻止过早发送打断正在运行的后台子进程。
-  - **自动释放**：后台任务结束且无新状态阻塞时，composer 的 flush 效应自动解冻排队草稿并发出。
+  - **自动释放**：后台执行和后续回复均结束且无新状态阻塞时，composer 的 flush 效应自动解冻排队草稿并发出。服务端的后台驻留检查也包含后续回复，切走会话或断线不改变等待条件。
   - **强制中断逃生通道**：排队卡片提供 `forceSendQueuedDraft`（`isForced: true`），允许用户在需要时显式跳过等待，以 `forceInterrupt: true` 打断后台任务并立即发送。
+  - **会话忙状态与取消**：实时完成帧和订阅确认在后台等待期间保留会话的后台活动，切走会话的自动发送也等到后续回复结束。后台结束帧只清后台活动，不清新主轮的活动；这条判定不依赖时钟，两个阶段在同一毫秒交接也成立。执行和回复等待期间均可直接中止会话。
   - **可视化呈现**：输入框上方通过 `BackgroundTaskIndicator` 实时展示运行中的后台任务（工具名、命令、动态已用时间）。
-  - **完工庆祝防误报**：`useChatRealtimeHandlers` 在收到 `complete` 时，若会话仍有活跃后台任务，则暂不触发完工音效（`playChatCompletionSound`）与窗口标题提示（`showCompletionTitleIndicator`）；待后台任务全部清空（通过 `status(background_tasks: [])`）时统一触发，防止用户误以为全部工作已结束。
+  - **完工庆祝防误报**：`useChatRealtimeHandlers` 在收到 `complete` 时，若会话仍有后台等待，则暂不触发完工音效与窗口标题提示；待后台等待解除时统一触发。卡片消失本身不表示汇报回复已结束。
 
 ## run 的结束原因（诊断契约）
 

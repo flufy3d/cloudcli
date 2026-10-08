@@ -344,20 +344,23 @@ test('running sessions list a session whose background work outlived its turn', 
     run.writer.sendComplete({ exitCode: 0 });
     assert.equal(run.status, 'completed');
 
-    const tasks = [task('late', 2_000), task('early', 1_000)];
+    let tasks = [task('late', 2_000), task('early', 1_000)];
     await withClaudeCliRegistry([], async () => await withProviders(
       { claude: { run: async () => undefined, abort: () => false, listBackgroundWork: () => [{ sessionId: 'held-session', tasks }] } },
       async () => {
-        assert.deepEqual(await sessionsService.listRunningSessions(), [{
-          sessionId: 'held-session',
-          provider: 'claude',
-          startedAt: 1_000,
-          lastSeq: run.lastSeq,
-          background: true,
-          canInterrupt: false,
-          tasks,
+        for (const currentTasks of [tasks, []]) {
+          tasks = currentTasks;
+          assert.deepEqual(await sessionsService.listRunningSessions(), [{
+            sessionId: 'held-session',
+            provider: 'claude',
+            startedAt: tasks.length ? 1_000 : run.startedAt,
+            lastSeq: run.lastSeq,
+            background: true,
+            canInterrupt: false,
+            tasks,
         }]);
         assert.ok(run.lastSeq > 0, 'the finished run still reports its sequence for replay');
+        }
       },
     ));
   });

@@ -49,6 +49,8 @@ export interface IProviderRuntime {
   permissions?: ProviderRuntimePermissionGateway;
   backgroundTasks?: {
     list(sessionId: string): ActiveBackgroundTask[];
+    /** Includes pending execution and the follow-up reply after its task settles. */
+    isPending?(sessionId: string): boolean;
   };
   /**
    * Sessions with background tasks still outstanding, whether or not their

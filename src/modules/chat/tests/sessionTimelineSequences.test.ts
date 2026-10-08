@@ -21,6 +21,7 @@ import type { NormalizedMessage, PendingPermissionRequest } from '@/shared/types
 import { useChatRealtimeHandlers } from '@/modules/chat/hooks/useChatRealtimeHandlers';
 import { useSessionStore } from '@/modules/chat/hooks/useSessionStore';
 import { normalizedToChatMessages } from '@/modules/chat/hooks/useChatMessages';
+import { useSessionProtection } from '@/shared/hooks/useSessionProtection';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -149,6 +150,67 @@ function mountTimeline(activeSessionId: string | null = SESSION_ID): TimelineHar
 
 /** Lets the 100ms stream throttle fire exactly once and apply the row. */
 const tickThrottle = () => new Promise((resolve) => setTimeout(resolve, 130));
+
+test('off-screen background work retains processing until its reply ends', () => {
+  const timeline = mountTimeline();
+  const sessionId = 'off-screen';
+  timeline.emit(msg(1, { kind: 'status', sessionId, text: 'background_tasks', backgroundTasks: [], backgroundWorkPending: true }) as ServerEvent);
+  timeline.emit(msg(2, { kind: 'complete', sessionId, success: true }) as ServerEvent);
+  assert.equal(timeline.onSessionIdle.mock.calls.length, 0, 'primary complete must not trigger off-screen auto-send');
+  assert.equal(timeline.onSessionProcessing.mock.calls.at(-1)?.[0], sessionId);
+  timeline.emit(msg(3, { kind: 'status', sessionId, text: 'background_tasks', backgroundTasks: [], backgroundWorkPending: false }) as ServerEvent);
+  assert.equal(timeline.onSessionIdle.mock.calls.length, 1);
+  assert.equal(timeline.onSessionIdle.mock.calls[0][1]?.backgroundOnly, true, 'background idle must not clear a newer primary turn');
+  timeline.cleanup();
+});
+
+test('real processing state clears a background reply but retains a new turn within the same millisecond', () => {
+  const time = vi.spyOn(Date, 'now').mockReturnValue(BASE_TIME);
+  const listeners = new Set<(event: ServerEvent) => void>();
+  const subscribe = (listener: (event: ServerEvent) => void) => {
+    listeners.add(listener);
+    return () => { listeners.delete(listener); };
+  };
+  const { result, unmount } = renderHook(() => {
+    const sessionStore = useSessionStore();
+    const protection = useSessionProtection();
+    useChatRealtimeHandlers({
+      isActive: true, subscribe, provider: 'claude', selectedSession: null,
+      currentSessionId: SESSION_ID, setTokenBudget: vi.fn(), pendingPermissionRequests: [],
+      setPendingPermissionRequests: vi.fn(), statusCheckSentAtRef: { current: new Map() },
+      onSessionProcessing: protection.markSessionProcessing, onSessionIdle: protection.markSessionIdle,
+      requestLatestMessages: vi.fn(), sessionStore,
+    });
+    return protection;
+  });
+  const emit = (pending: boolean) => act(() => {
+    for (const listener of listeners) listener(msg(1, {
+      kind: 'status', text: 'background_tasks', backgroundTasks: [], backgroundWorkPending: pending,
+    }) as ServerEvent);
+  });
+  try {
+    emit(true);
+    emit(false);
+    assert.equal(result.current.processingSessions.has(SESSION_ID), false, 'same-millisecond background completion must clear its own state');
+    emit(true);
+    act(() => result.current.markSessionProcessing(SESSION_ID));
+    emit(false);
+    assert.equal(result.current.processingSessions.has(SESSION_ID), true, 'a new primary turn must survive old background cleanup');
+    act(() => result.current.markSessionIdle(SESSION_ID));
+    for (const terminal of [{ success: false, aborted: true }, { success: false }]) {
+      emit(true);
+      act(() => {
+        for (const listener of listeners) listener(msg(2, { kind: 'complete', ...terminal }) as ServerEvent);
+      });
+      emit(false);
+      assert.equal(result.current.processingSessions.has(SESSION_ID), false, 'abort or failure must clear the background activity');
+    }
+
+  } finally {
+    unmount();
+    time.mockRestore();
+  }
+});
 
 // ─── prune before the content-level bail-out ─────────────────────────────────
 

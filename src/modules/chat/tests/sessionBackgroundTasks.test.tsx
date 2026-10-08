@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import { useChatSessionState } from '@/modules/chat/hooks/useChatSessionState';
 import { useSessionStore } from '@/modules/chat/hooks/useSessionStore';
-import type { ActiveBackgroundTask, Project, ProjectSession, ServerEvent } from '@/shared/types';
+import type { ActiveBackgroundTask, Project, ProjectSession, ServerEvent, SessionActivityMap } from '@/shared/types';
 
 const project: Project = {
   projectId: 'project-1', name: 'project-1', displayName: 'Project 1', fullPath: '/tmp/project-1',
@@ -24,15 +24,16 @@ beforeEach(() => {
 
 afterEach(() => vi.unstubAllGlobals());
 
-function taskStatus(tasks: ActiveBackgroundTask[]): ServerEvent {
+function taskStatus(tasks: ActiveBackgroundTask[], backgroundWorkPending?: boolean): ServerEvent {
   return {
     id: 'background-status', kind: 'status', sessionId: session.id,
     timestamp: '2026-10-05T00:00:00.000Z', provider: 'claude',
     text: 'background_tasks', backgroundTasks: tasks,
+    backgroundWorkPending,
   };
 }
 
-function mountSession(initialTasks: ActiveBackgroundTask[]) {
+function mountSession(initialTasks: ActiveBackgroundTask[], processingSessions?: SessionActivityMap) {
   return renderHook(() => {
     const sessionStore = useSessionStore();
     if (!sessionStore.getSessionSlot(session.id)) {
@@ -41,7 +42,7 @@ function mountSession(initialTasks: ActiveBackgroundTask[]) {
     const state = useChatSessionState({
       isActive: true, selectedProject: project, selectedSession: session,
       ws: null, sendMessage, resetStreamingState, statusCheckSentAtRef,
-      sessionStore, showThinking: false,
+      sessionStore, showThinking: false, processingSessions,
     });
     return { ...state, sessionStore };
   });
@@ -76,6 +77,64 @@ test('shows tasks started in the current session and retains the gate until the 
     expect(result.current.backgroundTasks).toEqual(tasks);
     expect(result.current.hasActiveBackgroundTasks).toBe(tasks.length > 0);
   }
+});
+
+test('clears completed cards but holds the queue gate until the background reply finishes', async () => {
+  const { result } = mountSession([agent]);
+  await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+  act(() => { result.current.sessionStore.applyServerEvent(taskStatus([], true)); });
+  expect(result.current.backgroundTasks).toEqual([]);
+  expect(result.current.hasActiveBackgroundTasks).toBe(true);
+  expect(result.current.canAbortSession).toBe(true);
+  act(() => { result.current.sessionStore.applyServerEvent(taskStatus([], false)); });
+  expect(result.current.hasActiveBackgroundTasks).toBe(false);
+});
+
+test('the reply phase keeps one start time across renders', async () => {
+  const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+  try {
+    const { result, rerender } = mountSession([]);
+    await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+    act(() => { result.current.sessionStore.applyServerEvent(taskStatus([], true)); });
+    now.mockReturnValue(9_000);
+    rerender();
+    expect(result.current.sessionActivity?.startedAt).toBe(1_000);
+    act(() => { result.current.sessionStore.applyServerEvent(taskStatus([agent], true)); });
+    expect(result.current.sessionActivity?.startedAt).toBe(agent.startedAt);
+  } finally {
+    now.mockRestore();
+  }
+});
+
+test('the background phase times from its tasks, not from when this tab marked it busy', async () => {
+  const markedOnRefresh = new Map([[session.id, { statusText: null, canInterrupt: false, startedAt: 99_999, background: true }]]);
+  const { result } = mountSession([agent], markedOnRefresh);
+  await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+  expect(result.current.sessionActivity?.startedAt).toBe(agent.startedAt);
+  expect(result.current.canAbortSession).toBe(true);
+});
+
+test('a response turn keeps its own activity while background work is pending', async () => {
+  const responding = new Map([[session.id, { statusText: 'Compacting', canInterrupt: false, startedAt: 7 }]]);
+  const { result } = mountSession([agent], responding);
+  await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+  expect(result.current.hasActiveBackgroundTasks).toBe(true);
+  expect(result.current.sessionActivity).toEqual(responding.get(session.id));
+  expect(result.current.canAbortSession).toBe(false);
+});
+
+test('reconnect preserves the reply gate even when no task cards remain', async () => {
+  const { result } = mountSession([]);
+  await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+  act(() => {
+    result.current.sessionStore.applyServerEvent({
+      kind: 'chat_subscribed', sessionId: session.id, isProcessing: false,
+      timestamp: '2026-10-07T00:00:00.000Z', lastSeq: 0, stale: false,
+      pendingPermissions: [], backgroundTasks: [], backgroundWorkPending: true,
+    });
+  });
+  expect(result.current.backgroundTasks).toEqual([]);
+  expect(result.current.hasActiveBackgroundTasks).toBe(true);
 });
 
 test('reconciles task state from a reconnect acknowledgement without changing sessions', async () => {
