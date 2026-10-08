@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, readApiJson } from '@/shared/api';
 import { readExternalFile } from '@/shared/api';
 import type { CodeEditorFile } from '@/shared/types';
+import { saveOrShareBlob } from '@/shared/utils';
 import { isBinaryFile } from '@/modules/code-editor/utils/binaryFile';
 import { getPreviewKind } from '@/modules/code-editor/utils/previewableFile';
 
@@ -101,7 +102,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
         // Workspace-external documents are served by the read-only external
         // endpoint and are not tied to a project.
         if (isReadOnlyExternal) {
-          const externalResponse = await readExternalFile(filePath);
+          const externalResponse = await readExternalFile(filePath, fileProjectId);
           if (!externalResponse.ok) {
             throw new Error(`Failed to load file: ${externalResponse.status} ${externalResponse.statusText}`);
           }
@@ -203,18 +204,8 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
   }, [content, filePath, fileProjectId, previewKind, fileName, isReadOnlyExternal]);
 
   const handleDownload = useCallback(() => {
-    const blob = new Blob([content], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-
-    anchor.href = url;
-    anchor.download = file.name;
-
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-
-    URL.revokeObjectURL(url);
+    // The share hand-off keeps iOS PWAs from navigating to the blob URL.
+    void saveOrShareBlob(new Blob([content], { type: 'text/plain' }), file.name);
   }, [content, file.name]);
 
   // The baseline only changes on load and save, so it is not re-normalised on

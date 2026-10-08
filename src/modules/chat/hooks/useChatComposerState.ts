@@ -13,8 +13,10 @@ import { useDropzone } from 'react-dropzone';
 import { useTranslation } from 'react-i18next';
 
 import { authenticatedFetch } from '@/shared/api';
+import { createClientRequestId } from '@/shared/utils';
 import type { MarkSessionProcessing, SessionActivityMap } from '@/shared/types';
 import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabilities';
+import { uploadAttachmentFiles } from '@/modules/chat/utils/attachmentUpload';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
 import {
   clearQueuedMessage,
@@ -187,13 +189,6 @@ export type CommandModalPayload = {
 class ComposerSubmitError extends Error {}
 
 /**
- * One id per submit attempt, carried with the message so the backend can
- * recognise a repeat of the same attempt. The frontend latch already blocks a
- * second click in this composer; this covers what it cannot see — a retried
- * request, or another tab replaying the same submit — which would otherwise
- * open a second conversation for one message.
- */
-/**
  * How much of the first message the session gateway is given.
  *
  * The backend only reads it to title the session from its first few words, so
@@ -202,14 +197,6 @@ class ComposerSubmitError extends Error {}
  * could even start.
  */
 const SESSION_TITLE_SOURCE_CHARS = 200;
-
-const createClientRequestId = (): string => {
-  // Non-secure contexts (plain-HTTP LAN access) have no crypto.randomUUID.
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `submit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-};
 
 const createFakeSubmitEvent = () => {
   return { preventDefault: () => undefined } as unknown as FormEvent<HTMLFormElement>;
@@ -221,34 +208,6 @@ const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const isImageAttachment = (attachment: ChatAttachment) => {
   if (attachment.mimeType?.startsWith('image/')) return true;
   return /\.(gif|jpe?g|png|svg|webp)$/i.test(attachment.path || attachment.name || '');
-};
-
-const uploadAttachmentFiles = async (files: File[]): Promise<unknown[]> => {
-  if (files.length === 0) {
-    return [];
-  }
-
-  const formData = new FormData();
-  files.forEach((file) => {
-    formData.append('files', file);
-  });
-
-  const response = await authenticatedFetch('/api/assets/files', {
-    method: 'POST',
-    headers: {},
-    body: formData,
-  });
-
-  if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.error || 'Failed to upload files');
-  }
-
-  const result = await response.json();
-  if (!Array.isArray(result.attachments) || result.attachments.length !== files.length) {
-    throw new Error('File upload returned an incomplete result');
-  }
-  return result.attachments;
 };
 
 export type QueuedDraft = {

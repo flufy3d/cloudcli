@@ -1,37 +1,7 @@
 import type { ChatMessage, LLMProvider, Project, DiffLine } from '@/shared/types';
+import { saveOrShareBlob } from '@/shared/utils';
 import { buildTranscriptHtml } from '@/modules/chat/export/buildTranscriptHtml';
 import { buildTranscriptMarkdown } from '@/modules/chat/export/buildTranscriptMarkdown';
-
-/**
- * Hands the blob to the user. On iOS — the installed PWA especially — an
- * <a download> click navigates the webview to the blob URL instead of
- * downloading, and coming back reloads the whole app. The Web Share API is
- * the platform answer there (Save to Files, AirDrop, …) and never navigates
- * away; desktop browsers without file sharing keep the classic download link.
- */
-async function saveOrShareBlob(blob: Blob, filename: string): Promise<void> {
-  const file = new File([blob], filename, { type: blob.type });
-
-  if (navigator.canShare?.({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file] });
-      return;
-    } catch (error) {
-      // Dismissing the sheet is a normal outcome, not a failure.
-      if (error instanceof DOMException && error.name === 'AbortError') return;
-      // Anything else (e.g. a stale user gesture) falls through to the link.
-    }
-  }
-
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
-}
 
 /**
  * Get all export formats available.

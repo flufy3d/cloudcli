@@ -317,8 +317,13 @@ const INLINE_MATH_PATTERN = /\\\(([\s\S]*?)\\\)/g;
  * A single-dollar inline-math pair on one line. Display `$$` runs and escaped
  * `\$` are excluded, and the delimiters must hug the content, so plain currency
  * prose such as `$5 and $10` never matches.
+ *
+ * No lookbehind: Safari < 16.4 cannot parse it (the build's safari-regex-compat
+ * check rejects it). The opener's guard is captured as group 1 (start of text
+ * or any character but `\` / `$`) and must be written back; the closer's guard
+ * is folded into the body's last character, which may not be whitespace or `\`.
  */
-const SINGLE_DOLLAR_MATH_PATTERN = /(?<![\\$])\$(?![$\s])([^\n$]+?)(?<!\s)(?<!\\)\$(?!\$)/g;
+const SINGLE_DOLLAR_MATH_PATTERN = /(^|[^\\$])\$(?![$\s])([^\n$]*?[^\n$\s\\])\$(?!\$)/g;
 
 /**
  * Reads the content of a `$...$` pair as LaTeX rather than currency: it carries
@@ -364,8 +369,8 @@ function convertMathDelimiters(source: string, brackets: boolean): string {
     : value);
   const convert = (value: string) =>
     convertBrackets(value)
-      .replace(SINGLE_DOLLAR_MATH_PATTERN, (match, body: string) =>
-        looksLikeInlineMath(body) ? '$$' + body + '$$' : match,
+      .replace(SINGLE_DOLLAR_MATH_PATTERN, (match, prefix: string, body: string) =>
+        looksLikeInlineMath(body) ? prefix + '$$' + body + '$$' : match,
       );
 
   if (!source.includes('`')) {
@@ -462,3 +467,50 @@ export function toLocalDateTimeInputValue(date: Date): string {
 }
 
 // ---------------------------
+//----------------- FILE DOWNLOAD HAND-OFF ------------
+
+/**
+ * Hands a finished blob to the user as a saved file. On iOS — the installed
+ * PWA especially — an `<a download>` click navigates the webview to the blob
+ * URL instead of downloading, and coming back reloads the whole app; the Web
+ * Share API is the platform answer there (Save to Files, AirDrop, …) and
+ * never navigates away. Environments that cannot share files keep the
+ * classic download link. Used by the chat file cards and transcript export,
+ * the file tree, the code editor, the PRD editor, and the diagnostics report.
+ */
+export async function saveOrShareBlob(blob: Blob, filename: string): Promise<void> {
+  const file = new File([blob], filename, { type: blob.type });
+
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file] });
+      return;
+    } catch (error) {
+      // Dismissing the sheet is a normal outcome, not a failure.
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      // Anything else (e.g. a stale user gesture) falls through to the link.
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+// ---------------------------
+
+//----------------- REQUEST IDENTITY ------------
+
+/** Creates an identity for one user action; reuse it for retries of that action. */
+export function createClientRequestId(): string {
+  // Non-secure contexts (plain-HTTP LAN access) have no crypto.randomUUID.
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `submit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}

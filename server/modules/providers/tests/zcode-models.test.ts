@@ -58,7 +58,7 @@ test('getSupportedModels parses the v2 config provider catalog', async () => {
             kind: 'anthropic',
             models: {
               'GLM-5.3': {
-                reasoning: { variants: ['max', 'low'] },
+                reasoning: { variants: ['max', 'low', 'high'] },
                 limit: { context: 1000000, output: 128000 },
               },
             },
@@ -74,10 +74,10 @@ test('getSupportedModels parses the v2 config provider catalog', async () => {
     assert.equal(definition.OPTIONS.length, 1);
     assert.equal(definition.DEFAULT, 'GLM-5.3');
     assert.equal(definition.OPTIONS[0].description, 'ZCode model with 1000K context, 128K output');
-    // Variants are normalized to sorted effort values.
+    // Variants are normalized to reasoning intensity order: low -> high -> max
     assert.deepEqual(
       definition.OPTIONS[0].effort?.values.map((value) => value.value),
-      ['low', 'max']
+      ['low', 'high', 'max']
     );
   });
 });
@@ -310,3 +310,43 @@ test('ingestZCodeModelCatalog captures the engine-default reasoning level', () =
   assert.equal(resolveZCodeModelDefaultReasoningLevel('unknown-model'), undefined);
 });
 
+test('readZCodeSessionModelInfoFromDb preserves providerId when session ran on start-plan with providerID', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const dbDir = path.join(storageDir, 'cli', 'db');
+    await mkdir(dbDir, { recursive: true });
+
+    const db = new Database(path.join(dbDir, 'db.sqlite'));
+    try {
+      db.exec(`
+        CREATE TABLE message (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          time_created INTEGER NOT NULL,
+          time_updated INTEGER NOT NULL,
+          data TEXT NOT NULL,
+          sequence INTEGER
+        );
+      `);
+      const insert = db.prepare(
+        'INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      // Real engine writes providerID and modelID (uppercase ID)
+      insert.run('m_start', 'sess_start_plan', 2000, 2000, JSON.stringify({
+        role: 'user',
+        model: {
+          providerID: 'account:bigmodel-start-plan',
+          modelID: 'GLM-5.3-Flash',
+          variant: 'max',
+        },
+      }), 0);
+    } finally {
+      db.close();
+    }
+
+    const { readZCodeSessionModelInfoFromDb } = await import('@/modules/providers/list/zcode/zcode-models.provider.js');
+    assert.deepEqual(readZCodeSessionModelInfoFromDb('sess_start_plan'), {
+      modelId: 'account:bigmodel-start-plan/GLM-5.3-Flash',
+      variant: 'max',
+    });
+  });
+});

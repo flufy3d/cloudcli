@@ -25,6 +25,7 @@ import {
   sliceTailPage,
 } from '@/shared/utils.js';
 import { getGlobalImageAssetsDir } from '@/shared/image-attachments.js';
+import { resolveAttachmentAssetFile } from '@/modules/assets/index.js';
 
 import { readZCodeContextUsage } from './zcode-context-usage.js';
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
@@ -181,6 +182,55 @@ function materializeZcodeArtifactImage(
   }
 
   return { path: assetFilename, mimeType: resolvedMime };
+}
+
+/**
+ * Strips the upload-store prefix (`<timestamp>-<random>-`, per the assets
+ * route's multer naming) from a stored attachment filename, recovering the
+ * name the composer originally showed. Older rows and names that never had
+ * the prefix pass through unchanged.
+ */
+function stripStoredAttachmentPrefix(storedName: string): string {
+  return storedName.replace(/^\d{13}-\d+-/, '');
+}
+
+/**
+ * Resolves one persisted non-image zcode file part into a downloadable file
+ * card. Unlike images (whose parts carry a `zcode-artifact://` URI into the
+ * engine's artifact store), non-image uploads stay in cloudcli's own asset
+ * store, so the part's `filename`/`url` are plain references back into
+ * `~/.cloudcli/assets`. Only the basename is ever used, and the resolved file
+ * must exist — metadata-only rows (engine could not read the upload) and
+ * vanished files surface nothing rather than a dead card. Returns the
+ * attachment descriptor for the normalized message, or null.
+ */
+function resolveZcodeStoredFilePart(
+  partData: AnyRecord,
+): { name: string; path: string; mimeType?: string; size?: number } | null {
+  const storedName = path.basename(
+    readOptionalString(partData.filename) ?? readOptionalString(partData.url) ?? '',
+  );
+  if (!storedName || storedName === '/' || storedName === '.') {
+    return null;
+  }
+  const resolved = resolveAttachmentAssetFile(storedName);
+  if (!resolved || !fsSync.existsSync(resolved)) {
+    return null;
+  }
+
+  let size: number | undefined;
+  try {
+    size = fsSync.statSync(resolved).size;
+  } catch {
+    size = undefined;
+  }
+
+  return {
+    name: stripStoredAttachmentPrefix(storedName),
+    path: storedName,
+    mimeType: readOptionalString(partData.mime) ?? undefined,
+    size,
+  };
 }
 
 /**
@@ -443,18 +493,25 @@ export class ZCodeSessionsProvider implements IProviderSessions {
         continue;
       }
 
-      // Handle file parts — user-uploaded images. ZCode stores the binary in
-      // its artifact store and references it via a zcode-artifact:// URI;
-      // materialize it into the shared asset store and attach it to the
-      // message's text row (or as a standalone image-only user message).
+      // Handle file parts — user uploads. Images live in the engine's
+      // artifact store behind a zcode-artifact:// URI and are materialized
+      // into the shared asset store; non-image uploads keep pointing at
+      // cloudcli's own asset store and surface as downloadable file cards.
+      // Both attach to the message's text row (or a standalone user message).
       if (partType === 'file' || partType === 'image') {
         const image = materializeZcodeArtifactImage(partData, sessionId);
-        if (image) {
+        const file = image ? null : resolveZcodeStoredFilePart(partData);
+        if (image || file) {
           const existingIndex = textRowIndexByMessageId.get(row.message_id);
           if (existingIndex !== undefined) {
             const target = normalized[existingIndex];
-            const existingImages = Array.isArray(target.images) ? target.images : [];
-            target.images = [...existingImages, image];
+            if (image) {
+              const existingImages = Array.isArray(target.images) ? target.images : [];
+              target.images = [...existingImages, image];
+            } else if (file) {
+              const existingFiles = Array.isArray(target.files) ? target.files : [];
+              target.files = [...existingFiles, file];
+            }
           } else if (messageRole === 'user') {
             normalized.push(createNormalizedMessage({
               id: baseId,
@@ -464,7 +521,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
               kind: 'text',
               role: 'user',
               content: '',
-              images: [image],
+              ...(image ? { images: [image] } : file ? { files: [file] } : {}),
             }));
           }
         }

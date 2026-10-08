@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.7.2 / 2026-09-28
+> 基准：2.9.0 / 2026-10-08
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -132,6 +132,7 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 6. **WS 帧**：任何新功能不得在帧回调里直接 setState；进 store，靠 notify 批量提交。
 7. **滚动的验收只看行，不看 `scrollTop`**：`scripts/perf/chat-scroll-up-stability.mjs` 断言屏幕上的行走了多远（`visualProgress`）、有没有逆向漂移（`visualBacktrack`）。虚拟化会主动改写 `scrollTop` 来让行不动，因此基于 `scrollTop` 的断言两头不准——既放过了旧实现的卡顿，又会把新实现的正常补偿报成故障。
 8. **Git 变更面板按需取 diff**：`useGitPanelController` 只负责 `fetch` 单个文件的 diff，status 刷新时只清掉已不在变更列表里的缓存；`ChangesView` 在某行展开时才请求，`FileChangeItem` 折叠时**不挂载** `GitDiffViewer`。几百个变更文件若一次性预取并常驻 DOM（每行 diff 一个节点），移动端浏览器会被内存打死。
+9. **客户端包的两条构建闸门**：① 不得出现未加保护的正则后向断言 `(?<=` / `(?<!`——Safari < 16.4 解析即抛 SyntaxError，整个 chunk 失效；`vite.config.js` 的 `safariRegexCompatPlugin`（`src/modules/chat/utils/safariRegexCompat.ts`）在 `generateBundle` 扫描并让构建失败，需要“前一字符”判断时改用捕获组写回（如 `normalizeLatexMathDelimiters` 的单 `$` 规则）。② chunk 之间不得互相 import 成环（环会让 chunk 在 React 初始化前求值、白屏）：`manualChunks` 把 rollup/babel helper 钉进 `vendor-react`，`module-task-master` 保持独立 chunk（并进 `module-settings` 会让它与 mcp/skills/plugins 成环），`src/shared/tests/bundleNoCycles.test.ts` 在 `dist/` 上校验。
 
 ## i18n
 

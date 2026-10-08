@@ -412,6 +412,17 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
       if (readOnlyPath) {
         return readOnlyPath;
       }
+
+      if (dependencies.resolveWorktreeRoots) {
+        try {
+          const worktreeRoots = await dependencies.resolveWorktreeRoots(projectRoot);
+          if (worktreeRoots.length > 0) {
+            return await resolvePathInsideExternalRoots(fileSystem, worktreeRoots, targetPath);
+          }
+        } catch {
+          // Not inside a worktree root, fall through to project check
+        }
+      }
     }
 
     return resolvePathInsideProject(projectRoot, targetPath);
@@ -425,6 +436,24 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         // A successfully moved file no longer has a temporary source to clean.
       }
     }));
+  }
+
+  async function resolveExternalAllowedRoots(projectId?: string): Promise<string[]> {
+    if (!projectId || !dependencies.resolveWorktreeRoots) {
+      return dependencies.externalReadOnlyRoots;
+    }
+
+    try {
+      const projectRoot = await resolveProjectRoot(projectId);
+      const worktreeRoots = await dependencies.resolveWorktreeRoots(projectRoot);
+      if (worktreeRoots.length > 0) {
+        return [...dependencies.externalReadOnlyRoots, ...worktreeRoots];
+      }
+    } catch {
+      // If project resolution fails, fall back to default external roots
+    }
+
+    return dependencies.externalReadOnlyRoots;
   }
 
   return {
@@ -545,10 +574,11 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
       }
     },
 
-    async readExternalTextFile(filePath) {
+    async readExternalTextFile(filePath, projectId) {
+      const allowedRoots = await resolveExternalAllowedRoots(projectId);
       const resolvedPath = await resolvePathInsideExternalRoots(
         fileSystem,
-        dependencies.externalReadOnlyRoots,
+        allowedRoots,
         filePath,
       );
       try {
@@ -562,10 +592,11 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
       }
     },
 
-    async openExternalFile(filePath) {
+    async openExternalFile(filePath, projectId) {
+      const allowedRoots = await resolveExternalAllowedRoots(projectId);
       const resolvedPath = await resolvePathInsideExternalRoots(
         fileSystem,
-        dependencies.externalReadOnlyRoots,
+        allowedRoots,
         filePath,
       );
       try {

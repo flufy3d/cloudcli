@@ -82,3 +82,32 @@ test('validateWorktreeBranchName rejects unsafe names', () => {
     );
   }
 });
+
+test('getProjectWorktreeRoots resolves worktree roots and caches the result', async () => {
+  const { getProjectWorktreeRoots, clearWorktreeRootsCacheForTests } = await import(
+    '@/modules/worktrees/services/worktree-git.service.js'
+  );
+  clearWorktreeRootsCacheForTests();
+
+  let calls = 0;
+  const fakeRunGit = async () => {
+    calls += 1;
+    return { stdout: SAMPLE_PORCELAIN, stderr: '' };
+  };
+
+  const roots = await getProjectWorktreeRoots('/home/user/repo', fakeRunGit);
+  assert.equal(roots.length, 3);
+  assert.equal(calls, 1);
+
+  // Second call within TTL hits cache
+  const cachedRoots = await getProjectWorktreeRoots('/home/user/repo', fakeRunGit);
+  assert.deepEqual(cachedRoots, roots);
+  assert.equal(calls, 1);
+
+  // Failure in git returns empty array gracefully
+  const failRunGit = async () => {
+    throw new Error('Not a git repo');
+  };
+  const emptyRoots = await getProjectWorktreeRoots('/home/user/non-git', failRunGit);
+  assert.deepEqual(emptyRoots, []);
+});

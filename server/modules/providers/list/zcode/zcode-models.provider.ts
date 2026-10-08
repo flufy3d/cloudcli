@@ -22,6 +22,16 @@ import { tryResolveEnginePath } from './zcode-engine-path.js';
 import { protocolClient } from './zcode-protocol.client.js';
 
 /**
+ * ZCode's trial ("Start Plan") account provider. The engine lists its models in
+ * the resolved catalog once `provider/updateAccountConfig` (sent by the
+ * protocol client) grants entitlement; the run lifecycle answers its runtime
+ * auth-header requests with the stored ZCode JWT.
+ *
+ * Consumers: zcode-run-lifecycle.ts and `readZCodeSessionModelInfoFromDb`.
+ */
+export const ZCODE_START_PLAN_PROVIDER_ID = 'account:bigmodel-start-plan';
+
+/**
  * ZCode builtin models definition as fallback when config read fails.
  * Based on integration plan §3.2.5 and spike findings (GLM-5.3 with 1M context, 128K output).
  */
@@ -53,6 +63,14 @@ const EFFORT_DESCRIPTIONS: Record<string, string> = {
   low: 'Faster, less detailed reasoning',
   high: 'Balanced reasoning for most tasks',
   max: 'Maximum reasoning for complex tasks',
+};
+
+/** Reasoning levels listed weakest first; unknown levels sort after, alphabetically. */
+const REASONING_EFFORT_ORDER: Record<string, number> = {
+  low: 10,
+  medium: 20,
+  high: 30,
+  max: 40,
 };
 
 /**
@@ -128,7 +146,12 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
           const sortedVariants = variants
             .filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0)
             .map((variant) => variant.trim().toLowerCase())
-            .sort();
+            .sort((a, b) => {
+              const orderA = REASONING_EFFORT_ORDER[a] ?? 999;
+              const orderB = REASONING_EFFORT_ORDER[b] ?? 999;
+              if (orderA !== orderB) return orderA - orderB;
+              return a.localeCompare(b);
+            });
           effort = {
             default: readOptionalString(reasoning?.defaultLevel)?.toLowerCase() ?? 'max',
             values: sortedVariants.map((variant: string) => {
@@ -476,13 +499,23 @@ export function readZCodeSessionModelInfoFromDb(providerSessionId: string): { mo
 
     const messageData = readObjectRecord(JSON.parse(recentMessage.data));
     const modelRecord = readObjectRecord(messageData?.model);
-    const modelId = readOptionalString(messageData?.modelID)
+    const rawModelId = readOptionalString(messageData?.modelID)
+      || readOptionalString(messageData?.modelId)
       || readOptionalString(modelRecord?.modelID)
       || readOptionalString(modelRecord?.modelId);
 
-    if (!modelId) {
+    if (!rawModelId) {
       return null;
     }
+
+    const providerId = readOptionalString(messageData?.providerID)
+      || readOptionalString(messageData?.providerId)
+      || readOptionalString(modelRecord?.providerID)
+      || readOptionalString(modelRecord?.providerId);
+
+    const modelId = providerId === ZCODE_START_PLAN_PROVIDER_ID
+      ? `${providerId}/${rawModelId}`
+      : rawModelId;
 
     const variant = readOptionalString(messageData?.variant)
       || readOptionalString(modelRecord?.variant);

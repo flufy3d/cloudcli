@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.7.2 / 2026-09-28
+> 基准：2.9.0 / 2026-10-01
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -111,6 +111,7 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启
 - 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，这些请求产生的 item 通知流，以及反向的审批请求）。zcode supervisor 拉起 `app-server` 时先剥离环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留指向 App 自己的运行期文件），再注入 `zcode-provider-config.ts` 解析出的 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` / `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` / `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`——桌面端本来会传这三个变量，裸 spawn 缺了它引擎定位不到 provider 目录，`session/create` 会一直挂到超时（模型一个都用不了）。Codex 运行时开启 `features.defer_mailbox_preemption = true` 延缓 mailbox 抢占，避免子代理并发消息打断父会话推理；并在 `onNotification` 强制过滤非主会话 `threadId`，防止子代理事件流串线。
 - zcode 附件通道：上传描述符在 runtime 内映射为 `session/send` 的原生 `attachments` 项（`{kind, filename, mimeType, sizeBytes, localPath}`，localPath 必须绝对；引擎静默丢弃无法映射的形状），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
 - zcode 发送链路（引擎 0.16.9）：引擎对 `session/create` / `session/resume` / `session/send` 做严格 schema 校验，多一个键就报 -32602（`runtimeModel` 正是被拒的那个），所以请求只带 schema 声明的字段——resume 只发 `sessionId`，create 只发 workspace 描述符；模型选择经 `session/setModel` 设在会话上（reasoning 档位必须放 `model.options.reasoningLevel`，缺省取引擎目录里的 `defaultLevel`，恢复会话时强制重选以清掉 "model unavailable"（-32031）警告）。会话工作区必须由 `workspacePath` / `cwd` 显式给出：runtime 不再回退 `process.cwd()`，否则部署目录会被同步器登记成项目。
+- zcode 体验套餐（Start Plan，`account:bigmodel-start-plan`）：引擎以 app-server 启动时对 `zhipu-account` 类 provider 默认 fail-closed（`entitled: false`），不进可执行注册表。`ZCodeProtocolClient` 在每个引擎进程的首个业务请求前（崩溃重启后重做）检测 `~/.zcode/v2/credentials.json` 的 `zcodejwttoken`，有则发 `provider/updateAccountConfig` 授予 entitlement；`basedOnZCodeBuiltinRevision` 为 `zcode-builtin:<revision>:<sha256(绝对路径)>`，必须对 spawn env 里实际交给引擎的那份 builtin 目录（`findActiveZCodeBuiltinConfig`：runtime ?? bundled）计算，否则引擎拒收。之后体验套餐模型由引擎目录 `settings.model.available` 自然列出（value 仍是 `providerId/modelId`），不在本地手工追加；运行期引擎经 `interaction/requestProviderRuntimeHeaders` 回调索取鉴权，`zcode-run-lifecycle.ts` 以解密后的 JWT 作 `requestAuth.apiKey` 应答。
 - 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession`）。
 
 ## 会话索引准入：哪些工作区能变成项目

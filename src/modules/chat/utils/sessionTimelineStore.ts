@@ -191,29 +191,56 @@ export type SessionPageFetcher = (
 ) => Promise<SessionHistoryPage>;
 
 /**
+ * Bounded request timeout that also works on WebKit < 16 (e.g. iPadOS 15.4),
+ * where `AbortSignal.timeout` does not exist and calling it throws before the
+ * request is even started. The caller must invoke `dispose()` once the request
+ * settles so the fallback timer does not linger; the native path has no timer
+ * to clean up.
+ */
+export function createRequestTimeoutSignal(ms: number): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  if (typeof AbortSignal.timeout === 'function') {
+    return { signal: AbortSignal.timeout(ms), dispose: () => undefined };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return {
+    signal: controller.signal,
+    dispose: () => clearTimeout(timer),
+  };
+}
+
+/**
  * The default transport: one bounded page from the provider sessions
  * endpoint (the standard `{ success, data }` envelope).
  */
 export const requestSessionHistoryPage: SessionPageFetcher = async (sessionId, options) => {
-  const response = await authenticatedFetch(buildSessionMessagesUrl(sessionId, options), {
-    signal: AbortSignal.timeout(SESSION_HISTORY_REQUEST_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const timeout = createRequestTimeoutSignal(SESSION_HISTORY_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await authenticatedFetch(buildSessionMessagesUrl(sessionId, options), {
+      signal: timeout.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-  const body = await response.json();
-  const data = body?.data ?? body;
-  const messages: NormalizedMessage[] = Array.isArray(data.messages) ? data.messages : [];
+    const body = await response.json();
+    const data = body?.data ?? body;
+    const messages: NormalizedMessage[] = Array.isArray(data.messages) ? data.messages : [];
 
-  return {
-    messages,
-    total: typeof data.total === 'number' ? data.total : messages.length,
-    hasMore: Boolean(data.hasMore),
-    ...(
-      data && typeof data === 'object' && 'tokenUsage' in data
-        ? { tokenUsage: data.tokenUsage }
-        : {}
-    ),
-  };
+    return {
+      messages,
+      total: typeof data.total === 'number' ? data.total : messages.length,
+      hasMore: Boolean(data.hasMore),
+      ...(
+        data && typeof data === 'object' && 'tokenUsage' in data
+          ? { tokenUsage: data.tokenUsage }
+          : {}
+      ),
+    };
+  } finally {
+    timeout.dispose();
+  }
 };
 
 type LatestHistoryRefreshResult = {

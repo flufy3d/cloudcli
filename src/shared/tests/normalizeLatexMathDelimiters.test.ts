@@ -69,3 +69,34 @@ test('returns text without math delimiters unchanged', () => {
   const source = 'plain $5 and $$block$$ text';
   assert.equal(normalizeLatexMathDelimiters(source), source);
 });
+
+test('rejects dollars that do not hug their content or follow a backslash or dollar', () => {
+  assert.equal(normalizeLatexMathDelimiters('$ x_t$ 与 $x_t $'), '$ x_t$ 与 $x_t $');
+  assert.equal(normalizeLatexMathDelimiters('$x_t\\$'), '$x_t\\$');
+  assert.equal(normalizeLatexMathDelimiters('a$x_t$b'), 'a$$x_t$$b');
+  assert.equal(normalizeLatexMathDelimiters('第一行\n$x_t$ 开头'), '第一行\n$$x_t$$ 开头');
+});
+
+test('single-dollar matching stays lookbehind-free and equivalent to the lookbehind form', () => {
+  // Safari < 16.4 cannot parse lookbehind; the client bundle must not carry one.
+  // The pre-rewrite pattern is the behavioral reference.
+  const reference = /(?<![\\$])\$(?![$\s])([^\n$]+?)(?<!\s)(?<!\\)\$(?!\$)/g;
+  const referenceConvert = (value: string) =>
+    value.replace(reference, (match, body: string) =>
+      /[\\_^={}]/.test(body) || /^[A-Za-z]$/.test(body) ? '$$' + body + '$$' : match,
+    );
+
+  const alphabet = ['$', '$', '$', 'x', '_', ' ', '\\', '\n', '5', '{', 'a'];
+  let seed = 42;
+  const next = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed;
+  };
+  for (let i = 0; i < 5000; i += 1) {
+    let sample = '';
+    const length = 1 + (next() % 12);
+    for (let j = 0; j < length; j += 1) sample += alphabet[next() % alphabet.length];
+    // No brackets, backticks or fences in the alphabet, so only the dollar pass applies.
+    assert.equal(normalizeLatexMathDelimiters(sample), referenceConvert(sample), JSON.stringify(sample));
+  }
+});

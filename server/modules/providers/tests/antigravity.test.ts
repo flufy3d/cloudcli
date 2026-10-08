@@ -28,6 +28,7 @@ import {
 import {
   ANTIGRAVITY_EFFORT_TIERS,
   dedupeAntigravityVariantModels,
+  findCatalogOptionForModelString,
   resolveAntigravityModelArgs,
   stripEffortTierFromLabel,
 } from '../list/antigravity/antigravity-model-effort.js';
@@ -323,6 +324,96 @@ test('resolveAntigravityModelArgs maps catalog selections onto agy arguments', (
   // No model at all still forwards a valid effort flag.
   assert.deepEqual(resolveAntigravityModelArgs(undefined, 'low', undefined), { effort: 'low' });
   assert.deepEqual(resolveAntigravityModelArgs(undefined, undefined, undefined), {});
+});
+
+test('findCatalogOptionForModelString resolves ids, suffixed ids, and display labels', () => {
+  const options = dedupeAntigravityVariantModels([
+    { value: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)' },
+    { value: 'gemini-3.8-flash-medium', label: 'Gemini 3.8 Flash (Medium)' },
+    { value: 'gemini-3.8-flash-low', label: 'Gemini 3.8 Flash (Low)' },
+    { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)' },
+    { value: 'gpt-oss-120b-medium', label: 'GPT-OSS 120B (Medium)' },
+  ]);
+  const flash = options.find((option) => option.value === 'gemini-3.8-flash');
+
+  // Exact catalog id.
+  assert.deepEqual(findCatalogOptionForModelString('gemini-3.8-flash', options), { option: flash, labelTier: null });
+  // Legacy suffixed id reduces to its base family.
+  assert.deepEqual(findCatalogOptionForModelString('gemini-3.8-flash-low', options), { option: flash, labelTier: null });
+  // Display label with a tier qualifier — the form agy's own picker writes
+  // into settings.json and the form that poisons session rows. The label's
+  // tier rides along as recorded user intent.
+  assert.deepEqual(findCatalogOptionForModelString('Gemini 3.8 Flash (Medium)', options), { option: flash, labelTier: 'medium' });
+  // Bare display label.
+  assert.deepEqual(findCatalogOptionForModelString('Gemini 3.8 Flash', options), { option: flash, labelTier: null });
+  // Fixed-tier and passthrough rows match on their verbatim label.
+  assert.deepEqual(
+    findCatalogOptionForModelString('GPT-OSS 120B (Medium)', options),
+    {
+      option: options.find((option) => option.value === 'gpt-oss-120b-medium'),
+      labelTier: 'medium',
+    },
+  );
+  assert.deepEqual(
+    findCatalogOptionForModelString('Claude Sonnet 4.6 (Thinking)', options),
+    {
+      option: options.find((option) => option.value === 'claude-sonnet-4-6'),
+      labelTier: null,
+    },
+  );
+  // Surrounding whitespace must not leak into the match or the spawn id.
+  assert.deepEqual(
+    findCatalogOptionForModelString('  claude-sonnet-4-6  ', options),
+    { option: options.find((option) => option.value === 'claude-sonnet-4-6'), labelTier: null },
+  );
+  // Unknown ids and labels stay unknown so custom models keep their channel.
+  assert.equal(findCatalogOptionForModelString('my-custom-gpt', options), null);
+  assert.equal(findCatalogOptionForModelString('', options), null);
+});
+
+test('a display label plus effort resolves to the family id without the --effort flag', () => {
+  // Regression pin for the poisoned-row spawn: the label must ride the
+  // model-suffix channel, never the flag channel agy rejects.
+  const options = dedupeAntigravityVariantModels([
+    { value: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)' },
+    { value: 'gemini-3.8-flash-medium', label: 'Gemini 3.8 Flash (Medium)' },
+    { value: 'gemini-3.8-flash-low', label: 'Gemini 3.8 Flash (Low)' },
+  ]);
+  const resolved = findCatalogOptionForModelString('Gemini 3.8 Flash (Medium)', options);
+
+  assert.deepEqual(
+    resolveAntigravityModelArgs('Gemini 3.8 Flash (Medium)', 'medium', resolved?.option),
+    { model: 'gemini-3.8-flash-medium' },
+  );
+  // Without any tier the family default applies; applying the label's own
+  // tier is the runtime wiring's job (it passes labelTier as the effort).
+  assert.deepEqual(
+    resolveAntigravityModelArgs('Gemini 3.8 Flash (Medium)', undefined, resolved?.option),
+    { model: 'gemini-3.8-flash-high' },
+  );
+});
+
+test('non-family label rows resolve onto their catalog id, not the label', () => {
+  // The claude passthrough and the fixed-tier gpt-oss row carry no effort
+  // family, but a label-form row must still spawn the real id — agy knows
+  // no model by its display label.
+  const options = dedupeAntigravityVariantModels([
+    { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)' },
+    { value: 'gpt-oss-120b-medium', label: 'GPT-OSS 120B (Medium)' },
+  ]);
+
+  for (const [raw, expected] of [
+    ['Claude Sonnet 4.6 (Thinking)', 'claude-sonnet-4-6'],
+    ['claude-sonnet-4-6', 'claude-sonnet-4-6'],
+    ['GPT-OSS 120B (Medium)', 'gpt-oss-120b-medium'],
+  ] as const) {
+    const resolved = findCatalogOptionForModelString(raw, [...options]);
+    assert.deepEqual(
+      resolveAntigravityModelArgs(raw, 'high', resolved?.option),
+      { model: expected },
+      raw,
+    );
+  }
 });
 
 test('AntigravitySkillsProvider returns correct skill roots', async () => {
@@ -1200,6 +1291,29 @@ test('AntigravityProviderModels reads the default model from the overridden data
     restoreDataDir();
     await fs.rm(tempRoot, { recursive: true, force: true });
     await fs.rm(emptyHome, { recursive: true, force: true });
+  }
+});
+
+test('AntigravityProviderModels normalizes a display-label default model from settings', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-models-label-'));
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+
+  try {
+    // agy's own picker writes the display label, not the id; reporting it
+    // verbatim would poison the session model chain and make every spawn
+    // combine the label with --effort, which the CLI rejects.
+    await fs.writeFile(
+      path.join(tempRoot, 'settings.json'),
+      JSON.stringify({ model: 'Gemini 3.8 Flash (Medium)' }),
+      'utf8',
+    );
+
+    const models = new AntigravityProviderModels();
+    const active = await models.getCurrentActiveModel();
+    assert.equal(active.model, 'gemini-3.8-flash');
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });
 

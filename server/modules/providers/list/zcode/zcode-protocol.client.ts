@@ -28,6 +28,10 @@ import type { ProtocolServerRequest, SessionEventListener } from './zcode-codec.
 import type { ServerRequestAnswer } from './zcode-request-router.js';
 import { EngineSupervisor } from './zcode-engine-supervisor.js';
 import { RequestRouter } from './zcode-request-router.js';
+import {
+  buildZCodeAccountSyncPayload,
+  findActiveZCodeBuiltinConfig,
+} from './zcode-provider-config.js';
 
 export {
   parseProtocolLine,
@@ -40,18 +44,28 @@ export {
   type SessionEventListener,
 } from './zcode-codec.js';
 
+type ProtocolClientDeps = {
+  findActiveBuiltinConfig?: typeof findActiveZCodeBuiltinConfig;
+  buildZCodeAccountSyncPayload?: typeof buildZCodeAccountSyncPayload;
+};
+
 /**
  * ZCode Protocol Client - singleton facade over the supervisor and router.
  *
  * Consumers: zcode runtime provider (sendRequest + session listeners) and
  * `shutdownZCodeRuntime` in the zcode provider (shutdown).
  */
-class ZCodeProtocolClient {
+export class ZCodeProtocolClient {
   /** Singleton instance */
   private static instance: ZCodeProtocolClient | null = null;
 
-  private readonly supervisor = new EngineSupervisor();
+  private readonly supervisor: EngineSupervisor;
   private readonly router: RequestRouter;
+  private readonly findActiveBuiltinConfigFn: typeof findActiveZCodeBuiltinConfig;
+  private readonly buildAccountSyncPayloadFn: typeof buildZCodeAccountSyncPayload;
+
+  private syncedProcessId: number | null = null;
+  private syncAccountPromise: Promise<void> | null = null;
 
   /**
    * Gets the singleton protocol client instance. Construction performs no
@@ -64,11 +78,18 @@ class ZCodeProtocolClient {
     return ZCodeProtocolClient.instance;
   }
 
-  private constructor() {
-    this.router = new RequestRouter({
+  constructor(
+    supervisor?: EngineSupervisor,
+    router?: RequestRouter,
+    deps?: ProtocolClientDeps,
+  ) {
+    this.supervisor = supervisor ?? new EngineSupervisor();
+    this.router = router ?? new RequestRouter({
       ensureRunning: () => this.supervisor.ensureRunning(),
       writeLine: (line: string) => this.supervisor.writeLine(line),
     });
+    this.findActiveBuiltinConfigFn = deps?.findActiveBuiltinConfig ?? findActiveZCodeBuiltinConfig;
+    this.buildAccountSyncPayloadFn = deps?.buildZCodeAccountSyncPayload ?? buildZCodeAccountSyncPayload;
 
     this.supervisor.onLine((line) => this.router.handleLine(line));
 
@@ -76,12 +97,65 @@ class ZCodeProtocolClient {
     // that its engine-side session is gone. The stderr tail is the only
     // explanation the engine ever gave, so it rides on every failure.
     this.supervisor.onCrash(({ code, signal, stderrTail }) => {
+      this.syncedProcessId = null;
       const tail = stderrTail.trim();
       this.router.failAllPending(new Error(
         'ZCode process terminated unexpectedly' + (tail ? `\nstderr:\n${tail}` : ''),
       ));
       this.router.notifySessionLost(code, signal, tail);
     });
+  }
+
+  /**
+   * Synchronizes trial account entitlement to the running ZCode engine subprocess.
+   *
+   * ZCode engine's app-server mode starts in a fail-closed state where all
+   * `zhipu-account` providers (e.g. `account:bigmodel-start-plan`) are marked
+   * as `entitled: false`, excluding them from the active provider registry.
+   * This method issues `provider/updateAccountConfig` once per engine process
+   * lifecycle whenever user credentials for trial access are detected.
+   */
+  private async syncAccountConfigIfNeeded(): Promise<void> {
+    const currentPid = this.supervisor.getProcessId();
+    if (currentPid !== null && this.syncedProcessId === currentPid) {
+      return;
+    }
+
+    if (this.syncAccountPromise) {
+      return this.syncAccountPromise;
+    }
+
+    this.syncAccountPromise = (async () => {
+      try {
+        await this.supervisor.ensureRunning();
+        const pid = this.supervisor.getProcessId();
+        if (pid !== null && this.syncedProcessId === pid) {
+          return;
+        }
+
+        const enginePath = this.supervisor.getEnginePath();
+        const builtinConfigPath = enginePath ? this.findActiveBuiltinConfigFn(enginePath) : null;
+        if (!builtinConfigPath) {
+          if (pid !== null) this.syncedProcessId = pid;
+          return;
+        }
+
+        const syncPayload = this.buildAccountSyncPayloadFn(builtinConfigPath);
+        if (!syncPayload) {
+          if (pid !== null) this.syncedProcessId = pid;
+          return;
+        }
+
+        await this.router.request('provider/updateAccountConfig', syncPayload, 5000);
+        if (pid !== null) this.syncedProcessId = pid;
+      } catch (error) {
+        console.warn('[ZCode Protocol] Failed to sync account config to ZCode engine:', error);
+      } finally {
+        this.syncAccountPromise = null;
+      }
+    })();
+
+    return this.syncAccountPromise;
   }
 
   /**
@@ -97,6 +171,9 @@ class ZCodeProtocolClient {
     params: Record<string, unknown> = {},
     timeout?: number,
   ): Promise<T> {
+    if (method !== 'provider/updateAccountConfig') {
+      await this.syncAccountConfigIfNeeded();
+    }
     return this.router.request<T>(method, params, timeout);
   }
 
@@ -129,6 +206,7 @@ class ZCodeProtocolClient {
    * scheduled restart, fails in-flight requests, and stops the engine.
    */
   async shutdown(): Promise<void> {
+    this.syncedProcessId = null;
     this.router.failAllPending(new Error('Client is shutting down'));
     await this.supervisor.shutdown();
   }
@@ -140,3 +218,4 @@ class ZCodeProtocolClient {
  * provider barrel.
  */
 export const protocolClient = ZCodeProtocolClient.getInstance();
+

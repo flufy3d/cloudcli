@@ -37,6 +37,7 @@ function makeFakeProcess(): FakeProcess {
     on: () => undefined,
   };
   (proc as unknown as { killed: boolean }).killed = false;
+  (proc as unknown as { pid: number }).pid = 12345;
   (proc as unknown as { kill: () => void }).kill = () => {
     (proc as unknown as { killed: boolean }).killed = true;
   };
@@ -211,4 +212,16 @@ test('the stderr tail resets on respawn so a crash explains the current process'
 
   assert.equal(crashes.length, 2);
   assert.equal(crashes[1].stderrTail, '', 'the old process stderr must not explain the new one');
+});
+
+test('getProcessId returns child PID when running and null before spawn or after exit', async () => {
+  const processes: FakeProcess[] = [];
+  const supervisor = createSupervisor({}, processes);
+
+  assert.equal(supervisor.getProcessId(), null);
+  await supervisor.ensureRunning();
+  assert.equal(supervisor.getProcessId(), 12345);
+
+  processes[0].exit(0);
+  assert.equal(supervisor.getProcessId(), null);
 });

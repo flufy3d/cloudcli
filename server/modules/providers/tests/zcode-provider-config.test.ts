@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import {
+  buildZCodeAccountSyncPayload,
+  findActiveZCodeBuiltinConfig,
   findZCodeBundledProviderConfig,
   findZCodeRuntimeProviderConfig,
+  resolveZCodeBuiltinRevision,
   resolveZCodeProviderConfigEnv,
 } from '@/modules/providers/list/zcode/zcode-provider-config.js';
 
@@ -86,5 +90,68 @@ test('resolveZCodeProviderConfigEnv falls back to the bundled catalog without a 
     const env = resolveZCodeProviderConfigEnv(enginePath);
     assert.equal(env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, path.join(bundledDir, 'zcode-builtin.json'));
     assert.equal(env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, undefined);
+  });
+});
+
+test('findActiveZCodeBuiltinConfig returns the catalog the spawn env hands the engine', async () => {
+  await withFixture(async ({ storageDir, enginePath, bundledDir }) => {
+    assert.equal(findActiveZCodeBuiltinConfig(enginePath), path.join(bundledDir, 'zcode-builtin.json'));
+
+    const endpoint = path.join(storageDir, 'v2', 'runtime', 'provider', 'windows-x86_64', '3.12.3', 'endpoint-a');
+    await mkdir(endpoint, { recursive: true });
+    const runtimeCatalog = path.join(endpoint, 'zcode-builtin.json');
+    await writeFile(runtimeCatalog, '{"schemaVersion":1}', 'utf8');
+
+    assert.equal(findActiveZCodeBuiltinConfig(enginePath), runtimeCatalog);
+    assert.equal(findActiveZCodeBuiltinConfig(enginePath), resolveZCodeProviderConfigEnv(enginePath).ZCODE_BUILTIN_PROVIDER_CONFIG_FILE);
+  });
+});
+
+test('resolveZCodeBuiltinRevision tags the revision with the sha256 of the resolved path', async () => {
+  await withFixture(async ({ bundledDir }) => {
+    const configPath = path.join(bundledDir, 'zcode-builtin.json');
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+
+    const expectedHash = crypto.createHash('sha256').update(path.resolve(configPath)).digest('hex');
+    assert.equal(resolveZCodeBuiltinRevision(configPath), `zcode-builtin:30:${expectedHash}`);
+  });
+});
+
+test('resolveZCodeBuiltinRevision returns null for a missing file or a missing revision', async () => {
+  await withFixture(async ({ bundledDir }) => {
+    assert.equal(resolveZCodeBuiltinRevision(path.join(bundledDir, 'absent.json')), null);
+    // The fixture catalog carries no revision.
+    assert.equal(resolveZCodeBuiltinRevision(path.join(bundledDir, 'zcode-builtin.json')), null);
+  });
+});
+
+test('buildZCodeAccountSyncPayload entitles the start-plan provider when a JWT is stored', async () => {
+  await withFixture(async ({ storageDir, bundledDir }) => {
+    const configPath = path.join(bundledDir, 'zcode-builtin.json');
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+    await mkdir(path.join(storageDir, 'v2'), { recursive: true });
+    await writeFile(path.join(storageDir, 'v2', 'credentials.json'), JSON.stringify({ zcodejwttoken: 'test-jwt-token' }), 'utf8');
+
+    const payload = buildZCodeAccountSyncPayload(configPath);
+    assert.ok(payload);
+    assert.equal(payload.revision, '1');
+    assert.equal(payload.basedOnZCodeBuiltinRevision, resolveZCodeBuiltinRevision(configPath));
+    assert.deepEqual(payload.providers, {
+      'account:bigmodel-start-plan': { access: { type: 'zhipu-account', entitled: true } },
+    });
+    assert.deepEqual(payload.states, {
+      'account:bigmodel-start-plan': { availability: 'available', entitled: true, current: true },
+    });
+  });
+});
+
+test('buildZCodeAccountSyncPayload returns null without a stored JWT', async () => {
+  await withFixture(async ({ storageDir, bundledDir }) => {
+    const configPath = path.join(bundledDir, 'zcode-builtin.json');
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+    await mkdir(path.join(storageDir, 'v2'), { recursive: true });
+    await writeFile(path.join(storageDir, 'v2', 'credentials.json'), JSON.stringify({ other: 'value' }), 'utf8');
+
+    assert.equal(buildZCodeAccountSyncPayload(configPath), null);
   });
 });

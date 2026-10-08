@@ -195,21 +195,83 @@ function extractVariantFamilyFromOption(
   };
 }
 
+/** One resolved model string: its catalog entry plus any tier its label carries. */
+export type CatalogOptionForModelString = {
+  option: ProviderModelOption;
+  /**
+   * The trailing "(High)"-style tier of the raw string, lowercased — user
+   * intent recorded by agy's own picker. Null for id-form strings and labels
+   * without a tier qualifier; validity against the family is the caller's
+   * concern (resolveAntigravityModelArgs snaps out-of-family tiers to the
+   * default).
+   */
+  labelTier: string | null;
+};
+
+/**
+ * Resolves one raw model string onto its merged-catalog option.
+ *
+ * agy's own model picker writes display labels (`Gemini 3.8 Flash (Medium)`)
+ * into settings.json, and session rows created while such a default was
+ * active store the label verbatim. Both must resolve back onto the catalog
+ * before spawning: a label missed by the value lookup falls into the
+ * custom-model branch, whose `--effort` flag the CLI rejects for
+ * tier-qualified models, and non-family rows would spawn the label itself,
+ * which no engine id matches.
+ *
+ * Resolution order: exact catalog id, suffixed id reduced to its base family,
+ * then label match on the raw and the tier-stripped form (collapsed families
+ * carry the stripped label, fixed-tier rows the verbatim one). Returns null
+ * when nothing matches so custom models and unknown ids keep their existing
+ * behavior.
+ *
+ * Consumers: antigravity-models.provider (settings default-model
+ * normalization) and antigravity-runtime.provider (spawn-time catalog lookup).
+ */
+export function findCatalogOptionForModelString(
+  raw: string,
+  options: ProviderModelOption[],
+): CatalogOptionForModelString | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const labelTier = trimmed.match(/\s*\((High|Medium|Low)\)$/)?.[1]?.toLowerCase() ?? null;
+
+  const byValue = options.find((option) => option.value === trimmed);
+  if (byValue) {
+    return { option: byValue, labelTier };
+  }
+
+  const byBase = options.find((option) => option.value === splitModelEffortSuffix(trimmed).base);
+  if (byBase) {
+    return { option: byBase, labelTier };
+  }
+
+  const strippedLabel = stripEffortTierFromLabel(trimmed);
+  const byLabel = options.find((option) => option.label === trimmed || option.label === strippedLabel);
+  return byLabel ? { option: byLabel, labelTier } : null;
+}
+
 /**
  * Resolves the `--model` / `--effort` arguments one agy run should spawn with.
  *
  * Used by antigravity-runtime.provider when building the CLI argument list;
- * `catalogOption` is the merged-catalog entry for the model's base id.
+ * `catalogOption` is the merged-catalog entry for the model, located by
+ * findCatalogOptionForModelString (id, legacy suffixed id, or display label).
  *
  * Rules:
- * - A base id from a variant family gets the chosen tier appended to the
- *   model id (the family default tier applies when no valid effort was
- *   chosen), and a legacy suffixed id from an old session row keeps or
- *   rewrites its embedded tier within the family — the `--effort` flag is
- *   never combined with a suffixed id because the CLI rejects the run.
+ * - A model backed by a variant family runs as `<catalog value>-<tier>`: the
+ *   chosen tier when valid, otherwise the tier embedded in a legacy suffixed
+ *   id, otherwise the family default — the `--effort` flag is never combined
+ *   with a suffixed id because the CLI rejects the run. The id is always
+ *   built from the catalog value, never from the raw string, so label-form
+ *   rows resolve onto the real id instead of concatenating onto the label.
  * - A cataloged model without effort support (claude passthroughs, the
- *   fixed-tier gpt-oss-120b-medium) runs with its id verbatim; a stale
- *   effort choice is dropped and no model id is ever invented.
+ *   fixed-tier gpt-oss-120b-medium) runs with its catalog id; a stale effort
+ *   choice is dropped and no model id is ever invented. Label-form rows land
+ *   here too, so the catalog value — never the raw string — is what spawns.
  * - A model absent from the catalog (user-defined custom models) keeps its
  *   id and receives `--effort` when a valid tier was requested.
  */
@@ -227,27 +289,23 @@ export function resolveAntigravityModelArgs(
     return requested ? { effort: requested } : {};
   }
 
-  const { base, effort: embedded } = splitModelEffortSuffix(model);
+  const { effort: embedded } = splitModelEffortSuffix(model);
   const family = extractVariantFamilyFromOption(catalogOption);
 
-  if (embedded) {
-    if (!family) {
-      return { model };
-    }
-    let tier = embedded;
-    if (requested && requested !== embedded) {
-      tier = family.tiers.includes(requested) ? requested : family.default;
-    }
-    return { model: `${base}-${tier}` };
+  if (embedded && !family) {
+    return { model };
   }
 
-  if (family) {
-    const tier = requested && family.tiers.includes(requested) ? requested : family.default;
-    return { model: `${base}-${tier}` };
+  if (family && catalogOption) {
+    let tier = embedded ?? family.default;
+    if (requested && requested !== tier) {
+      tier = family.tiers.includes(requested) ? requested : family.default;
+    }
+    return { model: `${catalogOption.value}-${tier}` };
   }
 
   if (catalogOption) {
-    return { model };
+    return { model: catalogOption.value };
   }
 
   return requested ? { model, effort: requested } : { model };

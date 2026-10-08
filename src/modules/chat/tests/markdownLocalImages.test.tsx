@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { Markdown } from '@/modules/chat/transcript/Markdown';
+import { MarkdownWorkspaceContext } from '@/modules/chat/context/MarkdownWorkspaceContext';
 import type * as sharedApi from '@/shared/api';
 
 /**
@@ -141,5 +142,27 @@ describe('Markdown local image resolution', () => {
     fireEvent.click(img);
 
     expect(linkClickHandler).not.toHaveBeenCalled();
+  });
+
+  it('forwards active projectId to readExternalFileContent for worktree resolution', async () => {
+    readExternalFileContent.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(['png-bytes'], { type: 'image/png' }),
+    });
+
+    render(
+      <MarkdownWorkspaceContext.Provider value={{ projectId: 'proj-worktree' }}>
+        <Markdown>{'![worktree-shot](/Users/azrael/workspaces/MirLite-worktrees/feat/shot.png)'}</Markdown>
+      </MarkdownWorkspaceContext.Provider>,
+    );
+
+    await waitFor(() => {
+      expect(imageBySrc('blob:mock-image')).toBeDefined();
+    });
+    expect(readExternalFileContent).toHaveBeenCalledWith(
+      '/Users/azrael/workspaces/MirLite-worktrees/feat/shot.png',
+      expect.anything(),
+      'proj-worktree',
+    );
   });
 });

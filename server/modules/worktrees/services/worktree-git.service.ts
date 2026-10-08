@@ -205,3 +205,39 @@ export async function countChangedFiles(
   const { stdout } = await runGit(['status', '--porcelain'], worktreePath);
   return stdout.split('\n').filter((line) => line.trim().length > 0).length;
 }
+
+const WORKTREE_ROOTS_CACHE_TTL_MS = 30_000;
+type WorktreeRootsCacheEntry = { timestamp: number; roots: string[] };
+const worktreeRootsCache = new Map<string, WorktreeRootsCacheEntry>();
+
+/**
+ * Used by the File Tree module to dynamically resolve allowed read-only
+ * worktree roots for a project. Results are cached for 30s to avoid repeated
+ * git child processes on multiple file reads.
+ */
+export async function getProjectWorktreeRoots(
+  projectPath: string,
+  runGit: GitCommandRunner = runGitCommand,
+): Promise<string[]> {
+  const normalizedPath = normalizeProjectPath(projectPath);
+  const now = Date.now();
+  const cached = worktreeRootsCache.get(normalizedPath);
+  if (cached && now - cached.timestamp < WORKTREE_ROOTS_CACHE_TTL_MS) {
+    return cached.roots;
+  }
+
+  try {
+    const entries = await listWorktreePorcelainEntries(normalizedPath, runGit);
+    const roots = entries.map((entry) => entry.path);
+    worktreeRootsCache.set(normalizedPath, { timestamp: now, roots });
+    return roots;
+  } catch {
+    worktreeRootsCache.set(normalizedPath, { timestamp: now, roots: [] });
+    return [];
+  }
+}
+
+/** Used by tests to clear the worktree roots cache between test runs. */
+export function clearWorktreeRootsCacheForTests(): void {
+  worktreeRootsCache.clear();
+}

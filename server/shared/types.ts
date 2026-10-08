@@ -257,6 +257,7 @@ export type ProviderSessionFileSynchronizationDelta = {
 export type ProviderModelOption = {
   value: string;
   label: string;
+  group?: string;
   description?: string;
   /** Stable SQLite row id used only by model-management actions. */
   recordId?: number;
@@ -1190,6 +1191,12 @@ export type FileTreeServiceDependencies = {
    * Optional provider for available system drive roots (e.g. on Windows).
    */
   getAvailableDrives?: () => Promise<string[]>;
+  /**
+   * Optional resolver that returns the absolute worktree root directories for
+   * a given project root. Used to allow dynamic read-only access to files inside
+   * linked Git worktrees without relaxing project write boundaries.
+   */
+  resolveWorktreeRoots?: (projectRoot: string) => Promise<string[]>;
 };
 
 /**
@@ -1209,15 +1216,17 @@ export type FileTreeServices = {
   readTextFile(projectId: string, filePath: string): Promise<{ content: string; path: string }>;
   /**
    * Reads a text file outside any project root. The path must resolve inside
-   * one of the injected `externalReadOnlyRoots`; there is deliberately no
-   * write counterpart, so external files can never be modified through the API.
+   * one of the injected `externalReadOnlyRoots`, or within a linked worktree of
+   * `projectId` when provided; there is deliberately no write counterpart, so
+   * external files can never be modified through the API.
    */
-  readExternalTextFile(filePath: string): Promise<{ content: string; path: string }>;
+  readExternalTextFile(filePath: string, projectId?: string): Promise<{ content: string; path: string }>;
   /**
    * Opens a stream for a media or binary file outside any project root. The path
-   * must resolve inside one of the injected `externalReadOnlyRoots`.
+   * must resolve inside one of the injected `externalReadOnlyRoots`, or within a
+   * linked worktree of `projectId` when provided.
    */
-  openExternalFile(filePath: string): Promise<{ contentType: string; stream: Readable }>;
+  openExternalFile(filePath: string, projectId?: string): Promise<{ contentType: string; stream: Readable }>;
   openFile(projectId: string, filePath: string): Promise<{ contentType: string; stream: Readable }>;
   saveTextFile(projectId: string, filePath: string, content: string): Promise<{
     success: true;

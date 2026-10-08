@@ -905,6 +905,120 @@ test('fetchHistory materializes user image attachments into the asset store', as
   });
 });
 
+test('fetchHistory restores non-image file attachments as downloadable file cards', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    // Non-image uploads stay in cloudcli's own asset store; redirect HOME so
+    // the fixture never touches the real ~/.cloudcli.
+    const previousHome = process.env.HOME;
+    process.env.HOME = storageDir;
+
+    try {
+      await createFixtureDatabase(storageDir, 'sess_files');
+
+      // Two uploads stored by the assets route, named
+      // `<timestamp>-<random>-<original>` per the multer storage config.
+      const assetsDir = path.join(storageDir, '.cloudcli', 'assets');
+      await mkdir(assetsDir, { recursive: true });
+      const logStoredName = '1790841150705-59018875-mir-lite-log-20261001T073954.txt';
+      const perfStoredName = '1790841167755-533268251-mir-lite-perf-20261001T074001.txt';
+      await writeFile(path.join(assetsDir, logStoredName), 'a'.repeat(2048));
+      await writeFile(path.join(assetsDir, perfStoredName), 'b'.repeat(4096));
+
+      const db = new Database(path.join(storageDir, 'cli', 'db', 'db.sqlite'));
+      try {
+        const insertMessage = db.prepare(
+          'INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?)'
+        );
+        const insertPart = db.prepare(
+          'INSERT INTO part (id, message_id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        );
+        insertMessage.run('msg_files', 'sess_files', 5000, 5000, JSON.stringify({ role: 'user' }), 5);
+        insertPart.run(
+          'part_files_text', 'msg_files', 'sess_files', 5000, 5000,
+          JSON.stringify({ type: 'text', text: 'here are the logs' }),
+          0
+        );
+        // The shape the engine persists for a non-image upload: a plain file
+        // reference pointing back at cloudcli's asset store (real row,
+        // session sess_a9959c2c, 2026-10-01).
+        insertPart.run(
+          'part_files_log', 'msg_files', 'sess_files', 5001, 5001,
+          JSON.stringify({
+            type: 'file',
+            mime: 'text/plain',
+            filename: logStoredName,
+            url: path.join(assetsDir, logStoredName),
+          }),
+          1
+        );
+        insertPart.run(
+          'part_files_perf', 'msg_files', 'sess_files', 5002, 5002,
+          JSON.stringify({
+            type: 'file',
+            mime: 'text/plain',
+            filename: perfStoredName,
+            url: path.join(assetsDir, perfStoredName),
+          }),
+          2
+        );
+        // The engine also persists metadata-only rows when the attachment
+        // could not be read at send time — nothing servable, must be skipped.
+        insertPart.run(
+          'part_files_failed', 'msg_files', 'sess_files', 5003, 5003,
+          JSON.stringify({
+            type: 'file',
+            mime: 'text/plain',
+            url: '',
+            metadata: { errorCode: 'attachment_read_failed', recoverability: 'metadata_only', storageKind: 'metadata_only' },
+          }),
+          3
+        );
+        // A reference whose stored file has vanished must not surface either.
+        insertPart.run(
+          'part_files_missing', 'msg_files', 'sess_files', 5004, 5004,
+          JSON.stringify({
+            type: 'file',
+            mime: 'text/plain',
+            filename: '1790841000000-1234567890-vanished.txt',
+            url: path.join(assetsDir, '1790841000000-1234567890-vanished.txt'),
+          }),
+          4
+        );
+      } finally {
+        db.close();
+      }
+
+      const provider = new ZCodeSessionsProvider();
+      const result = await provider.fetchHistory('sess_files');
+
+      const message = result.messages.find(
+        (candidate) => candidate.role === 'user' && candidate.content === 'here are the logs'
+      );
+      assert.ok(message);
+      const files = message.files as Array<{ name?: string; path?: string; mimeType?: string; size?: number }>;
+      assert.equal(files?.length, 2);
+      assert.deepEqual(files[0], {
+        name: 'mir-lite-log-20261001T073954.txt',
+        path: logStoredName,
+        mimeType: 'text/plain',
+        size: 2048,
+      });
+      assert.deepEqual(files[1], {
+        name: 'mir-lite-perf-20261001T074001.txt',
+        path: perfStoredName,
+        mimeType: 'text/plain',
+        size: 4096,
+      });
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+    }
+  });
+});
+
 test('fetchHistory returns empty for sub-agent sessions and missing databases', async () => {
   await withZCodeStorage(async () => {
     const provider = new ZCodeSessionsProvider();

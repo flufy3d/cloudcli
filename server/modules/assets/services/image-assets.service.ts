@@ -1,7 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import fsSync, { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import mime from 'mime-types';
+import type multer from 'multer';
 
 import { getGlobalImageAssetsDir, toPosixPath } from '@/shared/image-attachments.js';
 
@@ -47,6 +49,74 @@ export async function ensureImageAssetsDir(): Promise<string> {
   const assetsDir = getGlobalImageAssetsDir();
   await fs.mkdir(assetsDir, { recursive: true });
   return assetsDir;
+}
+
+/**
+ * Used by the assets routes for streaming multipart files to the global asset store.
+ * Aborted requests close the writer and remove its partial file before notifying
+ * Multer, so failed uploads release the replay slot as well as disk resources.
+ */
+export function createAttachmentUploadStorage(): multer.StorageEngine {
+  return {
+    _handleFile(req, file, callback) {
+      let output: fsSync.WriteStream | undefined;
+      let filePath: string | undefined;
+      let finished = false;
+
+      const fail = (error: Error, notifyMulter = true) => {
+        if (finished) return;
+        finished = true;
+        req.off('aborted', onAbort);
+        file.stream.unpipe(output);
+        // Destroy without an error: Multer decrements its write counter itself
+        // on a source-stream error, and must not decrement it again via callback.
+        file.stream.destroy();
+        const removePartial = async () => {
+          let resolvedError: Error = error;
+          if (filePath) {
+            try { await fs.unlink(filePath); } catch (cleanupError) {
+              if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+                resolvedError = new AggregateError([error, cleanupError], 'Upload failed and partial file cleanup failed');
+              }
+            }
+          }
+          if (resolvedError !== error) console.error('Error cleaning up failed asset upload:', resolvedError);
+          if (notifyMulter) callback(resolvedError);
+        };
+        if (output && !output.closed) {
+          output.once('close', () => { void removePartial(); });
+          output.destroy();
+        } else {
+          void removePartial();
+        }
+      };
+      const onAbort = () => fail(new Error('Upload interrupted'));
+      req.once('aborted', onAbort);
+      file.stream.once('error', (error) => fail(error, false));
+
+      void ensureImageAssetsDir().then((destination) => {
+        if (finished) return;
+        if (req.aborted) { onAbort(); return; }
+        const filename = `${randomUUID()}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+        filePath = path.join(destination, filename);
+        output = fsSync.createWriteStream(filePath);
+        output.once('error', fail);
+        output.once('finish', () => {
+          if (finished) return;
+          finished = true;
+          req.off('aborted', onAbort);
+          callback(null, { destination, filename, path: filePath, size: output!.bytesWritten });
+        });
+        file.stream.pipe(output);
+      }, (error: unknown) => fail(error instanceof Error ? error : new Error(String(error))));
+    },
+    _removeFile(_req, file, callback) {
+      // After a size limit Multer can pass a failed file without storage metadata.
+      // The failure path already removed its partial file before invoking callback.
+      if (!file.path) { callback(null); return; }
+      fsSync.unlink(file.path, (error) => callback(error?.code === 'ENOENT' ? null : error));
+    },
+  };
 }
 
 /**

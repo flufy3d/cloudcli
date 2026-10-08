@@ -23,6 +23,7 @@ import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/inde
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
+import { configureHttpTimeouts } from './http-timeouts.js';
 import { createGitModule } from './modules/git/index.js';
 import {
     authenticateToken,
@@ -106,6 +107,7 @@ console.log('SERVER_PORT from env:', process.env.SERVER_PORT);
 
 const app = express();
 const server = http.createServer(app);
+configureHttpTimeouts(server);
 const queryClaude = providerRuntimeService.getRunner('claude');
 const queryCursor = providerRuntimeService.getRunner('cursor');
 const queryCodex = providerRuntimeService.getRunner('codex');

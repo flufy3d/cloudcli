@@ -4,6 +4,7 @@ import { fileURLToPath, URL } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import { getConnectableHost, normalizeLoopbackHost } from './shared/networkHosts.js'
+import { safariRegexCompatPlugin } from './src/modules/chat/utils/safariRegexCompat.ts'
 
 // The client shows the installed package version so it can be compared against the
 // version the server process is actually running. Reading package.json here and
@@ -54,6 +55,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [
       react(),
+      safariRegexCompatPlugin(),
       {
         name: 'cloudcli-build-info',
         apply: 'build',
@@ -105,16 +107,15 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         output: {
           manualChunks(id) {
-            // Rollup/Babel-generated helpers shared across vendor chunks must live in
-            // their own leaf chunk. If they land inside a vendor chunk, their
-            // consumers import that chunk, creating cycles (e.g. react ->
-            // highlight -> codemirror -> react) that evaluate before React is
-            // initialized and blank the app.
-            if (id.includes('@babel/runtime') || id.includes('commonjsHelpers')) {
-              return 'vendor-shared';
+            // Rollup synthetic helpers and common runtime helpers must stay with the foundational vendor
+            // chunk to prevent circular dependencies caused by helpers being placed into downstream chunks.
+            if (id.includes('commonjsHelpers') || id.includes('@babel/runtime') || id.includes('tslib')) {
+              return 'vendor-react';
             }
+
             if (id.includes('node_modules')) {
-              if (id.includes('react/') || id.includes('react-dom/') || id.includes('react-router-dom/') || id.includes('react-error-boundary/')) {
+              // Exact package boundaries to prevent matching 'lucide-react' or other packages ending in '-react/'
+              if (/\/node_modules\/(?:react|react-dom|react-router|react-router-dom|react-error-boundary|scheduler)\//.test(id)) {
                 return 'vendor-react';
               }
               if (id.includes('@codemirror') || id.includes('@uiw/react-codemirror') || id.includes('@replit/codemirror-minimap')) {
@@ -170,6 +171,9 @@ export default defineConfig(({ mode }) => {
             if (id.includes('/src/modules/settings/')) {
               return 'module-settings';
             }
+            // task-master keeps its own chunk: in this fork, folding it into
+            // module-settings makes module-settings import-cycle with
+            // module-mcp / module-skills / module-plugins (bundleNoCycles).
             if (id.includes('/src/modules/task-master/')) {
               return 'module-task-master';
             }

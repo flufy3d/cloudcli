@@ -24,9 +24,13 @@
  * @module zcode-provider-config
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { readObjectRecord } from '@/shared/utils.js';
+
+import { readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeStorageDir } from './zcode-data-root.js';
 
 /**
@@ -153,6 +157,81 @@ export function resolveZCodeProviderConfigPaths(enginePath: string): ProviderCon
   };
 }
 
+/** The builtin catalog the engine runs on: the refreshed runtime copy, else the bundled one. */
+function selectActiveBuiltinCatalog(paths: Pick<ProviderConfigPaths, 'bundled' | 'runtime'>): string | null {
+  return paths.runtime ?? paths.bundled;
+}
+
+/**
+ * Resolves the builtin catalog path this CloudCLI-spawned engine was handed as
+ * `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` (see {@link resolveZCodeProviderConfigEnv}).
+ *
+ * Consumer: zcode-protocol.client.ts (account-config sync), whose revision
+ * tag must hash exactly the file the engine loaded.
+ */
+export function findActiveZCodeBuiltinConfig(enginePath: string): string | null {
+  return selectActiveBuiltinCatalog(resolveZCodeProviderConfigPaths(enginePath));
+}
+
+/**
+ * Computes the exact revision string expected by ZCode app-server's
+ * `provider/updateAccountConfig` RPC
+ * (`zcode-builtin:${revision}:${sha256(path.resolve(configPath))}`).
+ * Returns null if the file cannot be read or is missing a valid revision.
+ *
+ * Consumer: {@link buildZCodeAccountSyncPayload}.
+ */
+export function resolveZCodeBuiltinRevision(builtinConfigPath: string): string | null {
+  try {
+    const parsed = readObjectRecord(JSON.parse(fs.readFileSync(builtinConfigPath, 'utf8')));
+    const revision = parsed?.revision;
+    if (typeof revision !== 'number' && typeof revision !== 'string') return null;
+    const hash = crypto.createHash('sha256').update(path.resolve(builtinConfigPath)).digest('hex');
+    return `zcode-builtin:${revision}:${hash}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the `provider/updateAccountConfig` payload that activates
+ * `account:bigmodel-start-plan` in ZCode's runtime provider registry.
+ *
+ * In app-server mode the engine starts fail-closed, marking every
+ * `zhipu-account` provider `entitled: false`. When a decrypted `zcodejwttoken`
+ * is available, this payload grants entitlement so the engine's resolved
+ * catalog (`settings.model.available`) and model resolver include the
+ * start-plan provider.
+ *
+ * Returns null when no JWT token is stored or the builtin config is unreadable.
+ *
+ * Consumer: zcode-protocol.client.ts.
+ */
+export function buildZCodeAccountSyncPayload(builtinConfigPath: string): Record<string, unknown> | null {
+  const jwtToken = readDecryptedZCodeJwtToken();
+  if (!jwtToken) return null;
+
+  const basedOnZCodeBuiltinRevision = resolveZCodeBuiltinRevision(builtinConfigPath);
+  if (!basedOnZCodeBuiltinRevision) return null;
+
+  return {
+    revision: '1',
+    basedOnZCodeBuiltinRevision,
+    providers: {
+      'account:bigmodel-start-plan': {
+        access: { type: 'zhipu-account', entitled: true },
+      },
+    },
+    states: {
+      'account:bigmodel-start-plan': {
+        availability: 'available',
+        entitled: true,
+        current: true,
+      },
+    },
+  };
+}
+
 /**
  * Builds the provider-config environment variables for an engine spawn.
  *
@@ -166,7 +245,7 @@ export function resolveZCodeProviderConfigEnv(enginePath: string): Record<string
   const { bundled, runtime, personal } = resolveZCodeProviderConfigPaths(enginePath);
   const env: Record<string, string> = {};
 
-  const activeCatalog = runtime ?? bundled;
+  const activeCatalog = selectActiveBuiltinCatalog({ bundled, runtime });
   if (activeCatalog) {
     env[ZCODE_BUILTIN_PROVIDER_CONFIG_ENV] = activeCatalog;
   }

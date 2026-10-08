@@ -565,6 +565,53 @@ test('browseWorkspace passes allowDriveRoot when validating candidate browse pat
   assert.equal(capturedOptions?.allowDriveRoot, true);
 });
 
+test('readExternalTextFile and openExternalFile allow reading inside a linked worktree when projectId is supplied', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const worktreeRoot = path.resolve('file-tree-test-worktrees/feature-branch');
+  const worktreeFilePath = path.join(worktreeRoot, 'notes.txt');
+  const worktreeImagePath = path.join(worktreeRoot, 'preview.png');
+
+  const fileSystem = createFakeFileSystem({
+    realpath: async (candidatePath) => candidatePath,
+    access: async () => {},
+    readTextFile: async (filePath) => {
+      assert.equal(filePath, worktreeFilePath);
+      return 'worktree content';
+    },
+    createReadStream: () => Readable.from(Buffer.from([0x89, 0x50, 0x4e, 0x47])) as any,
+  });
+
+  const dependencies = {
+    ...createDependencies(fileSystem, projectRoot, []),
+    resolveWorktreeRoots: async (root: string) => {
+      assert.equal(root, projectRoot);
+      return [worktreeRoot];
+    },
+    resolveMimeType: () => 'image/png',
+  };
+  const service = createFileTreeService(dependencies);
+
+  // Text file in worktree
+  const textResult = await service.readExternalTextFile(worktreeFilePath, 'project-1');
+  assert.equal(textResult.content, 'worktree content');
+
+  // Media file in worktree
+  const mediaResult = await service.openExternalFile(worktreeImagePath, 'project-1');
+  assert.equal(mediaResult.contentType, 'image/png');
+  assert.ok(mediaResult.stream);
+
+  // Path outside worktree rejected
+  const outsidePath = path.resolve('unrelated-directory/secret.txt');
+  await assert.rejects(
+    service.readExternalTextFile(outsidePath, 'project-1'),
+    (error: unknown) => error instanceof AppError && error.statusCode === 403,
+  );
+  await assert.rejects(
+    service.openExternalFile(outsidePath, 'project-1'),
+    (error: unknown) => error instanceof AppError && error.statusCode === 403,
+  );
+});
+
 /**
  * Builds the service against the real filesystem and the real workspace policy,
  * which is the only way to exercise the read-only roots: the whole guarantee

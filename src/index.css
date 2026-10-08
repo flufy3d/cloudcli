@@ -597,9 +597,10 @@
   .chat-message {
     contain: layout style paint;
   }
+}
 
-  /* Mobile touch optimization and safe areas */
-  @media (max-width: 768px) {
+/* Mobile touch optimization and safe areas */
+@media (max-width: 768px) {
     * {
       touch-action: manipulation;
       -webkit-tap-highlight-color: transparent;
@@ -796,7 +797,6 @@
   .scrollbar-hide::-webkit-scrollbar {
     display: none;
   }
-}
 
 /* Hide markdown backticks in prose content */
 .prose code::before,

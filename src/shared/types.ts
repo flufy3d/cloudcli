@@ -125,6 +125,7 @@ export type NormalizedMessage = Omit<WireNormalizedMessage, 'kind'> & {
 export type ProviderModelOption = {
   value: string;
   label: string;
+  group?: string;
   description?: string;
   recordId?: number;
   isCustom?: boolean;
