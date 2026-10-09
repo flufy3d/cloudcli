@@ -382,6 +382,7 @@ function ChatInterface({
     cronExpression?: string;
     runAt?: string;
     timezone: string;
+    rotateAfterDays?: number;
   }) => {
     const content = input.trim();
     const sessionId = currentSessionId || selectedSession?.id;
@@ -393,6 +394,7 @@ function ChatInterface({
         prompt: content,
         sessionMode: 'reuse',
         sessionId,
+        ...(schedule.rotateAfterDays ? { rotateAfterDays: schedule.rotateAfterDays } : {}),
         options: { model: currentProviderModel, effort: currentProviderEffort, permissionMode },
         cronExpression: schedule.cronExpression,
         runAt: schedule.runAt,
