@@ -455,9 +455,9 @@ async function handleChatEditSend(
 }
 
 /**
- * Handles `chat.abort`: cancels the run for one app session and emits the
- * terminal `complete` on its behalf (runtimes skip their own complete for
- * aborted runs, and the registry drops any duplicate).
+ * Handles `chat.abort`: cancels a foreground run or a held background reply.
+ * Only foreground runs need a terminal `complete`; held runtimes clear their
+ * background state through the existing status stream on release.
  */
 async function handleChatAbort(
   ws: WebSocket,
@@ -472,6 +472,16 @@ async function handleChatAbort(
 
   const run = chatRunRegistry.getRun(sessionId);
   if (!run || run.status !== 'running') {
+    // A turn's complete does not end the held process that relays background
+    // results. There is no task id during that reply, so stop the runtime.
+    const session = sessionsDb.getSessionById(sessionId);
+    if (session && dependencies.runtime.hasBackgroundWork(sessionId)) {
+      const success = await dependencies.runtime.abort(session.provider as LLMProvider, sessionId);
+      if (!success) {
+        sendProtocolError(ws, 'ABORT_FAILED', `Could not stop background work for session "${sessionId}".`, sessionId);
+      }
+      return;
+    }
     sendProtocolError(ws, 'NO_ACTIVE_RUN', `Session "${sessionId}" has no active run.`, sessionId);
     return;
   }
@@ -481,9 +491,13 @@ async function handleChatAbort(
     + `run started ${Date.now() - run.startedAt}ms ago`,
   );
   const success = await dependencies.runtime.abort(run.provider, sessionId);
+  if (!success) {
+    sendProtocolError(ws, 'ABORT_FAILED', `Could not stop the active run for session "${sessionId}".`, sessionId);
+    return;
+  }
 
-  chatRunRegistry.completeRun(sessionId, {
-    exitCode: success ? 0 : 1,
+  chatRunRegistry.completeRunIfCurrent(run, {
+    exitCode: 0,
     aborted: true,
     reason: 'client_abort',
   });
@@ -723,13 +737,14 @@ export function handleChatConnection(
   const userId = readRequestUserId(request);
 
   ws.on('message', async (rawMessage) => {
+    let data: AnyRecord | undefined;
     try {
       const parsed = parseIncomingJsonObject(rawMessage);
       if (!parsed) {
         throw new Error('Invalid websocket payload');
       }
 
-      const data = parsed as AnyRecord;
+      data = parsed as AnyRecord;
       const messageType = typeof data.type === 'string' ? data.type : '';
 
       switch (messageType) {
@@ -758,7 +773,12 @@ export function handleChatConnection(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error('[ERROR] Chat WebSocket error:', message);
-      sendProtocolError(ws, 'INTERNAL_ERROR', message);
+      // Stop failures belong to an existing session and do not finish its run.
+      // Preserve the request kind so clients show the error without dropping
+      // live activity or releasing queued messages.
+      const code = data?.type === 'chat.stop-task' ? 'TASK_STOP_FAILED'
+        : data?.type === 'chat.abort' ? 'ABORT_FAILED' : 'INTERNAL_ERROR';
+      sendProtocolError(ws, code, message, data ? readRequiredSessionId(data) ?? undefined : undefined);
     }
   });
 

@@ -297,7 +297,10 @@ export type SubagentInfo = {
 };
 
 export type ActiveBackgroundTask = {
+  /** Stable identity of the tool call that launched the card. */
   id: string;
+  /** Engine stop handle, when available; tool-call ids cannot be used to stop tasks. */
+  taskId?: string;
   toolName: string;
   command?: string;
   description?: string;

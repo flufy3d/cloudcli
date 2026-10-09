@@ -162,10 +162,14 @@ export function useChatRealtimeHandlers({
         }
 
         case 'protocol_error': {
-          // The store already surfaced the failure as an error row and the
-          // spinner must stop — the run never started, so no `complete`
-          // follows.
+          // A rejected stop is not a terminal event. The store has shown the
+          // error, but only the runtime can settle the foreground/background
+          // state and release queued input.
           console.error('[Chat] Protocol error:', directive.code, directive.error);
+          if (directive.code === 'NO_SUCH_TASK' || directive.code === 'TASK_ID_REQUIRED'
+            || directive.code === 'TASK_STOP_FAILED' || directive.code === 'ABORT_FAILED') {
+            return;
+          }
           onSessionIdle?.(directive.sessionId);
           return;
         }

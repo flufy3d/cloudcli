@@ -68,6 +68,7 @@ type ChatComposerProps = {
   activity: SessionActivity | null;
   isLoading: boolean;
   onAbortSession: () => void;
+  onAbortBackgroundTasks: () => void;
   permissionMode: PermissionMode | string;
   availablePermissionModes: (PermissionMode | string)[];
   onSelectPermissionMode: (mode: PermissionMode | string) => void;
@@ -150,6 +151,7 @@ function ChatComposer({
   activity,
   isLoading,
   onAbortSession,
+  onAbortBackgroundTasks,
   permissionMode,
   availablePermissionModes,
   onSelectPermissionMode,
@@ -350,7 +352,10 @@ function ChatComposer({
       )}
 
       {hasActiveBackgroundTasks && backgroundTasks.length > 0 && (
-        <BackgroundTaskIndicator tasks={backgroundTasks} onAbort={onAbortSession} />
+        <BackgroundTaskIndicator
+          tasks={backgroundTasks}
+          onAbort={backgroundTasks.every((task) => task.taskId) ? onAbortBackgroundTasks : undefined}
+        />
       )}
 
       {queuedDraft && (

@@ -6,6 +6,38 @@ import {
   startsBackgroundWork,
 } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 
+test('task cards expose the engine stop handle separately from the launching call id', () => {
+  const tracker = createBackgroundWorkTracker();
+  tracker.apply('s1', {
+    type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_bash', name: 'Bash', input: { run_in_background: true } }] },
+  });
+  assert.equal(tracker.apply('s1', {
+    type: 'system', subtype: 'task_started', task_id: 'bash-task', tool_use_id: 'toolu_bash', task_type: 'local_bash',
+  }), true, 'learning the stop handle must broadcast an updated task card');
+  assert.equal(tracker.activeTasks('s1')[0].id, 'toolu_bash');
+  assert.equal(tracker.activeTasks('s1')[0].taskId, 'bash-task');
+});
+
+for (const [toolName, acknowledgement] of [
+  ['Bash', { backgroundTaskId: 'engine-task' }],
+  ['Agent', { agentId: 'engine-task' }],
+  ['Workflow', { taskId: 'engine-task' }],
+] as const) {
+  test(`${toolName} acknowledgements expose a stop handle without task_started`, () => {
+    const tracker = createBackgroundWorkTracker();
+    tracker.apply('s1', {
+      type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_launch', name: toolName, input: { run_in_background: true } }] },
+    });
+    assert.equal(tracker.apply('s1', {
+      type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_launch', content: 'started' }] },
+      tool_use_result: acknowledgement,
+    }), true);
+    assert.equal(tracker.activeTasks('s1')[0].id, 'toolu_launch');
+    assert.equal(tracker.activeTasks('s1')[0].taskId, 'engine-task');
+    assert.equal(tracker.has('s1', 'engine-task'), true);
+  });
+}
+
 // Only turns that start work outliving the turn hold their CLI process open. A
 // turn scored `false` here has its stdin released the moment `result` arrives,
 // and the CLI reads that EOF as print wind-down — so anything still running dies.

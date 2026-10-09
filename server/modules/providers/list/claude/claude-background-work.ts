@@ -22,6 +22,16 @@ type SessionWork = {
   settledCalls: Set<string>;
 };
 
+// Keep the card's launch identity stable and replace its snapshot when the
+// engine supplies a stop handle, so the runtime broadcasts the updated card.
+function setStopHandle(record: TaskRecord, taskId: unknown): boolean {
+  if (typeof taskId !== 'string' || !taskId) return false;
+  record.taskId = taskId;
+  if (!record.card || record.card.taskId === taskId) return false;
+  record.card = { ...record.card, taskId };
+  return true;
+}
+
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : undefined;
@@ -126,7 +136,7 @@ export function createBackgroundWorkTracker() {
           if (!card.id || state.settledCalls.has(card.id)) continue;
           const record = state.records.get(card.id) ?? {};
           if (!record.card) {
-            record.card = card;
+            record.card = record.taskId ? { ...card, taskId: record.taskId } : card;
             state.records.set(card.id, record);
             changed = true;
           }
@@ -137,7 +147,7 @@ export function createBackgroundWorkTracker() {
         if (message.subtype === 'task_started') {
           if (state.settledCalls.has(toolUseId)) return false;
           const record = state.records.get(toolUseId) ?? {};
-          record.taskId = message.task_id;
+          changed = setStopHandle(record, message.task_id) || changed;
           record.summary = {
             taskId: message.task_id,
             toolUseId,
@@ -184,9 +194,9 @@ export function createBackgroundWorkTracker() {
             if (!stopped && record) record.wakeAt = output.scheduledFor as number;
           }
           if (!record) continue;
-          if (typeof output?.taskId === 'string') record.taskId = output.taskId;
-          if (typeof output?.agentId === 'string') record.taskId = output.agentId;
-          if (typeof output?.backgroundTaskId === 'string') record.taskId = output.backgroundTaskId;
+          for (const taskId of [output?.taskId, output?.agentId, output?.backgroundTaskId]) {
+            changed = setStopHandle(record, taskId) || changed;
+          }
           if (name === 'CronCreate' && typeof output?.id === 'string') record.cronId = output.id;
         }
       }

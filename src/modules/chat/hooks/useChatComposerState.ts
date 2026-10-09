@@ -1324,6 +1324,19 @@ export function useChatComposerState({
     setIsTextareaExpanded(false);
   }, [resetCommandMenuState, updateInput]);
 
+  // The task strip targets background work even while a foreground turn is
+  // responding. Leave cards and queued drafts intact until the server settles it.
+  const handleAbortBackgroundTasks = useCallback(() => {
+    const targetSessionId = selectedSession?.id || currentSessionId || null;
+    if (!targetSessionId) {
+      console.warn('Background stop requested but no session ID is available.');
+      return;
+    }
+    for (const taskId of new Set(backgroundTasks.flatMap((task) => task.taskId ? [task.taskId] : []))) {
+      sendMessage({ type: 'chat.stop-task', sessionId: targetSessionId, taskId });
+    }
+  }, [backgroundTasks, currentSessionId, selectedSession?.id, sendMessage]);
+
   const handleAbortSession = useCallback(() => {
     if (!canAbortSession) {
       return;
@@ -1335,13 +1348,20 @@ export function useChatComposerState({
       return;
     }
 
+    const activity = processingSessions?.get(targetSessionId);
+    if (backgroundTasks.length > 0 && backgroundTasks.every((task) => task.taskId)
+      && !(activity && !activity.background)) {
+      handleAbortBackgroundTasks();
+      return;
+    }
+
     // The backend resolves the provider from the session row, so no provider
     // field is needed here.
     sendMessage({
       type: 'chat.abort',
       sessionId: targetSessionId,
     });
-  }, [canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
+  }, [backgroundTasks, canAbortSession, currentSessionId, handleAbortBackgroundTasks, processingSessions, selectedSession?.id, sendMessage]);
 
   const handleGrantToolPermission = useCallback(
     (suggestion: { entry: string; toolName: string }) => {
@@ -1454,6 +1474,7 @@ export function useChatComposerState({
     syncInputOverlayScroll,
     handleClearInput,
     handleAbortSession,
+    handleAbortBackgroundTasks,
     handlePermissionDecision,
     handleGrantToolPermission,
     handleInputFocusChange,

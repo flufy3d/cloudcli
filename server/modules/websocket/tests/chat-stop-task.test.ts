@@ -37,6 +37,7 @@ async function withGateway(
     socket: ReturnType<typeof createFakeSocket>;
     stops: StopCall[];
   }) => Promise<void>,
+  stopError?: Error,
 ): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'chat-stop-task-'));
@@ -58,6 +59,7 @@ async function withGateway(
         runtime: {
           stopBackgroundTask: async (provider: string, sessionId: string, taskId: string) => {
             stops.push({ provider, sessionId, taskId });
+            if (stopError) throw stopError;
             return taskId === knownTaskId;
           },
         } as never,
@@ -124,4 +126,14 @@ test('a stop for a session that does not exist is refused', async () => {
     assert.equal(stops.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'SESSION_NOT_FOUND');
   });
+});
+
+test('an engine stop exception is reported against the task session', async () => {
+  await withGateway('task-1', async ({ socket }) => {
+    socket.emit('message', JSON.stringify({ type: 'chat.stop-task', sessionId: SESSION_ID, taskId: 'task-1' }));
+    await settle();
+    assert.equal(socket.frames[0]?.code, 'TASK_STOP_FAILED');
+    assert.equal(socket.frames[0]?.sessionId, SESSION_ID);
+    assert.equal(socket.frames[0]?.error, 'Engine refused stop');
+  }, new Error('Engine refused stop'));
 });

@@ -1,5 +1,7 @@
 # WebSocket Module
 
+> 基准：2.9.0 / 2026-10-09
+
 This module owns the server-side WebSocket gateway used by:
 
 1. Chat streaming (`/ws`)
@@ -131,7 +133,7 @@ flowchart TD
 
   D -->|chat.send| E[resolve session row -> startRun -> providerRuntimeService.run]
   D -->|chat.edit-send| E2[history_truncated -> rewind or resume at the anchor -> same as chat.send]
-  D -->|chat.abort| F[providerRuntimeService.abort + synthetic complete]
+  D -->|chat.abort| F[providerRuntimeService.abort; foreground run emits complete, held background reply clears status]
   D -->|chat.stop-task| F2[providerRuntimeService.stopBackgroundTask]
   D -->|chat.subscribe| G[chat_subscribed ack + attach socket + replay events seq > lastSeq]
   D -->|chat.permission-response| H[providerRuntimeService.resolveToolApproval]
