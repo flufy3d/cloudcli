@@ -219,6 +219,18 @@ rl.on('line', (line) => {
     }
     log('session_send', redactSendParams(msg.params));
     send({ id: msg.id, result: {} });
+    if (readMode() === 'tool-results') {
+      const notify = (payload) => send({ method: 'session/event', params: { sessionId, type: 'tool.updated', payload } });
+      notify({ kind: 'scheduled', toolCallId: 'call_live_bash', toolName: 'Bash', input: { command: 'ls' } });
+      notify({ kind: 'scheduled', toolCallId: 'call_live_read', toolName: 'Read', input: { path: 'missing.txt' } });
+      // Results can arrive in reverse call order, and after the result event
+      // the next model segment starts before the turn finally completes.
+      notify({ kind: 'error', toolCallId: 'call_live_read', error: 'File not found' });
+      notify({ kind: 'result', toolCallId: 'call_live_bash', result: { success: true, content: 'a.txt' } });
+      send({ method: 'session/event', params: { sessionId, type: 'model.streaming', payload: { kind: 'text_delta', delta: 'done' } } });
+      send({ method: 'session/event', params: { sessionId, type: 'turn.completed', payload: {} } });
+      return;
+    }
     if (readMode() === 'send-fail') {
       send({ method: 'session/event', params: { sessionId, type: 'turn.failed', payload: { error: { message: 'provider auth failed', attribution: { statusCode: 401, reason: 'auth_failed' } } } } });
       return;
@@ -1002,4 +1014,20 @@ test('an engine crash fails the run fast through session-lost instead of timing 
 
   // The run's state is gone: a late abort finds nothing left to stop.
   assert.equal(await runtime.abort('app-sess-crash'), false);
+});
+
+
+test('runtime delivers native tool outputs before turn completion without fetching history', async () => {
+  fsSync.writeFileSync(modeFilePath, 'tool-results\n');
+  const { messages, writer } = createWriter();
+  const result = await new ZCodeRuntimeProvider().run('list files', {sessionId:'app-sess-tools', cwd:stubDir}, writer, context);
+  assert.deepEqual(result, {sessionId:'sess_stub_1', success:true});
+  const results = messages.filter((message) => message.kind === 'tool_result');
+  assert.deepEqual(results.map((message) => [message.toolId, message.toolResult]), [
+    ['call_live_read', {content:'File not found', isError:true}],
+    ['call_live_bash', {content:'a.txt', isError:false}],
+  ]);
+  const nextTextIndex = messages.findIndex((message) => message.kind === 'stream_delta');
+  for (const message of results) assert.ok(messages.indexOf(message) < nextTextIndex);
+  assert.equal(messages.at(-1)?.kind, 'complete');
 });

@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.9.0 / 2026-10-09
+> 基准：2.9.0 / 2026-10-10
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -70,6 +70,7 @@ flowchart LR
 - `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类。
 - 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，这些请求产生的 item 通知流，以及反向的审批请求）。Codex 运行时开启 `features.defer_mailbox_preemption = true` 延缓 mailbox 抢占，避免子代理并发消息打断父会话推理；并在 `onNotification` 强制过滤非主会话 `threadId`，防止子代理事件流串线。
+- zcode 工具结果：实时事件的 `tool.updated`（旧名 `tool_call_scheduled`）在 `kind=result` 时直接携带 `result.content` 与 `result.success`，`kind=error` 携带 `error`。`ZCodeLiveEventNormalizer` 将它们与 `model_streaming` 的 `tool_result/tool_error` 共用一条转换路径，按原生 `toolCallId` 把输出或错误送回已有工具卡；空字符串是有效的成功输出。实时显示不依赖历史拉取或 SQLite 落库时序。没有内容的异常结果事件记录警告；失败事件即使没有错误正文也发送失败标记，只有索引的成功事件不生成结果正文。独立 `tool_result` 同时携带顶层和嵌套的错误标记，供前端配对与历史卡片使用；历史结果仍由持久化工具记录的 `state.output/state.error` 恢复。
 - zcode 附件通道：上传描述符在 runtime 内映射为 `session/send` 的原生 `attachments` 项（`{kind, filename, mimeType, sizeBytes, localPath}`，localPath 必须绝对；引擎静默丢弃无法映射的形状），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
 - zcode 发送链路（引擎 0.16.9）：每 turn 的模型选择随 `session/send` 下发（`modelSelection` + `modelExecution`，均 optional——本地 `cli/config.json` 配置不完整时降级省略，由引擎默认模型执行，不阻断发送）；引擎所需的 personal provider registry 由服务端从 `cli/config.json` 物化为 `~/.zcode/cli/cloudcli-provider-config.json` 并随 spawn env 注入，环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留）一律剥离，注入以 cloudcli 的解析为权威。
 - zcode 模型发现与体验套餐（Start Plan）：模型目录 `zcode-models.provider.ts` 按白名单提取个人套餐模型（`GLM-5.3`、`GLM-5.3-Flash`，分组 `BigModel (个人)`）；同时探测 `~/.zcode/v2/credentials.json` 的 `zcodejwttoken`，存在有效凭证时精准注入体验套餐专享模型（`GLM-5.3-Flash`，value 为 `account:bigmodel-start-plan/GLM-5.3-Flash`，分组 `BigModel (体验)`，统一 effort 为 `low/high/max`），杜绝冗余重复模型膨胀。发送与运行时双重保障鉴权：`buildZCodeSendModelParams` 直接为体验模型注入 `zcodejwttoken` 作为 apiKey，`zcode-run-lifecycle.ts` 同时响应引擎内部 `interaction/requestProviderRuntimeHeaders` 回调下发凭证。针对引擎启动时默认 fail-closed 将 `zhipu-account` 类 provider 设为非 entitled 从而排除在注册表之外的问题，`ZCodeProtocolClient` 在首个业务请求前基于内置配置路径与 revision 哈希通过 RPC `provider/updateAccountConfig` 激活 `account:bigmodel-start-plan`，并在进程崩溃重启后自动重新同步。
