@@ -21,7 +21,7 @@ import * as path from 'node:path';
 import { readObjectRecord, readOptionalString, readTrimmedStringRecord } from '@/shared/utils.js';
 import type { AnyRecord } from '@/shared/types.js';
 
-import { readDecryptedZCodeJwtToken } from './zcode-credentials.js';
+import { readDecryptedZCodeIndividualPlanApiKey, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeStorageDir } from './zcode-data-root.js';
 
 /**
@@ -272,41 +272,35 @@ export function resolveZCodeBuiltinRevision(builtinConfigPath: string): string |
 }
 
 /**
- * Builds the `provider/updateAccountConfig` payload that activates
- * `account:bigmodel-start-plan` in ZCode's runtime Provider Registry.
+ * Builds the `provider/updateAccountConfig` payload for available account plans.
  *
  * In app-server mode, the engine starts fail-closed by marking all account
- * providers as `entitled: false`. When a valid decrypted `zcodejwttoken` is
- * available, this payload grants entitlement so the engine's model resolver
- * includes the start-plan provider in its executable registry view.
+ * providers as `entitled: false`. A trial JWT or an individual-plan API key
+ * activates the matching provider in the engine's executable registry view.
  *
- * Returns null when no JWT token is stored or the built-in config is unavailable.
+ * Returns null when no eligible credential is stored or the built-in config is unavailable.
  */
 export function buildZCodeAccountSyncPayload(builtinConfigPath: string): Record<string, unknown> | null {
   const jwtToken = readDecryptedZCodeJwtToken();
-  if (!jwtToken) return null;
+  const individualApiKey = readDecryptedZCodeIndividualPlanApiKey();
+  if (!jwtToken && !individualApiKey) return null;
 
   const basedOnZCodeBuiltinRevision = resolveZCodeBuiltinRevision(builtinConfigPath);
   if (!basedOnZCodeBuiltinRevision) return null;
 
+  const entitledProviderIds = [
+    ...(jwtToken ? ['account:bigmodel-start-plan'] : []),
+    ...(individualApiKey ? ['account:bigmodel-individual-coding-plan'] : []),
+  ];
   return {
     revision: '1',
     basedOnZCodeBuiltinRevision,
-    providers: {
-      'account:bigmodel-start-plan': {
-        access: {
-          type: 'zhipu-account',
-          entitled: true,
-        },
-      },
-    },
-    states: {
-      'account:bigmodel-start-plan': {
-        availability: 'available',
-        entitled: true,
-        current: true,
-      },
-    },
+    providers: Object.fromEntries(entitledProviderIds.map((providerId) => [providerId, {
+      access: { type: 'zhipu-account', entitled: true },
+    }])),
+    states: Object.fromEntries(entitledProviderIds.map((providerId) => [providerId, {
+      availability: 'available', entitled: true, current: true,
+    }])),
   };
 }
 

@@ -18,11 +18,13 @@ import {
   readTrimmedStringRecord,
 } from '@/shared/utils.js';
 
-import { readDecryptedZCodeJwtToken } from './zcode-credentials.js';
+import { readDecryptedZCodeIndividualPlanApiKey, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
 import { resolveZCodeProviderApiType } from './zcode-provider-config.js';
 
 export const ZCODE_START_PLAN_PROVIDER_ID = 'account:bigmodel-start-plan';
+/** Used by the send model resolver and runtime header bridge to keep account identity consistent. */
+export const ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID = 'account:bigmodel-individual-coding-plan';
 const ZCODE_START_PLAN_MODEL_ID = 'GLM-5.3-Flash';
 const ZCODE_START_PLAN_MODEL_VALUE = `${ZCODE_START_PLAN_PROVIDER_ID}/${ZCODE_START_PLAN_MODEL_ID}`;
 const ZCODE_GROUP_PERSONAL = 'BigModel (个人)';
@@ -204,7 +206,13 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
     baseDefinition = ZCODE_BUILTIN_MODELS;
   }
 
-  const optionsWithStartPlan = appendStartPlanModelIfEligible(baseDefinition.OPTIONS);
+  const personalApiKey = readDecryptedZCodeIndividualPlanApiKey();
+  const personalOptions = personalApiKey
+    ? baseDefinition.OPTIONS.map((option) => option.group === ZCODE_GROUP_PERSONAL
+      ? { ...option, value: `${ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID}/${option.value}` }
+      : option)
+    : baseDefinition.OPTIONS;
+  const optionsWithStartPlan = appendStartPlanModelIfEligible(personalOptions);
   return {
     OPTIONS: optionsWithStartPlan,
     DEFAULT: optionsWithStartPlan[0]?.value ?? baseDefinition.DEFAULT,
@@ -255,7 +263,7 @@ export function readZCodeSessionModelInfoFromDb(providerSessionId: string): { mo
       || readOptionalString(modelRecord?.providerID)
       || readOptionalString(modelRecord?.providerId);
 
-    const modelId = providerId === ZCODE_START_PLAN_PROVIDER_ID
+    const modelId = providerId === ZCODE_START_PLAN_PROVIDER_ID || providerId === ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID
       ? `${providerId}/${rawModelId}`
       : rawModelId;
 
@@ -298,8 +306,20 @@ export function resolveZCodeModelRef(
   const slashIndex = trimmed.indexOf('/');
   const requestedProviderId = slashIndex >= 0 ? trimmed.slice(0, slashIndex).trim() : undefined;
   const requestedModelId = slashIndex >= 0 ? trimmed.slice(slashIndex + 1).trim() : trimmed;
+  const hasIndividualKey = Boolean(readDecryptedZCodeIndividualPlanApiKey());
+  const nativePersonalId = hasIndividualKey && ZCODE_PERSONAL_MODELS_WHITELIST.has(requestedModelId)
+    ? ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID : null;
 
-  if (requestedProviderId === ZCODE_START_PLAN_PROVIDER_ID) {
+  if (nativePersonalId && (requestedProviderId === 'bigmodel-coding-plan'
+      || requestedProviderId === 'builtin:bigmodel-coding-plan')) {
+    return {
+      providerId: nativePersonalId,
+      modelId: requestedModelId,
+      ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
+    };
+  }
+
+  if (requestedProviderId === ZCODE_START_PLAN_PROVIDER_ID || requestedProviderId === ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID) {
     return {
       providerId: requestedProviderId,
       modelId: requestedModelId,
@@ -335,7 +355,8 @@ export function resolveZCodeModelRef(
         const models = readObjectRecord(providerRecord?.models);
         if (models && requestedModelId in models) {
           return {
-            providerId,
+            providerId: providerId === 'bigmodel-coding-plan' && nativePersonalId
+              ? nativePersonalId : providerId,
             modelId: requestedModelId,
             ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
           };
@@ -348,7 +369,8 @@ export function resolveZCodeModelRef(
         const models = readObjectRecord(providerRecord?.models);
         if (models && requestedModelId in models) {
           return {
-            providerId,
+            providerId: providerId === 'bigmodel-coding-plan' && nativePersonalId
+              ? nativePersonalId : providerId,
             modelId: requestedModelId,
             ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
           };
@@ -360,7 +382,7 @@ export function resolveZCodeModelRef(
   }
 
   return {
-    providerId: requestedProviderId ?? 'builtin:bigmodel-coding-plan',
+    providerId: requestedProviderId ?? nativePersonalId ?? 'builtin:bigmodel-coding-plan',
     modelId: requestedModelId,
     ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
   };
@@ -396,10 +418,13 @@ export function buildZCodeSendModelParams(
 } | null {
   const explicitSelection = resolveZCodeModelRef(modelKey, reasoningLevel);
 
-  if (explicitSelection.providerId === ZCODE_START_PLAN_PROVIDER_ID) {
-    const jwtToken = readDecryptedZCodeJwtToken();
-    if (!jwtToken) {
-      return null;
+  if (explicitSelection.providerId === ZCODE_START_PLAN_PROVIDER_ID
+      || explicitSelection.providerId === ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID) {
+    const apiKey = explicitSelection.providerId === ZCODE_START_PLAN_PROVIDER_ID
+      ? readDecryptedZCodeJwtToken() : readDecryptedZCodeIndividualPlanApiKey();
+    if (!apiKey) {
+      const plan = explicitSelection.providerId === ZCODE_START_PLAN_PROVIDER_ID ? 'start' : 'individual';
+      throw new Error(`ZCode ${plan} plan credential is missing or ambiguous`);
     }
     const selectedReasoningLevel = explicitSelection.options?.reasoningLevel ?? 'max';
     return {
@@ -411,7 +436,7 @@ export function buildZCodeSendModelParams(
       modelExecution: {
         selectionScope: 'execution',
         requestAuth: {
-          apiKey: jwtToken,
+          apiKey,
         },
       },
     };

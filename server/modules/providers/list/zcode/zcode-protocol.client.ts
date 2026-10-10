@@ -107,13 +107,13 @@ export class ZCodeProtocolClient {
   }
 
   /**
-   * Synchronizes trial account entitlement to the running ZCode engine subprocess.
+   * Synchronizes account-plan entitlements to the running ZCode engine subprocess.
    *
    * ZCode engine's app-server mode starts in a fail-closed state where all
-   * `zhipu-account` providers (e.g. `account:bigmodel-start-plan`) are marked
+   * `zhipu-account` providers are marked
    * as `entitled: false`, excluding them from the active provider registry.
    * This method issues `provider/updateAccountConfig` once per engine process
-   * lifecycle whenever user credentials for trial access are detected.
+   * lifecycle whenever a supported account-plan credential is detected.
    */
   private async syncAccountConfigIfNeeded(): Promise<void> {
     const currentPid = this.supervisor.getProcessId();
@@ -218,4 +218,3 @@ export class ZCodeProtocolClient {
  * provider barrel.
  */
 export const protocolClient = ZCodeProtocolClient.getInstance();
-

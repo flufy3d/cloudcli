@@ -502,3 +502,29 @@ test('requestProviderRuntimeHeaders returns jwt token for start-plan provider', 
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('requestProviderRuntimeHeaders returns the native individual-plan key', async () => {
+  const previous = process.env.ZCODE_STORAGE_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'zcode-personal-headers-'));
+  process.env.ZCODE_STORAGE_DIR = tempDir;
+  try {
+    const v2Dir = path.join(tempDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(path.join(v2Dir, 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key':
+        encryptZCodeCredentialValue('individual-plan-key'),
+    }), 'utf8');
+    const answer = new ZCodeRunLifecycle().handleServerRequest({
+      id: 'req-individual',
+      method: 'interaction/requestProviderRuntimeHeaders',
+      params: { providerId: 'account:bigmodel-individual-coding-plan' },
+    });
+    assert.deepEqual(answer, {
+      result: { headersApplied: true, requestAuth: { apiKey: 'individual-plan-key' } },
+    });
+  } finally {
+    if (previous === undefined) delete process.env.ZCODE_STORAGE_DIR;
+    else process.env.ZCODE_STORAGE_DIR = previous;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

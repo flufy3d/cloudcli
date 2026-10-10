@@ -219,6 +219,32 @@ test('buildZCodeAccountSyncPayload produces the exact payload when token and bui
   });
 });
 
+test('account sync activates the native individual provider when its plan key is available', async () => {
+  await withEngineLayout(path.join('provider', 'zcode-builtin.json'), async (_enginePath, configPath) => {
+    assert.ok(configPath);
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+    const previousStorage = process.env.ZCODE_STORAGE_DIR;
+    const storageDir = await mkdtemp(path.join(os.tmpdir(), 'zcode-individual-sync-'));
+    process.env.ZCODE_STORAGE_DIR = storageDir;
+    await mkdir(path.join(storageDir, 'v2'), { recursive: true });
+    await writeFile(path.join(storageDir, 'v2', 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'individual-key',
+    }), 'utf8');
+    try {
+      const payload = buildZCodeAccountSyncPayload(configPath);
+      assert.deepEqual((payload?.providers as Record<string, unknown>)?.['account:bigmodel-individual-coding-plan'], {
+        access: { type: 'zhipu-account', entitled: true },
+      });
+      assert.deepEqual((payload?.states as Record<string, unknown>)?.['account:bigmodel-individual-coding-plan'], {
+        availability: 'available', entitled: true, current: true,
+      });
+    } finally {
+      if (previousStorage === undefined) delete process.env.ZCODE_STORAGE_DIR;
+      else process.env.ZCODE_STORAGE_DIR = previousStorage;
+    }
+  });
+});
+
 test('buildZCodeAccountSyncPayload returns null when credentials have no jwtToken', async () => {
   await withEngineLayout(path.join('provider', 'zcode-builtin.json'), async (_enginePath, configPath) => {
     assert.ok(configPath);

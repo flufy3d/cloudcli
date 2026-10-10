@@ -594,16 +594,15 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * [reason=selection-missing]" even though the main turn carries its own
    * per-turn `modelSelection`. Resume restores that selection from the
    * engine's database but silently drops it when the current engine's
-   * registry cannot validate the stored selection — a session last driven by
-   * the ZCode App (account-plan provider ids) being resumed by this engine,
-   * whose personal registry only knows the API-key provider ids, loses it
-   * every time — and a resumed session never receives the default selection
-   * a fresh create would.
+   * registry cannot validate the stored selection. It can also keep a valid
+   * legacy provider selection while this turn resolves to a native account
+   * provider. A resumed session never receives the default selection a fresh
+   * create would.
    *
-   * The resume response therefore carries `settings.model.current` exactly
-   * when the session still has a usable selection. When it does not,
-   * re-apply this run's resolved model through `session/setModel` so the
-   * next subagent spawn inherits it. Best-effort by design: a refused repair
+   * The resume response carries `settings.model.current` when the session
+   * has a usable selection. Re-apply this run's resolved model when that
+   * selection is missing or differs, so the next subagent spawn inherits
+   * the same provider as the main turn. Best-effort by design: a refused repair
    * must not block the send — the turn itself still carries its per-turn
    * selection; only subagent spawns would keep failing.
    */
@@ -616,16 +615,18 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     const settings = readObjectRecord(resumeResponse?.settings);
     const model = readObjectRecord(settings?.model);
     const current = readObjectRecord(model?.current);
-    if (readOptionalString(current?.providerId) && readOptionalString(current?.modelId)) {
-      return;
-    }
-
     const modelParams = await this.resolveSendModelParams(options, context);
     const selection = modelParams?.modelSelection;
     if (!selection) {
       console.debug(
         `[ZCodeRuntime] Session ${sessionId} has no engine-side model selection and this run resolves no model; subagent spawns may fail with selection-missing until a modeled send.`
       );
+      return;
+    }
+    const currentOptions = readObjectRecord(current?.options);
+    if (readOptionalString(current?.providerId) === selection.providerId
+        && readOptionalString(current?.modelId) === selection.modelId
+        && readOptionalString(currentOptions?.reasoningLevel) === selection.options?.reasoningLevel) {
       return;
     }
 

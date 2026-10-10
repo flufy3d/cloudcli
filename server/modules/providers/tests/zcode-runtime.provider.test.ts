@@ -351,7 +351,7 @@ rl.on('line', (line) => {
         settings: {
           model: {
             available: [],
-            ...(noSelection ? {} : { current: { providerId: 'bigmodel-coding-plan', modelId: 'GLM-5.3-Flash', options: { reasoningLevel: 'max' } } }),
+            ...(noSelection ? {} : { current: { providerId: 'bigmodel-coding-plan', modelId: readMode() === 'resume-matching-selection' ? 'GLM-5.3' : 'GLM-5.3-Flash', options: { reasoningLevel: 'max' } } }),
           },
         },
       },
@@ -619,8 +619,8 @@ test('runtime still completes a run when the post-resume model repair is refused
   assert.equal(readStubLog().filter((entry) => entry.name === 'setModel').length, 1, 'the repair attempt must still have been made');
 });
 
-test('resume responses carrying a valid selection must not trigger a model repair', async () => {
-  fsSync.writeFileSync(modeFilePath, 'ok\n');
+test('resume responses carrying the same selection do not trigger a model repair', async () => {
+  fsSync.writeFileSync(modeFilePath, 'resume-matching-selection\n');
   fsSync.writeFileSync(logFilePath, '');
   const runtime = new ZCodeRuntimeProvider();
   const { writer } = createWriter();
@@ -638,6 +638,37 @@ test('resume responses carrying a valid selection must not trigger a model repai
   assert.deepEqual(result, { sessionId: 'sess_stub_resume', success: true });
   const setModelEntry = readStubLog().find((entry) => entry.name === 'setModel');
   assert.equal(setModelEntry, undefined, 'a session with a usable selection must not be re-modeled');
+});
+
+test('resume replaces a legacy provider selection with the native individual plan', async () => {
+  fsSync.writeFileSync(modeFilePath, 'ok\n');
+  fsSync.writeFileSync(logFilePath, '');
+  const credentialsDir = path.join(stubDir, 'v2');
+  fsSync.mkdirSync(credentialsDir, { recursive: true });
+  const credentialsPath = path.join(credentialsDir, 'credentials.json');
+  fsSync.writeFileSync(credentialsPath, JSON.stringify({
+    'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'fixture-personal-key',
+  }));
+  try {
+    const resumeContext: ProviderRuntimeContext = {
+      ...context,
+      resolveProviderSessionId: () => 'sess_stub_resume',
+    };
+    const { writer } = createWriter();
+    await new ZCodeRuntimeProvider().run('hello', {
+      sessionId: 'app-sess-native-personal',
+      model: 'bigmodel-coding-plan/GLM-5.3-Flash',
+      cwd: stubDir,
+    }, writer, resumeContext);
+
+    const selection = { providerId: 'account:bigmodel-individual-coding-plan', modelId: 'GLM-5.3-Flash', options: { reasoningLevel: 'max' } };
+    assert.deepEqual(readStubLog().filter((entry) => entry.name === 'setModel').at(-1)?.value,
+      { sessionId: 'sess_stub_resume', model: selection });
+    assert.deepEqual((readStubLog().filter((entry) => entry.name === 'session_send').at(-1)?.value as { modelSelection?: unknown })?.modelSelection,
+      selection);
+  } finally {
+    fsSync.rmSync(credentialsPath, { force: true });
+  }
 });
 
 test('runtime bridges interaction/requestPermission to the chat stream and answers the engine', async () => {

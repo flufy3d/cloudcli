@@ -238,11 +238,9 @@ export async function readDecryptedZCodeCredentials(
   }
 }
 
-/**
- * Synchronously reads and decrypts the ZCode JWT token from credentials.json.
- * Returns null if the file is missing, the token is absent, or decryption fails.
- */
-export function readDecryptedZCodeJwtToken(
+/** Reads one selected credential, rejecting missing or undecryptable values. */
+function readDecryptedCredential(
+  select: (rawMap: Record<string, unknown>) => string | null,
   storageDir = getZCodeStorageDir(),
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
@@ -250,7 +248,8 @@ export function readDecryptedZCodeJwtToken(
   try {
     const content = fsSync.readFileSync(credPath, 'utf8');
     const rawMap = readObjectRecord(JSON.parse(content));
-    const rawToken = readOptionalString(rawMap?.zcodejwttoken);
+    if (!rawMap) return null;
+    const rawToken = select(rawMap);
     if (!rawToken) {
       return null;
     }
@@ -267,3 +266,23 @@ export function readDecryptedZCodeJwtToken(
   }
 }
 
+/** Used by the account model catalog, send builder, and runtime header bridge. */
+export function readDecryptedZCodeIndividualPlanApiKey(
+  storageDir = getZCodeStorageDir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  return readDecryptedCredential((rawMap) => {
+    const keys = Object.keys(rawMap).filter((key) =>
+      /^account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:[^:]+:api-key$/.test(key));
+    // Never guess between accounts: that could charge the wrong subscription.
+    return keys.length === 1 ? readOptionalString(rawMap[keys[0]]) ?? null : null;
+  }, storageDir, env);
+}
+
+/** Used by trial-plan model discovery, send auth, and account activation. */
+export function readDecryptedZCodeJwtToken(
+  storageDir = getZCodeStorageDir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  return readDecryptedCredential((rawMap) => readOptionalString(rawMap.zcodejwttoken) ?? null, storageDir, env);
+}

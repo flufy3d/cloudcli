@@ -371,6 +371,97 @@ test('buildZCodeSendModelParams resolves credentials for start-plan model from e
   });
 });
 
+test('personal plan uses the native account provider and its own credential', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const cliDir = path.join(storageDir, 'cli');
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(cliDir, { recursive: true });
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(path.join(cliDir, 'config.json'), JSON.stringify({
+      provider: {
+        'bigmodel-coding-plan': {
+          kind: 'anthropic',
+          options: { apiKey: 'legacy-key', baseURL: 'https://example.invalid/api/anthropic' },
+          models: { 'GLM-5.3-Flash': {} },
+        },
+      },
+    }), 'utf8');
+    await writeFile(path.join(v2Dir, 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key':
+        encryptZCodeCredentialValue('personal-plan-key'),
+      zcodejwttoken: encryptZCodeCredentialValue('trial-jwt'),
+    }), 'utf8');
+
+    const catalog = await new ZCodeProviderModels().getSupportedModels();
+    assert.equal(catalog.OPTIONS.find((option) => option.group === 'BigModel (个人)')?.value,
+      'account:bigmodel-individual-coding-plan/GLM-5.3-Flash');
+    assert.deepEqual(buildZCodeSendModelParams('account:bigmodel-individual-coding-plan/GLM-5.3-Flash', 'high'), {
+      modelSelection: {
+        providerId: 'account:bigmodel-individual-coding-plan',
+        modelId: 'GLM-5.3-Flash',
+        options: { reasoningLevel: 'high' },
+      },
+      modelExecution: { selectionScope: 'execution', requestAuth: { apiKey: 'personal-plan-key' } },
+    });
+    for (const legacyRef of [
+      'bigmodel-coding-plan/GLM-5.3-Flash',
+      'builtin:bigmodel-coding-plan/GLM-5.3-Flash',
+    ]) {
+      assert.equal(buildZCodeSendModelParams(legacyRef)?.modelSelection.providerId,
+        'account:bigmodel-individual-coding-plan');
+    }
+  });
+});
+
+test('native individual plan remains selectable without a legacy provider config', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(path.join(v2Dir, 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'personal-key',
+    }), 'utf8');
+    const catalog = await new ZCodeProviderModels().getSupportedModels();
+    assert.equal(catalog.DEFAULT, 'account:bigmodel-individual-coding-plan/GLM-5.3');
+    assert.deepEqual(buildZCodeSendModelParams('GLM-5.3-Flash')?.modelSelection, {
+      providerId: 'account:bigmodel-individual-coding-plan', modelId: 'GLM-5.3-Flash',
+      options: { reasoningLevel: 'max' },
+    });
+  });
+});
+
+test('account plan selection fails when its credential is missing', async () => {
+  await withZCodeStorage(async () => {
+    assert.throws(() => buildZCodeSendModelParams('account:bigmodel-individual-coding-plan/GLM-5.3-Flash'),
+      /individual.*credential/i);
+    assert.throws(() => buildZCodeSendModelParams('account:bigmodel-start-plan/GLM-5.3-Flash'),
+      /start.*credential/i);
+  });
+});
+
+test('a same-name custom model keeps its provider when an individual-plan key exists', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await mkdir(path.join(storageDir, 'cli'), { recursive: true });
+    await mkdir(path.join(storageDir, 'v2'), { recursive: true });
+    await writeFile(path.join(storageDir, 'cli', 'config.json'), JSON.stringify({ provider: {
+      'custom-provider': {
+        kind: 'anthropic', options: { apiKey: 'custom-key', baseURL: 'https://example.invalid/api' },
+        models: { 'GLM-5.3-Flash': {} },
+      },
+      'bigmodel-coding-plan': {
+        kind: 'anthropic', options: { apiKey: 'legacy-key', baseURL: 'https://example.invalid/api' },
+        models: { 'GLM-5.3-Flash': {} },
+      },
+    } }), 'utf8');
+    await writeFile(path.join(storageDir, 'v2', 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'personal-key',
+    }), 'utf8');
+    const catalog = await new ZCodeProviderModels().getSupportedModels();
+    assert.equal(catalog.OPTIONS[0]?.group, 'custom-provider');
+    assert.equal(buildZCodeSendModelParams(catalog.OPTIONS[0].value)?.modelSelection.providerId,
+      'custom-provider');
+  });
+});
+
 test('readZCodeSessionModelInfoFromDb preserves providerId when session ran on start-plan with providerID', async () => {
   await withZCodeStorage(async (storageDir) => {
     const dbDir = path.join(storageDir, 'cli', 'db');
@@ -458,4 +549,3 @@ test('getSupportedModels enforces personal whitelist and keeps custom provider g
     assert.equal(customModel.group, 'Custom Provider');
   });
 });
-
