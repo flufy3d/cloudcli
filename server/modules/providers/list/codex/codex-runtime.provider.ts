@@ -307,6 +307,21 @@ async function queryCodex(
   const sessionKey = () => sessionId || capturedSessionId || null;
   const currentSession = () => activeCodexSessions.get(sessionKey() || '');
 
+  // Both `error` and `turn/completed` can report the same terminal cause.
+  const surfaceFailure = (message: string): void => {
+    if (errorSurfaced && terminalFailure?.message === message) {
+      return;
+    }
+    terminalFailure = { message };
+    errorSurfaced = true;
+    sendMessage(ws, createNormalizedMessage({
+      kind: 'error',
+      content: message,
+      sessionId: capturedSessionId || sessionId || null,
+      provider: 'codex',
+    }));
+  };
+
   /** Resolves once the turn reaches a terminal state, or the child dies. */
   let settleTurn: (() => void) | null = null;
   const turnSettled = new Promise<void>((resolve) => {
@@ -547,15 +562,17 @@ async function queryCodex(
           }
 
           case 'error': {
-            errorSurfaced = true;
-            const message = typeof params.message === 'string' ? params.message : 'Codex reported an error.';
-            terminalFailure = terminalFailure ?? { message };
-            sendMessage(ws, createNormalizedMessage({
-              kind: 'error',
-              content: message,
-              sessionId: capturedSessionId || sessionId || null,
-              provider: 'codex',
-            }));
+            const error = readObjectRecord(params.error);
+            const message = readNonEmptyString(error?.message)?.trim()
+              || readNonEmptyString(params.message)?.trim()
+              || 'Codex reported an error.';
+            // A recoverable stream error is progress, not a failed turn. Keep
+            // its cause in logs without adding a permanent chat error row.
+            if (params.willRetry === true) {
+              console.warn('[Codex] Retrying turn:', message);
+              return;
+            }
+            surfaceFailure(message);
             return;
           }
 
@@ -563,15 +580,8 @@ async function queryCodex(
             const turn = readObjectRecord(params.turn);
             if (turn?.status === 'failed') {
               const error = readObjectRecord(turn.error);
-              const message = typeof error?.message === 'string' ? error.message : 'Turn failed';
-              terminalFailure = { message };
-              errorSurfaced = true;
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'error',
-                content: message,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
+              const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
+              surfaceFailure(message);
               notifyRunFailed({
                 userId: normalizedUserId,
                 provider: 'codex',
@@ -590,15 +600,8 @@ async function queryCodex(
               // invisible until history re-read it and diagnostics logged the run
               // as a success. A stop the user asked for (`abort` already flagged
               // the session) arrives as the same status and must stay silent.
-              const message = 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
-              terminalFailure = terminalFailure ?? { message };
-              errorSurfaced = true;
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'error',
-                content: message,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
+              const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
+              surfaceFailure(message);
               notifyRunFailed({
                 userId: normalizedUserId,
                 provider: 'codex',

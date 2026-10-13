@@ -242,6 +242,81 @@ test('an item that starts empty is not announced before it has content', async (
   );
 });
 
+test('retry notifications keep the turn running and do not poison a successful completion', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      fake.handlers.onNotification?.('error', {
+        threadId: THREAD_ID,
+        turnId: TURN_ID,
+        error: { message: `Reconnecting... ${attempt}/5` },
+        willRetry: true,
+      });
+    }
+    replayOneTurn(fake);
+  });
+  const messages: any[] = [];
+  await codexRuntime.run('hey there', { sessionId: 'app-session' }, {
+    send: (message) => messages.push(message),
+  }, runtimeContext(true));
+
+  assert.equal(messages.filter((message) => message.kind === 'error').length, 0);
+  assert.ok(messages.some((message) => message.type === 'assistant'));
+  assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 0));
+});
+
+test('a non-retry error and failed completion surface the original cause only once', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    const error = { message: 'usage limit reached' };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      fake.handlers.onNotification?.('error', {
+        threadId: THREAD_ID, turnId: TURN_ID, error, willRetry: false,
+      });
+    }
+    fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID, turn: { id: TURN_ID, status: 'failed', error },
+    });
+  });
+  const messages: any[] = [];
+  await codexRuntime.run('hey there', { sessionId: 'app-session' }, {
+    send: (message) => messages.push(message),
+  }, runtimeContext(true));
+
+  assert.deepEqual(messages.filter((message) => message.kind === 'error').map((message) => message.content),
+    ['usage limit reached']);
+  assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
+});
+
+for (const scenario of [
+  { name: 'retry exhaustion', params: { error: { message: 'connection failed' }, willRetry: true },
+    turn: { status: 'failed', error: { message: 'retry limit reached' } }, expected: ['retry limit reached'], exitCode: 1 },
+  { name: 'missing completion cause', params: { error: { message: 'connection failed' }, willRetry: false },
+    turn: { status: 'failed', error: null }, expected: ['connection failed'], exitCode: 1 },
+  { name: 'interruption after a terminal error', params: { error: { message: 'usage limit reached' }, willRetry: false },
+    turn: { status: 'interrupted', error: null }, expected: ['usage limit reached'], exitCode: 1 },
+  { name: 'legacy flat error', params: { message: 'legacy failure' },
+    turn: { status: 'failed', error: null }, expected: ['legacy failure'], exitCode: 1 },
+  { name: 'malformed error', params: { error: { message: ' ' }, message: '' },
+    turn: { status: 'failed', error: null }, expected: ['Codex reported an error.'], exitCode: 1 },
+  { name: 'subagent error', params: { threadId: 'another-thread', error: { message: 'subagent failure' }, willRetry: false },
+    turn: { status: 'completed', error: null }, expected: [], exitCode: 0 },
+]) {
+  test(`Codex handles ${scenario.name} without hiding or duplicating failures`, async (t) => {
+    installFakeAppServer(t, (fake) => {
+      fake.handlers.onNotification?.('error', { threadId: THREAD_ID, turnId: TURN_ID, ...scenario.params });
+      fake.handlers.onNotification?.('turn/completed', {
+        threadId: THREAD_ID, turn: { id: TURN_ID, ...scenario.turn },
+      });
+    });
+    const messages: any[] = [];
+    await codexRuntime.run('hey there', { sessionId: 'app-session' }, {
+      send: (message) => messages.push(message),
+    }, runtimeContext(true));
+
+    assert.deepEqual(messages.filter((message) => message.kind === 'error').map((message) => message.content), scenario.expected);
+    assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === scenario.exitCode));
+  });
+}
+
 test('a failed turn surfaces the error and exits non-zero', async (t) => {
   installFakeAppServer(t, (fake) => {
     fake.handlers.onNotification?.('turn/completed', {
