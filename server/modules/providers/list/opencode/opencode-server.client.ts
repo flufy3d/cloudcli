@@ -44,7 +44,33 @@ const SERVER_HEALTH_TIMEOUT_MS = 3_000;
 const STREAM_RECONNECT_DELAY_MS = 1_000;
 const SESSION_STATUS_TIMEOUT_MS = 15_000;
 const SESSION_IDLE_POLL_INTERVAL_MS = 1_500;
-const SESSION_IDLE_WAIT_TIMEOUT_MS = 60 * 60_000;
+
+/**
+ * How long the shared server may sit idle before shutdown, and how often a
+ * shutdown that had to be deferred because the engine still reports work in
+ * flight is re-checked.
+ */
+const SERVER_BUSY_RECHECK_MS = 60_000;
+
+/**
+ * Ceiling on how long the idle shutdown keeps yielding to a busy engine.
+ *
+ * The engine's own turns can legitimately run for hours after the client run
+ * ended (a failed run leaves the engine working), and killing the server mid
+ * turn destroys that work — the failure this guard exists for. The cap only
+ * exists so a truly wedged engine cannot pin a node process forever; hitting
+ * it is logged loudly.
+ */
+const SERVER_BUSY_DEFER_MAX_MS = 6 * 60 * 60_000;
+
+/** Longest an async prompt delivery may wait for its 204 before giving up. */
+const ASYNC_PROMPT_ACCEPT_TIMEOUT_MS = 60_000;
+
+/**
+ * Directories whose sessions the idle shutdown must check before killing the
+ * server. Kept small — the probe walks them on every deferred check.
+ */
+const SERVER_PROBE_DIRECTORY_LIMIT = 6;
 
 type ServerState = {
   process: ChildProcess;
@@ -58,6 +84,15 @@ type ServerState = {
   stderr: { tail: string };
   /** Set while we stop the server on purpose, so its exit is not reported as a crash. */
   stopping: boolean;
+  /**
+   * Directories seen on recent requests/events (path → last-seen epoch ms).
+   * The idle shutdown probes each one's `/session/status` before killing the
+   * server: a run ending is not proof the engine stopped working — a failed
+   * run's turn can still be in flight, and a busy engine must not be killed.
+   */
+  recentDirectories: Map<string, number>;
+  /** When the current idle-shutdown deferral began; null while not deferred. */
+  idleDeferStartedAt: number | null;
 };
 
 let serverState: ServerState | null = null;
@@ -101,6 +136,34 @@ function buildUrl(baseUrl: string, path: string, directory: string | null): stri
   }
   const separator = path.includes('?') ? '&' : '?';
   return `${baseUrl}${path}${separator}directory=${encodeURIComponent(directory)}`;
+}
+
+/**
+ * Records a directory a request or event touched, so the idle shutdown knows
+ * which project instances may still have engine work in flight.
+ *
+ * Consumers: `requestJson` (every call carries `?directory=`) and
+ * `dispatchEventChunk` (the global envelope names the event's directory).
+ */
+function noteServerDirectory(state: ServerState | null, directory: string | null): void {
+  if (!state || !directory) {
+    return;
+  }
+  state.recentDirectories.set(directory, Date.now());
+  if (state.recentDirectories.size > 24) {
+    const oldest = [...state.recentDirectories.entries()].sort((a, b) => a[1] - b[1]).slice(0, state.recentDirectories.size - 24);
+    for (const [key] of oldest) {
+      state.recentDirectories.delete(key);
+    }
+  }
+}
+
+/** The most recently touched directories, capped for the idle-shutdown probe. */
+function recentProbeDirectories(state: ServerState): string[] {
+  return [...state.recentDirectories.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, SERVER_PROBE_DIRECTORY_LIMIT)
+    .map(([directory]) => directory);
 }
 
 async function waitForServer(baseUrl: string, headers: Record<string, string>, child: ChildProcess): Promise<void> {
@@ -211,6 +274,8 @@ function dispatchEventChunk(state: ServerState, chunk: string): void {
     directory: readOptionalString(envelope.directory) ?? null,
   };
 
+  noteServerDirectory(state, event.directory);
+
   for (const subscriber of state.subscribers) {
     try {
       subscriber(event);
@@ -312,12 +377,14 @@ function describeRequestFailure(method: string, path: string, error: unknown): E
 /**
  * Probes the shared server's health endpoint.
  *
- * Consumers: `acquireOpenCodeServer`. Reusing a handle that points at a process
- * which died without its child `exit` event firing (on Windows the `cmd.exe`
- * shim can outlive the real `opencode.exe`) would fail the next request with
- * `fetch failed`; probing first lets the caller restart instead.
+ * Consumers: `acquireOpenCodeServer` (reuse check) and `opencode-runtime.provider.js`
+ * (deciding whether a failed status read means a transport blip or a dead
+ * server while it waits for a turn to settle). Reusing a handle that points at
+ * a process which died without its child `exit` event firing (on Windows the
+ * `cmd.exe` shim can outlive the real `opencode.exe`) would fail the next
+ * request with `fetch failed`; probing first lets the caller restart instead.
  */
-async function isOpenCodeServerResponsive(handle: OpenCodeServerHandle): Promise<boolean> {
+export async function isOpenCodeServerReachable(handle: OpenCodeServerHandle): Promise<boolean> {
   try {
     const response = await openCodeFetch(`${handle.baseUrl}/global/health`, {
       headers: handle.headers,
@@ -386,6 +453,8 @@ async function startOpenCodeServer(): Promise<ServerState> {
     streamAbort: new AbortController(),
     stderr,
     stopping: false,
+    recentDirectories: new Map(),
+    idleDeferStartedAt: null,
   };
 
   void readOpenCodeServerEventStream(state);
@@ -418,7 +487,7 @@ async function startOpenCodeServer(): Promise<ServerState> {
 export async function acquireOpenCodeServer(): Promise<OpenCodeServerHandle> {
   const existing = serverState;
   if (existing) {
-    const responsive = await isOpenCodeServerResponsive(existing);
+    const responsive = await isOpenCodeServerReachable(existing);
     // A failed probe only proves the server is gone when nothing is using it:
     // an in-flight run pins `refCount`, and a busy server can still miss a short
     // health timeout without being dead. Killing it there would abort a healthy
@@ -431,6 +500,7 @@ export async function acquireOpenCodeServer(): Promise<OpenCodeServerHandle> {
         clearTimeout(existing.idleTimer);
         existing.idleTimer = null;
       }
+      existing.idleDeferStartedAt = null;
       existing.refCount += 1;
       return { baseUrl: existing.baseUrl, headers: existing.headers };
     }
@@ -456,6 +526,103 @@ export async function acquireOpenCodeServer(): Promise<OpenCodeServerHandle> {
   return { baseUrl: state.baseUrl, headers: state.headers };
 }
 
+/** What an idle-shutdown probe learned about the engine's in-flight work. */
+export type OpenCodeServerWorkState = 'idle' | 'busy' | 'unknown' | 'unreachable';
+
+/**
+ * Asks the engine whether any session in the given directories still has work
+ * in flight, via the per-directory `/session/status` map.
+ *
+ * The idle shutdown consults this before killing the server: the end of a
+ * client run is not proof the turn is over — a run whose client failed leaves
+ * the engine executing with nobody watching, and killing it there destroyed
+ * real work (a training command) in the field. `idle` is the only state that
+ * permits the shutdown; `busy` and `unknown` (a failed query on a reachable
+ * server) defer it, while `unreachable` means the server is gone and the kill
+ * is mere cleanup. Consumers: `attemptOpenCodeServerIdleShutdown`; tests probe
+ * it directly.
+ */
+export async function probeOpenCodeServerWork(
+  handle: OpenCodeServerHandle,
+  directories: readonly string[],
+): Promise<OpenCodeServerWorkState> {
+  let sawFailure = false;
+  for (const directory of directories) {
+    try {
+      const response = await openCodeFetch(buildUrl(handle.baseUrl, '/session/status', directory), {
+        headers: handle.headers,
+        signal: AbortSignal.timeout(SERVER_HEALTH_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        sawFailure = true;
+        continue;
+      }
+      const record = readObjectRecord(await response.json().catch(() => null));
+      for (const value of Object.values(record ?? {})) {
+        const type = readOptionalString(readObjectRecord(value)?.type);
+        if (type === 'busy' || type === 'retry') {
+          return 'busy';
+        }
+      }
+    } catch {
+      sawFailure = true;
+    }
+  }
+
+  if (!sawFailure) {
+    return 'idle';
+  }
+  return (await isOpenCodeServerReachable(handle)) ? 'unknown' : 'unreachable';
+}
+
+/**
+ * Kills the shared server once it stays idle, unless the engine still reports
+ * work in flight for a recently touched directory.
+ *
+ * The deferral exists because a run can end while its turn is still executing
+ * (its client failed, or a later turn was queued): the engine must be allowed
+ * to finish, and only its settling to idle — or the deferral ceiling — ends
+ * the wait. Consumers: the idle timer set by `releaseOpenCodeServer`.
+ */
+async function attemptOpenCodeServerIdleShutdown(state: ServerState): Promise<void> {
+  state.idleTimer = null;
+  if (serverState !== state || state.refCount > 0 || state.stopping) {
+    return;
+  }
+
+  const directories = recentProbeDirectories(state);
+  const work = directories.length > 0
+    ? await probeOpenCodeServerWork({ baseUrl: state.baseUrl, headers: state.headers }, directories)
+    : 'idle';
+
+  // The probe awaited; a run may have pinned the server again meanwhile.
+  if (serverState !== state || state.refCount > 0 || state.stopping) {
+    return;
+  }
+
+  if (work === 'busy' || work === 'unknown') {
+    const deferStartedAt = state.idleDeferStartedAt ?? Date.now();
+    if (state.idleDeferStartedAt === null) {
+      console.warn(
+        `[OpenCode] Shared server is idle but the engine still reports work in flight (${work}); keeping it alive until the turn finishes.`,
+      );
+      state.idleDeferStartedAt = deferStartedAt;
+    }
+    if (Date.now() - deferStartedAt >= SERVER_BUSY_DEFER_MAX_MS) {
+      console.warn('[OpenCode] Busy engine did not settle within the shutdown deferral window; killing the shared server anyway.');
+      discardOpenCodeServerState(state);
+      return;
+    }
+    state.idleTimer = setTimeout(() => {
+      void attemptOpenCodeServerIdleShutdown(state);
+    }, SERVER_BUSY_RECHECK_MS);
+    state.idleTimer.unref?.();
+    return;
+  }
+
+  discardOpenCodeServerState(state);
+}
+
 /** Drops one run's hold on the shared server; idle servers shut down later. */
 export function releaseOpenCodeServer(): void {
   const state = serverState;
@@ -468,11 +635,9 @@ export function releaseOpenCodeServer(): void {
     return;
   }
 
+  state.idleDeferStartedAt = null;
   state.idleTimer = setTimeout(() => {
-    if (serverState !== state || state.refCount > 0) {
-      return;
-    }
-    discardOpenCodeServerState(state);
+    void attemptOpenCodeServerIdleShutdown(state);
   }, SERVER_IDLE_SHUTDOWN_MS);
   state.idleTimer.unref?.();
 }
@@ -498,6 +663,9 @@ async function requestJson(
   timeoutMs = OPENCODE_SERVER_RESPONSE_TIMEOUT_MS,
 ): Promise<unknown> {
   const url = buildUrl(handle.baseUrl, path, directory);
+  if (serverState && serverState.baseUrl === handle.baseUrl) {
+    noteServerDirectory(serverState, directory);
+  }
   let response: Response;
   try {
     response = await openCodeFetch(url, {
@@ -649,21 +817,16 @@ export async function forkOpenCodeSession(
   return id;
 }
 
-/**
- * Sends one user turn and resolves when the assistant turn completes. Live
- * output arrives through the event stream meanwhile.
- */
-export async function sendOpenCodeMessage(
-  handle: OpenCodeServerHandle,
-  directory: string,
-  sessionId: string,
-  input: {
-    text: string;
-    model: { providerId: string; modelId: string } | null;
-    agent?: string;
-    variant?: string;
-  },
-): Promise<void> {
+/** One prompt's text, model, agent and effort, in the shape both sends take. */
+export type OpenCodePromptInput = {
+  text: string;
+  model: { providerId: string; modelId: string } | null;
+  agent?: string;
+  variant?: string;
+};
+
+/** Builds the prompt body the blocking and async send endpoints both expect. */
+function buildPromptBody(input: OpenCodePromptInput): AnyRecord {
   const body: AnyRecord = {
     parts: [{ type: 'text', text: input.text }],
   };
@@ -676,8 +839,93 @@ export async function sendOpenCodeMessage(
   if (input.variant) {
     body.variant = input.variant;
   }
+  return body;
+}
 
-  await requestJson(handle, 'POST', `/session/${encodeURIComponent(sessionId)}/message`, directory, body);
+/**
+ * Sends one user turn with the blocking endpoint and resolves when the whole
+ * assistant turn completes. Live output arrives through the event stream
+ * meanwhile.
+ *
+ * Kept for engines whose server predates `prompt_async`; the runtime prefers
+ * `sendOpenCodeMessageAsync`, because binding a multi-hour turn to one held
+ * request was the source of the old timeout failure mode.
+ */
+export async function sendOpenCodeMessage(
+  handle: OpenCodeServerHandle,
+  directory: string,
+  sessionId: string,
+  input: OpenCodePromptInput,
+): Promise<void> {
+  await requestJson(handle, 'POST', `/session/${encodeURIComponent(sessionId)}/message`, directory, buildPromptBody(input));
+}
+
+/** Error code marking the fallback marker for engines without `prompt_async`. */
+export const OPENCODE_ASYNC_PROMPT_UNSUPPORTED = 'OPENCODE_ASYNC_PROMPT_UNSUPPORTED';
+
+/** Servers (by base URL) whose `prompt_async` endpoint answered 404/405. */
+const asyncPromptUnsupportedServers = new Set<string>();
+
+/**
+ * Whether this server is expected to expose `prompt_async`. A server only
+ * enters the negative set after actually answering 404/405, and servers get a
+ * fresh loopback port on restart, so a stale entry cannot outlive the process
+ * it describes in any way that matters.
+ */
+export function openCodeServerSupportsAsyncPrompt(handle: OpenCodeServerHandle): boolean {
+  return !asyncPromptUnsupportedServers.has(handle.baseUrl);
+}
+
+/** Whether `error` is the marker thrown for a server without `prompt_async`. */
+export function isOpenCodeAsyncPromptUnsupportedError(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === OPENCODE_ASYNC_PROMPT_UNSUPPORTED;
+}
+
+function asyncPromptUnsupportedError(): Error {
+  const error = new Error('This OpenCode server has no async prompt endpoint; use the blocking message endpoint instead.');
+  (error as { code?: string }).code = OPENCODE_ASYNC_PROMPT_UNSUPPORTED;
+  return error;
+}
+
+/**
+ * Delivers one prompt without waiting for the turn: the engine answers
+ * 204 ("Prompt accepted") in milliseconds and the turn's progress and
+ * completion are observed through the event stream and `/session/status`.
+ *
+ * This is the healthy delivery path for long turns — the request itself lives
+ * for milliseconds, so no client-side deadline can cut a multi-hour turn
+ * short, and a transport hiccup after acceptance cannot end the turn either.
+ * Consumers: `opencode-runtime.provider.js` (`spawnOpenCode` and
+ * `injectOpenCodeInput`), with `sendOpenCodeMessage` as the fallback for older
+ * engines.
+ */
+export async function sendOpenCodeMessageAsync(
+  handle: OpenCodeServerHandle,
+  directory: string,
+  sessionId: string,
+  input: OpenCodePromptInput,
+): Promise<void> {
+  if (asyncPromptUnsupportedServers.has(handle.baseUrl)) {
+    throw asyncPromptUnsupportedError();
+  }
+
+  try {
+    await requestJson(
+      handle,
+      'POST',
+      `/session/${encodeURIComponent(sessionId)}/prompt_async`,
+      directory,
+      buildPromptBody(input),
+      ASYNC_PROMPT_ACCEPT_TIMEOUT_MS,
+    );
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    if (status === 404 || status === 405) {
+      asyncPromptUnsupportedServers.add(handle.baseUrl);
+      throw asyncPromptUnsupportedError();
+    }
+    throw error;
+  }
 }
 
 /** The engine's view of one session: idle, running a turn, or retrying a failed one. */
@@ -703,6 +951,9 @@ export async function getOpenCodeSessionStatus(
   return status === 'idle' || status === 'busy' || status === 'retry' ? status : null;
 }
 
+/** Consecutive failed status reads tolerated while the server still answers its health probe. */
+const SESSION_STATUS_FAILURE_TOLERANCE = 5;
+
 /**
  * Blocks until the session stops running, polling the engine for its status.
  *
@@ -712,21 +963,35 @@ export async function getOpenCodeSessionStatus(
  * null case is what used to keep the poll spinning until the one-hour deadline
  * — the engine had finished, but the gateway never saw the run end.
  *
- * Consumers: `opencode-runtime.provider.js`, which resumes a run this way when
- * the blocking prompt request dropped but the engine kept working. Throws when
- * the poll itself fails (the server went away), so the caller fails the run for
- * real instead of waiting forever.
+ * There is no deadline by default: turns legitimately run for hours, and a
+ * client-side cap only produced false failures for work the engine was still
+ * doing. A failed status read is retried while the server answers its health
+ * probe, and only rethrown when the server is truly gone — that is a real
+ * failure the caller must surface. The runtime's settle loops embed the same
+ * poll and also wake on idle events; this is the direct, unit-tested form of
+ * the status contract. Consumers: tests.
  */
 export async function waitForOpenCodeSessionIdle(
   handle: OpenCodeServerHandle,
   directory: string | null,
   sessionId: string,
-  timeoutMs = SESSION_IDLE_WAIT_TIMEOUT_MS,
+  timeoutMs = 0,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY;
+  let consecutiveFailures = 0;
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, SESSION_IDLE_POLL_INTERVAL_MS));
-    const status = await getOpenCodeSessionStatus(handle, directory, sessionId);
+    let status: OpenCodeSessionStatus | null;
+    try {
+      status = await getOpenCodeSessionStatus(handle, directory, sessionId);
+      consecutiveFailures = 0;
+    } catch (error) {
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= SESSION_STATUS_FAILURE_TOLERANCE || !(await isOpenCodeServerReachable(handle))) {
+        throw error;
+      }
+      continue;
+    }
     if (status === null || status === 'idle') {
       return;
     }

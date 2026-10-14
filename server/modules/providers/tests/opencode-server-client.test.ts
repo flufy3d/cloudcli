@@ -14,6 +14,7 @@ import test from 'node:test';
 import {
   createOpenCodeSession,
   getOpenCodeSessionStatus,
+  probeOpenCodeServerWork,
   waitForOpenCodeSessionIdle,
 } from '@/modules/providers/list/opencode/opencode-server.client.js';
 import type { OpenCodeServerHandle } from '@/modules/providers/list/opencode/opencode-server.client.js';
@@ -162,4 +163,64 @@ test('idle-wait finishes when a finished session leaves the status map', async (
 test('idle-wait rejects when the server disappears mid-turn', async () => {
   const port = await reserveClosedPort();
   await assert.rejects(waitForOpenCodeSessionIdle(handleFor(`http://127.0.0.1:${port}`), '/tmp/project', 'ses_test', 30_000));
+});
+
+test('the idle-shutdown probe reports busy sessions per directory', async () => {
+  // The probe guards the shared server's idle shutdown: a run ending is not
+  // proof the engine stopped, so only a positively idle answer may kill it.
+  const server = http.createServer((request, res) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    if (url.pathname === '/session/status') {
+      const directory = url.searchParams.get('directory');
+      const body = directory === '/busy-dir'
+        ? JSON.stringify({ ses_x: { type: 'busy' } })
+        : directory === '/retry-dir'
+          ? JSON.stringify({ ses_y: { type: 'retry' } })
+          : '{}';
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(body);
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const handle = handleFor(`http://127.0.0.1:${address.port}`);
+
+  try {
+    assert.equal(await probeOpenCodeServerWork(handle, ['/idle-dir']), 'idle');
+    assert.equal(await probeOpenCodeServerWork(handle, ['/busy-dir']), 'busy');
+    assert.equal(await probeOpenCodeServerWork(handle, ['/retry-dir']), 'busy');
+    assert.equal(await probeOpenCodeServerWork(handle, ['/idle-dir', '/busy-dir']), 'busy');
+    assert.equal(await probeOpenCodeServerWork(handle, []), 'idle');
+  } finally {
+    server.close();
+  }
+});
+
+test('a failed status query is unknown while reachable, unreachable when dead', async () => {
+  const server = http.createServer((request, res) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    if (url.pathname === '/global/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ healthy: true }));
+      return;
+    }
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+
+  try {
+    assert.equal(await probeOpenCodeServerWork(handleFor(`http://127.0.0.1:${address.port}`), ['/some-dir']), 'unknown');
+  } finally {
+    server.close();
+  }
+
+  const port = await reserveClosedPort();
+  assert.equal(await probeOpenCodeServerWork(handleFor(`http://127.0.0.1:${port}`), ['/some-dir']), 'unreachable');
 });

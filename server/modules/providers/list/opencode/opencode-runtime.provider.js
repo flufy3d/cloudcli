@@ -28,11 +28,14 @@ import {
   acquireOpenCodeServer,
   createOpenCodeSession,
   getOpenCodeSessionStatus,
+  isOpenCodeAsyncPromptUnsupportedError,
+  isOpenCodeServerReachable,
+  openCodeServerSupportsAsyncPrompt,
   releaseOpenCodeServer,
   resolveOpenCodeAgent,
   sendOpenCodeMessage,
+  sendOpenCodeMessageAsync,
   subscribeOpenCodeEvents,
-  waitForOpenCodeSessionIdle,
 } from './opencode-server.client.js';
 import {
   handleOpenCodeApprovalEvent,
@@ -69,6 +72,45 @@ const LIVE_CONTEXT_MIN_INTERVAL_MS = 1_500;
  * lands within milliseconds; this only bounds a lost event.
  */
 const RUN_IDLE_EVENT_TIMEOUT_MS = 3_000;
+
+/**
+ * Default window for an accepted async prompt to show any sign of life before
+ * the engine is presumed to have dropped it (see
+ * `confirmOpenCodePromptStarted`). `OPENCODE_PROMPT_START_TIMEOUT_MS` overrides
+ * it per run, which tests use to exercise the failure path quickly.
+ */
+const PROMPT_START_TIMEOUT_DEFAULT_MS = 60_000;
+
+/** Cadence of the start check while waiting for the engine to pick up a prompt. */
+const PROMPT_START_POLL_INTERVAL_MS = 1_500;
+
+/** How often the settle loop asks the engine when no event wakes it sooner. */
+const TURN_SETTLE_POLL_INTERVAL_MS = 2_000;
+
+/**
+ * How long a not-busy status must hold before the turn counts as settled.
+ *
+ * A message delivered at a loop boundary (the prompt itself, or a mid-turn
+ * injection) can start a fresh loop right as the previous one goes idle; the
+ * engine reports busy again within milliseconds when that happens (verified
+ * with `scripts/probe/opencode-async-probe.mjs`), so a stable-idle check is
+ * what tells a real turn end from that hand-over.
+ */
+const TURN_SETTLE_CONFIRM_MS = 600;
+
+/**
+ * Ceiling on how long a run's tail keeps waiting for injected messages to be
+ * answered (see `drainOpenCodeRun`). Injected turns normally settle long
+ * before it; it only bounds a message the engine accepted but never ran, or
+ * one left pending when the server died mid-drain.
+ */
+const DRAIN_INJECTION_WAIT_CEILING_MS = 10 * 60_000;
+
+/** Silence after which a still-busy turn logs one stall warning (never fails it). */
+const TURN_STALL_WARN_MS = 30 * 60_000;
+
+/** Waits `ms`, for the polling loops above. */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Kills a spawned CLI process and everything it started.
@@ -149,15 +191,17 @@ function readOpenCodeTokenUsage(sessionId) {
 }
 
 /**
- * Decides whether a dropped prompt request should fail the run or keep waiting.
+ * Decides whether a dropped delivery should fail the run or keep waiting.
  *
- * The blocking `POST /session/:id/message` holds a socket for the whole turn and
- * can lose it (idle timeout, proxy, process hiccup) while the engine keeps
- * executing. When the session is still busy/retrying, wait for it to go idle so
- * the run finishes normally instead of surfacing a spurious transport error.
- * Returns false when the server is unreachable or the session is already done,
- * so the caller can fail the run for real. Consumers: `spawnOpenCode`'s
- * send-failure path.
+ * A prompt can be lost to the client (dropped socket, a failed async accept)
+ * while the engine keeps executing. When the session is still busy/retrying,
+ * wait for it to settle so the run finishes normally instead of surfacing a
+ * spurious transport error; the wait is health-driven and has no deadline,
+ * because turns legitimately run for hours and a client-side cap only ever
+ * produced false failures for work the engine was still doing. Returns false
+ * when the server is unreachable or the session is already done, so the
+ * caller can fail the run for real. Consumers: the failure paths of
+ * `spawnOpenCode` and `injectOpenCodeInput`.
  */
 async function resumeOpenCodeRun(run, workingDir) {
   if (!run.providerSessionId) {
@@ -169,7 +213,7 @@ async function resumeOpenCodeRun(run, workingDir) {
     if (status !== 'busy' && status !== 'retry') {
       return false;
     }
-    await waitForOpenCodeSessionIdle(run.handle, workingDir, run.providerSessionId);
+    await awaitOpenCodeTurnSettled(run, workingDir);
     return true;
   } catch (error) {
     console.warn('[OpenCode] Could not confirm the dropped turn is still running:', error);
@@ -252,21 +296,292 @@ function waitForOpenCodeIdleEvent(run, timeoutMs) {
   });
 }
 
+/** Reads whether the engine still lists the session as running; false when it cannot be read. */
+async function openCodeSessionIsBusy(run) {
+  try {
+    const status = await getOpenCodeSessionStatus(run.handle, run.directory, run.providerSessionId);
+    return status === 'busy' || status === 'retry';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Registers one async-injected message as pending the engine's answer.
+ *
+ * The tracked promise resolves when the settle logic has confirmed the engine
+ * idle after this message was accepted (`noteOpenCodeIdleObserved`) — the
+ * async equivalent of the blocking request resolving when its loop goes idle.
+ * Consumers: `injectOpenCodeInput`.
+ */
+function registerOpenCodeInjection(run, acceptedAt) {
+  let resolveTracked = () => {};
+  const accepted = new Promise((resolve) => {
+    resolveTracked = resolve;
+  });
+  const tracked = accepted.finally(() => {
+    run.injections.delete(tracked);
+    run.pendingInjectionAnswers.delete(tracked);
+  });
+  run.injections.add(tracked);
+  run.pendingInjectionAnswers.set(tracked, { acceptedAt, resolve: resolveTracked });
+}
+
+/** Releases every pending async injection; nothing will answer a stopped turn. */
+function forceResolveOpenCodeInjections(run) {
+  if (!run.pendingInjectionAnswers) {
+    return;
+  }
+  for (const record of Array.from(run.pendingInjectionAnswers.values())) {
+    record.resolve();
+  }
+}
+
+/** Releases async injections accepted before `observedAt`. */
+function resolveOpenCodeInjectionsAnsweredBefore(run, observedAt) {
+  for (const [tracked, record] of Array.from(run.pendingInjectionAnswers)) {
+    if (record.acceptedAt <= observedAt) {
+      record.resolve();
+    }
+  }
+}
+
+/**
+ * Confirms an observed idle really is the engine settling, not a loop
+ * hand-over: a message accepted at the boundary is picked up by a fresh loop
+ * within milliseconds, and the busy status that starts it is the proof it
+ * happened. When the idle holds, injections accepted before the observation
+ * are released as answered (the loops that ended had read them).
+ *
+ * Returns true on settled idle, false when a fresh loop took over (the
+ * caller keeps waiting). Throws only when the status read fails and the
+ * server is unreachable, so the caller surfaces a real failure.
+ * Consumers: `awaitOpenCodeTurnSettled` and `noteOpenCodeIdleObserved`.
+ */
+async function confirmOpenCodeSettledIdle(run, workingDir, observedAt) {
+  await sleep(TURN_SETTLE_CONFIRM_MS);
+  if (run.aborted || run.terminal) {
+    return false;
+  }
+
+  let status;
+  try {
+    status = await getOpenCodeSessionStatus(run.handle, workingDir, run.providerSessionId);
+  } catch (error) {
+    if (await isOpenCodeServerReachable(run.handle)) {
+      return false;
+    }
+    throw error;
+  }
+
+  if (status === 'busy' || status === 'retry') {
+    run.engineIdle = false;
+    return false;
+  }
+
+  resolveOpenCodeInjectionsAnsweredBefore(run, observedAt);
+  return true;
+}
+
+/**
+ * Runs on every idle observation made through the event stream.
+ *
+ * This is what releases messages injected after the settle loop finished but
+ * while the run still drains (their turns stream through this run). Single
+ * flight, because `session.idle` and `session.status` often arrive together.
+ * Failures are swallowed: the settle loop (or a later idle observation) owns
+ * them. Consumers: `spawnOpenCode`'s event handler.
+ */
+function noteOpenCodeIdleObserved(run) {
+  if (run.aborted || run.terminal || run.pendingInjectionAnswers.size === 0 || run.injectionSettlePromise) {
+    return;
+  }
+  run.injectionSettlePromise = (async () => {
+    try {
+      let observedAt = Date.now();
+      for (;;) {
+        if (!(await confirmOpenCodeSettledIdle(run, run.directory, observedAt))) {
+          return;
+        }
+        if (run.pendingInjectionAnswers.size === 0) {
+          return;
+        }
+        // Messages accepted during the grace period were not read by the
+        // loops that already ended; if the engine holds idle they are
+        // released on the next round, otherwise the busy check above keeps
+        // the wait alive.
+        observedAt = Date.now();
+      }
+    } catch {
+      // The run's own wait or the next idle observation handles real failures.
+    }
+  })().finally(() => {
+    run.injectionSettlePromise = null;
+  });
+}
+
+/** Logs once per stall window when the engine reports busy with no events at all. */
+function maybeWarnOpenCodeTurnStall(run) {
+  const now = Date.now();
+  if (now - run.lastEventAt < TURN_STALL_WARN_MS || now - run.stallWarnedAt < TURN_STALL_WARN_MS) {
+    return;
+  }
+  run.stallWarnedAt = now;
+  console.warn(
+    `[OpenCode] Turn ${run.providerSessionId || run.runId} has reported busy for ${Math.round((now - run.lastEventAt) / 60_000)} minutes with no events; still waiting.`,
+  );
+}
+
+/**
+ * Waits until the engine has finished the turn this run is driving.
+ *
+ * The engine is the authority on turn state, so the loop ends on a
+ * confirmed-settled idle and throws only when the server is unreachable (its
+ * work is gone; the caller fails the run for real). Idle events wake it early;
+ * the status poll is the fallback that survives stream gaps. There is no
+ * deadline: a server that answers its health probe is allowed to keep working,
+ * however long the turn takes. Consumers: `spawnOpenCode`'s async path and
+ * `resumeOpenCodeRun`.
+ */
+async function awaitOpenCodeTurnSettled(run, workingDir) {
+  for (;;) {
+    if (run.aborted || run.terminal) {
+      return;
+    }
+
+    if (!run.engineIdle) {
+      await waitForOpenCodeIdleEvent(run, TURN_SETTLE_POLL_INTERVAL_MS);
+      if (run.aborted || run.terminal) {
+        return;
+      }
+      if (!run.engineIdle) {
+        let status;
+        try {
+          status = await getOpenCodeSessionStatus(run.handle, workingDir, run.providerSessionId);
+        } catch (error) {
+          if (await isOpenCodeServerReachable(run.handle)) {
+            maybeWarnOpenCodeTurnStall(run);
+            continue;
+          }
+          throw error;
+        }
+        if (status === 'busy' || status === 'retry') {
+          maybeWarnOpenCodeTurnStall(run);
+          continue;
+        }
+        run.engineIdle = true;
+        run.lastIdleObservedAt = Date.now();
+      }
+    }
+
+    const observedAt = Date.now();
+    if (await confirmOpenCodeSettledIdle(run, workingDir, observedAt)) {
+      if (run.injections.size === 0) {
+        return;
+      }
+      // Injections accepted during the grace period stay pending until the
+      // loops answering them settle; keep waiting.
+    }
+  }
+}
+
+/**
+ * Watches a freshly accepted async prompt for any sign of life.
+ *
+ * `prompt_async` answering 204 only means the message was enqueued — the
+ * engine accepts even prompts it is about to reject (an unknown model rides
+ * on a `session.error` event, verified with the probe). A turn that actually
+ * ran is proven by a busy status, a session error, or an idle observed after
+ * acceptance (an ultra-fast turn can finish before the first poll). Nothing
+ * within the window means the engine dropped the prompt, which must surface
+ * as a real failure instead of a silently empty turn. Throws when the server
+ * goes away mid-check, so the caller reports the transport failure.
+ * Consumers: `deliverOpenCodePrompt`.
+ */
+async function confirmOpenCodePromptStarted(run, workingDir) {
+  const startTimeoutMs = Number(process.env.OPENCODE_PROMPT_START_TIMEOUT_MS) || PROMPT_START_TIMEOUT_DEFAULT_MS;
+  const deadline = Date.now() + startTimeoutMs;
+  for (;;) {
+    if (run.aborted || run.terminal) {
+      return true;
+    }
+    if (run.sawSessionError || run.lastIdleObservedAt >= run.promptAcceptedAt) {
+      return true;
+    }
+
+    let status = null;
+    let probeFailed = false;
+    try {
+      status = await getOpenCodeSessionStatus(run.handle, workingDir, run.providerSessionId);
+    } catch (error) {
+      probeFailed = true;
+      if (!(await isOpenCodeServerReachable(run.handle))) {
+        throw error;
+      }
+    }
+
+    if (!probeFailed && (status === 'busy' || status === 'retry')) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await sleep(PROMPT_START_POLL_INTERVAL_MS);
+  }
+}
+
+/**
+ * Delivers the run's prompt, preferring the async endpoint.
+ *
+ * The async send resolves on acceptance (204) and the caller then watches the
+ * engine for the turn itself; engines whose server predates `prompt_async`
+ * fall back to the blocking send, whose response is the old turn-end signal.
+ * The mode is recorded on the run so the completion path knows which
+ * lifecycle applies. Consumers: `spawnOpenCode`.
+ */
+async function deliverOpenCodePrompt(run, workingDir, input) {
+  if (openCodeServerSupportsAsyncPrompt(run.handle)) {
+    try {
+      await sendOpenCodeMessageAsync(run.handle, workingDir, run.providerSessionId, input);
+      run.sendMode = 'async';
+      run.promptAcceptedAt = Date.now();
+      if (await confirmOpenCodePromptStarted(run, workingDir)) {
+        return;
+      }
+      throw new Error('OpenCode accepted the prompt but the turn never started; the engine may have dropped it.');
+    } catch (error) {
+      if (!isOpenCodeAsyncPromptUnsupportedError(error)) {
+        throw error;
+      }
+      // Endpoint missing on this engine: use the blocking send below.
+    }
+  }
+
+  run.sendMode = 'blocking';
+  await sendOpenCodeMessage(run.handle, workingDir, run.providerSessionId, input);
+}
+
 /**
  * Holds the run open until its turn has fully played out on the event stream.
  *
- * The blocking prompt request resolves when the prompt loop ends, but the
- * stream delivers that loop's tail (the final reply's last deltas, its
- * completed part, `session.idle`) a few milliseconds later; unsubscribing on
- * the response dropped the final reply's text (verified against the engine).
- * So after the injected messages settle, wait for the idle event — bounded, so
- * a lost event (a stream reconnect gap) cannot hang the run — and repeat while
- * an injection arrived meanwhile. The loop exits on a synchronous check, so the
- * caller's cleanup runs with no await in between and no injection slips in
- * unobserved. Consumers: `spawnOpenCode`'s `finally`, and tests.
+ * Once the settle loop (or the blocking send) is done, the stream may still
+ * carry the turn's tail (final deltas, the completed part, `session.idle`),
+ * and messages injected meanwhile must be answered by loops whose output
+ * streams through this run. The loop repeats while injections exist; the
+ * injection ceiling and stopped runs release whatever cannot be answered, so
+ * the drain cannot hang on a dead server. The loop exits on a synchronous
+ * check, so the caller's cleanup runs with no await in between and no
+ * injection slips in unobserved. Consumers: `spawnOpenCode`'s `finally`, and
+ * tests.
  */
 export async function drainOpenCodeRun(run, idleTimeoutMs = RUN_IDLE_EVENT_TIMEOUT_MS) {
+  const injectionDeadline = Date.now() + DRAIN_INJECTION_WAIT_CEILING_MS;
   do {
+    if (run.aborted || run.terminal || Date.now() >= injectionDeadline) {
+      // A stopped (or over-deadline) turn takes no more messages, so nothing
+      // will answer the pending ones; release them so the drain ends.
+      forceResolveOpenCodeInjections(run);
+    }
     await settleOpenCodeInjections(run);
     await waitForOpenCodeIdleEvent(run, idleTimeoutMs);
   } while (run.injections.size > 0);
@@ -394,11 +709,27 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     variant: resolvedEffort || undefined,
     /** Pending requests of messages injected into this turn (see `injectOpenCodeInput`). */
     injections: new Set(),
+    /** Async injections awaiting an idle confirmation, keyed by their tracked promise. */
+    pendingInjectionAnswers: new Map(),
+    /** In-flight single-flight settle pass started by an idle observation (see `noteOpenCodeIdleObserved`). */
+    injectionSettlePromise: null,
     /** Whether the stream last reported the session idle, and who waits for it (see `drainOpenCodeRun`). */
     engineIdle: false,
     idleWaiters: new Set(),
     aborted: false,
     completeSent: false,
+    /** True once the run takes no more messages (failure or cleanup; see `injectOpenCodeInput`). */
+    terminal: false,
+    /** 'async' | 'blocking': which delivery lifecycle this run uses (see `deliverOpenCodePrompt`). */
+    sendMode: null,
+    /** When the async accept landed, and when an idle was last observed (any path). */
+    promptAcceptedAt: 0,
+    lastIdleObservedAt: 0,
+    /** Set when the engine reported a session.error for this turn. */
+    sawSessionError: false,
+    /** Timestamp of the newest event of any session, for the stall warning. */
+    lastEventAt: Date.now(),
+    stallWarnedAt: 0,
     terminalNotified: false,
     /** Timestamp of the last mid-turn context read, and the occupancy it published. */
     contextPublishedAt: 0,
@@ -663,8 +994,13 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       case 'session.idle':
       case 'session.status':
         trackOpenCodeSessionIdle(run, event);
+        if (run.engineIdle) {
+          run.lastIdleObservedAt = Date.now();
+          noteOpenCodeIdleObserved(run);
+        }
         return;
       case 'session.error': {
+        run.sawSessionError = true;
         const errorRecord = readObjectRecord(event.properties.error) ?? {};
         const message = readOptionalString(readObjectRecord(errorRecord.data)?.message)
           ?? readOptionalString(errorRecord.message)
@@ -679,6 +1015,10 @@ async function spawnOpenCode(command, options = {}, ws, context) {
   };
 
   const unsubscribe = subscribeOpenCodeEvents((event) => {
+    // Any event proves the shared engine is alive; the stall warning is about
+    // a server that went entirely quiet, not just this session.
+    run.lastEventAt = Date.now();
+
     if (!run.providerSessionId) {
       return;
     }
@@ -713,15 +1053,22 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       registerProviderSession(createdSessionId);
     }
 
-    await sendOpenCodeMessage(handle, workingDir, run.providerSessionId, {
+    await deliverOpenCodePrompt(run, workingDir, {
       text: promptText,
       model: run.model,
       agent: run.agent,
       variant: run.variant,
     });
+
+    if (run.sendMode === 'async') {
+      // Delivery only proved acceptance; the engine remains the authority on
+      // the turn itself. This wait ends when the engine settles — or throws
+      // when the server is gone, which fails the run for real below.
+      await awaitOpenCodeTurnSettled(run, workingDir);
+    }
   } catch (error) {
     if (!run.aborted) {
-      // A dropped prompt socket does not mean the turn died: the engine often
+      // A dropped delivery does not mean the turn died: the engine often
       // keeps going. Only fail the run when it truly is not running anymore.
       const resumed = await resumeOpenCodeRun(run, workingDir);
       if (!resumed) {
@@ -736,10 +1083,17 @@ async function spawnOpenCode(command, options = {}, ws, context) {
   } finally {
     // The turn is not over until messages injected into it are answered and
     // its last events have streamed: their output goes through this run, and
-    // its `complete` ends them. Nothing awaits between the drain's last
+    // its `complete` ends them. A failed turn takes no more messages and has
+    // no tail left to wait for. Nothing awaits between the drain's last
     // injection check and the cleanup below, so no injection can slip in
-    // unobserved. A failed turn has no tail left to wait for.
+    // unobserved.
+    if (failure) {
+      run.terminal = true;
+    }
     await drainOpenCodeRun(run, failure ? 0 : RUN_IDLE_EVENT_TIMEOUT_MS);
+    // From here on the run takes no more messages: `injectOpenCodeInput`
+    // either lands fully before this point or starts a fresh run.
+    run.terminal = true;
     unsubscribe();
     unregisterOpenCodeRun(runId);
     activeRuns.delete(runId);
@@ -827,25 +1181,67 @@ async function abortOpenCodeSession(sessionId) {
  * OpenCode's prompt loop re-reads the conversation after every step, so a
  * message posted while the session is busy is answered once the current step
  * ends — a running tool or subagent is not interrupted (verified with
- * scripts/probe/opencode-midturn-probe.mjs). The message reuses the turn's
- * model, agent and effort, its output streams through the run's writer, and
- * the run does not complete before it is answered (`settleOpenCodeInjections`).
- * Resolves false when there is no live turn left to take it.
+ * scripts/probe/opencode-midturn-probe.mjs for the blocking send and
+ * scripts/probe/opencode-async-probe.mjs for the async one). The message
+ * reuses the turn's model, agent and effort, its output streams through the
+ * run's writer, and the run does not complete before it is answered: the
+ * async send registers a pending answer that the settle logic releases once
+ * the engine is confirmed idle after acceptance, while the blocking fallback
+ * resolves when its own request returns. Resolves false when there is no live
+ * turn left to take it.
  */
 async function injectOpenCodeInput(command, options = {}) {
   const run = activeRuns.get(options.sessionId);
-  if (!run || run.aborted || run.completeSent || !run.providerSessionId) {
+  if (!run || run.aborted || run.terminal || run.completeSent || !run.providerSessionId) {
     return false;
   }
 
-  // Registered synchronously after the check above: the run's cleanup only
-  // starts once `injections` is empty, so this message cannot be orphaned.
-  const tracked = sendOpenCodeMessage(run.handle, run.directory, run.providerSessionId, {
+  const input = {
     text: buildOpenCodePrompt(command, options.images, options.files),
     model: run.model,
     agent: run.agent,
     variant: run.variant,
-  })
+  };
+
+  if (openCodeServerSupportsAsyncPrompt(run.handle)) {
+    let accepted = false;
+    try {
+      await sendOpenCodeMessageAsync(run.handle, run.directory, run.providerSessionId, input);
+      accepted = true;
+    } catch (error) {
+      if (!isOpenCodeAsyncPromptUnsupportedError(error)) {
+        // As with the turn's own prompt, a dropped socket does not mean the
+        // engine lost the message; only report it when the session stopped.
+        if (await openCodeSessionIsBusy(run)) {
+          accepted = true;
+        } else {
+          const reason = error instanceof Error ? error.message : String(error);
+          console.error('[OpenCode] Mid-turn message was not delivered:', reason);
+          run.writer.send(createNormalizedMessage({
+            kind: 'error',
+            content: `OpenCode did not take the message sent during the turn: ${reason}`,
+            sessionId: run.providerSessionId || run.appSessionId || null,
+            provider: 'opencode',
+          }));
+          return true;
+        }
+      }
+      // The unsupported marker falls through to the blocking endpoint below.
+    }
+
+    if (accepted) {
+      // Registered synchronously after acceptance: the run's cleanup only
+      // starts once `injections` is empty, so this message cannot be orphaned.
+      registerOpenCodeInjection(run, Date.now());
+      // An idle seen earlier no longer ends the turn: the loop that answers
+      // this message reports its own idle once its output has streamed.
+      run.engineIdle = false;
+      return true;
+    }
+  }
+
+  // Legacy blocking send: its response is the "answered" signal.
+  const tracked = sendOpenCodeMessage(run.handle, run.directory, run.providerSessionId, input)
     .catch(async (error) => {
       if (run.aborted) {
         return;
