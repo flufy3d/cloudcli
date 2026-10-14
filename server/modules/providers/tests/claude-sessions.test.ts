@@ -10,6 +10,8 @@ import { AppError } from '@/shared/utils.js';
 import { ClaudeSessionSynchronizer } from '@/modules/providers/list/claude/claude-session-synchronizer.provider.js';
 import { buildLookupMap } from '@/shared/utils.js';
 
+import { createWorkspaceFixture } from './workspace-fixture.js';
+
 async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'claude-provider-db-'));
@@ -1999,8 +2001,7 @@ test('buildLookupMap skips rows with non-string key or value', async () => {
 
 test('synchronizeFile uses ai-title from JSONL when no DB custom_name exists', { concurrency: false }, async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-aititle-'));
-  const workspacePath = path.join(tmp, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
   try {
@@ -2044,8 +2045,7 @@ test('synchronizeFile uses ai-title from JSONL when no DB custom_name exists', {
 
 test('synchronizeFile uses custom-title from JSONL when no DB custom_name and no ai-title', { concurrency: false }, async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-customtitle-'));
-  const workspacePath = path.join(tmp, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
   try {
@@ -2083,8 +2083,7 @@ test('synchronizeFile uses custom-title from JSONL when no DB custom_name and no
 
 test('synchronizeFile falls back to history.jsonl display when JSONL has no title events', { concurrency: false }, async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-fallback-'));
-  const workspacePath = path.join(tmp, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
   try {
@@ -2125,8 +2124,7 @@ test('synchronizeFile falls back to history.jsonl display when JSONL has no titl
 
 test('synchronizeFile falls back to Untitled Claude Session when all sources are empty', { concurrency: false }, async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-untitled-'));
-  const workspacePath = path.join(tmp, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
   try {
@@ -2167,8 +2165,7 @@ test('synchronizeFile falls back to Untitled Claude Session when all sources are
 
 test('synchronizeFile preserves existing DB custom_name regardless of JSONL and history.jsonl', { concurrency: false }, async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-dbwins-'));
-  const workspacePath = path.join(tmp, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
   try {
@@ -2213,8 +2210,7 @@ test('synchronizeFile preserves existing DB custom_name regardless of JSONL and 
 
 test('synchronizeFile does NOT treat "Untitled Claude Session" in DB as a real custom_name', { concurrency: false }, async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-untitled-db-'));
-  const workspacePath = path.join(tmp, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
   try {
@@ -2258,8 +2254,7 @@ test('synchronizeFile does NOT treat "Untitled Claude Session" in DB as a real c
 
 test('synchronizeFile skips subagent transcripts', { concurrency: false }, async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-subagent-'));
-  const workspacePath = path.join(tmp, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
   try {

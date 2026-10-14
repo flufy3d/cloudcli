@@ -31,24 +31,31 @@ async function withIsolatedDatabase(runTest: (scratchDir: string) => void | Prom
   }
 }
 
-test('active-project listing omits the operating-system temporary directory root', async () => {
-  await withIsolatedDatabase(async (scratchDir) => {
+test('active-project listing omits workspaces inside operating-system temporary directories', async () => {
+  await withIsolatedDatabase(async () => {
+    // Rows stay in the database — hidden, not deleted — so a filter revert
+    // brings them back. The control project lives outside the temporary roots
+    // because the fixture scratch dir itself is a temporary directory.
     projectsDb.ensureProjectPath(tmpdir());
-    projectsDb.ensureProjectPath(path.join(scratchDir, 'real-project'));
+    projectsDb.ensureProjectPath(path.join(tmpdir(), 'task-review-X3ZEvD'));
+    const realProject = path.join(os.homedir(), 'Projects', 'real-project');
+    projectsDb.ensureProjectPath(realProject);
 
     const projects = await getProjectsWithSessions({ skipSynchronization: true });
 
-    assert.deepEqual(projects.map((project) => project.fullPath), [path.join(scratchDir, 'real-project')]);
+    assert.deepEqual(projects.map((project) => project.fullPath), [realProject]);
   });
 });
 
-test('archived-project listing omits the operating-system temporary directory root', async () => {
-  await withIsolatedDatabase(async (scratchDir) => {
+test('archived-project listing omits workspaces inside operating-system temporary directories', async () => {
+  await withIsolatedDatabase(async () => {
     const temporaryRoot = tmpdir();
-    const realProject = path.join(scratchDir, 'archived-real-project');
+    const realProject = path.join(os.homedir(), 'Projects', 'archived-real-project');
     projectsDb.ensureProjectPath(temporaryRoot);
+    projectsDb.ensureProjectPath(path.join(temporaryRoot, 'task-review-X3ZEvD'));
     projectsDb.ensureProjectPath(realProject);
     projectsDb.updateProjectIsArchived(temporaryRoot, true);
+    projectsDb.updateProjectIsArchived(path.join(temporaryRoot, 'task-review-X3ZEvD'), true);
     projectsDb.updateProjectIsArchived(realProject, true);
 
     const projects = await getArchivedProjectsWithSessions({ skipSynchronization: true });

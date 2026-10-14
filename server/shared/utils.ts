@@ -720,23 +720,61 @@ export const isInfrastructureWorkspacePath = (projectPath: string): boolean => {
 };
 
 /**
- * Identifies a system temporary-directory root, which is runtime staging space
- * rather than a user workspace. The session admission and project-list modules
- * use this exact-root check so a real project nested below a temporary
- * directory remains valid while engine sessions recorded with cwd `/tmp` do
- * not become sidebar projects.
+ * Identifies a workspace path inside a system temporary directory (the root
+ * itself or anything nested below it), which is runtime staging space rather
+ * than a user workspace. The session admission and project-list modules use
+ * this check so engine sessions recorded inside `/tmp`, `$TMPDIR`, or — on
+ * macOS — `/var/folders` never become sidebar projects.
+ *
+ * Each root is compared in both its literal and its symlink-resolved spelling:
+ * macOS hands out `$TMPDIR` as `/var/folders/...` while engines record the
+ * same directory as `/private/var/folders/...`, and a literal prefix compare
+ * would miss the alias. Roots that do not exist on this machine contribute
+ * only their literal spelling.
  */
-export function isSystemTemporaryDirectoryRoot(projectPath: string): boolean {
+export function isSystemTemporaryWorkspacePath(projectPath: string): boolean {
   const normalizedProjectPath = normalizeProjectPath(projectPath);
   if (!normalizedProjectPath) {
     return false;
   }
 
-  const roots = process.platform === 'win32'
-    ? [os.tmpdir()]
-    : [os.tmpdir(), '/tmp', '/private/tmp'];
+  return systemTemporaryDirectoryRoots().some(
+    (root) => normalizedProjectPath === root || normalizedProjectPath.startsWith(`${root}${path.sep}`),
+  );
+}
 
-  return roots.some((root) => normalizeProjectPath(root) === normalizedProjectPath);
+/**
+ * Builds the root list for `isSystemTemporaryWorkspacePath`: the OS temporary
+ * directory plus the well-known staging roots, each expanded with its real
+ * path so `/var` and `/private/var` spellings both match. Evaluated per call
+ * because tests may run with a different `TMPDIR`; the handful of `realpath`
+ * syscalls is negligible next to the per-project I/O around the call sites.
+ */
+function systemTemporaryDirectoryRoots(): string[] {
+  const candidates = process.platform === 'win32'
+    ? [os.tmpdir()]
+    : process.platform === 'darwin'
+      ? [os.tmpdir(), '/var/folders', '/tmp', '/private/tmp']
+      : [os.tmpdir(), '/tmp', '/private/tmp'];
+
+  const roots = new Set<string>();
+  for (const candidate of candidates) {
+    const normalized = normalizeProjectPath(candidate);
+    if (normalized) {
+      roots.add(normalized);
+    }
+
+    try {
+      const resolved = normalizeProjectPath(fs.realpathSync(candidate));
+      if (resolved) {
+        roots.add(resolved);
+      }
+    } catch {
+      // A root absent from this machine only matches by its literal spelling.
+    }
+  }
+
+  return [...roots];
 }
 
 // ---------------------------

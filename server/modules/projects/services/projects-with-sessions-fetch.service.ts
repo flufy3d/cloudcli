@@ -5,7 +5,7 @@ import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { sessionSynchronizerService } from '@/modules/providers/index.js';
 import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
 import type { RealtimeClientConnection } from '@/shared/types.js';
-import { AppError, isSystemTemporaryDirectoryRoot } from '@/shared/utils.js';
+import { AppError, isSystemTemporaryWorkspacePath } from '@/shared/utils.js';
 
 type SessionSummary = {
   id: string;
@@ -31,7 +31,7 @@ type ProjectRepositoryRow = {
 };
 
 function isVisibleProjectRow(project: ProjectRepositoryRow): boolean {
-  return !isSystemTemporaryDirectoryRoot(project.project_path);
+  return !isSystemTemporaryWorkspacePath(project.project_path);
 }
 
 export type ProjectListItem = {

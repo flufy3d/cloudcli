@@ -13,6 +13,8 @@ import { ZCodeSessionsProvider } from '@/modules/providers/list/zcode/zcode-sess
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { AppError } from '@/shared/utils.js';
 
+import { createWorkspaceFixture } from './workspace-fixture.js';
+
 /** Redirects ZCODE_STORAGE_DIR to a temp dir for fixture isolation. */
 const withZCodeStorage = async (runTest: (storageDir: string) => Promise<void>): Promise<void> => {
   const previous = process.env.ZCODE_STORAGE_DIR;
@@ -1125,10 +1127,10 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
   await withZCodeStorage(async (storageDir) => {
     await createFixtureDatabase(storageDir, 'sess_sync');
 
-    // Session indexing only admits a workspace that exists on disk, so the
-    // fixture's directory has to be a real one.
-    const workspaceDir = path.join(storageDir, 'workspace');
-    await mkdir(workspaceDir, { recursive: true });
+    // Session indexing only admits a workspace that exists on disk outside
+    // the system temporary directories, so the fixture's directory has to be
+    // a real one beside the tests.
+    const workspaceDir = await createWorkspaceFixture();
 
     // The synchronizer reads the session table, which the history fixture
     // does not create: add the top-level row plus a subagent row to filter.

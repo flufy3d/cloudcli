@@ -36,6 +36,8 @@ import { AntigravitySessionsProvider } from '../list/antigravity/antigravity-ses
 import { providerRegistry } from '../provider.registry.js';
 import { providerCapabilitiesService } from '../services/provider-capabilities.service.js';
 
+import { createWorkspaceFixture } from './workspace-fixture.js';
+
 /**
  * Sets environment variable `name` to `value` and returns a restore function
  * that puts back the previous value, so test overrides cannot leak into each
@@ -1090,6 +1092,9 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   // A mocked, empty home proves the synchronizer resolves the db through the
   // shared data root instead of the historical ~/.gemini hardcode.
   const emptyHome = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-sync-home-'));
+  // The workspace the fixture conversations claim must exist outside the
+  // system temporary directories or the admission gate refuses to index it.
+  const workspaceDir = await createWorkspaceFixture();
   const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
   const restoreHomedir = mock.method(os, 'homedir', () => emptyHome);
   const previousDatabasePath = process.env.DATABASE_PATH;
@@ -1113,7 +1118,7 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   `).run(
     'fixture-conv-1',
     'Fixture Conversation',
-    JSON.stringify([`file://${tempRoot}/workspace`]),
+    JSON.stringify([`file://${workspaceDir}`]),
     new Date().toISOString(),
     'ACTIVE',
     '',
@@ -1126,7 +1131,7 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   `).run(
     'fixture-child-agent-1',
     'Child Agent Conversation',
-    JSON.stringify([`file://${tempRoot}/workspace`]),
+    JSON.stringify([`file://${workspaceDir}`]),
     new Date().toISOString(),
     'ACTIVE',
     'fixture-conv-1',
@@ -1139,7 +1144,7 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   `).run(
     'fixture-child-agent-negative-depth',
     'Malformed Child Agent Conversation',
-    JSON.stringify([`file://${tempRoot}/workspace`]),
+    JSON.stringify([`file://${workspaceDir}`]),
     new Date().toISOString(),
     'ACTIVE',
     '',
@@ -1159,20 +1164,20 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
     sessionsDb.createAppSession(
       'fixture-other-provider-session',
       'zcode',
-      path.join(tempRoot, 'workspace'),
+      workspaceDir,
       'Unrelated Provider Session',
     );
     sessionsDb.assignProviderSessionId('fixture-other-provider-session', 'fixture-child-agent-1');
     sessionsDb.createSession(
       'fixture-child-agent-1',
       'antigravity',
-      path.join(tempRoot, 'workspace'),
+      workspaceDir,
       'Previously Indexed Child Agent',
     );
     sessionsDb.createSession(
       'fixture-child-agent-negative-depth',
       'antigravity',
-      path.join(tempRoot, 'workspace'),
+      workspaceDir,
       'Malformed Previously Indexed Child Agent',
     );
     const synchronizer = new AntigravitySessionSynchronizer();

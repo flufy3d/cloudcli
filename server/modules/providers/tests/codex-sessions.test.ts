@@ -11,6 +11,8 @@ import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sess
 import { readCodexProposedPlan } from '@/modules/providers/list/codex/codex-thread-items.js';
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 
+import { createWorkspaceFixture } from './workspace-fixture.js';
+
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
   (os as any).homedir = () => nextHomeDir;
@@ -69,8 +71,7 @@ const writeCodexTranscript = async (
 
 test('Codex synchronizer preserves the title assigned when CloudCLI creates a session', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-app-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -94,8 +95,7 @@ test('Codex synchronizer preserves the title assigned when CloudCLI creates a se
 
 test('Codex synchronizer skips sub-agent rollout files', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-subagent-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -135,8 +135,7 @@ test('Codex synchronizer skips sub-agent rollout files', { concurrency: false },
 
 test('Codex synchronizer leaves indexed sessions untitled when no name is available', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-indexed-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -157,8 +156,7 @@ test('Codex synchronizer leaves indexed sessions untitled when no name is availa
 
 test('Codex history reads 0.153-era prompts from item_completed UserMessage rows', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-user-153-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -294,8 +292,7 @@ test('getTokenUsage 404s when no rollout file can be located', async () => {
 
 test('Codex history renders one file row per patched file, from the applied diff', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-patch-history-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -354,8 +351,7 @@ test('Codex history renders one file row per patched file, from the applied diff
 
 test('Codex history attaches a spawned agent\'s own transcript to the Task row', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-history-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -446,8 +442,7 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
 
 test('Codex history closes a still-running subagent when its turn was aborted', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-aborted-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -522,8 +517,7 @@ test('Codex memory citations are lifted out of the reply they trail', () => {
 
 test('a plan followed by a memory citation is still recognized as a plan', async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-plan-citation-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -572,8 +566,7 @@ test('a plan followed by a memory citation is still recognized as a plan', async
 
 test('an interrupted subagent closes its Task row instead of running forever', async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-interrupted-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -690,8 +683,7 @@ test('readCodexProposedPlan ignores an unmatched terminal closing tag', () => {
 
 test('a spawned agent picks up its thread id from a SubAgentActivity item', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-thread-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -764,8 +756,7 @@ test('a spawned agent picks up its thread id from a SubAgentActivity item', { co
 
 test('Codex history rows reuse the item id on every read', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-row-identity-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -831,8 +822,7 @@ test('Codex history rows reuse the item id on every read', { concurrency: false 
 
 test('Codex history restores user prompts from typed item_completed rows', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-typed-user-history-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {

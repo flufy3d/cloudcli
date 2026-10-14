@@ -11,6 +11,8 @@ import { OpenCodeSessionSynchronizer } from '@/modules/providers/list/opencode/o
 import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
 import { appendImagesInputTag } from '@/shared/image-attachments.js';
 
+import { createWorkspaceFixture } from './workspace-fixture.js';
+
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
   (os as any).homedir = () => nextHomeDir;
@@ -272,8 +274,7 @@ const createOpenCodeDatabase = async (homeDir: string, workspacePath: string): P
 
 test('OpenCode session synchronizer indexes sqlite sessions without deletable transcript paths', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -312,8 +313,7 @@ test('OpenCode session synchronizer indexes sqlite sessions without deletable tr
 
 test('OpenCode session synchronizer returns the app session id once provider mapping exists', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-mapped-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -338,8 +338,7 @@ test('OpenCode session synchronizer returns the app session id once provider map
 
 test('OpenCode session synchronizer adopts the pending app session before watcher sync creates a duplicate', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-race-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -362,8 +361,7 @@ test('OpenCode session synchronizer adopts the pending app session before watche
 
 test('OpenCode sessions provider strips <images_input> from user turns and exposes attachments', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-images-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -419,8 +417,7 @@ test('OpenCode sessions provider normalizes quoted live text and skips user echo
 
 test('OpenCode sessions provider reads sqlite history and token usage', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-history-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -511,8 +508,7 @@ const seedOpenCodeSession = async (
 
 test('OpenCode synchronizer preserves the title assigned when CloudCLI creates a session', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-app-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -539,8 +535,7 @@ test('OpenCode synchronizer preserves the title assigned when CloudCLI creates a
 
 test('OpenCode synchronizer keeps the stored title for indexed sessions', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-indexed-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -562,8 +557,7 @@ test('OpenCode synchronizer keeps the stored title for indexed sessions', { conc
 
 test('getTokenUsage reads the token columns for the provider-native session', async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-token-usage-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
