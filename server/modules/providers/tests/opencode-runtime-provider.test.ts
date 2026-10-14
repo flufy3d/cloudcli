@@ -98,6 +98,18 @@ const server = http.createServer((request, response) => {
           info: { id: 'message-stub-assistant', role: 'assistant' },
         },
       });
+      // A non-empty reply: an all-empty turn is the truncation failure the
+      // runtime now rescues, and this stub only pins budget publishing.
+      writeEvent({
+        type: 'message.part.delta',
+        properties: {
+          sessionID: sessionId,
+          messageID: 'message-stub-assistant',
+          partID: 'part-stub-assistant',
+          field: 'text',
+          delta: 'stub reply',
+        },
+      });
       setTimeout(() => {
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ info: { id: 'message-stub-assistant' } }));
@@ -198,6 +210,13 @@ const server = http.createServer((request, response) => {
       });
     });
     void permissionReplied.then(() => {
+      // The approved turn produces a non-empty reply so it is not mistaken
+      // for the truncation failure the runtime rescues.
+      writeEvent({ type: 'message.updated', properties: { sessionID: parentSessionId, info: { id: 'message-stub-approved', role: 'assistant' } } });
+      writeEvent({
+        type: 'message.part.delta',
+        properties: { sessionID: parentSessionId, messageID: 'message-stub-approved', partID: 'part-stub-approved', field: 'text', delta: 'approved and done' },
+      });
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ info: { id: 'msg-stub-done' } }));
     });
@@ -313,6 +332,111 @@ const server = http.createServer((request, response) => {
           writeEvent({ type: 'session.idle', properties: { sessionID: sessionId } });
         }, 100);
       }, 100);
+    });
+    return;
+  }
+
+  response.writeHead(404, { 'content-type': 'application/json' });
+  response.end('{}');
+});
+
+server.listen(port, '127.0.0.1');
+`;
+
+/**
+ * Stub for the empty-result rescue: the first prompt POST emits a completed
+ * `task` part whose `<task_result>` is empty (the engine's shape for a
+ * subagent cut off at the output limit). The run must not report complete;
+ * it must post exactly one auto-retry message, whose turn streams a reply and
+ * ends the client turn. Every POST body is logged to `STUB_MESSAGE_LOG`.
+ */
+const openCodeEmptyResultStubScript = `const http = require('node:http');
+const fs = require('node:fs');
+
+const portIndex = process.argv.indexOf('--port');
+const port = Number(process.argv[portIndex + 1]);
+const sessionId = '${stubSessionId}';
+const messageLogPath = process.env.STUB_MESSAGE_LOG;
+
+let streamResponse = null;
+let markStreamReady = null;
+const streamReady = new Promise((resolve) => {
+  markStreamReady = resolve;
+});
+
+let messageCount = 0;
+
+const writeEvent = (payload) => {
+  if (!streamResponse) {
+    return;
+  }
+  streamResponse.write('data: ' + JSON.stringify({ directory: null, payload }) + '\\n\\n');
+};
+
+const server = http.createServer((request, response) => {
+  const url = new URL(request.url, 'http://127.0.0.1');
+
+  if (url.pathname === '/global/health') {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ healthy: true }));
+    return;
+  }
+
+  if (url.pathname === '/global/event') {
+    response.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    });
+    streamResponse = response;
+    markStreamReady();
+    return;
+  }
+
+  if (url.pathname === '/session/' + sessionId + '/message' && request.method === 'POST') {
+    let body = '';
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      messageCount += 1;
+      if (messageLogPath) {
+        fs.appendFileSync(messageLogPath, body + '\\n');
+      }
+      void streamReady.then(() => {
+        if (messageCount === 1) {
+          writeEvent({ type: 'message.updated', properties: { sessionID: sessionId, info: { id: 'message-stub-task', role: 'assistant' } } });
+          writeEvent({
+            type: 'message.part.updated',
+            properties: {
+              sessionID: sessionId,
+              part: {
+                id: 'part-stub-task',
+                messageID: 'message-stub-task',
+                type: 'tool',
+                tool: 'task',
+                callID: 'call-stub-task',
+                state: {
+                  status: 'completed',
+                  input: { description: 'dufu.js 调度器实现', subagent_type: 'general' },
+                  output: '<task id="ses_stub_child_task" state="completed">\\n<task_result>\\n\\n</task_result>\\n</task>',
+                },
+              },
+            },
+          });
+        } else {
+          writeEvent({ type: 'message.updated', properties: { sessionID: sessionId, info: { id: 'message-stub-final', role: 'assistant' } } });
+          writeEvent({
+            type: 'message.part.delta',
+            properties: { sessionID: sessionId, messageID: 'message-stub-final', partID: 'part-stub-final', field: 'text', delta: 'resumed' },
+          });
+        }
+        setTimeout(() => {
+          writeEvent({ type: 'session.idle', properties: { sessionID: sessionId } });
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ info: { id: 'message-stub-final' } }));
+        }, 50);
+      });
     });
     return;
   }
@@ -651,6 +775,97 @@ test('the final reply streams completely when the prompt request resolves before
       delete process.env.DATABASE_PATH;
     } else {
       process.env.DATABASE_PATH = previousDatabasePath;
+    }
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('an empty subagent result does not report complete; the run resumes it once', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-empty-result-'));
+  const binDir = path.join(tempRoot, 'bin');
+  const previousPath = process.env.PATH;
+  const previousDatabasePath = process.env.DATABASE_PATH;
+  const previousMessageLog = process.env.STUB_MESSAGE_LOG;
+  const previousHomeDir = os.homedir;
+
+  closeConnection();
+  process.env.DATABASE_PATH = path.join(tempRoot, 'auth.db');
+  process.env.STUB_MESSAGE_LOG = path.join(tempRoot, 'messages.jsonl');
+  await initializeDatabase();
+  (os as unknown as { homedir: () => string }).homedir = () => tempRoot;
+
+  try {
+    await mkdir(binDir, { recursive: true });
+    const stubPath = path.join(tempRoot, 'opencode-empty-result-stub.cjs');
+    await writeFile(stubPath, openCodeEmptyResultStubScript);
+    await writeOpenCodeShim(binDir, stubPath);
+
+    process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ''}`;
+
+    const messages: NormalizedMessage[] = [];
+    const writer: ProviderRuntimeWriter = {
+      userId: null,
+      send: (message) => {
+        messages.push(message as NormalizedMessage);
+      },
+    };
+    const sessionsProvider = new OpenCodeSessionsProvider();
+    const context = {
+      resolveProviderSessionId: () => null,
+      resolveResumeModel: async (_sessionId: string | undefined, model?: string | null) =>
+        model ?? 'opencode-go/deepseek-v4.1-flash',
+      getProviderModels: async () => ({}),
+      normalizeMessage: (raw: unknown, sessionId: string | null) =>
+        sessionsProvider.normalizeMessage(raw, sessionId),
+      isProviderInstalled: async () => true,
+    } as unknown as ProviderRuntimeContext;
+
+    await spawnOpenCode(
+      'hello',
+      // The provider session already exists (a resumed session); the rescue
+      // turn must keep addressing it.
+      { sessionId: 'app-sess-empty-result', cwd: tempRoot, providerSessionId: stubSessionId },
+      writer,
+      context,
+    );
+
+    const card = messages.find((message) => message.kind === 'tool_use' && message.toolName === 'task');
+    assert.ok(card, 'the task card must be emitted');
+    assert.equal(card.toolResult?.isError, true, 'an empty delivery must not render as success');
+
+    const completes = messages.filter((message) => message.kind === 'complete');
+    assert.equal(completes.length, 1, 'the empty attempt must not report complete; only the resumed turn does');
+
+    const completeIndex = messages.findIndex((message) => message.kind === 'complete');
+    assert.ok(
+      messages
+        .slice(0, completeIndex)
+        .some((message) => message.kind === 'stream_delta' && message.content === 'resumed'),
+      'the resumed turn must stream into the same client turn before the single complete frame',
+    );
+
+    const sent = (await readFile(process.env.STUB_MESSAGE_LOG as string, 'utf8')).trim().split('\n');
+    assert.equal(sent.length, 2, 'the prompt and exactly one auto-retry message must be posted');
+    assert.ok(sent[1]?.includes('cloudcli auto-retry'), 'the retry must be labeled as an automatic rescue');
+    assert.ok(sent[1]?.includes('ses_stub_child_task'), 'the retry must name the empty subagent for task_id resume');
+  } finally {
+    shutdownOpenCodeServer();
+    (os as unknown as { homedir: () => string }).homedir = previousHomeDir;
+    if (previousPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = previousPath;
+    }
+    closeConnection();
+    if (previousDatabasePath === undefined) {
+      delete process.env.DATABASE_PATH;
+    } else {
+      process.env.DATABASE_PATH = previousDatabasePath;
+    }
+    if (previousMessageLog === undefined) {
+      delete process.env.STUB_MESSAGE_LOG;
+    } else {
+      process.env.STUB_MESSAGE_LOG = previousMessageLog;
     }
     await rm(tempRoot, { recursive: true, force: true });
   }

@@ -41,6 +41,7 @@ import {
   registerOpenCodeRun,
   unregisterOpenCodeRun,
 } from './opencode-permissions.provider.js';
+import { readOpenCodeTaskDelivery } from './opencode-sessions.provider.js';
 
 // cross-spawn resolves .cmd shims/PATHEXT on Windows and delegates to
 // child_process.spawn everywhere else.
@@ -272,6 +273,70 @@ export async function drainOpenCodeRun(run, idleTimeoutMs = RUN_IDLE_EVENT_TIMEO
 }
 
 /**
+ * Decides whether a finished turn must be resumed once to rescue its work.
+ *
+ * Two shapes of the same failure: a subagent (task) part completed with an
+ * empty `<task_result>` — the subagent's response was cut off at the output
+ * limit before it delivered — or the turn itself ended with no assistant text
+ * and no tool call, the same truncation hitting the parent. The engine reports
+ * both as success, so without this the run ends green having delivered
+ * nothing; with it the runtime re-prompts once (see
+ * `buildOpenCodeResumeMessage`).
+ *
+ * A run the user aborted or that truly failed is never resumed, and the
+ * one-attempt flag (`emptyResultResumeAttempt` on the run options) caps the
+ * rescue so a model that truncates every response cannot loop.
+ * Consumed by `spawnOpenCode`'s completion path.
+ */
+export function shouldResumeOpenCodeTurn({
+  hasPrompt,
+  aborted,
+  failed,
+  attempted,
+  emptyDeliveries,
+  toolPartCount,
+  sawAssistantText,
+}) {
+  if (!hasPrompt || aborted || failed || attempted) {
+    return false;
+  }
+
+  if (Array.isArray(emptyDeliveries) && emptyDeliveries.length > 0) {
+    return true;
+  }
+
+  return toolPartCount === 0 && !sawAssistantText;
+}
+
+/**
+ * Builds the one user message that resumes a turn whose work never landed.
+ *
+ * The empty attempt never reported complete, so the resumed turn's output
+ * streams into the same client turn. The message is persisted like any user
+ * input, which is why it reads as an explicit system-level retry and names
+ * the empty subagent — the parent should continue it through `task_id`
+ * instead of redoing the work from scratch.
+ * Consumed by `spawnOpenCode`'s completion path.
+ */
+export function buildOpenCodeResumeMessage({ emptyDeliveries }) {
+  const deliveries = Array.isArray(emptyDeliveries) ? emptyDeliveries : [];
+  if (deliveries.length === 0) {
+    return '[cloudcli auto-retry] The previous response ended without any output — no text and no tool calls were produced. '
+      + 'It was most likely cut off at the output limit. Continue the task from where it stopped and produce the deliverables.';
+  }
+
+  const named = deliveries.slice(0, 3).map((delivery) => {
+    const description = readOptionalString(delivery?.description);
+    const taskId = readOptionalString(delivery?.taskId);
+    return `${description ? `"${description}"` : 'subagent task'}${taskId ? ` (task_id ${taskId})` : ''}`;
+  });
+  const overflow = deliveries.length > named.length ? ` and ${deliveries.length - named.length} more` : '';
+  const pronoun = deliveries.length > 1 ? 'each one via its task_id' : 'it via its task_id';
+  return `[cloudcli auto-retry] This subagent run finished with an empty result and delivered nothing: ${named.join('; ')}${overflow}. `
+    + `Resume ${pronoun} and have it finish the original task, then verify the deliverables actually exist before reporting back.`;
+}
+
+/**
  * Runs one OpenCode turn against the shared `opencode serve` instance.
  *
  * The CLI's `run` mode cannot surface tool approvals (it auto-rejects every
@@ -293,10 +358,13 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     permissionMode
   } = options;
   // Callers pass the stable app session id; the server resumes with the
-  // provider-native id recorded on the session row.
-  const providerSessionId = context.resolveProviderSessionId(sessionId);
+  // provider-native id recorded on the session row. A resume launched by this
+  // function itself passes the native id explicitly, because the session row
+  // may not carry it yet when the rescue turn starts.
+  const providerSessionId = options.providerSessionId || context.resolveProviderSessionId(sessionId);
   const workingDir = cwd || projectPath || process.cwd();
   const runId = sessionId || `opencode-${Date.now()}`;
+  const promptText = buildOpenCodePrompt(command, images, files);
 
   let effortModels = null;
   try {
@@ -339,6 +407,13 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     assistantMessageIds: new Set(),
     partTypes: new Map(),
     deltaPartIds: new Set(),
+    /** Empty subagent deliveries seen this turn (see `readOpenCodeTaskDelivery`), deduplicated by part id. */
+    emptyDeliveries: [],
+    emptyDeliveryPartIds: new Set(),
+    /** Whether any main-thread assistant text streamed; an all-empty turn is a failure the run must rescue. */
+    sawAssistantText: false,
+    /** Distinct tool parts of this turn's own session, counted once per part id. */
+    toolPartCount: 0,
   };
 
   const indexRun = () => {
@@ -474,7 +549,11 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     const messageId = readOptionalString(part.messageID);
 
     if (partId && partType) {
+      const isFirstSighting = !run.partTypes.has(partId);
       run.partTypes.set(partId, partType);
+      if (isFirstSighting && partType === 'tool') {
+        run.toolPartCount += 1;
+      }
     }
 
     if (messageId && run.userMessageIds.has(messageId)) {
@@ -489,6 +568,13 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     }
 
     if (partType === 'tool') {
+      const delivery = readOpenCodeTaskDelivery(part);
+      if (delivery?.empty && (!partId || !run.emptyDeliveryPartIds.has(partId))) {
+        if (partId) {
+          run.emptyDeliveryPartIds.add(partId);
+        }
+        run.emptyDeliveries.push(delivery);
+      }
       emitNormalized({ type: 'tool_use', id: partId, sessionID: run.providerSessionId, part });
       return;
     }
@@ -507,6 +593,9 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       const time = readObjectRecord(part.time) ?? {};
       const completed = time.end !== undefined && time.end !== null;
       if (completed && !run.deltaPartIds.has(partId) && typeof part.text === 'string' && part.text.trim()) {
+        if (partType === 'text') {
+          run.sawAssistantText = true;
+        }
         emitNormalized({ type: partType, id: partId, partID: partId, sessionID: run.providerSessionId, text: part.text, messageID: messageId });
       }
     }
@@ -531,6 +620,9 @@ async function spawnOpenCode(command, options = {}, ws, context) {
 
     run.deltaPartIds.add(partId);
     const kind = run.partTypes.get(partId) === 'reasoning' ? 'reasoning' : 'text';
+    if (kind === 'text' && delta.trim().length > 0) {
+      run.sawAssistantText = true;
+    }
     // `partID` is what the persisted row is reconciled through: the streamed
     // text has no row id of its own, so the part is the identity both paths
     // share (see buildOpenCodeTextRowKey).
@@ -611,6 +703,9 @@ async function spawnOpenCode(command, options = {}, ws, context) {
   });
 
   let failure = null;
+  // Set when the turn delivered nothing and the completion path will resume it
+  // once (see `shouldResumeOpenCodeTurn`).
+  let pendingResume = false;
 
   try {
     if (!run.providerSessionId) {
@@ -619,7 +714,7 @@ async function spawnOpenCode(command, options = {}, ws, context) {
     }
 
     await sendOpenCodeMessage(handle, workingDir, run.providerSessionId, {
-      text: buildOpenCodePrompt(command, images, files),
+      text: promptText,
       model: run.model,
       agent: run.agent,
       variant: run.variant,
@@ -655,23 +750,57 @@ async function spawnOpenCode(command, options = {}, ws, context) {
 
     if (!run.aborted && !run.completeSent) {
       run.completeSent = true;
-      const tokenBudget = readOpenCodeTokenUsage(run.providerSessionId);
-      if (tokenBudget) {
-        sendTokenBudget(tokenBudget);
-      }
+      // A turn that delivered nothing (an empty subagent result, or an empty
+      // whole turn) must not report complete: the rescue turn below streams
+      // into the same client turn and sends the only terminal frame.
+      pendingResume = shouldResumeOpenCodeTurn({
+        hasPrompt: promptText.length > 0,
+        aborted: run.aborted,
+        failed: Boolean(failure),
+        attempted: Boolean(options.emptyResultResumeAttempt),
+        emptyDeliveries: run.emptyDeliveries,
+        toolPartCount: run.toolPartCount,
+        sawAssistantText: run.sawAssistantText,
+      });
 
-      ws.send(createCompleteMessage({
-        provider: 'opencode',
-        sessionId: run.appSessionId || run.providerSessionId || runId,
-        actualSessionId: run.providerSessionId || undefined,
-        exitCode: failure ? 1 : 0,
-      }));
-      notifyTerminalState({ error: failure });
+      if (!pendingResume) {
+        const tokenBudget = readOpenCodeTokenUsage(run.providerSessionId);
+        if (tokenBudget) {
+          sendTokenBudget(tokenBudget);
+        }
+
+        ws.send(createCompleteMessage({
+          provider: 'opencode',
+          sessionId: run.appSessionId || run.providerSessionId || runId,
+          actualSessionId: run.providerSessionId || undefined,
+          exitCode: failure ? 1 : 0,
+        }));
+        notifyTerminalState({ error: failure });
+      }
     }
   }
 
   if (failure) {
     throw failure;
+  }
+
+  if (pendingResume) {
+    console.log(
+      `[OpenCode] Turn ${run.providerSessionId || runId} delivered no result; resuming once with an auto-retry message`
+    );
+    return spawnOpenCode(
+      buildOpenCodeResumeMessage({ emptyDeliveries: run.emptyDeliveries }),
+      {
+        ...options,
+        // The retry carries no new attachments; originals were already sent.
+        images: undefined,
+        files: undefined,
+        providerSessionId: run.providerSessionId || options.providerSessionId,
+        emptyResultResumeAttempt: true,
+      },
+      ws,
+      context,
+    );
   }
 }
 

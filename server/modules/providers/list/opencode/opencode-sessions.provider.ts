@@ -86,6 +86,73 @@ const formatToolContent = (value: unknown): string => {
   }
 };
 
+/**
+ * The delivery outcome of one OpenCode `task` (subagent) tool part.
+ *
+ * A completed task part carries the subagent's outcome in `state.output` as
+ * `<task id="ses_…" state="completed"><task_result>…</task_result></task>`.
+ * The engine reports the call completed even when `<task_result>` is empty —
+ * the subagent's response was cut off at the output limit before it delivered
+ * anything — so the emptiness, not the status, is what says "nothing landed".
+ */
+type OpenCodeTaskDelivery = {
+  /** True when the subagent delivered nothing (its `<task_result>` was empty). */
+  empty: boolean;
+  /** The subagent's provider session id when the output names one. */
+  taskId: string | null;
+  /** The task description from the call input, when present. */
+  description: string | null;
+};
+
+/**
+ * Reads a completed task part's delivery outcome; null for anything that is
+ * not a completed task part.
+ *
+ * Consumed by this provider's live and history tool normalization (an empty
+ * delivery is surfaced as an error card, never as success) and by the runtime
+ * provider (the same reading triggers its one-shot resume of the parent).
+ */
+export function readOpenCodeTaskDelivery(part: unknown): OpenCodeTaskDelivery | null {
+  const record = readObjectRecord(part);
+  if (!record || readOptionalString(record.tool) !== 'task') {
+    return null;
+  }
+
+  const state = readObjectRecord(record.state) ?? {};
+  if (readOptionalString(state.status) !== 'completed') {
+    return null;
+  }
+
+  const output = typeof state.output === 'string' ? state.output : '';
+  const resultMatch = output.match(/<task_result>([\s\S]*?)<\/task_result>/);
+  if (!resultMatch) {
+    return null;
+  }
+
+  return {
+    empty: (resultMatch[1] ?? '').trim().length === 0,
+    taskId: output.match(/<task id="([^"]+)"/)?.[1] ?? null,
+    description: readOptionalString(readObjectRecord(state.input)?.description) ?? null,
+  };
+}
+
+/**
+ * The transcript note an empty subagent delivery renders with.
+ *
+ * Shared by the live and history normalization paths so a reloaded session
+ * shows the same failure the live stream announced instead of flipping back
+ * to a green "completed" card.
+ */
+const emptyTaskResultNote = (delivery: OpenCodeTaskDelivery): string => {
+  const subject = delivery.description
+    ? `Subagent "${delivery.description}"`
+    : delivery.taskId
+      ? `Subagent ${delivery.taskId}`
+      : 'The subagent';
+  return `${subject} returned an empty result — nothing was delivered. `
+    + "This usually means the model's response was cut off at the output limit before it produced anything.";
+};
+
 const extractText = (value: unknown): string => {
   if (typeof value === 'string') {
     return unwrapJsonStringLiteral(value);
@@ -246,7 +313,15 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       const status = readOptionalString(state.status);
       const output = state.output ?? part.output;
       const error = state.error ?? part.error;
-      if (status === 'completed' || status === 'error' || output !== undefined || error !== undefined) {
+      const delivery = readOpenCodeTaskDelivery(part);
+      if (delivery?.empty) {
+        // The engine reports a truncated subagent call as completed; nothing
+        // was delivered, so the card must not render as success.
+        toolMessage.toolResult = {
+          content: emptyTaskResultNote(delivery),
+          isError: true,
+        };
+      } else if (status === 'completed' || status === 'error' || output !== undefined || error !== undefined) {
         toolMessage.toolResult = {
           content: formatToolContent(output ?? error),
           isError: status === 'error' || error !== undefined,
@@ -445,10 +520,18 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         });
 
         if (status === 'completed' || status === 'error') {
-          toolMessage.toolResult = {
-            content: formatToolContent(state.output ?? state.error),
-            isError: status === 'error',
-          };
+          const delivery = readOpenCodeTaskDelivery(partData);
+          if (delivery?.empty) {
+            toolMessage.toolResult = {
+              content: emptyTaskResultNote(delivery),
+              isError: true,
+            };
+          } else {
+            toolMessage.toolResult = {
+              content: formatToolContent(state.output ?? state.error),
+              isError: status === 'error',
+            };
+          }
         }
 
         normalized.push(toolMessage);
