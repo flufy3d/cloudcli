@@ -99,11 +99,13 @@ test('OpenCode falls back to the anchor catalog when nothing dynamic is readable
   );
   // The anchors deliberately stay tiny: the dynamic CLI listing is the real
   // catalog, so every hardcoded id is a maintenance liability that will churn
-  // with OpenCode's console lineup. They only stand in when the probe fails
-  // and anchor the shared capability catalogs' default model.
+  // with OpenCode's console lineup. They only stand in when the probe fails,
+  // anchor the shared capability catalogs' default model, and carry the Go
+  // effort variants a synthesized option cannot know.
   assert.equal(OPENCODE_PREDEFINED_MODELS.DEFAULT, 'opencode/gpt-5.6-terra');
-  assert.ok(
-    OPENCODE_PREDEFINED_MODELS.OPTIONS.some((option) => option.value === 'opencode/claude-fable-5'),
+  assert.deepEqual(
+    OPENCODE_PREDEFINED_MODELS.OPTIONS.map((option) => option.value),
+    ['opencode/gpt-5.6-terra', 'opencode-go/glm-5.3'],
   );
   // Effort choices come from `opencode models --verbose` variants; the runtime
   // turns a selected value into `--variant`, so the values have to match the
@@ -236,13 +238,14 @@ test('OpenCode lists only the models the CLI reports for the account', async () 
     async (adapter) => {
       const catalog = await adapter.getSupportedModels();
 
-      // Deduplicated, malformed lines dropped; curated entries keep their
+      // Deduplicated, malformed lines dropped; anchor entries keep their
       // label and description; unknown ids get synthesized display text, and
       // direct-connect families are labeled with their own name rather than
-      // the OpenCode gateways.
+      // the OpenCode gateways. claude-fable-5 used to be an anchor and now
+      // pins the synthesis path for formerly hardcoded ids.
       assert.deepEqual(catalog.OPTIONS, [
         OPENCODE_PREDEFINED_MODELS.OPTIONS.find((option) => option.value === 'opencode/gpt-5.6-terra'),
-        OPENCODE_PREDEFINED_MODELS.OPTIONS.find((option) => option.value === 'opencode/claude-fable-5'),
+        { value: 'opencode/claude-fable-5', label: 'Claude Fable 5', description: 'OpenCode Zen' },
         { value: 'opencode/beam-free', label: 'Beam Free', description: 'OpenCode Zen · Free' },
         OPENCODE_PREDEFINED_MODELS.OPTIONS.find((option) => option.value === 'opencode-go/glm-5.3'),
         { value: 'anthropic/claude-sonnet-9', label: 'Claude Sonnet 9', description: 'Anthropic' },

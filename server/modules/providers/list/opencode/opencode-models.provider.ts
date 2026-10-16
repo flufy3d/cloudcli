@@ -34,17 +34,18 @@ import { getOpenCodeDatabasePath } from './opencode-data-root.js';
  * Static anchor catalog for OpenCode.
  *
  * The real catalog is the account-scoped list `opencode models` reports at
- * runtime; these three entries only stand in when that probe is unavailable
+ * runtime; these two entries only stand in when that probe is unavailable
  * (CLI missing, failing, or answering empty) and anchor the shared capability
  * catalogs' default model. Model ids churn with OpenCode's console lineup, so
  * this list is deliberately tiny: every entry here is a maintenance liability,
- * not a feature. Unknown dynamic ids are synthesized on the fly by
- * buildOpenCodeModelOption, which reuses an entry's display metadata on match.
+ * not a feature. The Go anchor additionally carries the effort variants a
+ * dynamic option cannot know. Unknown dynamic ids are synthesized on the fly
+ * by buildOpenCodeModelOption, which reuses an entry's display metadata on
+ * match.
  */
 export const OPENCODE_PREDEFINED_MODELS: ProviderModelsDefinition = {
   OPTIONS: [
     { value: 'opencode/gpt-5.6-terra', label: 'GPT 5.6 Terra', description: 'OpenCode Zen' },
-    { value: 'opencode/claude-fable-5', label: 'Claude Fable 5', description: 'OpenCode Zen' },
     {
       value: 'opencode-go/glm-5.3',
       label: 'GLM 5.3',
