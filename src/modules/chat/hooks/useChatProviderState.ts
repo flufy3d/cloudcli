@@ -132,10 +132,9 @@ export function useChatProviderState({
     Partial<Record<LLMProvider, ProviderModelsDefinition>>
   >({});
   const [providerModelsLoading, setProviderModelsLoading] = useState(true);
-  // Tracks a exhausted model-catalog load so the composer menu can offer a retry
-  // instead of staying silently blank (fresh PWA installs can mount during a
-  // server restart and lose the only fetch).
-  const [providerModelsError, setProviderModelsError] = useState(false);
+  // Failed providers need their own retry state so another provider's success cannot hide the error.
+  const [failedModelProviders, setFailedModelProviders] = useState<LLMProvider[]>([]);
+  const providerModelsError = failedModelProviders.includes(provider);
 
   const providerModelsRequestIdRef = useRef(0);
   const sessionSelectionLoadRequestIdRef = useRef(0);
@@ -168,7 +167,7 @@ export function useChatProviderState({
     const requestId = providerModelsRequestIdRef.current + 1;
     providerModelsRequestIdRef.current = requestId;
     setProviderModelsLoading(true);
-    setProviderModelsError(false);
+    setFailedModelProviders([]);
 
     // A failed load auto-retries before surfacing an error: fresh installs and
     // page loads that land in a server-restart window would otherwise keep the
@@ -182,53 +181,35 @@ export function useChatProviderState({
         return null;
       }
 
+      if (providerModelsRequestIdRef.current === requestId) {
+        const models = body.data.models;
+        setProviderModelCatalog((previous) => ({ ...previous, [p]: models }));
+      }
       return body.data.models;
     };
 
+    let pendingProviders = [...PROVIDERS];
     try {
       for (let attempt = 0; ; attempt++) {
-        let nextCatalog: Partial<Record<LLMProvider, ProviderModelsDefinition>> = {};
-        let failed = false;
-
-        try {
-          const results = await Promise.all(PROVIDERS.map(fetchCatalogEntry));
-          if (providerModelsRequestIdRef.current !== requestId) {
-            return;
+        const results = await Promise.allSettled(pendingProviders.map(fetchCatalogEntry));
+        if (providerModelsRequestIdRef.current !== requestId) return;
+        const failed: LLMProvider[] = [];
+        pendingProviders.forEach((targetProvider, index) => {
+          const result = results[index];
+          if (result.status !== 'fulfilled' || !result.value) {
+            failed.push(targetProvider);
+            if (result.status === 'rejected') console.error(`Error loading ${targetProvider} models:`, result.reason);
           }
-
-          PROVIDERS.forEach((p, i) => {
-            const entry = results[i];
-            if (entry) {
-              nextCatalog[p] = entry;
-            }
-          });
-        } catch {
-          failed = true;
-        }
-
-        // An all-empty catalog counts as a failure too: providers respond with
-        // success:false instead of throwing on auth/server errors.
-        if (!failed && Object.keys(nextCatalog).length > 0) {
-          if (providerModelsRequestIdRef.current !== requestId) {
-            return;
-          }
-          setProviderModelCatalog(nextCatalog);
-          return;
-        }
-
+        });
+        // Successful requests publish immediately; retry only the failed providers.
+        if (failed.length === 0) return;
         if (attempt >= retryDelaysMs.length) {
-          if (failed) {
-            throw new Error('Provider model catalog unreachable');
-          }
-          setProviderModelsError(true);
+          setFailedModelProviders(failed);
           return;
         }
+        pendingProviders = failed;
         await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
-      }
-    } catch (error) {
-      console.error('Error loading provider models:', error);
-      if (providerModelsRequestIdRef.current === requestId) {
-        setProviderModelsError(true);
+        if (providerModelsRequestIdRef.current !== requestId) return;
       }
     } finally {
       if (providerModelsRequestIdRef.current === requestId) {
@@ -363,7 +344,8 @@ export function useChatProviderState({
         let resolved = definition.DEFAULT;
         if (stored && definition.OPTIONS.some((option) => option.value === stored)) {
           resolved = stored;
-        } else if (current && definition.OPTIONS.some((option) => option.value === current)) {
+        } else if (current && current !== FALLBACK_DEFAULT_MODEL[targetProvider]
+          && definition.OPTIONS.some((option) => option.value === current)) {
           resolved = current;
         }
 
@@ -810,10 +792,11 @@ export function useChatProviderState({
     const result = await readModelMutationResponse(response);
     applyProviderCatalog(targetProvider, result.models);
 
-    if (providerModels[targetProvider] === existing.value) {
+    const remainsAvailable = result.models.OPTIONS.some((option) => option.value === existing.value);
+    if (!remainsAvailable && providerModels[targetProvider] === existing.value) {
       setProviderModel(targetProvider, result.models.DEFAULT);
     }
-    if (provider === targetProvider && sessionModel === existing.value) {
+    if (!remainsAvailable && provider === targetProvider && sessionModel === existing.value) {
       setSessionSelection((current) => current ? {
         ...current,
         model: result.models.DEFAULT,
@@ -855,7 +838,7 @@ export function useChatProviderState({
     persistPermissionModeForSession,
     cyclePermissionMode,
     providerModelCatalog,
-    providerModelsLoading,
+    providerModelsLoading: providerModelsLoading && !providerModelCatalog[provider],
     providerModelsError,
     providerModelsReload: loadProviderModels,
     providerModelActions,

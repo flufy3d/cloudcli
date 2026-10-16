@@ -8,179 +8,112 @@ import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
   ProviderModelsDefinition,
+  ProviderModelOption,
 } from '@/shared/types.js';
 import {
+  AppError,
   buildDefaultProviderCurrentActiveModel,
   readObjectRecord,
   readOptionalString,
 } from '@/shared/utils.js';
 
-/** Curated Codex catalog shipped as immutable CloudCLI defaults. */
-export const CODEX_PREDEFINED_MODELS: ProviderModelsDefinition = {
-  OPTIONS: [
-    {
-      value: 'gpt-6-astra',
-      label: 'GPT-6 Astra',
-      description: 'Our most capable model for complex, demanding work.',
-      effort: {
-        default: 'low',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          { value: 'ultra' },
-        ],
-      },
-    },
-    {
-      value: 'gpt-6.1-sol',
-      label: 'GPT-6.1 Sol',
-      description: 'Latest workhorse model for coding and everyday work.',
-      effort: {
-        default: 'low',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          { value: 'ultra' },
-        ],
-      },
-    },
-    {
-      value: 'gpt-6-sol',
-      label: 'GPT-6 Sol',
-      description: 'Previous generation workhorse model.',
-      effort: {
-        default: 'medium',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          { value: 'ultra' },
-        ],
-      },
-    },
-    {
-      value: 'gpt-6-luna',
-      label: 'GPT-6 Luna',
-      description: 'Fast and affordable model for easier tasks.',
-      effort: {
-        default: 'medium',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-        ],
-      },
-    },
-    {
-      value: 'gpt-5.6-sol',
-      label: 'GPT-5.6 Sol',
-      description: 'Latest frontier agentic coding model.',
-      effort: {
-        default: 'low',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          { value: 'ultra' },
-        ],
-      },
-    },
-    {
-      value: 'gpt-5.6-terra',
-      label: 'GPT-5.6 Terra',
-      description: 'Balanced agentic coding model for everyday work.',
-      effort: {
-        default: 'medium',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          { value: 'ultra' },
-        ],
-      },
-    },
-    {
-      value: 'gpt-5.6-luna',
-      label: 'GPT-5.6 Luna',
-      description: 'Fast and affordable agentic coding model.',
-      effort: {
-        default: 'medium',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-        ],
-      },
-    },
-    {
-      value: 'gpt-5.5',
-      label: 'GPT-5.5',
-      description: 'Frontier model for complex coding, research, and real-world work.',
-      effort: {
-        default: 'medium',
-        values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }],
-      },
-    },
-    {
-      value: 'gpt-5.4',
-      label: 'GPT-5.4',
-      description: 'Strong model for everyday coding.',
-      effort: {
-        default: 'medium',
-        values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }],
-      },
-    },
-    {
-      value: 'gpt-5.4-mini',
-      label: 'GPT-5.4 Mini',
-      description: 'Small, fast, and cost-efficient model for simpler coding tasks.',
-      effort: {
-        default: 'medium',
-        values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }],
-      },
-    },
-  ],
-  DEFAULT: 'gpt-6.1-sol',
-};
+import { codexAppServerTransport } from './codex-app-server.client.js';
 
 const CODEX_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
 
-/** Provider registry model adapter for Codex predefined models and active config. */
+const invalidCatalog = () => new AppError('Codex returned an invalid or empty model catalog.', {
+  code: 'CODEX_MODEL_CATALOG_INVALID', statusCode: 502,
+});
+
+/** Reads only complete model entries so a broken refresh cannot replace a working catalog. */
+function parseModel(value: unknown): ProviderModelOption | null {
+  const entry = readObjectRecord(value);
+  if (!entry) throw invalidCatalog();
+  if (entry.hidden === true) return null;
+  const modelId = readOptionalString(entry.model);
+  const label = readOptionalString(entry.displayName);
+  if (!modelId || !label || !Array.isArray(entry.supportedReasoningEfforts)) throw invalidCatalog();
+  const values = entry.supportedReasoningEfforts.map((raw) => {
+    const effort = readObjectRecord(raw);
+    const value = readOptionalString(effort?.reasoningEffort);
+    if (!value) throw invalidCatalog();
+    const description = readOptionalString(effort?.description);
+    return { value, ...(description ? { description } : {}) };
+  });
+  const defaultEffort = readOptionalString(entry.defaultReasoningEffort);
+  if (defaultEffort && !values.some((item) => item.value === defaultEffort)) throw invalidCatalog();
+  const description = readOptionalString(entry.description);
+  return {
+    value: modelId, label,
+    ...(description ? { description } : {}),
+    ...(values.length ? { effort: { ...(defaultEffort ? { default: defaultEffort } : {}), values } } : {}),
+  };
+}
+
+/** Provider registry consumer: discovers models from the same bundled CLI used for conversations. */
 export class CodexProviderModels implements IProviderModels {
+  private cachedModels: ProviderModelsDefinition | null = null;
+  private cacheExpiry = 0;
+  private pending: Promise<ProviderModelsDefinition> | null = null;
+
+  private async fetchModels(): Promise<ProviderModelsDefinition> {
+    const connection = await codexAppServerTransport.open();
+    try {
+      const options = new Map<string, ProviderModelOption>();
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      let defaultModel: string | undefined;
+      do {
+        const page = readObjectRecord(await connection.call('model/list', {
+          limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}),
+        }));
+        if (!page || !Array.isArray(page.data)) throw invalidCatalog();
+        for (const raw of page.data) {
+          const option = parseModel(raw);
+          if (!option) continue;
+          options.set(option.value, option);
+          if (readObjectRecord(raw)?.isDefault === true) defaultModel = option.value;
+        }
+        if (page.nextCursor != null && !readOptionalString(page.nextCursor)) throw invalidCatalog();
+        cursor = readOptionalString(page.nextCursor) ?? undefined;
+        if (cursor && cursors.has(cursor)) throw invalidCatalog();
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      const first = options.values().next().value;
+      if (!first) throw invalidCatalog();
+      return { OPTIONS: [...options.values()], DEFAULT: defaultModel ?? first.value };
+    } finally {
+      connection.close();
+    }
+  }
+
   async getSupportedModels(): Promise<ProviderModelsDefinition> {
-    return CODEX_PREDEFINED_MODELS;
+    const now = Date.now();
+    if (this.cachedModels && now < this.cacheExpiry) return this.cachedModels;
+    if (this.pending) return this.pending;
+    this.pending = this.fetchModels().then((models) => {
+      this.cachedModels = models;
+      this.cacheExpiry = Date.now() + 5 * 60_000;
+      return models;
+    }).catch((error: unknown) => {
+      console.error('[Codex] Model catalog refresh failed:', error);
+      if (!this.cachedModels) throw error;
+      // Briefly back off after failure; never replace discovered models with static guesses.
+      this.cacheExpiry = Date.now() + 10_000;
+      return this.cachedModels;
+    }).finally(() => { this.pending = null; });
+    return this.pending;
   }
 
   async getCurrentActiveModel(): Promise<ProviderCurrentActiveModel> {
+    let model: string | null = null;
     try {
       const raw = await readFile(CODEX_CONFIG_PATH, 'utf8');
       const parsed = readObjectRecord(TOML.parse(raw));
-      const model = readOptionalString(parsed?.model);
-      if (!model) {
-        return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
-      }
-
-      return {
-        model,
-      };
+      model = readOptionalString(parsed?.model) ?? null;
     } catch {
-      return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+      // Missing or unreadable config uses the discovered default below.
     }
+    return model ? { model } : buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
   }
 }

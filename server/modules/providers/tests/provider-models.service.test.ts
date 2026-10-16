@@ -351,3 +351,34 @@ test('resolveResumeModel never consults provider-global state', async () => {
   assert.equal(model, 'gpt-5.5');
   assert.equal(providerLookups, 0);
 });
+
+test('a custom model later discovered by the engine stays editable as one row with engine efforts', async (t) => {
+  let discovered = false;
+  const catalog = createCatalogStore();
+  const service = createProviderModelsService({
+    catalog, sessions: createSessionStore(),
+    resolveProvider: () => ({ models: {
+      getCurrentActiveModel: async () => ({ model: 'base' }),
+      getSupportedModels: async () => ({ DEFAULT: 'base', OPTIONS: [
+        { value: 'base', label: 'Base' },
+        ...(discovered ? [{ value: 'future', label: 'Official', effort: { default: 'high', values: [{ value: 'high' }] } }] : []),
+      ] }),
+    } }),
+  });
+  const created = await service.createCustomModel('codex', { id: 'future', model: 'My label' });
+  discovered = true;
+  const models = await service.getProviderModels('codex');
+  const matches = models.OPTIONS.filter((option) => option.value === 'future');
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].label, 'My label');
+  assert.equal(matches[0].recordId, created.model.recordId);
+  assert.equal(matches[0].effort?.default, 'high');
+  const updated = await service.updateCustomModel('codex', created.model.recordId!, { id: 'future', model: 'Renamed' });
+  assert.equal(updated.model.label, 'Renamed');
+  await assert.rejects(service.createCustomModel('codex', { id: 'future', model: 'Duplicate' }), /already exists/);
+  await assert.rejects(service.updateCustomModel('codex', created.model.recordId!, { id: 'base', model: 'Collision' }), /already exists/);
+  const remove = t.mock.method(catalog, 'deleteCustomProviderModel');
+  const deleted = await service.deleteCustomModel('codex', created.model.recordId!);
+  assert.equal(remove.mock.calls[0].arguments[2], 'future');
+  assert.equal(deleted.models.OPTIONS.find((option) => option.value === 'future')?.label, 'Official');
+});

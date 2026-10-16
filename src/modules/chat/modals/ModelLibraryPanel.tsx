@@ -368,7 +368,7 @@ export default function ModelLibraryPanel({
                       </div>
                       {confirming && (
                         <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
-                          <p className="text-xs text-muted-foreground">Delete this model from all pickers?</p>
+                          <p className="text-xs text-muted-foreground">Delete this custom model entry?</p>
                           <div className="flex items-center gap-2">
                             <Button type="button" variant="ghost" size="sm" onClick={() => setConfirmDeleteRecordId(null)} className="h-8 rounded-lg">
                               Cancel

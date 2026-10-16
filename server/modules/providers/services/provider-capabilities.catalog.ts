@@ -33,9 +33,9 @@ export type ProviderCatalogEntry = {
   defaultPermissionMode: string;
   /**
    * Static fallback default model, shown before the model catalog loads.
-   * Must equal the provider's predefined models definition's `DEFAULT`
-   * (pinned by the capability tests); zcode/antigravity resolve dynamic
-   * catalogs at runtime and fall back to this same value.
+   * Static providers keep this equal to their models definition's `DEFAULT`.
+   * Codex uses the bundled CLI's discovered default once its catalog loads;
+   * zcode/antigravity resolve their own dynamic catalogs at runtime.
    */
   defaultModel: string;
   /** Whether image attachments can be included in a chat.send. */

@@ -49,10 +49,16 @@ const mergeProviderModels = (
   predefined: ProviderModelsDefinition,
   custom: CustomProviderModelRecord[],
 ): ProviderModelsDefinition => {
+  const customById = new Map(custom.map((record) => [record.modelId, record]));
+  const predefinedIds = new Set(predefined.OPTIONS.map((option) => option.value));
   return {
     OPTIONS: [
-      ...predefined.OPTIONS.map((option) => ({ ...option, isCustom: false })),
-      ...custom.map(toCustomProviderModelOption),
+      ...predefined.OPTIONS.map((option) => {
+        const record = customById.get(option.value);
+        // Keep the saved label and edit target while inheriting discovered capabilities.
+        return record ? { ...option, ...toCustomProviderModelOption(record) } : { ...option, isCustom: false };
+      }),
+      ...custom.filter((record) => !predefinedIds.has(record.modelId)).map(toCustomProviderModelOption),
     ],
     DEFAULT: predefined.DEFAULT,
   };
@@ -118,7 +124,8 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
     modelId: string,
     currentRecordId?: number,
   ): void => {
-    if (predefined.OPTIONS.some((option) => option.value === modelId)) {
+    const existing = currentRecordId === undefined ? null : catalog.getCustomProviderModel(provider, currentRecordId);
+    if (existing?.modelId !== modelId && predefined.OPTIONS.some((option) => option.value === modelId)) {
       throw new AppError(`A ${provider} model with this ID already exists.`, {
         code: 'MODEL_ID_ALREADY_EXISTS',
         statusCode: 409,
@@ -198,8 +205,10 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
     recordId: number,
   ): Promise<{ model: ProviderModelOption; models: ProviderModelsDefinition }> => {
     const predefined = await resolveProvider(provider).models.getSupportedModels();
-    readCustomModel(provider, recordId);
-    const removed = catalog.deleteCustomProviderModel(provider, recordId, predefined.DEFAULT);
+    const existing = readCustomModel(provider, recordId);
+    const fallback = predefined.OPTIONS.some((option) => option.value === existing.modelId)
+      ? existing.modelId : predefined.DEFAULT;
+    const removed = catalog.deleteCustomProviderModel(provider, recordId, fallback);
     if (!removed) {
       throw new AppError('Model not found.', {
         code: 'MODEL_NOT_FOUND',
