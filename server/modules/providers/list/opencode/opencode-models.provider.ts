@@ -315,6 +315,39 @@ const readOpenCodeJsonFile = async (filePath: string): Promise<Record<string, un
 };
 
 /**
+ * Reads the upstream provider ids OpenCode v2 records in its shared database.
+ *
+ * OpenCode v2 stores one `credential` row per connected integration and no
+ * longer writes the v1-era auth.json, so without this sweep a v2 install
+ * contributes no provider ids at all and the picker offers models the CLI
+ * cannot route. Only active rows count — rotating a login deactivates the
+ * replaced row. A missing database or an older layout without the credential
+ * table contributes nothing.
+ */
+const readDatabaseCredentialProviderIds = (): Set<string> => {
+  const providerIds = new Set<string>();
+  try {
+    const db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
+    try {
+      const rows = db.prepare(
+        'SELECT integration_id FROM credential WHERE active = 1 AND integration_id IS NOT NULL',
+      ).all() as Array<{ integration_id?: string | null }>;
+      for (const row of rows) {
+        const integrationId = row.integration_id?.trim();
+        if (integrationId) {
+          providerIds.add(integrationId);
+        }
+      }
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Contributes nothing, mirroring the missing-auth.json handling.
+  }
+  return providerIds;
+};
+
+/**
  * Lists the upstream providers this OpenCode install can actually route to.
  *
  * OpenCode resolves `<providerID>/<modelID>` against the providers the user has
@@ -332,6 +365,10 @@ const readOpenCodeJsonFile = async (filePath: string): Promise<Record<string, un
 const readConnectedOpenCodeProviderIds = async (): Promise<Set<string> | null> => {
   const providerIds = new Set<string>();
   const configDir = path.join(os.homedir(), '.config', 'opencode');
+
+  for (const providerId of readDatabaseCredentialProviderIds()) {
+    providerIds.add(providerId);
+  }
 
   const auth = await readOpenCodeJsonFile(
     path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),

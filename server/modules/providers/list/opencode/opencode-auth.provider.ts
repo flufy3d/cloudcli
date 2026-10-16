@@ -2,6 +2,9 @@ import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import Database from 'better-sqlite3';
+
+import { getOpenCodeDatabasePath } from '@/modules/providers/list/opencode/opencode-data-root.js';
 import { createCliInstallationProbe } from '@/modules/providers/shared/installation/cli-installation-probe.js';
 import type { IProviderAuth } from '@/shared/interfaces.js';
 import type { ProviderAuthStatus } from '@/shared/types.js';
@@ -50,9 +53,22 @@ export class OpenCodeProviderAuth implements IProviderAuth {
   }
 
   /**
-   * Reads OpenCode's auth store or falls back to provider API key environment variables.
+   * Reads OpenCode's credential store. OpenCode v2 keeps credentials in the
+   * `credential` table of its shared SQLite database and no longer writes the
+   * v1-era auth.json, so the database is checked first; auth.json and the
+   * provider API key environment variables remain as fallbacks for older CLI
+   * layouts.
    */
   private async checkCredentials(): Promise<OpenCodeCredentialsStatus> {
+    const databaseCredential = this.readActiveDatabaseCredential();
+    if (databaseCredential) {
+      return {
+        authenticated: true,
+        email: databaseCredential,
+        method: 'credentials_db',
+      };
+    }
+
     try {
       const authPath = path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json');
       const content = await readFile(authPath, 'utf8');
@@ -102,5 +118,32 @@ export class OpenCodeProviderAuth implements IProviderAuth {
       method: null,
       error: 'OpenCode not configured',
     };
+  }
+
+  /**
+   * Returns the label of the most recently updated active credential row, or
+   * null when the database is absent, unreadable, or has no active row. A
+   * read-only connection never blocks against the CLI's WAL writes, and a
+   * database without the credential table (older v2 layouts) just means "no
+   * database credential" rather than an error.
+   */
+  private readActiveDatabaseCredential(): string | null {
+    let db: Database.Database;
+    try {
+      db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
+    } catch {
+      return null;
+    }
+
+    try {
+      const row = db.prepare(
+        'SELECT label FROM credential WHERE active = 1 ORDER BY time_updated DESC, time_created DESC LIMIT 1',
+      ).get() as { label?: string } | undefined;
+      return row?.label?.trim() || null;
+    } catch {
+      return null;
+    } finally {
+      db.close();
+    }
   }
 }

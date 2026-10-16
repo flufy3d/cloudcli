@@ -201,6 +201,58 @@ test('OpenCode offers only models the install can route to', async () => {
   );
 });
 
+const writeOpenCodeCredentialDatabase = async (
+  homeDir: string,
+  rows: Array<{ integrationId: string; label: string; active: number }>,
+) => {
+  const dbPath = path.join(homeDir, '.local', 'share', 'opencode', 'opencode.db');
+  await mkdir(path.dirname(dbPath), { recursive: true });
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE credential (
+        id text PRIMARY KEY,
+        integration_id text,
+        label text NOT NULL,
+        value text NOT NULL,
+        connector_id text,
+        method_id text,
+        active integer,
+        time_created integer NOT NULL,
+        time_updated integer NOT NULL
+      );
+    `);
+    const insert = db.prepare(
+      'INSERT INTO credential (id, integration_id, label, value, active, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    );
+    for (const [index, row] of rows.entries()) {
+      insert.run(`cred_${index}`, row.integrationId, row.label, 'secret', row.active, 1000 + index, 2000 + index);
+    }
+  } finally {
+    db.close();
+  }
+};
+
+test('OpenCode reads connected providers from the v2 credential database', async () => {
+  // OpenCode v2 no longer writes auth.json; `opencode auth login` stores one
+  // row per connected integration in opencode.db, so a Console-only install
+  // must narrow the catalog to Zen models instead of offering every provider.
+  await withOpenCodeHome(
+    (homeDir) => writeOpenCodeCredentialDatabase(homeDir, [
+      { integrationId: 'opencode', label: 'Personal', active: 0 },
+      { integrationId: 'opencode', label: 'Azrael', active: 1 },
+    ]),
+    async (adapter) => {
+      const catalog = await adapter.getSupportedModels();
+      const providerIds = new Set(catalog.OPTIONS.map((option) => option.value.split('/')[0]));
+
+      assert.deepEqual([...providerIds], ['opencode']);
+      assert.equal(catalog.DEFAULT, OPENCODE_PREDEFINED_MODELS.DEFAULT);
+      assert.ok(catalog.OPTIONS.some((option) => option.value === catalog.DEFAULT));
+    },
+  );
+});
+
 const writeOpenCodeSessionDatabase = async (homeDir: string, rows: Array<Record<string, unknown>>) => {
   const dbPath = path.join(homeDir, '.local', 'share', 'opencode', 'opencode.db');
   await mkdir(path.dirname(dbPath), { recursive: true });
