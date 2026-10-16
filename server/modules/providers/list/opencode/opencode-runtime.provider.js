@@ -22,6 +22,10 @@ import { getOpenCodeDatabasePath, readOpenCodeSessionTokenTotals } from './openc
 // child_process.spawn everywhere else.
 const spawnFunction = crossSpawn;
 
+// Captured at module scope: abortOpenCodeSession shadows `process` with the
+// child handle, so the platform check must not be taken from it.
+const isWindows = process.platform === 'win32';
+
 const activeOpenCodeProcesses = new Map();
 
 /**
@@ -236,7 +240,19 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       }
 
       const resolvedEffort = resolveModelEffort(resolvedModel, effort, effortModels);
-      const args = ['run', '--format', 'json'];
+      // --standalone boots a private v2 API server inside this client process
+      // (about 2s per message). Three verified payoffs against v2.0.31:
+      // 1. abort: with the shared background service, killing the client only
+      //    detaches — the service kept running the turn and orphaned tool
+      //    children. Standalone puts the server and every tool child in this
+      //    client's process group, so abortOpenCodeSession's group kill tears
+      //    the whole turn down.
+      // 2. the question tool self-cancels with a clear message and the model
+      //    continues on assumptions; against the shared service it pended
+      //    forever with no way to answer from `run`.
+      // 3. session anchoring follows this process (plus the pinned $PWD), so
+      //    sessions always land in the user's project.
+      const args = ['run', '--standalone', '--format', 'json'];
       // v2.0.31 removed `run --dir` outright (`Unrecognized flag: --dir`), so
       // the workspace comes from the spawn cwd alone; the child is always
       // spawned with cwd already set to the project path.
@@ -268,6 +284,10 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       opencodeProcess = spawnFunction('opencode', args, {
         cwd: workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
+        // detached puts the CLI (and with --standalone its private API server
+        // and every tool child) into its own process group so abort can kill
+        // the whole tree, not just the client.
+        detached: process.platform !== 'win32',
         env: {
           ...process.env,
           ...permissionOptions.env,
@@ -397,7 +417,27 @@ function abortOpenCodeSession(sessionId) {
   // The abort handler sends the terminal complete (aborted: true); flag the
   // process so its close handler does not emit a second one.
   process.aborted = true;
-  process.kill('SIGTERM');
+  // The --standalone CLI is its own process group leader: the group signal
+  // tears down the private API server and every tool child with it. Plain
+  // SIGTERM on the client alone left the shared service running the turn and
+  // orphaned tool children (verified on v2.0.31). Escalate to SIGKILL if
+  // anything survives the grace period; Windows has no process groups, so it
+  // falls back to the plain signal.
+  const killTarget = !isWindows && typeof process.pid === 'number' ? -process.pid : null;
+  const signal = (sig) => {
+    try {
+      process.kill(killTarget ?? process.pid, sig);
+    } catch (groupError) {
+      try {
+        process.kill(sig);
+      } catch {
+        // Already gone.
+      }
+    }
+  };
+  signal('SIGTERM');
+  const escalate = setTimeout(() => signal('SIGKILL'), 4000);
+  escalate.unref?.();
   activeOpenCodeProcesses.delete(sessionId);
   return true;
 }

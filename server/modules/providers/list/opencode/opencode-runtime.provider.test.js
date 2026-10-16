@@ -118,8 +118,12 @@ test('spawnOpenCode emits session_created before normalized live messages for ne
     const capture = JSON.parse(await readFile(argsCapturePath, 'utf8'));
     const launchedArgs = capture.args;
     assert.ok(Array.isArray(launchedArgs));
+    // --standalone boots a private API server in the client's process group,
+    // which is what makes abort tear the whole turn down: against the shared
+    // background service the run survived the client kill and orphaned tool
+    // children (verified on v2.0.31).
+    assert.deepEqual(launchedArgs.slice(0, 4), ['run', '--standalone', '--format', 'json']);
     // v2 removed `run --dir`; the workspace comes from the spawn cwd alone.
-    assert.deepEqual(launchedArgs.slice(0, 3), ['run', '--format', 'json']);
     assert.equal(launchedArgs.includes('--dir'), false);
     // The stale inherited PWD must be corrected to the workspace.
     assert.equal(capture.pwd, tempRoot);
