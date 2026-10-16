@@ -17,6 +17,7 @@ import type { ProviderModelOption } from '@/shared/types.js';
 
 import { AntigravityProviderAuth } from '../list/antigravity/antigravity-auth.provider.js';
 import { getAntigravitySummariesDbPath } from '../list/antigravity/antigravity-data-root.js';
+import { clearEnginePathCache } from '../list/antigravity/antigravity-engine-path.js';
 import {
   ANTIGRAVITY_BUILTIN_MODELS,
   AntigravityProviderModels,
@@ -123,11 +124,26 @@ test('AntigravityProviderAuth only reports authenticated with an OAuth token fil
 });
 
 test('AntigravityProviderModels returns builtin models fallback', async () => {
-  const models = new AntigravityProviderModels();
-  const definition = await models.getSupportedModels();
-  assert.ok(definition.OPTIONS.length > 0);
-  assert.ok(definition.DEFAULT);
-  assert.ok(definition.OPTIONS.some((m) => m.value === 'gemini-3.7-flash'));
+  // Isolate from the machine's real Antigravity install: the engine stub is
+  // an empty script, so `agy models` reports no entries and the provider must
+  // fall back to the builtin catalog even where the CLI is installed and
+  // logged in. The engine-path cache is process-wide, so it is cleared around
+  // the fixture or a previous test's resolution would win over the stub.
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'antigravity-models-'));
+  const restoreAgyPath = withEnvValue('CLOUDCLI_AGY_PATH', path.join(tempRoot, 'agy'));
+  await fs.writeFile(path.join(tempRoot, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
+  clearEnginePathCache();
+  try {
+    const models = new AntigravityProviderModels();
+    const definition = await models.getSupportedModels();
+    assert.ok(definition.OPTIONS.length > 0);
+    assert.ok(definition.DEFAULT);
+    assert.ok(definition.OPTIONS.some((m) => m.value === 'gemini-3.7-flash'));
+  } finally {
+    restoreAgyPath();
+    clearEnginePathCache();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test('ANTIGRAVITY_BUILTIN_MODELS collapses multi-tier families and keeps fixed models', () => {

@@ -75,3 +75,13 @@ export const tryResolveEnginePath = resolver.tryResolveEnginePath;
  * Consumers: antigravity auth provider (status `method` annotation).
  */
 export const getEngineVersion = resolver.getEngineVersion;
+
+/**
+ * Clears the cached engine path and version probe so a later resolution
+ * re-reads the environment. Tests need this because the cache outlives any
+ * single test's CLOUDCLI_ANTIGRAVITY_PATH / CLOUDCLI_AGY_PATH fixture:
+ * without a clear, one test's real (or stubbed) engine leaks into the next.
+ *
+ * Consumers: antigravity provider tests.
+ */
+export const clearEnginePathCache = resolver.clearEnginePathCache;
