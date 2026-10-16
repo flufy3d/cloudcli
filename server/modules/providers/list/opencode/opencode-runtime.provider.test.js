@@ -37,6 +37,7 @@ if (capturePath) {
   require('node:fs').writeFileSync(capturePath, JSON.stringify({
     args: process.argv.slice(2),
     permissionEnv: process.env.OPENCODE_PERMISSION ?? null,
+    pwd: process.env.PWD ?? null,
   }));
 }
 
@@ -69,6 +70,7 @@ test('spawnOpenCode emits session_created before normalized live messages for ne
   const previousPath = process.env[pathKey];
   const previousPathExt = process.env[pathExtKey];
   const previousArgsCapture = process.env.OPENCODE_ARGS_CAPTURE;
+  const previousPwd = process.env.PWD;
   const messages = [];
   const writer = {
     userId: null,
@@ -85,6 +87,10 @@ test('spawnOpenCode emits session_created before normalized live messages for ne
     await createFakeOpenCodeExecutable(tempRoot);
     process.env[pathKey] = `${tempRoot}${path.delimiter}${previousPath || ''}`;
     process.env.OPENCODE_ARGS_CAPTURE = argsCapturePath;
+    // Simulate a daemon parent (pm2) whose stale PWD points at the install
+    // dir: opencode resolves the session's project from $PWD rather than the
+    // process cwd, so the spawn must correct it to the workspace.
+    process.env.PWD = path.join(tempRoot, 'stale-install-dir');
     if (process.platform === 'win32') {
       process.env[pathExtKey] = previousPathExt?.toUpperCase().includes('.CMD')
         ? previousPathExt
@@ -115,6 +121,8 @@ test('spawnOpenCode emits session_created before normalized live messages for ne
     // v2 removed `run --dir`; the workspace comes from the spawn cwd alone.
     assert.deepEqual(launchedArgs.slice(0, 3), ['run', '--format', 'json']);
     assert.equal(launchedArgs.includes('--dir'), false);
+    // The stale inherited PWD must be corrected to the workspace.
+    assert.equal(capture.pwd, tempRoot);
     // No permission mode requested → no permission flags and no env override.
     assert.equal(launchedArgs.includes('--auto'), false);
     assert.equal(launchedArgs.includes('--agent'), false);
@@ -160,6 +168,12 @@ test('spawnOpenCode emits session_created before normalized live messages for ne
       delete process.env[pathKey];
     } else {
       process.env[pathKey] = previousPath;
+    }
+
+    if (previousPwd === undefined) {
+      delete process.env.PWD;
+    } else {
+      process.env.PWD = previousPwd;
     }
 
     if (previousPathExt === undefined) {

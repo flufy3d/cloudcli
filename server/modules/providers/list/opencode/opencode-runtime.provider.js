@@ -268,7 +268,15 @@ async function spawnOpenCode(command, options = {}, ws, context) {
       opencodeProcess = spawnFunction('opencode', args, {
         cwd: workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, ...permissionOptions.env },
+        env: {
+          ...process.env,
+          ...permissionOptions.env,
+          // opencode resolves the session's project from $PWD, not from the
+          // process cwd. A daemon parent (pm2) leaves a stale PWD pointing at
+          // the install dir, which would anchor every session outside the
+          // user's project (verified on v2.0.31), so pin it to the workspace.
+          PWD: workingDir,
+        },
       });
 
       activeOpenCodeProcesses.set(processKey, opencodeProcess);
