@@ -415,6 +415,61 @@ test('OpenCode sessions provider normalizes quoted live text and skips user echo
   assert.deepEqual(userEcho, []);
 });
 
+test('OpenCode sessions provider normalizes v2 part-wrapped live events', () => {
+  // Shapes captured verbatim from `opencode run --format json` on v2.0.31:
+  // the payload rides in a `part` object instead of on the event itself.
+  const provider = new OpenCodeSessionsProvider();
+
+  const text = provider.normalizeMessage({
+    type: 'text',
+    timestamp: 1792166313551,
+    sessionID: 'ses_v2',
+    part: { id: 'prt_text', sessionID: 'ses_v2', messageID: 'msg_1', type: 'text', text: 'pong' },
+  }, null);
+  assert.equal(text.length, 1);
+  assert.equal(text[0]?.kind, 'stream_delta');
+  assert.equal(text[0]?.content, 'pong');
+  assert.equal(text[0]?.sessionId, 'ses_v2');
+
+  const tool = provider.normalizeMessage({
+    type: 'tool_use',
+    sessionID: 'ses_v2',
+    part: {
+      id: 'call-1',
+      type: 'tool',
+      tool: 'write',
+      state: { status: 'completed', input: { path: '/tmp/x' }, output: 'Created file successfully' },
+    },
+  }, null);
+  assert.equal(tool.length, 1);
+  assert.equal(tool[0]?.kind, 'tool_use');
+  assert.equal(tool[0]?.toolName, 'write');
+  assert.equal(tool[0]?.toolId, 'call-1');
+  assert.deepEqual(tool[0]?.toolInput, { path: '/tmp/x' });
+  assert.deepEqual(tool[0]?.toolResult, { content: 'Created file successfully', isError: false });
+
+  const streamEnd = provider.normalizeMessage({
+    type: 'step_finish',
+    sessionID: 'ses_v2',
+    part: { type: 'step-finish', reason: 'stop' },
+  }, null);
+  assert.equal(streamEnd.length, 1);
+  assert.equal(streamEnd[0]?.kind, 'stream_end');
+});
+
+test('OpenCode sessions provider surfaces v2 error events with their detail', () => {
+  const provider = new OpenCodeSessionsProvider();
+  const normalized = provider.normalizeMessage({
+    type: 'error',
+    sessionID: 'ses_v2',
+    error: { type: 'provider.no-route', message: 'Variant unavailable for opencode/beam-free: nope' },
+  }, null);
+
+  assert.equal(normalized.length, 1);
+  assert.equal(normalized[0]?.kind, 'error');
+  assert.equal(normalized[0]?.content, 'Variant unavailable for opencode/beam-free: nope');
+});
+
 test('OpenCode sessions provider reads sqlite history and token usage', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-history-'));
   const workspacePath = await createWorkspaceFixture();
@@ -574,6 +629,85 @@ test('getTokenUsage reads the token columns for the provider-native session', as
       }),
       { used: 42, inputTokens: 13, outputTokens: 20, breakdown: { input: 13, output: 20 } },
     );
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('OpenCode sessions provider reads v2 session_message history and token columns', { concurrency: false }, async () => {
+  // v2.0.31 renamed `session` to `session_v2` and folds messages plus their
+  // content blocks into `session_message` rows; the reader has to flatten
+  // them back into the (message, part) shape the normalizer consumes.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-history-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (
+          id, project_id, slug, directory, title, version,
+          tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          time_created, time_updated
+        ) VALUES (
+          'ses_v2_hist', 'proj_1', 'v2-session', '/tmp/proj', 'V2 session', '2.0.31',
+          100, 20, 5, 8, 2, 1000, 2000
+        );
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_u', 'ses_v2_hist', 'user', 1, 1000, 1000, '{"time":{"created":1000},"text":"Build it","files":[],"agents":[]}'),
+          ('msg_a', 'ses_v2_hist', 'assistant', 2, 1100, 1200, '{"time":{"created":1100},"model":{"id":"beam-free","providerID":"opencode","variant":"high"},"content":[{"type":"reasoning","text":"thinking"},{"type":"tool","id":"call_1","name":"write","state":{"status":"completed","input":{"path":"/tmp/x"},"output":"ok"}},{"type":"text","text":"done"}]}');
+      `);
+    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('ses_v2_hist');
+
+    assert.equal(history.total, 4);
+    assert.equal(history.messages[0]?.role, 'user');
+    assert.equal(history.messages[0]?.content, 'Build it');
+    assert.equal(history.messages[1]?.kind, 'thinking');
+    assert.equal(history.messages[1]?.content, 'thinking');
+    assert.equal(history.messages[2]?.kind, 'tool_use');
+    assert.equal(history.messages[2]?.toolName, 'write');
+    assert.deepEqual(history.messages[2]?.toolInput, { path: '/tmp/x' });
+    assert.deepEqual(history.messages[2]?.toolResult, { content: 'ok', isError: false });
+    assert.equal(history.messages[3]?.content, 'done');
+    // Totals come from the session_v2 token columns: 100+20+5+8+2.
+    assert.deepEqual(history.tokenUsage, {
+      used: 135,
+      inputTokens: 108,
+      outputTokens: 20,
+      breakdown: { input: 108, output: 20 },
+    });
   } finally {
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });

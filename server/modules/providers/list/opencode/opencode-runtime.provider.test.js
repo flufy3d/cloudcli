@@ -14,7 +14,14 @@ const sessionsProvider = new OpenCodeSessionsProvider();
 const runtimeContext = {
   resolveProviderSessionId: (sessionId) => sessionId || null,
   resolveResumeModel: async (_sessionId, requestedModel) => requestedModel || undefined,
-  getProviderModels: async () => ({ OPTIONS: [], DEFAULT: '' }),
+  getProviderModels: async () => ({
+    OPTIONS: [{
+      value: 'opencode/beam-free',
+      label: 'Beam Free',
+      effort: { values: [{ value: 'low' }, { value: 'high' }] },
+    }],
+    DEFAULT: 'opencode/beam-free',
+  }),
   normalizeMessage: (raw, sessionId) => sessionsProvider.normalizeMessage(raw, sessionId),
   isProviderInstalled: async () => true,
 };
@@ -105,8 +112,9 @@ test('spawnOpenCode emits session_created before normalized live messages for ne
     const capture = JSON.parse(await readFile(argsCapturePath, 'utf8'));
     const launchedArgs = capture.args;
     assert.ok(Array.isArray(launchedArgs));
-    assert.deepEqual(launchedArgs.slice(0, 4), ['run', '--format', 'json', '--dir']);
-    assert.equal(launchedArgs[4], tempRoot);
+    // v2 removed `run --dir`; the workspace comes from the spawn cwd alone.
+    assert.deepEqual(launchedArgs.slice(0, 3), ['run', '--format', 'json']);
+    assert.equal(launchedArgs.includes('--dir'), false);
     // No permission mode requested → no permission flags and no env override.
     assert.equal(launchedArgs.includes('--auto'), false);
     assert.equal(launchedArgs.includes('--agent'), false);
@@ -131,6 +139,22 @@ test('spawnOpenCode emits session_created before normalized live messages for ne
     const attachmentPrompt = attachmentOnlyCapture.args[attachmentOnlyCapture.args.length - 1];
     assert.match(attachmentPrompt, /<files_input>/);
     assert.match(attachmentPrompt, /brief\.pdf/);
+
+    // v2 folds the reasoning variant into the model id (`provider/model#variant`);
+    // the removed `--variant` flag must not reappear.
+    const effortCapturePath = path.join(tempRoot, 'opencode-effort.json');
+    process.env.OPENCODE_ARGS_CAPTURE = effortCapturePath;
+    await opencodeRuntime.run(
+      'Hi',
+      { cwd: tempRoot, model: 'opencode/beam-free', effort: 'high' },
+      writer,
+      runtimeContext,
+    );
+    const effortCapture = JSON.parse(await readFile(effortCapturePath, 'utf8'));
+    const modelIndex = effortCapture.args.indexOf('--model');
+    assert.notEqual(modelIndex, -1);
+    assert.equal(effortCapture.args[modelIndex + 1], 'opencode/beam-free#high');
+    assert.equal(effortCapture.args.includes('--variant'), false);
   } finally {
     if (previousPath === undefined) {
       delete process.env[pathKey];
@@ -163,10 +187,10 @@ test('resolveOpenCodePermissionOptions maps UI permission modes onto OpenCode co
     args: ['--auto'],
     env: {},
   });
-  assert.deepEqual(resolveOpenCodePermissionOptions('acceptEdits'), {
-    args: [],
-    env: { OPENCODE_PERMISSION: '{"edit":"allow"}' },
-  });
+  // v2 removed the OPENCODE_PERMISSION env var, and a live probe confirmed
+  // non-interactive `run` completes file edits with no permission config, so
+  // acceptEdits maps to the same no-op posture as default.
+  assert.deepEqual(resolveOpenCodePermissionOptions('acceptEdits'), { args: [], env: {} });
   // default and anything unknown leave the user's own opencode config in charge.
   assert.deepEqual(resolveOpenCodePermissionOptions('default'), { args: [], env: {} });
   assert.deepEqual(resolveOpenCodePermissionOptions(undefined), { args: [], env: {} });
@@ -211,7 +235,7 @@ test('spawnOpenCode passes permission mode flags and env to the CLI', async () =
       {
         permissionMode: 'acceptEdits',
         expectArgs: [],
-        expectPermissionEnv: '{"edit":"allow"}',
+        expectPermissionEnv: null,
       },
     ];
 

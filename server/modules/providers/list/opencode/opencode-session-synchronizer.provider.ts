@@ -5,7 +5,11 @@ import { sessionsDb } from '@/modules/database/index.js';
 
 import { SqliteSessionSynchronizer } from '../../shared/sessions/sqlite-session-synchronizer.provider.js';
 
-import { getOpenCodeDatabasePath } from './opencode-data-root.js';
+import {
+  getOpenCodeDatabasePath,
+  resolveOpenCodeMessageLayout,
+  resolveOpenCodeSessionTableName,
+} from './opencode-data-root.js';
 
 type OpenCodeSessionRow = {
   id: string;
@@ -50,7 +54,10 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
       let db: Database.Database | null = null;
       try {
         db = new Database(this.getDatabasePath(), { readonly: true, fileMustExist: true });
-        const children = db.prepare('SELECT id FROM session WHERE parent_id IS NOT NULL').all() as OpenCodeChildSessionRow[];
+        const table = resolveOpenCodeSessionTableName(db);
+        const children = table
+          ? db.prepare(`SELECT id FROM ${table} WHERE parent_id IS NOT NULL`).all() as OpenCodeChildSessionRow[]
+          : [];
         for (const child of children) {
           sessionsDb.deleteSessionByProviderSessionId(child.id, 'opencode');
         }
@@ -72,6 +79,11 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
     sinceMillis: number | null,
     limit: number | null,
   ): OpenCodeSessionRow[] {
+    const table = resolveOpenCodeSessionTableName(db);
+    if (!table) {
+      return [];
+    }
+
     return db.prepare(`
       SELECT
         s.id AS id,
@@ -80,7 +92,7 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
         s.time_created AS time_created,
         s.time_updated AS time_updated,
         p.worktree AS worktree
-      FROM session s
+      FROM ${table} s
       LEFT JOIN project p ON p.id = s.project_id
       WHERE s.time_archived IS NULL
         AND s.parent_id IS NULL
@@ -112,18 +124,30 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
    */
   private readFirstUserText(db: Database.Database, sessionId: string): string | undefined {
     try {
-      const row = db.prepare(`
-        SELECT p.data AS data
-        FROM message m
-        INNER JOIN part p
-          ON p.session_id = m.session_id
-         AND p.message_id = m.id
-        WHERE m.session_id = ?
-          AND json_extract(m.data, '$.role') = 'user'
-          AND json_extract(p.data, '$.type') = 'text'
-        ORDER BY COALESCE(m.time_created, 0), COALESCE(p.time_created, 0)
-        LIMIT 1
-      `).get(sessionId) as { data: string | null } | undefined;
+      let row: { data: string | null } | undefined;
+      if (resolveOpenCodeMessageLayout(db) === 'session_message') {
+        row = db.prepare(`
+          SELECT data AS data
+          FROM session_message
+          WHERE session_id = ?
+            AND type = 'user'
+          ORDER BY seq
+          LIMIT 1
+        `).get(sessionId) as { data: string | null } | undefined;
+      } else {
+        row = db.prepare(`
+          SELECT p.data AS data
+          FROM message m
+          INNER JOIN part p
+            ON p.session_id = m.session_id
+           AND p.message_id = m.id
+          WHERE m.session_id = ?
+            AND json_extract(m.data, '$.role') = 'user'
+            AND json_extract(p.data, '$.type') = 'text'
+          ORDER BY COALESCE(m.time_created, 0), COALESCE(p.time_created, 0)
+          LIMIT 1
+        `).get(sessionId) as { data: string | null } | undefined;
+      }
 
       const data = readJsonRecord(row?.data);
       const text = readOptionalString(data?.text);

@@ -214,6 +214,65 @@ test('OpenCode reads connected providers from the v2 credential database', async
   );
 });
 
+test('OpenCode reads display names and effort variants from the cached catalog', async () => {
+  // v2's `opencode models` prints ids only; the models.dev catalog the CLI
+  // caches in opencode.db carries the official display names and the
+  // reasoning-effort values each model accepts.
+  await withOpenCodeHome(
+    async (homeDir) => {
+      const cliPath = await writeFakeOpenCodeCli(
+        homeDir,
+        ['opencode/beam-free', 'opencode/glm-5.3-flash-free'].join('\n'),
+      );
+      process.env.CLOUDCLI_OPENCODE_CLI = cliPath;
+
+      const dbPath = path.join(homeDir, '.local', 'share', 'opencode', 'opencode.db');
+      await mkdir(path.dirname(dbPath), { recursive: true });
+      const db = new Database(dbPath);
+      try {
+        db.exec('CREATE TABLE kv (key text PRIMARY KEY, value text NOT NULL);');
+        db.prepare('INSERT INTO kv (key, value) VALUES (?, ?)').run(
+          'models-dev:catalog',
+          JSON.stringify({
+            updatedAt: 1,
+            digest: 'd',
+            body: JSON.stringify({
+              opencode: {
+                models: {
+                  'beam-free': {
+                    name: 'Beam Free',
+                    reasoning_options: [{ type: 'effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] }],
+                  },
+                  'glm-5.3-flash-free': { name: 'GLM 5.3 Flash Free', reasoning_options: [] },
+                },
+              },
+            }),
+          }),
+        );
+      } finally {
+        db.close();
+      }
+    },
+    async (adapter) => {
+      const catalog = await adapter.getSupportedModels();
+
+      assert.deepEqual(catalog.OPTIONS, [
+        {
+          value: 'opencode/beam-free',
+          label: 'Beam Free',
+          description: 'OpenCode Zen · Free',
+          effort: {
+            values: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }, { value: 'xhigh' }, { value: 'max' }],
+          },
+        },
+        // Empty reasoning_options mean no effort picker, and the -free suffix
+        // keeps its gateway annotation.
+        { value: 'opencode/glm-5.3-flash-free', label: 'GLM 5.3 Flash Free', description: 'OpenCode Zen · Free' },
+      ]);
+    },
+  );
+});
+
 test('OpenCode lists only the models the CLI reports for the account', async () => {
   // `opencode models` answers with the models the logged-in account can
   // actually route, so the picker must mirror it instead of the curated

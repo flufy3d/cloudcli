@@ -15,12 +15,16 @@ import type {
 } from '@/shared/types.js';
 import {
   buildDefaultProviderCurrentActiveModel,
+  readJsonRecord,
   readObjectRecord,
   readOptionalString,
   stripAnsiSequences,
 } from '@/shared/utils.js';
 
-import { getOpenCodeDatabasePath } from './opencode-data-root.js';
+import {
+  getOpenCodeDatabasePath,
+  resolveOpenCodeSessionTableName,
+} from './opencode-data-root.js';
 
 /**
  * Curated OpenCode catalog shipped as immutable CloudCLI defaults.
@@ -223,7 +227,58 @@ const OPENCODE_FAMILY_DESCRIPTIONS: Record<string, string> = {
   'opencode-go': 'OpenCode Go',
 };
 
-const buildOpenCodeModelOption = (value: string): ProviderModelOption => {
+type OpenCodeCatalogModelEntry = {
+  name?: string;
+  reasoning_options?: Array<{ type?: string; values?: string[] }>;
+};
+
+/**
+ * Reads the models.dev catalog OpenCode caches in its database (`kv` key
+ * `models-dev:catalog`) and maps `<family>/<modelId>` to the display name and
+ * reasoning-effort values it records for each model.
+ *
+ * This is where the reasoning-variant data lives in v2 — `opencode models`
+ * prints ids only, but this catalog carries `reasoning_options` per model and
+ * is refreshed by the CLI itself. A missing database, missing key, or a
+ * `body` encoded as an embedded JSON string all degrade to an empty map, so
+ * options fall back to synthesized labels without effort variants.
+ */
+const readOpenCodeCatalogEntries = (): Map<string, OpenCodeCatalogModelEntry> => {
+  const entries = new Map<string, OpenCodeCatalogModelEntry>();
+  try {
+    const db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
+    try {
+      const row = db.prepare("SELECT value FROM kv WHERE key = 'models-dev:catalog'").get() as {
+        value?: string;
+      } | undefined;
+      const parsed = readJsonRecord(row?.value);
+      let body: unknown = parsed?.body;
+      if (typeof body === 'string') {
+        body = JSON.parse(body);
+      }
+      const families = readObjectRecord(body) ?? {};
+      for (const [familyId, family] of Object.entries(families)) {
+        const models = readObjectRecord(readObjectRecord(family)?.models) ?? {};
+        for (const [modelId, model] of Object.entries(models)) {
+          const record = readObjectRecord(model);
+          if (record) {
+            entries.set(`${familyId}/${modelId}`, record as OpenCodeCatalogModelEntry);
+          }
+        }
+      }
+    } finally {
+      db.close();
+    }
+  } catch {
+    // No database or no cached catalog: options fall back to synthesis.
+  }
+  return entries;
+};
+
+const buildOpenCodeModelOption = (
+  value: string,
+  catalogEntries: Map<string, OpenCodeCatalogModelEntry> = new Map(),
+): ProviderModelOption => {
   const curated = OPENCODE_PREDEFINED_MODELS.OPTIONS.find((option) => option.value === value);
   if (curated) {
     return curated;
@@ -234,12 +289,20 @@ const buildOpenCodeModelOption = (value: string): ProviderModelOption => {
   // Direct-connect families (anthropic/openai/...) are labeled with their own
   // name — stamping them "OpenCode Zen" would misrepresent where the run goes.
   const gateway = OPENCODE_FAMILY_DESCRIPTIONS[familyId] ?? humanizeOpenCodeModelLabel(familyId);
+  const catalogEntry = catalogEntries.get(value);
+  const effortValues = (catalogEntry?.reasoning_options ?? [])
+    .find((option) => option?.type === 'effort')
+    ?.values?.filter((entry): entry is string => typeof entry === 'string') ?? [];
+
   return {
     value,
-    label: humanizeOpenCodeModelLabel(modelId),
+    label: catalogEntry?.name?.trim() || humanizeOpenCodeModelLabel(modelId),
     description: modelId.endsWith('-free') && familyId.startsWith('opencode')
       ? `${gateway} · Free`
       : gateway,
+    ...(effortValues.length > 0
+      ? { effort: { values: effortValues.map((effortValue) => ({ value: effortValue })) } }
+      : {}),
   };
 };
 
@@ -250,8 +313,11 @@ const buildOpenCodeModelOption = (value: string): ProviderModelOption => {
  * otherwise the first reported model takes over, so the picker never opens on
  * a model the CLI would refuse to run.
  */
-const buildAccountScopedOpenCodeCatalog = (modelIds: string[]): ProviderModelsDefinition => {
-  const options = modelIds.map(buildOpenCodeModelOption);
+const buildAccountScopedOpenCodeCatalog = (
+  modelIds: string[],
+  catalogEntries: Map<string, OpenCodeCatalogModelEntry>,
+): ProviderModelsDefinition => {
+  const options = modelIds.map((modelId) => buildOpenCodeModelOption(modelId, catalogEntries));
   const curatedDefault = OPENCODE_PREDEFINED_MODELS.DEFAULT;
   return {
     OPTIONS: options,
@@ -341,7 +407,7 @@ export class OpenCodeProviderModels implements IProviderModels {
     // covers the fallback path (CLI missing, failing, or answering empty).
     const cliModelIds = await readOpenCodeCliModelIds();
     if (cliModelIds.length > 0) {
-      return buildAccountScopedOpenCodeCatalog(cliModelIds);
+      return buildAccountScopedOpenCodeCatalog(cliModelIds, readOpenCodeCatalogEntries());
     }
 
     return filterOpenCodeModelsByProvider(
@@ -365,26 +431,29 @@ export class OpenCodeProviderModels implements IProviderModels {
       const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 
       try {
-        const row = db.prepare(`
-          SELECT
-            s.id AS sessionId,
-            s.model AS model,
-            s.agent AS agent,
-            s.directory AS directory,
-            s.time_updated AS timeUpdated,
-            s.time_created AS timeCreated
-          FROM session s
-          WHERE s.id = ?
-          ORDER BY COALESCE(s.time_updated, s.time_created, 0) DESC
-          LIMIT 1
-        `).get(providerSessionId) as {
-          sessionId?: string;
-          model?: unknown;
-          agent?: string | null;
-          directory?: string | null;
-          timeUpdated?: number | null;
-          timeCreated?: number | null;
-        } | undefined;
+        const table = resolveOpenCodeSessionTableName(db);
+        const row = table
+          ? db.prepare(`
+              SELECT
+                s.id AS sessionId,
+                s.model AS model,
+                s.agent AS agent,
+                s.directory AS directory,
+                s.time_updated AS timeUpdated,
+                s.time_created AS timeCreated
+              FROM ${table} s
+              WHERE s.id = ?
+              ORDER BY COALESCE(s.time_updated, s.time_created, 0) DESC
+              LIMIT 1
+            `).get(providerSessionId) as {
+              sessionId?: string;
+              model?: unknown;
+              agent?: string | null;
+              directory?: string | null;
+              timeUpdated?: number | null;
+              timeCreated?: number | null;
+            } | undefined
+          : undefined;
 
         const model = parseOpenCodeSessionModelValue(row?.model);
         if (model) {

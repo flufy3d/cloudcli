@@ -16,7 +16,7 @@ import {
   resolveModelEffort,
   stripAnsiSequences
 } from '@/shared/utils.js';
-import { getOpenCodeDatabasePath } from './opencode-data-root.js';
+import { getOpenCodeDatabasePath, readOpenCodeSessionTokenTotals } from './opencode-data-root.js';
 
 // cross-spawn resolves .cmd shims/PATHEXT on Windows and delegates to
 // child_process.spawn everywhere else.
@@ -27,17 +27,17 @@ const activeOpenCodeProcesses = new Map();
 /**
  * Maps the UI permission mode onto OpenCode's non-interactive controls.
  *
- * OpenCode has no single "permission mode" flag; each mode uses a different
- * lever of the `opencode run` CLI (verified against v1.17.13):
+ * Each mode uses a different lever of the `opencode run` CLI (verified
+ * against v2.0.31):
  * - plan              → the built-in read-only `plan` agent (`--agent plan`).
  * - bypassPermissions → `--auto`, which auto-approves every permission that
  *                       is not explicitly denied in the user's config.
- * - acceptEdits       → the OPENCODE_PERMISSION env var, whose JSON body the
- *                       CLI merges into its permission config. Forcing
- *                       `edit: allow` guarantees file edits go through while
- *                       every other rule stays under the user's own config.
- * - default           → nothing; the user's opencode.json governs. In
- *                       non-interactive `run` mode any `ask` rule is denied.
+ * - acceptEdits       → nothing. v1's OPENCODE_PERMISSION env var no longer
+ *                       exists in the v2 binary, and a live probe confirmed
+ *                       v2's non-interactive `run` completes file edits with
+ *                       no permission config at all, so acceptEdits already
+ *                       holds unless the user's own config denies edits.
+ * - default           → nothing; the user's opencode.json governs.
  *
  * Exported for tests only.
  */
@@ -47,8 +47,6 @@ export function resolveOpenCodePermissionOptions(permissionMode) {
       return { args: ['--agent', 'plan'], env: {} };
     case 'bypassPermissions':
       return { args: ['--auto'], env: {} };
-    case 'acceptEdits':
-      return { args: [], env: { OPENCODE_PERMISSION: JSON.stringify({ edit: 'allow' }) } };
     default:
       return { args: [], env: {} };
   }
@@ -71,35 +69,18 @@ function readOpenCodeTokenUsage(sessionId) {
   let db = null;
   try {
     db = new Database(dbPath, { readonly: true, fileMustExist: true });
-    const columns = db.prepare('PRAGMA table_info(session)').all();
-    const columnNames = new Set(columns.map((column) => column.name));
-    const requiredColumns = ['tokens_input', 'tokens_output', 'tokens_reasoning', 'tokens_cache_read', 'tokens_cache_write'];
-    if (!requiredColumns.every((column) => columnNames.has(column))) {
+    const totals = readOpenCodeSessionTokenTotals(db, sessionId);
+    if (!totals) {
       return null;
     }
 
-    const row = db.prepare(`
-      SELECT
-        tokens_input AS inputTokens,
-        tokens_output AS outputTokens,
-        tokens_reasoning AS reasoningTokens,
-        tokens_cache_read AS cacheReadTokens,
-        tokens_cache_write AS cacheWriteTokens
-      FROM session
-      WHERE id = ?
-    `).get(sessionId);
-
-    if (!row) {
-      return null;
-    }
-
-    const inputTokens = Number(row.inputTokens || 0) + Number(row.cacheReadTokens || 0);
-    const outputTokens = Number(row.outputTokens || 0);
-    const used = Number(row.inputTokens || 0)
+    const inputTokens = totals.inputTokens + totals.cacheReadTokens;
+    const outputTokens = totals.outputTokens;
+    const used = totals.inputTokens
       + outputTokens
-      + Number(row.reasoningTokens || 0)
-      + Number(row.cacheReadTokens || 0)
-      + Number(row.cacheWriteTokens || 0);
+      + totals.reasoningTokens
+      + totals.cacheReadTokens
+      + totals.cacheWriteTokens;
     if (used <= 0) {
       return null;
     }
@@ -256,18 +237,16 @@ async function spawnOpenCode(command, options = {}, ws, context) {
 
       const resolvedEffort = resolveModelEffort(resolvedModel, effort, effortModels);
       const args = ['run', '--format', 'json'];
-      // OpenCode's `run` command owns workspace selection through `--dir`.
-      // Relying on the child-process cwd alone is not enough on Linux, where
-      // the CLI can still resolve the session under the server install dir.
-      args.push('--dir', workingDir);
+      // v2.0.31 removed `run --dir` outright (`Unrecognized flag: --dir`), so
+      // the workspace comes from the spawn cwd alone; the child is always
+      // spawned with cwd already set to the project path.
       if (providerSessionId) {
         args.push('--session', providerSessionId);
       }
       if (resolvedModel) {
-        args.push('--model', resolvedModel);
-      }
-      if (resolvedEffort) {
-        args.push('--variant', resolvedEffort);
+        // v2.0.31 removed `--variant`; the reasoning variant now rides in the
+        // model id itself (`provider/model#variant`).
+        args.push('--model', resolvedEffort ? `${resolvedModel}#${resolvedEffort}` : resolvedModel);
       }
       const permissionOptions = resolveOpenCodePermissionOptions(permissionMode);
       args.push(...permissionOptions.args);
