@@ -25,6 +25,7 @@ import {
   getOpenCodeDatabasePath,
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
+import { tryResolveOpenCodeEnginePath } from './opencode-engine-path.js';
 
 /**
  * Curated OpenCode catalog shipped as immutable CloudCLI defaults.
@@ -336,10 +337,12 @@ const buildAccountScopedOpenCodeCatalog = (
  * (missing CLI, non-zero exit, timeout, empty output) returns empty so the
  * caller falls back to the curated catalog. The executable override follows
  * the CLAUDE_CLI_PATH / CLOUDCLI_ZCODE_ENGINE precedent and is read per call
- * so tests can install a fake after import.
+ * so tests can install a fake after import; without an override the shared
+ * engine-path resolver supplies the binary (platform install locations
+ * included, which matters under pm2 where PATH may lack Homebrew).
  */
 const readOpenCodeCliModelIds = async (): Promise<string[]> => {
-  const executable = process.env.CLOUDCLI_OPENCODE_CLI?.trim() || 'opencode';
+  const executable = process.env.CLOUDCLI_OPENCODE_CLI?.trim() || tryResolveOpenCodeEnginePath() || 'opencode';
   try {
     const { stdout } = await execFileAsync(executable, ['models'], {
       timeout: OPENCODE_MODELS_PROBE_TIMEOUT_MS,

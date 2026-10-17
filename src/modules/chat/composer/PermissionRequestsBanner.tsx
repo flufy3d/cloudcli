@@ -2,7 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { ShieldAlertIcon } from 'lucide-react';
 
-import type { PendingPermissionRequest } from '@/shared/types';
+import type { LLMProvider, PendingPermissionRequest } from '@/shared/types';
 import { buildClaudeToolPermissionEntry, formatToolInputForDisplay } from '@/modules/chat/utils/chatPermissions';
 import { getClaudeSettings } from '@/modules/chat/utils/chatStorage';
 import { getPermissionPanel, registerPermissionPanel } from '@/modules/chat/tools/configs/permissionPanelRegistry';
@@ -19,6 +19,9 @@ registerPermissionPanel('AskUserQuestion', AskUserQuestionPanel);
 
 type PermissionRequestsBannerProps = {
   pendingPermissionRequests: PendingPermissionRequest[];
+  /** The session's engine: only Claude honours persisted allow rules, so the remember button shows for it alone. */
+  provider: LLMProvider;
+  providerLabel: string;
   handlePermissionDecision: (
     requestIds: string | string[],
     decision: { allow?: boolean; message?: string; rememberEntry?: string | null; updatedInput?: unknown },
@@ -32,10 +35,16 @@ type PermissionRequestsBannerProps = {
  */
 export default function PermissionRequestsBanner({
   pendingPermissionRequests,
+  provider,
+  providerLabel,
   handlePermissionDecision,
   handleGrantToolPermission,
 }: PermissionRequestsBannerProps) {
   const { t } = useTranslation();
+  // Only Claude reads the persisted allow list; every other engine treats
+  // "remember" as session-scoped, so showing the persistent button there
+  // would write dead entries into Claude's settings while claiming "saved".
+  const supportsPersistentRules = provider === 'claude';
   // Filter out plan tool requests — they are handled inline by PlanDisplay
   const filteredRequests = pendingPermissionRequests.filter(
     (r) => r.toolName !== 'ExitPlanMode' && r.toolName !== 'exit_plan_mode'
@@ -54,15 +63,18 @@ export default function PermissionRequestsBanner({
             <CustomPanel
               key={request.requestId}
               request={request}
+              providerLabel={providerLabel}
               onDecision={handlePermissionDecision}
             />
           );
         }
 
         const rawInput = formatToolInputForDisplay(request.input);
-        const permissionEntry = buildClaudeToolPermissionEntry(request.toolName, rawInput);
-        const settings = getClaudeSettings();
-        const alreadyAllowed = permissionEntry ? settings.allowedTools.includes(permissionEntry) : false;
+        const permissionEntry = supportsPersistentRules
+          ? buildClaudeToolPermissionEntry(request.toolName, rawInput)
+          : null;
+        const settings = supportsPersistentRules ? getClaudeSettings() : null;
+        const alreadyAllowed = permissionEntry && settings ? settings.allowedTools.includes(permissionEntry) : false;
         const rememberLabel = alreadyAllowed ? 'Allow (saved)' : 'Allow & remember';
         const matchingRequestIds = permissionEntry
           ? pendingPermissionRequests
@@ -110,18 +122,20 @@ export default function PermissionRequestsBanner({
               >
                 Deny
               </ConfirmationAction>
-              <ConfirmationAction
-                variant="outline"
-                onClick={() => {
-                  if (permissionEntry && !alreadyAllowed) {
-                    handleGrantToolPermission({ entry: permissionEntry, toolName: request.toolName });
-                  }
-                  handlePermissionDecision(matchingRequestIds, { allow: true, rememberEntry: permissionEntry });
-                }}
-                disabled={!permissionEntry}
-              >
-                {rememberLabel}
-              </ConfirmationAction>
+              {supportsPersistentRules && (
+                <ConfirmationAction
+                  variant="outline"
+                  onClick={() => {
+                    if (permissionEntry && !alreadyAllowed) {
+                      handleGrantToolPermission({ entry: permissionEntry, toolName: request.toolName });
+                    }
+                    handlePermissionDecision(matchingRequestIds, { allow: true, rememberEntry: permissionEntry });
+                  }}
+                  disabled={!permissionEntry}
+                >
+                  {rememberLabel}
+                </ConfirmationAction>
+              )}
               <ConfirmationAction
                 variant="default"
                 onClick={() => handlePermissionDecision(request.requestId, { allow: true })}

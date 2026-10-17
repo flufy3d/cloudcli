@@ -706,6 +706,8 @@ export type ToolStatus = 'running' | 'completed' | 'error' | 'denied';
 /** Props contract that every interactive permission panel implements, giving the panel the pending request and the callback it calls to allow or deny that request; use it when registering a panel in the permission panel registry. */
 export type PermissionPanelProps = {
   request: PendingPermissionRequest;
+  /** Display name of the provider that raised the request ("OpenCode"); panels show it in their titles instead of a hardcoded engine name. */
+  providerLabel?: string;
   onDecision: (
     requestIds: string | string[],
     decision: { allow?: boolean; message?: string; updatedInput?: unknown },
