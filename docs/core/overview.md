@@ -1,6 +1,6 @@
 # 系统全景（Overview）
 
-> 基准：2.9.0 / 2026-10-04
+> 基准：2.9.0 / 2026-10-17
 
 > **核心文档**：本文描述整个系统的进程拓扑、目录地图、数据分布与部署方式。
 > 改动 `server/index.ts`、数据库 schema、构建产物结构或部署方式时**必须同步更新本文**。
@@ -23,15 +23,19 @@ flowchart LR
   S -->|CLI| E3["cursor / opencode"]
   S -->|协议客户端| E4["zcode 引擎"]
   S -->|CLI print| E5["agy (Antigravity)"]
+  S -->|本轮 stdio MCP| M["Codex task bridge"]
+  M -->|经已挂载的 REST API| S
+  S -->|独立 app-server command/exec| W["脱离宿主的任务 worker"]
 ```
 
 要点：
 
 - **服务端是引擎的宿主**，不是代理。引擎子进程/SDK 由服务端拉起，会话原件落盘在各引擎自己的数据目录，服务端只做索引、归一化与转发。
-- 入口 `server/index.ts`：组装 Express、挂全部 REST 路由、挂 WS（`server/modules/websocket`）、托管 `dist/`、SPA fallback、优雅停机。
+- 入口 `server/index.ts`：组装 Express、挂全部 REST 路由、挂 WS（`server/modules/websocket`）、托管 `dist/`、SPA fallback、启动异步任务恢复与派发、优雅停机。异步任务 worker 是脱离宿主生命周期的子进程。
 - 端口：`SERVER_PORT` 默认 **3001**，`HOST` 默认 `0.0.0.0`；开发模式 Vite 跑 5173 并把 API 代理到 3001（`vite.config.js`）。
 - HTTP 连接配置：`server/http-timeouts.ts` 在监听前配置 origin 的连接空闲时间；默认覆盖常见代理的默认空闲池时间，但自定义代理仍需保证其空闲池先于 origin 过期。`HTTP_KEEP_ALIVE_TIMEOUT_MS` 可覆盖默认值，单位为毫秒，必须是 Node 定时器范围内的正整数；非法配置使启动失败。请求头接收超时保持大于连接空闲超时。默认值与校验范围以实现为准，PM2 实例的覆盖值写在 `~/.pm2/ecosystem.config.cjs`。
 - 启动标记：`~/.cloudcli/local-server.json`（host/port/pid/appRoot），用于 CLI 与健康检查定位实例。
+- 异步任务入口只在本次 Codex 运行配置 stdio MCP；宿主凭可信运行上下文登记任务，再以独立 app-server `command/exec` 按原沙箱执行。敏感运行凭证只进 MCP 子进程环境，并从命令环境排除。管理 CLI 使用用户 JWT 调用认证接口。
 
 ## 目录地图（两层）
 
@@ -42,8 +46,9 @@ server/
   modules/
     providers/             ★ 引擎接入层（registry + 6 家 provider + services），见 providers.md
     websocket/             ★ WS 网关（/ws 聊天、/shell 终端、通知、插件代理），见 chat.md
+    task-continuations/    ★ 异步任务接续（任务登记、隔离 worker、事务型发件箱、状态机、非抢断派发器与崩溃恢复）
     auth/                  JWT 注册/登录/刷新 + authenticateToken 中间件
-    database/              better-sqlite3 连接、schema、migrations、repositories（16 张表）
+    database/              better-sqlite3 连接、schema、migrations 与 repositories
     assets/                聊天上传资产（~/.cloudcli/assets）的上传与读取
     agent/                 无头 Agent API（API key / 平台模式鉴权）
     notifications/         Web Push（VAPID）+ 桌面通知 WS
@@ -54,7 +59,7 @@ server/
     voice/  cli/  git/  file-tree/  worktrees/  projects/  settings/  system/  user/
                            其余领域模块（每个 = routes + services 的薄模块）
   shared/                  interfaces.ts（IProvider 契约）、types.ts（NormalizedMessage、
-                           ServerEventKind 等）、message-unification.ts、utils.ts
+                           ServerEventKind、AsyncTaskRecord 等）、message-unification.ts、utils.ts
 src/
   modules/
     chat/                  ★ 聊天前端（composer、transcript、tools、实时 hooks、store、导出）
@@ -74,15 +79,17 @@ docs/
 
 | 数据 | 位置 | 说明 |
 | --- | --- | --- |
-| SQLite（账号/会话元数据/配置） | `~/.cloudcli/auth.db`（`DATABASE_PATH` 可改） | 16 张表：users、api_keys、user_credentials、projects、sessions、app_config、provider_models、user_preferences、session_drafts、scheduled_messages、notification 系列、vapid_keys、push_subscriptions、scan_state、superseded_provider_sessions。连接单例 `server/modules/database/connection.ts`，表定义 `schema.ts`，迁移 `migrations.ts` |
+| SQLite（账号/会话元数据/配置/任务） | `~/.cloudcli/auth.db`（`DATABASE_PATH` 可改） | 连接单例 `server/modules/database/connection.ts`，表定义 `schema.ts`，迁移 `migrations.ts` |
+| 异步任务目录与产物 | `~/.cloudcli/tasks/<taskId>` | 后台命令日志 `output.log` 与原子结果 `result.json`，支持宿主断电/崩溃重启后自动扫描补录入库 |
 | 聊天上传资产 | `~/.cloudcli/assets` | `server/modules/assets`；聊天发送只信任该目录**直接子文件**（`chat-websocket.service.ts` 过滤） |
 | 插件本体与启用状态 | `~/.cloudcli/plugins` + `~/.cloudcli/plugins.json` | `server/modules/plugins`（注册表扫描 + 子进程管理）；首次访问时从旧 `~/.claude-code-ui` 一次性自动迁移（`migrateLegacyPluginPaths`） |
-| 各引擎会话原件 | `~/.claude` / `~/.codex` / `~/.cursor` / `~/.local/share/opencode` / `~/.zcode` / `~/.gemini/antigravity*` | 云 CLI 不复制、不改写；同步器只读解析后把元数据 upsert 进 SQLite（`sessions` 表含 `jsonl_path`） |
+| 各引擎会话原件 | `~/.claude` / `~/.codex` / `~/.cursor` / `~/.local/share/opencode` / `~/.zcode` / `~/.gemini/antigravity*` | 云 CLI 不复制、不改写；同步器只读解析后把元数据 upsert进 SQLite（`sessions` 表含 `jsonl_path`） |
 | 运行结束记录 | 服务进程内存（有界，约百条） | `server/modules/diagnostics`：每个 run 为什么结束（见 [chat.md](./chat.md)）。刻意不入库——它服务于"刚刚出了什么事"，重启即弃；`GET /api/diagnostics/runs` 读出，前端诊断报告把它和浏览器侧证据合成一份文件 |
 | 前端构建产物 | `dist/`（vite build） | Express 静态托管 + SPA fallback |
 | 服务端构建产物 | `dist-server/` | `tsc + tsc-alias` 先产出 `dist-server.next`，`scripts/promote-dist-server.mjs` 原子晋升（保留 `dist-server.old`；`preserver` 钩子启动前自愈） |
 
 **数据库改动规则**：改 `schema.ts` 必须同时写 `migrations.ts` 增量迁移（初始化走 INIT_SCHEMA_SQL，存量库走迁移链），并更新本文。
+
 
 ## 认证与安全边界
 

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import {
@@ -37,6 +37,11 @@ import type {
   SubagentActivity,
   WorkspacePathValidationResult,
 } from './types.js';
+
+/** Returns the lowercase SHA-256 hex digest for opaque tokens and content. */
+export function sha256Hex(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 //----------------- ENVIRONMENT UTILITIES ------------
 /**
@@ -1778,4 +1783,41 @@ export function forwardToLoopbackService(
   }
 
   upstreamRequest.end();
+}
+
+/**
+ * Resolves the permission mode for Codex's app-server turn and any detached
+ * command that must inherit that same sandbox. The chat gateway and Codex
+ * adapter both use this mapping so task registration cannot claim a broader
+ * sandbox than the original turn received.
+ */
+export function resolveCodexExecutionPolicy(permissionMode: string): {
+  sandbox: 'workspace-write' | 'danger-full-access';
+  approvalPolicy: 'never' | 'on-request';
+  sandboxPolicy: {
+    type: 'workspaceWrite' | 'dangerFullAccess';
+    networkAccess: boolean;
+  };
+} {
+  if (permissionMode === 'bypassPermissions') {
+    return {
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess', networkAccess: true },
+    };
+  }
+
+  if (permissionMode === 'acceptEdits') {
+    return {
+      sandbox: 'workspace-write',
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    };
+  }
+
+  return {
+    sandbox: 'workspace-write',
+    approvalPolicy: 'on-request',
+    sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+  };
 }

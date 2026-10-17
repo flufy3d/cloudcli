@@ -63,6 +63,10 @@ import {
 } from './modules/browser-use/index.js';
 import { initializeDatabase, sessionsDb } from './modules/database/index.js';
 import { configureWebPush } from './modules/notifications/index.js';
+import {
+    startTaskContinuationRuntime,
+    taskContinuationsRouter,
+} from './modules/task-continuations/index.js';
 
 const __dirname = getModuleDirectory(import.meta.url);
 // The server source runs from /server, while the compiled output runs from /dist-server/server.
@@ -213,6 +217,7 @@ app.use('/api/browser-use', authenticateToken, browserUseRoutes);
 // Unified provider MCP routes (protected)
 app.use('/api/providers', authenticateToken, providerRoutes);
 app.use('/api/scheduled-messages', authenticateToken, scheduledMessagesRoutes);
+app.use('/api/tasks', taskContinuationsRouter);
 
 // Agent API Routes (uses API key authentication)
 app.use('/api/agent', agentRoutes);
@@ -391,6 +396,12 @@ async function startServer() {
             console.log(`${terminalTextStyles.tip('[TIP]')}  Run "cloudcli status" for full configuration details`);
             console.log('');
 
+            // Expose the packaged task management CLI and host URL to user-run management commands.
+            const distRunner = path.join(APP_ROOT, 'dist-server', 'server', 'modules', 'task-continuations', 'cli', 'task-runner.js');
+            const srcRunner = path.join(APP_ROOT, 'server', 'modules', 'task-continuations', 'cli', 'task-runner.ts');
+            process.env.CLOUDCLI_TASK_RUNNER = fs.existsSync(distRunner) ? distRunner : srcRunner;
+            process.env.CLOUDCLI_API_URL = `http://${DISPLAY_HOST}:${SERVER_PORT}`;
+
             // Start watching the projects folder for changes
             await initializeSessionsWatcher();
             // Sends anything that came due while the server was not running,
@@ -409,9 +420,19 @@ async function startServer() {
             await browserUseService.syncAgentMcpIfNeeded().catch((err) => {
                 console.warn('[Browser] Failed to sync agent MCP configuration during startup:', getErrorMessage(err));
             });
+
+            // Recover results, verify accepted Codex turns, and start the async task worker.
+            const continuationWorker = await startTaskContinuationRuntime({
+                runtime: providerRuntimeService,
+            });
+
+            activeContinuationWorker = continuationWorker;
         });
 
+        let activeContinuationWorker: { stop: () => void } | null = null;
+
         const shutdownRuntimeServices = async () => {
+            activeContinuationWorker?.stop();
             sessionsAutoArchiveService.stopScheduler();
             try {
                 await closeSessionsWatcher();

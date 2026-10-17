@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import type { WebSocket } from 'ws';
 
@@ -21,7 +22,8 @@ import type {
   ProviderPermissionDecision,
   ProviderRuntimeWriter,
 } from '@/shared/types.js';
-import { createNormalizedMessage, parseIncomingJsonObject } from '@/shared/utils.js';
+import { createNormalizedMessage, parseIncomingJsonObject, readObjectRecord } from '@/shared/utils.js';
+import { resolveCodexExecutionPolicy } from '@/shared/index.js';
 
 /**
  * Trust boundary for client-supplied image attachments: chat.send options come
@@ -90,6 +92,26 @@ type ChatWebSocketDependencies = {
   runtime: ProviderRuntimeGateway;
 };
 
+const CLIENT_RESERVED_RUNTIME_OPTIONS = new Set([
+  'toolOutput',
+  'taskContinuation',
+  'taskExecutionContext',
+  'taskContinuationContext',
+  'taskContinuationLifecycle',
+  'taskContinuationTarget',
+]);
+
+
+/** Removes options that only the server may use to resume or register tasks. */
+function readClientRuntimeOptions(value: unknown): AnyRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter(([key]) => !CLIENT_RESERVED_RUNTIME_OPTIONS.has(key)),
+  );
+}
+
 /**
  * Extracts the authenticated request user id in the formats currently produced
  * by platform and OSS auth code paths.
@@ -111,6 +133,11 @@ function readRequestUserId(
   }
 
   return null;
+}
+
+function readTaskOwnerId(userId: string | number | null): number | null {
+  const parsed = typeof userId === 'number' ? userId : Number(userId);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 function sendJson(ws: WebSocket, payload: unknown): void {
@@ -257,7 +284,13 @@ async function dispatchRun(
   dependencies: ChatWebSocketDependencies,
   extraRuntimeOptions: AnyRecord = {},
   beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
-): Promise<{ started: boolean; error: string | null }> {
+): Promise<{
+  started: boolean;
+  busy?: boolean;
+  error: string | null;
+  engineTurnId?: string;
+  terminalStatus?: 'completed' | 'failed' | 'interrupted' | 'unknown';
+}> {
   const provider = session.provider as LLMProvider;
 
   const run = chatRunRegistry.startRun({
@@ -277,12 +310,12 @@ async function dispatchRun(
         sessionId
       );
     }
-    return { started: false, error: 'A run is already in progress for this session.' };
+    return { started: false, busy: true, error: 'A run is already in progress for this session.' };
   }
 
   sessionsDb.touchSession(sessionId);
 
-  const clientOptions = (data.options ?? {}) as AnyRecord;
+  const clientOptions = readClientRuntimeOptions(data.options);
   const command = typeof data.content === 'string' ? data.content : '';
 
   // Record what this turn runs with so reopening the session later restores the
@@ -325,18 +358,60 @@ async function dispatchRun(
   };
 
   let failure: string | null = null;
+  let runtimeOutcome: unknown;
+  let taskRunToken: string | null = null;
+  let revokeTaskCapability: ((token: string) => boolean) | null = null;
   try {
     // Runs only now that the session is reserved, because an edit rewinds the
     // conversation here and a rewind for a run that was never admitted cannot
     // be taken back. Inside the try so a rewind that throws still releases the
     // run instead of leaving the session processing forever.
     await beforeRun?.(run);
-    await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
+
+    if (provider === 'codex') {
+      const taskContinuationModule = await import('@/modules/task-continuations/index.js');
+      if (taskContinuationModule.areTaskContinuationsEnabled()) {
+      const ownerId = readTaskOwnerId(userId);
+      if (ownerId !== null) {
+        const permissionMode = typeof runtimeOptions.permissionMode === 'string'
+          ? runtimeOptions.permissionMode
+          : 'default';
+        const executionPolicy = resolveCodexExecutionPolicy(permissionMode);
+        const capability = taskContinuationModule.createTaskRunCapability({
+          userId: ownerId,
+          sessionId,
+          runId: randomUUID(),
+          providerThreadId: session.provider_session_id,
+          sessionProjectPath: path.resolve(session.project_path || runtimeOptions.cwd || process.cwd()),
+          cwd: path.resolve(typeof runtimeOptions.cwd === 'string' ? runtimeOptions.cwd : process.cwd()),
+          sandboxPolicy: executionPolicy.sandboxPolicy,
+          approvalPolicy: executionPolicy.approvalPolicy,
+        });
+        taskRunToken = capability.token;
+        revokeTaskCapability = taskContinuationModule.revokeTaskRunCapability;
+        runtimeOptions.taskExecutionContext = { token: taskRunToken };
+        const trustedLifecycle = readObjectRecord(runtimeOptions.taskContinuationLifecycle);
+        const onEngineTurnStarted = typeof trustedLifecycle?.onEngineTurnStarted === 'function'
+          ? trustedLifecycle.onEngineTurnStarted as (engineTurnId: string) => boolean
+          : undefined;
+        runtimeOptions.taskContinuationLifecycle = {
+          onNativeThreadResolved: (providerThreadId: string) =>
+            taskContinuationModule.setTaskRunProviderThreadId(taskRunToken!, providerThreadId),
+          ...(onEngineTurnStarted ? { onEngineTurnStarted } : {}),
+        };
+      }
+      }
+    }
+
+    runtimeOutcome = await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     console.error(`[Chat] Provider runtime "${provider}" failed`, { sessionId, error: failure });
     emitRuntimeFailureFallback(run, { provider, sessionId, message: failure });
   } finally {
+    if (taskRunToken && revokeTaskCapability) {
+      revokeTaskCapability(taskRunToken);
+    }
     // Safety net: a runtime that crashed (or resolved) without emitting its
     // terminal `complete` would otherwise leave the session stuck in
     // "processing" forever on every connected client. Scoped to THIS run —
@@ -346,7 +421,17 @@ async function dispatchRun(
     sessionsDb.touchSession(sessionId);
   }
 
-  return { started: true, error: failure };
+  const outcome = readObjectRecord(runtimeOutcome);
+  const terminalStatus = outcome?.terminalStatus;
+  return {
+    started: true,
+    error: failure,
+    ...(typeof outcome?.engineTurnId === 'string' ? { engineTurnId: outcome.engineTurnId } : {}),
+    ...(terminalStatus === 'completed' || terminalStatus === 'failed'
+      || terminalStatus === 'interrupted' || terminalStatus === 'unknown'
+      ? { terminalStatus }
+      : {}),
+  };
 }
 
 /**
@@ -685,12 +770,37 @@ export async function runDetachedChatTurn(
      * land mid-run, so the timer outranks whatever is running.
      */
     interruptActiveRun?: boolean;
+    taskContinuation?: AnyRecord;
+    onEngineTurnStarted?: (engineTurnId: string) => boolean;
+    taskContinuationTarget?: {
+      providerThreadId: string;
+      sessionProjectPath: string;
+      workingDirectory: string;
+      sandboxPolicyType: 'workspaceWrite' | 'dangerFullAccess';
+      networkAccess: boolean;
+      approvalPolicy: 'never' | 'on-request';
+    };
   },
   dependencies: ChatWebSocketDependencies,
-): Promise<{ started: boolean; error: string | null }> {
+): Promise<{
+  started: boolean;
+  busy?: boolean;
+  error: string | null;
+  engineTurnId?: string;
+  terminalStatus?: 'completed' | 'failed' | 'interrupted' | 'unknown';
+}> {
   const session = sessionsDb.getSessionById(input.sessionId);
   if (!session) {
     return { started: false, error: 'The session no longer exists.' };
+  }
+
+  const taskTarget = input.taskContinuationTarget;
+  if (taskTarget && (session.provider !== 'codex'
+    || session.isArchived
+    || session.provider_session_id !== taskTarget.providerThreadId
+    || !session.project_path
+    || path.resolve(session.project_path) !== path.resolve(taskTarget.sessionProjectPath))) {
+    return { started: false, error: 'The original conversation is archived or its thread/workspace has changed.' };
   }
 
   const provider = session.provider as LLMProvider;
@@ -701,7 +811,7 @@ export async function runDetachedChatTurn(
   const activeRun = chatRunRegistry.getRun(input.sessionId);
   if (activeRun && activeRun.status === 'running') {
     if (!input.interruptActiveRun) {
-      return { started: false, error: 'A run was already in progress for this session.' };
+      return { started: false, busy: true, error: 'A run was already in progress for this session.' };
     }
     // Same shape as `chat.abort`: cancel the provider run and emit the
     // terminal `complete` on its behalf, so every watching client sees the
@@ -723,6 +833,13 @@ export async function runDetachedChatTurn(
     session,
     { sessionId: input.sessionId, content: input.content, options: input.options ?? {} },
     dependencies,
+    {
+      ...(input.taskContinuation ? { taskContinuation: input.taskContinuation } : {}),
+      ...(taskTarget ? { taskContinuationTarget: taskTarget } : {}),
+      ...(input.onEngineTurnStarted ? {
+        taskContinuationLifecycle: { onEngineTurnStarted: input.onEngineTurnStarted },
+      } : {}),
+    },
   );
 }
 

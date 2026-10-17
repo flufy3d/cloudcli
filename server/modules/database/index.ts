@@ -25,3 +25,5 @@ export { userPreferencesDb } from '@/modules/database/repositories/user-preferen
 export { vapidKeysDb } from '@/modules/database/repositories/vapid-keys.js';
 export { scheduledMessagesDb } from './repositories/scheduled-messages.db.js';
 export type { ScheduledMessageRow, ScheduledMessageStatus } from './repositories/scheduled-messages.db.js';
+// taskContinuationDb: used by Task Continuations module to persist async tasks and transactional outbox continuation events.
+export { taskContinuationDb } from '@/modules/database/repositories/task-continuation.repository.js';

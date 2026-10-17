@@ -250,6 +250,75 @@ CREATE TABLE IF NOT EXISTS superseded_provider_sessions (
 );
 `;
 
+export const ASYNC_TASKS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS async_tasks (
+    task_id TEXT PRIMARY KEY NOT NULL,
+    user_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    run_id TEXT,
+    provider_thread_id TEXT,
+    session_project_path TEXT,
+    working_directory TEXT,
+    sandbox_policy_type TEXT,
+    network_access BOOLEAN,
+    approval_policy TEXT,
+    title TEXT NOT NULL,
+    command TEXT,
+    registration_key TEXT,
+    auto_notify BOOLEAN DEFAULT 0,
+    notification_cancelled_at DATETIME,
+    notification_cancelled_reason TEXT,
+    status TEXT NOT NULL DEFAULT 'registered',
+    exit_code INTEGER,
+    result_digest TEXT,
+    result_path TEXT,
+    result_summary TEXT,
+    result_json TEXT,
+    last_error TEXT,
+    token_hash TEXT NOT NULL,
+    token_expires_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+`;
+
+export const TASK_CONTINUATION_EVENTS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS task_continuation_events (
+    event_id TEXT PRIMARY KEY NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER DEFAULT 0,
+    lease_owner TEXT,
+    lease_expires_at DATETIME,
+    lease_expires_at_ms INTEGER,
+    last_attempt_at DATETIME,
+    engine_turn_id TEXT,
+    host_run_id TEXT,
+    last_error TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES async_tasks(task_id) ON DELETE CASCADE
+);
+`;
+
+export const TASK_CONTINUATION_MANUAL_ACTIONS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS task_continuation_manual_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    previous_receipt_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (event_id) REFERENCES task_continuation_events(event_id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES async_tasks(task_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+`;
+
 export const INIT_SCHEMA_SQL = `
 -- Initialize authentication database
 PRAGMA foreign_keys = ON;
@@ -303,4 +372,11 @@ ${USER_PREFERENCES_TABLE_SCHEMA_SQL}
 ${SESSION_DRAFTS_TABLE_SCHEMA_SQL}
 
 ${SUPERSEDED_PROVIDER_SESSIONS_TABLE_SCHEMA_SQL}
+
+${ASYNC_TASKS_TABLE_SCHEMA_SQL}
+
+${TASK_CONTINUATION_EVENTS_TABLE_SCHEMA_SQL}
+${TASK_CONTINUATION_MANUAL_ACTIONS_TABLE_SCHEMA_SQL}
+CREATE INDEX IF NOT EXISTS idx_continuation_events_status_lease ON task_continuation_events(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_continuation_events_session ON task_continuation_events(session_id);
 `;
