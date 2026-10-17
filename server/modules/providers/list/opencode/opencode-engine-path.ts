@@ -65,9 +65,11 @@ const resolver = createCliEnginePathResolver({
     // `opencode --version` prints `opencode v2.0.31`.
     parse: (output) => output.match(/(\d+\.\d+\.\d+)/)?.[1] ?? null,
   },
-  // The service supervisor resolves the engine on the first chat send; the
-  // version probe must never block that spawn.
-  eagerVersionProbe: true,
+  // Deliberately NOT eager: the service supervisor reads the version during
+  // boot to refuse v1 engines, so the probe must have run by then. On-demand
+  // mode probes synchronously inside the first getEngineVersion() call and
+  // caches the result; an eager (async) probe would race that first boot and
+  // let the gate see a null version.
 });
 
 /**
@@ -87,18 +89,11 @@ const resolver = createCliEnginePathResolver({
 export const tryResolveOpenCodeEnginePath = resolver.tryResolveEnginePath;
 
 /**
- * Returns the cached CLI version (`2.0.31`) once the asynchronous probe has
- * run, or `null` before that / when the CLI is missing.
+ * Returns the cached CLI version (`2.0.31`) once the probe has run, or `null`
+ * before that / when the CLI is missing. The probe runs synchronously inside
+ * the first call (no eager mode: the service supervisor reads the version
+ * during boot to refuse v1 engines, so it must be resolved by then).
  *
- * Consumer: opencode service supervisor (refuses v1 engines, whose `serve`
- * command speaks a different protocol).
+ * Consumer: opencode service supervisor.
  */
 export const getOpenCodeEngineVersion = resolver.getEngineVersion;
-
-/**
- * Clears the cached path and version so tests can swap the override env var
- * between cases.
- *
- * Consumers: opencode provider tests.
- */
-export const clearOpenCodeEnginePathCache = resolver.clearEnginePathCache;

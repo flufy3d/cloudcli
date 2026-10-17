@@ -15,6 +15,9 @@
 
 //----------------- ENDPOINT & MODEL REFERENCES ------------
 
+/** Ceiling for one API round trip; prompt/interrupt calls are short by design. */
+const REQUEST_TIMEOUT_MS = 30_000;
+
 /**
  * One reachable `opencode serve` instance plus the credential to talk to it.
  *
@@ -149,13 +152,10 @@ export class OpenCodeApiClient {
   }
 
   /** `POST /api/session` — anchored to `directory`; returns the new session id. */
-  async createSession(input: { directory: string; title?: string; model?: OpenCodeModelRef }): Promise<{ id: string }> {
+  async createSession(input: { directory: string; title?: string }): Promise<{ id: string }> {
     const body: Record<string, unknown> = { location: { directory: input.directory } };
     if (input.title) {
       body.title = input.title;
-    }
-    if (input.model) {
-      body.model = input.model;
     }
     const result = await this.request<{ data?: { id?: unknown } }>('POST', '/api/session', body);
     const id = result?.data?.id;
@@ -275,6 +275,9 @@ export class OpenCodeApiClient {
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
+      // A half-dead service must not hold a chat send for the network stack's
+      // default (~5 min) timeout; every call here is a short API round trip.
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     const text = await response.text();
     let parsed: unknown = text;

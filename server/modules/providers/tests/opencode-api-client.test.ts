@@ -87,7 +87,7 @@ test('parseOpenCodeModelRef splits provider, model and inline or explicit varian
 
 test('sends the verified wire shapes with Basic auth on every call', async () => {
   await withFakeService(async ({ client, requests }) => {
-    const created = await client.createSession({ directory: '/tmp/project', title: 'hello', model: { providerID: 'opencode', id: 'beam-free' } });
+    const created = await client.createSession({ directory: '/tmp/project', title: 'hello' });
     assert.equal(created.id, 'ses_fake');
 
     await client.switchModel('ses_fake', { providerID: 'opencode-go', id: 'glm-5.3', variant: 'high' });
@@ -128,7 +128,6 @@ test('sends the verified wire shapes with Basic auth on every call', async () =>
     assert.deepEqual(requests[0].body, {
       location: { directory: '/tmp/project' },
       title: 'hello',
-      model: { providerID: 'opencode', id: 'beam-free' },
     });
     assert.deepEqual(requests[1].body, { model: { providerID: 'opencode-go', id: 'glm-5.3', variant: 'high' } });
     assert.deepEqual(requests[2].body, { agent: 'plan' });

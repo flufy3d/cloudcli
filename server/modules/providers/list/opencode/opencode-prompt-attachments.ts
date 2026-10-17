@@ -82,16 +82,24 @@ export async function buildOpenCodePromptFiles(options: AnyRecord, workingDir: s
       continue;
     }
     try {
-      const stats = await fs.stat(absolutePath);
+      // Second containment pass on the symlink-resolved path: a link pointing
+      // out of the allowed roots must not widen the read (same barrier as the
+      // Claude image builder).
+      const canonicalPath = await fs.realpath(absolutePath);
+      if (!isAllowedImageSourcePath(canonicalPath, workingDir)) {
+        console.warn(`[OpenCode] skipping symlinked attachment outside the allowed directories: ${descriptor.path}`);
+        continue;
+      }
+      const stats = await fs.stat(canonicalPath);
       if (stats.size > MAX_INLINE_ATTACHMENT_BYTES) {
         console.warn(`[OpenCode] attachment too large to inline (${stats.size} bytes): ${descriptor.path}`);
         continue;
       }
-      const content = await fs.readFile(absolutePath);
+      const content = await fs.readFile(canonicalPath);
       const mime = resolveMediaType(descriptor);
       files.push({
         uri: `data:${mime};base64,${content.toString('base64')}`,
-        filename: descriptor.name || path.basename(absolutePath),
+        filename: descriptor.name || path.basename(canonicalPath),
         mime,
       });
     } catch (error) {

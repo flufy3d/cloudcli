@@ -127,7 +127,7 @@ test('ignores an unparseable tool input chunk instead of clobbering the card', (
   assert.deepEqual(partial.frames, []);
 });
 
-test('sums token usage across steps and exposes it without emitting frames', () => {
+test('step.ended carries no frames: the runtime reads authoritative totals from the session snapshot', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
   const first = translator.translate(event('session.step.ended', {
     assistantMessageID: MESSAGE, finish: 'tool-calls', rawFinish: 'tool_calls', cost: 0.001,
@@ -139,7 +139,6 @@ test('sums token usage across steps and exposes it without emitting frames', () 
   }));
   assert.deepEqual(first.frames, []);
   assert.deepEqual(second.frames, []);
-  assert.deepEqual(translator.getUsage(), { input: 2663, output: 30, reasoning: 54, cacheRead: 18112, cacheWrite: 5, cost: 0.003 });
 });
 
 test('maps execution terminals: succeeded, failed (message for the runtime), interrupted', () => {

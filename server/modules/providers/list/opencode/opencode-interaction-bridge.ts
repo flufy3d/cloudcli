@@ -300,6 +300,13 @@ export class OpenCodeInteractionBridge {
       return;
     }
     const metadata = readObjectRecord(form.metadata);
+    const kind = readOptionalString(metadata?.kind);
+    if (kind !== 'question') {
+      // Only the question tool's form has the panel shape; anything else the
+      // service adds later must not be rendered as an answerable survey.
+      console.warn(`[OpenCode] ignoring form of unsupported kind "${kind ?? 'unknown'}"`);
+      return;
+    }
     const tool = readObjectRecord(metadata?.tool);
     const fields = readFormFields(form.fields);
     this.announce(session, {

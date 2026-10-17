@@ -150,11 +150,14 @@ const session = (type: string, data: Record<string, unknown>) => ({
 
 const withRuntime = async (run: (input: { service: FakeService; runtime: ReturnType<typeof createOpenCodeRuntime> }) => Promise<void>) => {
   const service = await startFakeService();
+  const endpoint = { url: service.url, authorization: 'Basic dGVzdA==' };
   const runtime = createOpenCodeRuntime({
     supervisor: {
-      ensureEndpoint: async () => ({ url: service.url, authorization: 'Basic dGVzdA==' }),
+      // currentEndpoint backs the event stream's re-resolver: after a boot it
+      // must hand out the same endpoint the supervisor does.
+      ensureEndpoint: async () => endpoint,
       onExit: () => () => {},
-      currentEndpoint: () => null,
+      currentEndpoint: () => endpoint,
     },
     abortSettleGraceMs: 300,
   });

@@ -74,7 +74,19 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   const createClient = dependencies.createClient ?? ((endpoint) => new OpenCodeApiClient(endpoint));
   const abortSettleGraceMs = dependencies.abortSettleGraceMs ?? 5_000;
 
-  const eventStream = new OpenCodeEventStream(() => supervisor.ensureEndpoint());
+  // Reconnects only boot the service while a run is in flight (runs create
+  // their registry entry before awaiting the stream); with nobody chatting a
+  // broken engine must not be resurrected forever.
+  const eventStream = new OpenCodeEventStream(async () => {
+    const endpoint = supervisor.currentEndpoint();
+    if (endpoint) {
+      return endpoint;
+    }
+    if (runs.all().length === 0) {
+      throw new Error('OpenCode service is not running');
+    }
+    return supervisor.ensureEndpoint();
+  });
   let client: OpenCodeApiClient | null = null;
 
   const bridge = new OpenCodeInteractionBridge({ getClient: () => client });
@@ -191,6 +203,8 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
         const modelRef = parseOpenCodeModelRef(resolvedModel, effort);
         if (modelRef) {
           await settings.applyModel(activeClient, providerSessionId, modelRef);
+        } else {
+          console.warn(`[OpenCode] cannot parse model reference "${resolvedModel}"; the session keeps its previous model`);
         }
       }
     } catch (error) {
@@ -211,21 +225,35 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       resolveToolCall: (callId) => activeRun.translator.getToolCall(callId),
     });
 
+    // The feed must be live before the prompt: events emitted between the
+    // prompt POST and the stream connecting would be lost for good.
+    await eventStream.connected();
+
     try {
       await activeClient.prompt(providerSessionId, { text, files });
       activeRun.promptAccepted = true;
     } catch (error) {
       runs.release(activeRun);
       bridge.cancelSession(appSessionId, 'The message was rejected by the OpenCode service.');
+      bridge.detach(providerSessionId);
       return failRun(`OpenCode rejected the message: ${describeError(error)}`);
     }
 
     const settlement = await activeRun.settled;
     runs.release(activeRun);
+    // Retract any cards still pending, then drop the run's writer from the
+    // bridge so finished sessions do not pin memory forever.
     bridge.cancelSession(appSessionId, 'The run ended with cards still pending.');
+    bridge.detach(providerSessionId);
 
     await sendTokenBudget(appSessionId, providerSessionId, writer);
 
+    if (activeRun.aborted) {
+      // The user stopped this run: the gateway's abort handler already
+      // emitted the aborted complete, and a racing terminal event must not
+      // paint a second, contradictory outcome over it.
+      return;
+    }
     if (settlement.outcome === 'succeeded') {
       writer.send(createCompleteMessage({ provider: PROVIDER, sessionId: appSessionId, exitCode: 0 }));
       notifyRunStopped({
@@ -234,10 +262,6 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       return;
     }
     if (settlement.outcome === 'interrupted') {
-      if (activeRun.aborted) {
-        // The gateway's abort handler already emitted the aborted complete.
-        return;
-      }
       writer.send(createCompleteMessage({ provider: PROVIDER, sessionId: appSessionId, exitCode: 0, aborted: true }));
       notifyRunStopped({
         userId, provider: PROVIDER, sessionId: appSessionId, sessionName: sessionSummary, stopReason: 'aborted',

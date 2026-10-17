@@ -102,6 +102,7 @@ export class OpenCodeEventStream {
   private readonly backoffMaxMs: number;
   private readonly listeners = new Set<EventListener>();
   private readonly reconnectListeners = new Set<() => void>();
+  private readonly openWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
   private controller: AbortController | null = null;
   private wakeSleep: (() => void) | null = null;
   private loop: Promise<void> | null = null;
@@ -139,12 +140,11 @@ export class OpenCodeEventStream {
     this.controller?.abort();
     this.controller = null;
     this.wakeSleep?.();
-  }
-
-  /** Forces the current connection to drop so the loop re-resolves the endpoint (e.g. after a service respawn). */
-  reconnectNow(): void {
-    this.controller?.abort();
-    this.wakeSleep?.();
+    const stoppedError = new Error('event stream is stopped');
+    for (const waiter of this.openWaiters) {
+      waiter.reject(stoppedError);
+    }
+    this.openWaiters.clear();
   }
 
   subscribe(listener: EventListener): () => void {
@@ -160,6 +160,24 @@ export class OpenCodeEventStream {
     return () => {
       this.reconnectListeners.delete(listener);
     };
+  }
+
+  /**
+   * Resolves once the stream is open — immediately when it already is.
+   * Senders await this before posting a prompt so the feed cannot miss the
+   * first events of a run. Waiters are released unresolved-free on stop
+   * (callers fail on their own timeouts instead of hanging here).
+   */
+  connected(): Promise<void> {
+    if (this.stateValue === 'open') {
+      return Promise.resolve();
+    }
+    if (this.stopped) {
+      return Promise.reject(new Error('event stream is stopped'));
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.openWaiters.add({ resolve, reject });
+    });
   }
 
   private async runLoop(): Promise<void> {
@@ -183,6 +201,10 @@ export class OpenCodeEventStream {
         }
         this.stateValue = 'open';
         attempts = 0;
+        for (const waiter of this.openWaiters) {
+          waiter.resolve();
+        }
+        this.openWaiters.clear();
         if (hadConnection) {
           for (const listener of this.reconnectListeners) {
             try {
@@ -195,7 +217,9 @@ export class OpenCodeEventStream {
         hadConnection = true;
         await this.consume(response.body);
       } catch (error) {
-        if (!this.stopped && !controller.signal.aborted) {
+        // Warn once per failure streak: a service that stays down must not
+        // flood the log on every backoff retry.
+        if (!this.stopped && !controller.signal.aborted && attempts === 0) {
           console.warn('[OpenCode] event stream dropped:', error instanceof Error ? error.message : error);
         }
       } finally {

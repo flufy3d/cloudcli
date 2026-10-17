@@ -11,7 +11,8 @@
  * - `session.tool.input.started` / `tool.called` → `tool_use` snapshots that
  *   the timeline upserts by toolId; `tool.success` / `tool.failed` → `tool_result`
  * - `session.execution.{succeeded,failed,interrupted}` → run terminal
- * - `session.step.ended` → token accounting (read via `getUsage`)
+ *   (`session.step.ended` carries token totals, but the runtime reads the
+ *   authoritative session totals from the API snapshot instead)
  *
  * Ids on transcript rows (thinking / tool_use / tool_result) derive from the
  * engine's own identifiers (assistant message id + ordinal, tool call id) so
@@ -45,16 +46,6 @@ export type OpenCodeRunOutcome =
 export type OpenCodeTranslatedEvent = {
   frames: NormalizedMessage[];
   terminal?: OpenCodeRunOutcome;
-};
-
-/** Token totals summed over every `session.step.ended` seen so far. */
-export type OpenCodeRunTokenUsage = {
-  input: number;
-  output: number;
-  reasoning: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cost: number;
 };
 
 /** A tool call the translator has seen; the interaction bridge labels permission cards with it. */
@@ -124,7 +115,6 @@ export class OpenCodeSessionEventTranslator {
   private readonly toolCalls = new Map<string, OpenCodeToolCall>();
   /** Reasoning blocks that already streamed deltas; `reasoning.ended` must not repeat them. */
   private readonly streamedReasoningBlocks = new Set<string>();
-  private readonly usage: OpenCodeRunTokenUsage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
   constructor(
     /** The app session id stamped on every frame (the writer owns provider↔app mapping). */
@@ -133,10 +123,6 @@ export class OpenCodeSessionEventTranslator {
 
   getToolCall(callId: string): OpenCodeToolCall | null {
     return this.toolCalls.get(callId) ?? null;
-  }
-
-  getUsage(): OpenCodeRunTokenUsage {
-    return { ...this.usage };
   }
 
   translate(event: OpenCodeEventEnvelope): OpenCodeTranslatedEvent {
@@ -250,17 +236,10 @@ export class OpenCodeSessionEventTranslator {
         return { frames: [this.toolResultFrame(callId, readErrorMessage(data.error), true, timestamp)] };
       }
 
-      case 'session.step.ended': {
-        const tokens = readObjectRecord(data.tokens);
-        const cache = readObjectRecord(tokens?.cache);
-        this.usage.input += toNumber(tokens?.input);
-        this.usage.output += toNumber(tokens?.output);
-        this.usage.reasoning += toNumber(tokens?.reasoning);
-        this.usage.cacheRead += toNumber(cache?.read);
-        this.usage.cacheWrite += toNumber(cache?.write);
-        this.usage.cost += toNumber(data.cost);
+      case 'session.step.ended':
+        // Token totals ride on the session snapshot the runtime already
+        // fetches for the budget frame; nothing to accumulate here.
         return { frames: [] };
-      }
 
       case 'session.execution.succeeded':
         return { frames: [], terminal: { outcome: 'succeeded' } };

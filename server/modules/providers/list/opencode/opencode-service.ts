@@ -175,11 +175,13 @@ export class OpenCodeServiceSupervisor {
     const bootedAt = this.now();
     const stderrTail: string[] = [];
     child.stderr?.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString().split(/\r?\n/)) {
-        if (!line.trim()) {
+      for (const rawLine of chunk.toString().split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) {
           continue;
         }
-        stderrTail.push(line);
+        // Cap each line: a giant dump must not pin memory or flood the exit warning.
+        stderrTail.push(line.length > 500 ? `${line.slice(0, 500)}…` : line);
         if (stderrTail.length > STDERR_TAIL_LINES) {
           stderrTail.shift();
         }
