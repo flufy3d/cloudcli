@@ -142,7 +142,7 @@ test('sums token usage across steps and exposes it without emitting frames', () 
   assert.deepEqual(translator.getUsage(), { input: 2663, output: 30, reasoning: 54, cacheRead: 18112, cacheWrite: 5, cost: 0.003 });
 });
 
-test('maps execution terminals: succeeded, failed (with error frame), interrupted', () => {
+test('maps execution terminals: succeeded, failed (message for the runtime), interrupted', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
 
   const succeeded = translator.translate(event('session.execution.succeeded', {}, { location: undefined }));
@@ -151,10 +151,10 @@ test('maps execution terminals: succeeded, failed (with error frame), interrupte
   const failed = translator.translate(event('session.execution.failed', {
     error: { type: 'provider.quota', message: 'Upstream request failed: Insufficient account funds', status: 402 },
   }, { location: undefined }));
-  assert.deepEqual(failed.terminal, { outcome: 'failed', error: 'Upstream request failed: Insufficient account funds' });
-  assert.equal(failed.frames.length, 1);
-  assert.equal(failed.frames[0].kind, 'error');
-  assert.equal(failed.frames[0].content, 'Upstream request failed: Insufficient account funds');
+  assert.deepEqual(failed, {
+    frames: [],
+    terminal: { outcome: 'failed', error: 'Upstream request failed: Insufficient account funds' },
+  });
 
   const interrupted = translator.translate(event('session.execution.interrupted', { reason: 'user' }, { location: undefined }));
   assert.deepEqual(interrupted, { frames: [], terminal: { outcome: 'interrupted', reason: 'user' } });

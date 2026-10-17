@@ -265,20 +265,10 @@ export class OpenCodeSessionEventTranslator {
       case 'session.execution.succeeded':
         return { frames: [], terminal: { outcome: 'succeeded' } };
 
-      case 'session.execution.failed': {
-        const message = readErrorMessage(data.error);
-        return {
-          frames: [createNormalizedMessage({
-            id: `${readOptionalString(event.id) ?? messageId}_error`,
-            sessionId: this.sessionId,
-            timestamp,
-            provider: PROVIDER,
-            kind: 'error',
-            content: message,
-          })],
-          terminal: { outcome: 'failed', error: message },
-        };
-      }
+      case 'session.execution.failed':
+        // The runtime renders the failure (one place for failures seen live
+        // and failures reconciled after a stream drop), so no frame here.
+        return { frames: [], terminal: { outcome: 'failed', error: readErrorMessage(data.error) } };
 
       case 'session.execution.interrupted':
         return {
