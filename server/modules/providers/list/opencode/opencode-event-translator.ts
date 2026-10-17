@@ -10,9 +10,11 @@
  *   (the timeline appends same-id thinking frames, so deltas, not totals)
  * - `session.tool.input.started` / `tool.called` → `tool_use` snapshots that
  *   the timeline upserts by toolId; `tool.success` / `tool.failed` → `tool_result`
+ * - `session.step.ended` → no frames, but its per-step `tokens` ride on the
+ *   result so the runtime can publish the live context-occupancy frame
+ *   (session-lifetime totals live on the API snapshot and are a different
+ *   number — see `opencode-context-usage.ts`)
  * - `session.execution.{succeeded,failed,interrupted}` → run terminal
- *   (`session.step.ended` carries token totals, but the runtime reads the
- *   authoritative session totals from the API snapshot instead)
  *
  * Ids on transcript rows (thinking / tool_use / tool_result) derive from the
  * engine's own identifiers (assistant message id + ordinal, tool call id) so
@@ -26,6 +28,8 @@
 import type { NormalizedMessage } from '@/shared/types.js';
 import { createNormalizedMessage, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
+import type { OpenCodeStepTokens } from './opencode-context-usage.js';
+import { readOpenCodeStepTokens } from './opencode-context-usage.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 
 const PROVIDER = 'opencode' as const;
@@ -39,13 +43,17 @@ export type OpenCodeRunOutcome =
   | { outcome: 'interrupted'; reason: string };
 
 /**
- * Frames to forward plus, on execution-terminal events, how the run ended.
+ * Frames to forward plus, on execution-terminal events, how the run ended;
+ * `stepTokens` rides on `session.step.ended`, whose `tokens` describe that
+ * step's context occupancy (the runtime turns it into the live
+ * `token_budget` frame).
  *
  * Consumer: opencode runtime.
  */
 export type OpenCodeTranslatedEvent = {
   frames: NormalizedMessage[];
   terminal?: OpenCodeRunOutcome;
+  stepTokens?: OpenCodeStepTokens;
 };
 
 /** A tool call the translator has seen; the interaction bridge labels permission cards with it. */
@@ -236,10 +244,13 @@ export class OpenCodeSessionEventTranslator {
         return { frames: [this.toolResultFrame(callId, readErrorMessage(data.error), true, timestamp)] };
       }
 
-      case 'session.step.ended':
-        // Token totals ride on the session snapshot the runtime already
-        // fetches for the budget frame; nothing to accumulate here.
-        return { frames: [] };
+      case 'session.step.ended': {
+        // Step occupancy, not the session's lifetime totals: the runtime
+        // forwards it as the live token-budget frame so the composer badge
+        // tracks the same number a reload reads from the database.
+        const stepTokens = readOpenCodeStepTokens(data.tokens);
+        return { frames: [], ...(stepTokens ? { stepTokens } : {}) };
+      }
 
       case 'session.execution.succeeded':
         return { frames: [], terminal: { outcome: 'succeeded' } };

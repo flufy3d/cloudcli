@@ -14,6 +14,12 @@ import path from 'node:path';
 
 import type { Database as SqliteDatabase } from 'better-sqlite3';
 
+import type { AnyRecord } from '@/shared/types.js';
+import {
+  readJsonRecord,
+  readOptionalString,
+} from '@/shared/utils.js';
+
 /**
  * Resolves the OpenCode CLI data directory shared by all of its state files.
  */
@@ -55,8 +61,8 @@ export function getOpenCodeAuthPath(): string {
  * `providerID.modelID.limit.context` entries are the only place this app can
  * learn a model's context window without calling the gateway.
  *
- * Consumers: opencode models provider (live catalog overlay) and opencode
- * sessions provider (context-usage percent).
+ * Consumers: opencode context usage and runtime providers (context-window
+ * lookup for the composer badge's percentage).
  */
 export function getOpenCodeModelsCachePath(): string {
   return path.join(os.homedir(), '.cache', 'opencode', 'models.json');
@@ -165,4 +171,99 @@ export function readOpenCodeSessionTokenTotals(
   `).get(sessionId) as OpenCodeSessionTokenTotals | undefined;
 
   return row ?? null;
+}
+
+/**
+ * Reads one session row's stored model selection, normalized to a
+ * `providerId/modelId` key (OpenCode's routing key and the models.json cache
+ * key). Both layouts store it as a JSON object on the `model` column
+ * (`{providerID, id}` or `{providerID, modelID}`); rows that predate the
+ * column, or a missing session table, answer null.
+ *
+ * Consumers: opencode context usage (context-window lookup) and runtime
+ * (fallback when a run carries no model reference).
+ */
+export function readOpenCodeSessionModelKey(
+  db: OpenCodeReadableDatabase,
+  sessionId: string,
+): string | null {
+  const table = resolveOpenCodeSessionTableName(db);
+  if (!table) {
+    return null;
+  }
+
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+  if (!columns.some((column) => column.name === 'model')) {
+    return null;
+  }
+
+  const row = db.prepare(`SELECT model FROM ${table} WHERE id = ?`).get(sessionId) as { model?: unknown } | undefined;
+  const model = readJsonRecord(row?.model);
+  if (!model) {
+    return null;
+  }
+
+  const providerId = readOptionalString(model.providerID) ?? readOptionalString(model.providerId);
+  const modelId = readOptionalString(model.id)
+    ?? readOptionalString(model.modelID)
+    ?? readOptionalString(model.modelId);
+  if (!modelId) {
+    return null;
+  }
+  // Some rows carry the routed id as `provider/model` with an optional
+  // `#variant` suffix; models.json keys are `provider/model` alone.
+  const [bare, inlineProvider] = modelId.includes('/')
+    ? [modelId.split('/').slice(1).join('/'), modelId.split('/')[0]]
+    : [modelId, null];
+  const resolvedProvider = providerId ?? inlineProvider;
+  return resolvedProvider ? `${resolvedProvider}/${bare}` : bare;
+}
+
+export type OpenCodeAssistantMessageRecord = {
+  /** Message row id; identifies the newest compaction summary for the size reading. */
+  id: string;
+  /** Parsed message payload (raw row data can also be a plain string). */
+  data: AnyRecord | null;
+};
+
+/**
+ * Reads one session's assistant message rows, newest first.
+ *
+ * Blind to the storage layout: v2 folds messages into `session_message` rows
+ * (with the payload inline), v1 splits them across `message` and `part`. Both
+ * carry per-message token usage on the assistant payload, which is what the
+ * context-usage reader needs; timeline rendering uses the layout-aware
+ * fetchers instead. Returns an empty list when neither layout exists.
+ *
+ * Consumer: opencode context usage.
+ */
+export function readOpenCodeAssistantMessages(
+  db: OpenCodeReadableDatabase,
+  sessionId: string,
+): OpenCodeAssistantMessageRecord[] {
+  const layout = resolveOpenCodeMessageLayout(db);
+  if (layout === 'session_message') {
+    const rows = db.prepare(`
+      SELECT id, data
+      FROM session_message
+      WHERE session_id = ? AND type = 'assistant'
+      ORDER BY seq DESC
+    `).all(sessionId) as Array<{ id: string; data: string }>;
+    return rows.map((row) => ({ id: row.id, data: readJsonRecord(row.data) }));
+  }
+
+  if (layout === 'message_part') {
+    // v1 stores the role on each message payload; the LIKE prefilter keeps the
+    // scan off user rows whose bodies can be far larger than their headers.
+    const rows = db.prepare(`
+      SELECT id, data
+      FROM message
+      WHERE session_id = ?
+        AND (data LIKE '%"role":"assistant"%' OR data LIKE '%"role": "assistant"%')
+      ORDER BY time_created DESC, id DESC
+    `).all(sessionId) as Array<{ id: string; data: string }>;
+    return rows.map((row) => ({ id: row.id, data: readJsonRecord(row.data) }));
+  }
+
+  return [];
 }

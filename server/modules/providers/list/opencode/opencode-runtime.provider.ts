@@ -20,6 +20,8 @@
  * @module opencode-runtime.provider
  */
 
+import Database from 'better-sqlite3';
+
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type {
@@ -42,10 +44,12 @@ import {
   parseOpenCodeModelRef,
   type OpenCodeServiceEndpoint,
 } from './opencode-api.client.js';
+import { readOpenCodeContextUsage } from './opencode-context-usage.js';
+import { getOpenCodeDatabasePath } from './opencode-data-root.js';
 import { OpenCodeEventStream } from './opencode-event-stream.js';
 import { OpenCodeInteractionBridge } from './opencode-interaction-bridge.js';
 import { buildOpenCodePromptFiles, buildOpenCodePromptText } from './opencode-prompt-attachments.js';
-import { OpenCodeRunRegistry, toOpenCodeTokenBudget } from './opencode-run-registry.js';
+import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker } from './opencode-run-registry.js';
 import { OpenCodeServiceError, OpenCodeServiceSupervisor } from './opencode-service.js';
 import {
   OpenCodeSessionSettingsApplier,
@@ -92,10 +96,12 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   const bridge = new OpenCodeInteractionBridge({ getClient: () => client });
   const runs = new OpenCodeRunRegistry();
   const settings = new OpenCodeSessionSettingsApplier();
+  /** Live occupancy publisher for the run in flight; recreated per run. */
+  let budgetTracker: OpenCodeTokenBudgetTracker | null = null;
 
   eventStream.subscribe((event) => {
     bridge.handleEvent(event);
-    runs.dispatch(event);
+    runs.dispatch(event, budgetTracker ?? undefined);
   });
   eventStream.onReconnect(() => {
     void runs.reconcile({ getSession: (sessionId) => client?.getSession(sessionId)
@@ -106,26 +112,31 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     runs.settleAll({ outcome: 'lost', error: 'The OpenCode service exited while the run was in progress.' });
   });
 
-  const sendTokenBudget = async (
+  /**
+   * Publishes the authoritative end-of-run reading: the same reader the
+   * `/token-usage` endpoint and history pages use, so the reload path and the
+   * realtime path can never disagree — including the context window, which
+   * the live step frames carry and must not be dropped by the final repaint.
+   * A session whose database row cannot be read sends no frame; the
+   * frontend's end-of-turn refresh covers it.
+   */
+  const sendFinalTokenBudget = (
+    modelRef: { providerID: string; id: string } | null,
     appSessionId: string,
     providerSessionId: string,
     writer: ProviderRuntimeWriter,
-  ): Promise<void> => {
-    if (!client) {
-      return;
-    }
+  ): void => {
     try {
-      const snapshot = await client.getSession(providerSessionId);
-      const budget = snapshot.tokens ? toOpenCodeTokenBudget(snapshot.tokens) : null;
-      if (budget) {
-        writer.send(createNormalizedMessage({
-          id: generateMessageId(PROVIDER),
-          sessionId: appSessionId,
-          provider: PROVIDER,
-          kind: 'status',
-          text: 'token_budget',
-          tokenBudget: budget,
-        }));
+      const db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
+      try {
+        const usage = readOpenCodeContextUsage(db, providerSessionId);
+        if (!usage || usage.used <= 0) {
+          return;
+        }
+        const tracker = new OpenCodeTokenBudgetTracker(modelRef?.providerID ?? null, modelRef?.id ?? null);
+        tracker.emit(usage, writer, appSessionId);
+      } finally {
+        db.close();
       }
     } catch (error) {
       console.warn('[OpenCode] failed to read the token budget:', error);
@@ -176,6 +187,8 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     client = activeClient;
 
     let providerSessionId = context.resolveProviderSessionId(appSessionId);
+    /** Model the run switched to, for the live budget frame's context window. */
+    let budgetTrackerModel: { providerID: string; id: string } | null = null;
     try {
       if (!providerSessionId) {
         const created = await activeClient.createSession({ directory: workingDir, title: sessionSummary });
@@ -202,6 +215,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
         const effort = resolveModelEffort(resolvedModel, options.effort, effortModels);
         const modelRef = parseOpenCodeModelRef(resolvedModel, effort);
         if (modelRef) {
+          budgetTrackerModel = { providerID: modelRef.providerID, id: modelRef.id };
           await settings.applyModel(activeClient, providerSessionId, modelRef);
         } else {
           console.warn(`[OpenCode] cannot parse model reference "${resolvedModel}"; the session keeps its previous model`);
@@ -217,6 +231,9 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       return failRun('Nothing to send: the message is empty.');
     }
 
+    // One tracker per run: the window comes from the model this run switched
+    // to, and the throttle state must not leak across runs.
+    budgetTracker = new OpenCodeTokenBudgetTracker(budgetTrackerModel?.providerID ?? null, budgetTrackerModel?.id ?? null);
     const activeRun = runs.create(appSessionId, providerSessionId, writer);
     bridge.attach({
       appSessionId,
@@ -245,8 +262,9 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     // bridge so finished sessions do not pin memory forever.
     bridge.cancelSession(appSessionId, 'The run ended with cards still pending.');
     bridge.detach(providerSessionId);
+    budgetTracker = null;
 
-    await sendTokenBudget(appSessionId, providerSessionId, writer);
+    sendFinalTokenBudget(budgetTrackerModel, appSessionId, providerSessionId, writer);
 
     if (activeRun.aborted) {
       // The user stopped this run: the gateway's abort handler already

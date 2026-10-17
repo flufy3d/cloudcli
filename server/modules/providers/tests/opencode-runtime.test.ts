@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import http from 'node:http';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test, { after, before } from 'node:test';
@@ -11,15 +11,29 @@ import { createOpenCodeRuntime } from '@/modules/providers/list/opencode/opencod
 import type { NormalizedMessage, ProviderModelsDefinition, ProviderRuntimeContext } from '@/shared/types.js';
 
 // Run notifications consult the app database; give the suite a throwaway one.
+// The home directory is redirected too: token-budget frames read opencode's
+// own database and model cache, which must not be whatever the developer has.
 let databaseDirectory = '';
+let homeDirectory = '';
 const previousDatabasePath = process.env.DATABASE_PATH;
+const originalHomedir = os.homedir;
 before(async () => {
   databaseDirectory = await mkdtemp(path.join(os.tmpdir(), 'cloudcli-opencode-runtime-db-'));
+  homeDirectory = await mkdtemp(path.join(os.tmpdir(), 'cloudcli-opencode-runtime-home-'));
+  const cacheDirectory = path.join(homeDirectory, '.cache', 'opencode');
+  await mkdir(cacheDirectory, { recursive: true });
+  await writeFile(
+    path.join(cacheDirectory, 'models.json'),
+    JSON.stringify({ 'opencode-go': { models: { 'glm-5.3': { limit: { context: 200_000 } } } } }),
+  );
+  (os as any).homedir = () => homeDirectory;
+
   closeConnection();
   process.env.DATABASE_PATH = path.join(databaseDirectory, 'auth.db');
   await initializeDatabase();
 });
 after(async () => {
+  (os as any).homedir = originalHomedir;
   closeConnection();
   if (previousDatabasePath === undefined) {
     delete process.env.DATABASE_PATH;
@@ -27,6 +41,7 @@ after(async () => {
     process.env.DATABASE_PATH = previousDatabasePath;
   }
   await rm(databaseDirectory, { recursive: true, force: true });
+  await rm(homeDirectory, { recursive: true, force: true });
 });
 
 type RecordedRequest = { method: string; path: string; body: unknown };
@@ -179,6 +194,12 @@ test('first send creates the session in the project directory, applies mode and 
     await service.waitForRequest((request) => request.path.endsWith('/prompt'));
     service.emit(session('session.text.delta', { assistantMessageID: 'msg_a', ordinal: 0, delta: 'Hi!' }));
     service.emit(session('session.text.ended', { assistantMessageID: 'msg_a', ordinal: 0, text: 'Hi!' }));
+    // The step's own occupancy rides the budget frame; the session snapshot's
+    // lifetime totals are deliberately never read as occupancy.
+    service.emit(session('session.step.ended', {
+      assistantMessageID: 'msg_a',
+      tokens: { input: 10, output: 5, reasoning: 1, cache: { read: 2, write: 0 } },
+    }));
     service.emit(session('session.execution.succeeded', {}));
     await running;
 
@@ -188,7 +209,6 @@ test('first send creates the session in the project directory, applies mode and 
       ['PATCH', '/api/session/ses_new'],
       ['POST', '/api/session/ses_new/model'],
       ['POST', '/api/session/ses_new/prompt'],
-      ['GET', '/api/session/ses_new'],
     ]);
     assert.deepEqual(service.requests[0].body, { location: { directory: '/tmp/project-a' }, title: 'Greeting' });
     assert.deepEqual(service.requests[1].body, { agent: 'build' });
@@ -203,7 +223,15 @@ test('first send creates the session in the project directory, applies mode and 
     assert.equal(frames[0].newSessionId, 'ses_new');
     assert.equal(frames[1].content, 'Hi!');
     assert.equal(frames[1].sessionId, 'app-1');
-    assert.deepEqual(frames[3].tokenBudget, { used: 18, inputTokens: 12, outputTokens: 5, breakdown: { input: 12, output: 5 } });
+    // Step occupancy: prompt 10 + 2 cache, output 5 + 1 reasoning, against the
+    // model cache's declared 200k window.
+    assert.deepEqual(frames[3].tokenBudget, {
+      used: 18,
+      total: 200_000,
+      inputTokens: 12,
+      outputTokens: 6,
+      breakdown: { input: 12, output: 6 },
+    });
     assert.equal(frames[4].success, true);
     assert.equal(frames[4].exitCode, 0);
   });
@@ -299,6 +327,10 @@ test('an execution failure surfaces one error frame, a failed complete, and reje
     const { writer, frames } = makeWriter();
     const running = runtime.run('x', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new'));
     await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    service.emit(session('session.step.ended', {
+      assistantMessageID: 'm',
+      tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+    }));
     service.emit(session('session.execution.failed', { error: { type: 'provider.quota', message: 'Insufficient account funds' } }));
     await assert.rejects(running, /Insufficient account funds/);
     assert.deepEqual(frames.map((frame) => frame.kind), ['status', 'complete']);

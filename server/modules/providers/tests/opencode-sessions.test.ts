@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -488,13 +488,20 @@ test('OpenCode sessions provider reads sqlite history and token usage', { concur
     assert.equal(history.messages[2]?.content, 'The provider is wired.');
     assert.equal(history.messages[3]?.kind, 'tool_use');
     assert.deepEqual(history.messages[3]?.toolResult, { content: 'ok', isError: false });
+    // Occupancy from message-assistant (input 10 + cache 3+2, output 20);
+    // the session row's lifetime columns surface only as `cumulative`.
     assert.deepEqual(history.tokenUsage, {
-      used: 42,
-      inputTokens: 13,
+      used: 35,
+      inputTokens: 15,
       outputTokens: 20,
       breakdown: {
-        input: 13,
+        input: 15,
         output: 20,
+      },
+      cumulative: {
+        used: 42,
+        inputTokens: 13,
+        outputTokens: 20,
       },
     });
 
@@ -610,7 +617,7 @@ test('OpenCode synchronizer keeps the stored title for indexed sessions', { conc
   }
 });
 
-test('getTokenUsage reads the token columns for the provider-native session', async () => {
+test('getTokenUsage reports the newest message occupancy, not the session lifetime totals', async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-token-usage-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
@@ -619,7 +626,9 @@ test('getTokenUsage reads the token columns for the provider-native session', as
     await createOpenCodeDatabase(tempRoot, workspacePath);
 
     const provider = new OpenCodeSessionsProvider();
-    // Seeded session row: tokens 10/20/7/3/2 → used 42, input incl. cache reads 13.
+    // Seeded message-assistant tokens: input 10 + cache read 3 + write 2 →
+    // prompt 15, output 20; the session row's lifetime columns (42 total leak
+    // into it) must only surface as `cumulative`, never as `used`.
     assert.deepEqual(
       await provider.getTokenUsage({
         appSessionId: 'app-1',
@@ -627,7 +636,37 @@ test('getTokenUsage reads the token columns for the provider-native session', as
         jsonlPath: null,
         projectPath: null,
       }),
-      { used: 42, inputTokens: 13, outputTokens: 20, breakdown: { input: 13, output: 20 } },
+      {
+        used: 35,
+        inputTokens: 15,
+        outputTokens: 20,
+        breakdown: { input: 15, output: 20 },
+        cumulative: { used: 42, inputTokens: 13, outputTokens: 20 },
+      },
+    );
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('getTokenUsage 404s an unknown session and reports unsupported for old schemas', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-token-usage-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await createOpenCodeDatabase(tempRoot, workspacePath);
+    const provider = new OpenCodeSessionsProvider();
+
+    await assert.rejects(
+      () => provider.getTokenUsage({
+        appSessionId: 'app-1',
+        nativeSessionId: 'missing-session',
+        jsonlPath: null,
+        projectPath: null,
+      }),
+      /OpenCode session was not found/,
     );
   } finally {
     restoreHomeDir();
@@ -645,6 +684,17 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
   try {
     const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
     await mkdir(dataDir, { recursive: true });
+    // The model cache is the only source of a model's context window; seed it
+    // so the reading carries the window (and with it, a percentage) the way a
+    // real install would.
+    const cacheDir = path.join(tempRoot, '.cache', 'opencode');
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(
+      path.join(cacheDir, 'models.json'),
+      JSON.stringify({
+        opencode: { models: { 'beam-free': { limit: { context: 200_000 } } } },
+      }),
+    );
     const db = new Database(path.join(dataDir, 'opencode.db'));
     try {
       db.exec(`
@@ -682,7 +732,7 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
         );
         INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
           ('msg_u', 'ses_v2_hist', 'user', 1, 1000, 1000, '{"time":{"created":1000},"text":"Build it","files":[],"agents":[]}'),
-          ('msg_a', 'ses_v2_hist', 'assistant', 2, 1100, 1200, '{"time":{"created":1100},"model":{"id":"beam-free","providerID":"opencode","variant":"high"},"content":[{"type":"reasoning","text":"thinking"},{"type":"tool","id":"call_1","name":"write","state":{"status":"completed","input":{"path":"/tmp/x"},"output":"ok"}},{"type":"text","text":"done"}]}');
+          ('msg_a', 'ses_v2_hist', 'assistant', 2, 1100, 1200, '{"time":{"created":1100},"model":{"id":"beam-free","providerID":"opencode","variant":"high"},"tokens":{"input":30,"output":10,"reasoning":5,"cache":{"read":2000,"write":100}},"content":[{"type":"reasoning","text":"thinking"},{"type":"tool","id":"call_1","name":"write","state":{"status":"completed","input":{"path":"/tmp/x"},"output":"ok"}},{"type":"text","text":"done"}]}');
       `);
     } finally {
       db.close();
@@ -701,12 +751,88 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
     assert.deepEqual(history.messages[2]?.toolInput, { path: '/tmp/x' });
     assert.deepEqual(history.messages[2]?.toolResult, { content: 'ok', isError: false });
     assert.equal(history.messages[3]?.content, 'done');
-    // Totals come from the session_v2 token columns: 100+20+5+8+2.
+    // Occupancy comes from the newest message: prompt 30 + 2000 + 100, output
+    // 10 + 5 reasoning. The session_v2 columns (135 lifetime) are `cumulative`.
     assert.deepEqual(history.tokenUsage, {
-      used: 135,
-      inputTokens: 108,
-      outputTokens: 20,
-      breakdown: { input: 108, output: 20 },
+      used: 2145,
+      total: 200_000,
+      inputTokens: 2130,
+      outputTokens: 15,
+      breakdown: { input: 2130, output: 15 },
+      cumulative: { used: 135, inputTokens: 108, outputTokens: 20 },
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('a v2 compaction summary resets the reading to compacted with its byte size', { concurrency: false }, async () => {
+  // The summary's own tokens describe the summarization request (the whole
+  // pre-compaction conversation), so it must never be reported as occupancy;
+  // only the summary's text size is honest until the next turn runs.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-compacted-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          model text,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (
+          id, project_id, slug, directory, title, version,
+          tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          model, time_created, time_updated
+        ) VALUES (
+          'ses_v2_compacted', 'proj_1', 'v2-compacted', '/tmp/proj', 'Compacted session', '2.0.31',
+          500, 50, 10, 400000, 0,
+          '{"providerID":"opencode-go","id":"glm-5.3"}', 1000, 3000
+        );
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_a', 'ses_v2_compacted', 'assistant', 1, 1000, 1000, '{"time":{"created":1000},"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":100,"write":0}},"content":[{"type":"text","text":"done"}]}'),
+          ('msg_summary', 'ses_v2_compacted', 'assistant', 2, 2000, 2000, '{"time":{"created":2000},"summary":true,"tokens":{"input":20,"output":10,"reasoning":0,"cache":{"read":400000,"write":0}},"content":[{"type":"text","text":"The conversation so far, summarized."}]}');
+      `);
+    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('ses_v2_compacted');
+    const summaryBytes = Buffer.byteLength('The conversation so far, summarized.', 'utf8');
+    assert.deepEqual(history.tokenUsage, {
+      used: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      breakdown: { input: 0, output: 0 },
+      compacted: true,
+      summaryBytes,
+      cumulative: { used: 400560, inputTokens: 400500, outputTokens: 50 },
     });
   } finally {
     restoreHomeDir();

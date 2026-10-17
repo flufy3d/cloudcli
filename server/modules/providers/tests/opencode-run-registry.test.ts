@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { OpenCodeApiError } from '@/modules/providers/list/opencode/opencode-api.client.js';
-import { OpenCodeRunRegistry, toOpenCodeTokenBudget } from '@/modules/providers/list/opencode/opencode-run-registry.js';
+import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker } from '@/modules/providers/list/opencode/opencode-run-registry.js';
 import type { NormalizedMessage } from '@/shared/types.js';
 
 const writerOf = () => {
@@ -98,10 +98,46 @@ test('reconcile: 404 loses the run, other errors keep it open, unaccepted prompt
   assert.equal(notAccepted.promptAccepted, false);
 });
 
-test('toOpenCodeTokenBudget sums cache reads into input and skips empty totals', () => {
-  assert.equal(toOpenCodeTokenBudget({ input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }), null);
-  assert.deepEqual(
-    toOpenCodeTokenBudget({ input: 19154, output: 10, reasoning: 435, cacheRead: 2048, cacheWrite: 0 }),
-    { used: 21647, inputTokens: 21202, outputTokens: 10, breakdown: { input: 21202, output: 10 } },
-  );
+test('dispatch publishes a budget frame from a step.ended event when a tracker is registered', () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-a', 'ses_a', writer);
+  const tracker = new OpenCodeTokenBudgetTracker(null, null);
+
+  registry.dispatch({
+    type: 'session.step.ended',
+    data: {
+      sessionID: 'ses_a',
+      tokens: { input: 2798, output: 509, reasoning: 711, cache: { read: 488192, write: 0 } },
+    },
+  }, tracker);
+
+  const budgetFrames = frames.filter((frame) => frame.kind === 'status' && frame.text === 'token_budget');
+  assert.equal(budgetFrames.length, 1);
+  assert.deepEqual(budgetFrames[0]?.tokenBudget, {
+    used: 492210,
+    inputTokens: 490990,
+    outputTokens: 1220,
+    breakdown: { input: 490990, output: 1220 },
+  });
+});
+
+test('dispatch drops step tokens when no tracker is registered, and throttles repeats', () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-a', 'ses_a', writer);
+  const stepEvent = {
+    type: 'session.step.ended',
+    data: { sessionID: 'ses_a', tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } },
+  };
+
+  // No tracker: nothing is emitted from step events.
+  registry.dispatch(stepEvent);
+  assert.equal(frames.length, 0);
+
+  const tracker = new OpenCodeTokenBudgetTracker(null, null);
+  registry.dispatch(stepEvent, tracker);
+  registry.dispatch(stepEvent, tracker);
+  const budgetFrames = frames.filter((frame) => frame.kind === 'status' && frame.text === 'token_budget');
+  assert.equal(budgetFrames.length, 1, 'an unchanged value inside the interval must not repaint');
 });

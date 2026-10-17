@@ -11,12 +11,71 @@
  * @module opencode-run-registry
  */
 
-import type { ProviderRuntimeWriter } from '@/shared/types.js';
-import { readObjectRecord, readOptionalString } from '@/shared/utils.js';
+import type { ProviderRuntimeWriter, ProviderTokenUsageResult } from '@/shared/types.js';
+import { createNormalizedMessage, generateMessageId, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
 import { OpenCodeApiError, type OpenCodeApiClient, type OpenCodeSessionSnapshot } from './opencode-api.client.js';
+import {
+  buildOpenCodeTokenBudget,
+  readOpenCodeStepTokens,
+  resolveOpenCodeContextWindow,
+  type OpenCodeStepTokens,
+} from './opencode-context-usage.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import { OpenCodeSessionEventTranslator, type OpenCodeRunOutcome } from './opencode-event-translator.js';
+
+const PROVIDER = 'opencode' as const;
+const MIN_BUDGET_FRAME_INTERVAL_MS = 1500;
+
+/**
+ * Live context-occupancy publisher for one opencode run.
+ *
+ * `session.step.ended` carries the step's own token usage (see
+ * `opencode-context-usage.ts` for why the session columns cannot stand in),
+ * and every report may emit a `token_budget` frame. Frames are deduplicated by
+ * value and floored at 1.5s apart, the same contract zcode's live refresher
+ * uses, so a long tool loop does not spam the composer with repaints.
+ *
+ * The window is resolved once at construction from the run's model reference;
+ * a model the cache does not know simply yields windowless frames (no
+ * percentage) rather than guessing one.
+ *
+ * Consumer: opencode runtime (`createOpenCodeRuntime`).
+ */
+export class OpenCodeTokenBudgetTracker {
+  private readonly contextWindow: number | undefined;
+  private lastSentAt = 0;
+  private lastSentUsed: number | null = null;
+
+  constructor(providerId: string | null, modelId: string | null) {
+    this.contextWindow = providerId && modelId
+      ? resolveOpenCodeContextWindow(providerId, modelId)
+      : undefined;
+  }
+
+  /** Live frame from a step event's tokens; throttled by value and time. */
+  report(tokens: OpenCodeStepTokens, writer: ProviderRuntimeWriter, appSessionId: string): void {
+    this.emit(buildOpenCodeTokenBudget(tokens, this.contextWindow), writer, appSessionId);
+  }
+
+  /** Publishes one frame, applying the throttle. Public so the runtime can push the authoritative end-of-run reading. */
+  emit(budget: ProviderTokenUsageResult, writer: ProviderRuntimeWriter, appSessionId: string): void {
+    if (this.lastSentUsed === budget.used && Date.now() - this.lastSentAt < MIN_BUDGET_FRAME_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastSentUsed = budget.used;
+    this.lastSentAt = Date.now();
+    writer.send(createNormalizedMessage({
+      id: generateMessageId(PROVIDER),
+      sessionId: appSessionId,
+      provider: PROVIDER,
+      kind: 'status',
+      text: 'token_budget',
+      tokenBudget: budget,
+    }));
+  }
+}
 
 /** How a run ended: an engine outcome, or `lost` when the service/session vanished under it. */
 export type OpenCodeRunSettlement =
@@ -42,23 +101,6 @@ export type OpenCodeActiveRun = {
   settled: Promise<OpenCodeRunSettlement>;
   settle: (settlement: OpenCodeRunSettlement) => void;
 };
-
-/** Session token totals → the status-frame budget shape other providers emit. */
-export function toOpenCodeTokenBudget(
-  tokens: NonNullable<OpenCodeSessionSnapshot['tokens']>,
-): { used: number; inputTokens: number; outputTokens: number; breakdown: { input: number; output: number } } | null {
-  const used = tokens.input + tokens.output + tokens.reasoning + tokens.cacheRead + tokens.cacheWrite;
-  if (used <= 0) {
-    return null;
-  }
-  const inputTokens = tokens.input + tokens.cacheRead;
-  return {
-    used,
-    inputTokens,
-    outputTokens: tokens.output,
-    breakdown: { input: inputTokens, output: tokens.output },
-  };
-}
 
 /**
  * Tracks the runs of one runtime instance.
@@ -114,16 +156,23 @@ export class OpenCodeRunRegistry {
     }
   }
 
-  /** Routes one service event to the run that owns its session: frames to the writer, terminals to settle. */
-  dispatch(event: OpenCodeEventEnvelope): void {
+  /**
+   * Routes one service event to the run that owns its session: frames to the
+   * writer, step occupancy to the budget tracker when one is registered, and
+   * terminals to settle.
+   */
+  dispatch(event: OpenCodeEventEnvelope, budgetTracker?: OpenCodeTokenBudgetTracker): void {
     const providerSessionId = readOptionalString(readObjectRecord(event.data)?.sessionID);
     const run = providerSessionId ? this.byProvider.get(providerSessionId) : null;
     if (!run) {
       return;
     }
-    const { frames, terminal } = run.translator.translate(event);
+    const { frames, terminal, stepTokens } = run.translator.translate(event);
     for (const frame of frames) {
       run.writer.send(frame);
+    }
+    if (stepTokens && budgetTracker) {
+      budgetTracker.report(stepTokens, run.writer, run.appSessionId);
     }
     if (terminal) {
       run.settle(terminal);

@@ -65,13 +65,13 @@ Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结�
 
 `ProviderTokenUsageResult`（`server/shared/types.ts`）的语义是"**当前上下文占用**"而不是"会话累计花费"：`used` 是这一刻窗口里承载的量，`total` 是窗口大小；需要累计的引擎（codex/opencode）把会话累计放在 `cumulative`，claude 自报的百分比放在 `percentage`。前端 composer 徽章显示 `used`（有 `total` 时追加 `xx%`），`/cost` 弹窗画占用条并单列累计行。
 
-引擎只在回合结束时才报用量的引擎（zcode），runtime 会在**回合进行中**补发 `token_budget`：监听器每次收到一个 step 收尾的信号（zcode 是 `tool_result`）就去引擎库读一次最新占用，距上次发送不足 1.5s 或读数没变则不发；帧的 payload 与 `/token-usage` 端点同形，长工具轮的徽章因此不必等到 `complete` 才动。opencode 的回合中预算来自服务 API 的会话快照（见「OpenCode 服务客户端」）。
+引擎只在回合结束时才报用量的引擎（zcode），runtime 会在**回合进行中**补发 `token_budget`：监听器每次收到一个 step 收尾的信号（zcode 是 `tool_result`）就去引擎库读一次最新占用，距上次发送不足 1.5s 或读数没变则不发；帧的 payload 与 `/token-usage` 端点同形，长工具轮的徽章因此不必等到 `complete` 才动。opencode 的回合中预算来自 `session.step.ended` 事件自带的该 step `tokens`（同一 1.5s/去重节流；窗口在回合开始时按所选模型解析一次），回合结束再用与 `/token-usage` 相同的 `opencode.db` 读取器补一帧权威读数（含窗口），保证实时与重开一致。
 
 | 引擎 | `used` 来源 | `total` 来源 | 备注 |
 | --- | --- | --- | --- |
 | claude | 最新一条主线程 assistant 的 `input + cache_read + cache_creation + output`；每回合结束再用 SDK `Query.getContextUsage({detail:'summary'})` 覆盖（带 `percentage`） | **会话维度持久化的 SDK 真值**（见下）＞`CONTEXT_WINDOW` ＞ 模型启发式（先看会话行的 `model`（用户选的变体，带 `[1m]`），再看转录里的模型 id；命中 `[1m]` 定 1M，否则 200k），单一 resolver `resolveClaudeContextWindow`（`services/claude-usage.ts`） | SDK 会执行输入流里的 `/compact`，无需额外协议 |
 | codex | rollout `token_count.info.last_token_usage`（live 用 `turn.completed.usage`） | `model_context_window` | 旧的 `total_token_usage` 只作 `cumulative` |
-| opencode | `opencode.db` 会话行 `tokens_*` 五列合计（推理/缓存计费同源；`GET /api/session/:id` 的 `tokens` 亦同值，驱动回合中 `token_budget` 帧） | 无窗口值（不显示百分比） | 语义是会话累计而非当前窗口占用；数据库早于 token 列时不支持（`unsupported: true`） |
+| opencode | 最新一条 assistant 消息自己的 `tokens`（prompt = input + cache read/write，输出 = output + reasoning；v1/v2 双布局同读） | 模型缓存 `~/.cache/opencode/models.json` 的 `limit.context`（`resolveOpenCodeContextWindow`，按 mtime+size 记忆化） | 会话行 `tokens_*` 五列（`GET /api/session/:id` 同值）只是会话累计花费，单列为 `cumulative`；压缩摘要行（`summary: true`）跳过 → `compacted` + 摘要字节数；数据库早于 token 列时不支持（`unsupported: true`） |
 | antigravity | live usageRecord 的 total | 1M（硬编码） | 同值持久化到 brain `token_usage.json` |
 | zcode | 最新 step 的 `tokens.total`；旧行没有该字段时取 `input + output + reasoning`（持久化 prompt 已含 cache read，不能再加） | 引擎目录的 `contextWindow`（`resolveZCodeModelContextWindow`；用户自加 provider 只有引擎目录里有），缺失时回退 `v2/config.json` 的 `limit.context` | 全转录求和只作 `cumulative`（`list/zcode/zcode-context-usage.ts`）；压缩摘要行（`summary` 对象）跳过 → `compacted` + `summaryBytes` |
 | cursor | 无 `getTokenUsage` 切面 | — | `supportsTokenUsage: false` |
@@ -129,10 +129,11 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 - `opencode-event-translator.ts`：会话事件 → 时间线帧（text.delta→stream_delta、reasoning.delta→同 id thinking、tool.*→tool_use/tool_result、execution.*→运行终态）。事件词表钉在测试夹具里，未知事件类型忽略，防版本漂移。
 - `opencode-interaction-bridge.ts`：`permission.asked` → 权限卡（Allow/记住/拒绝 → `once`/`always`/`reject`）；`form.created`（question 表单）→ `AskUserQuestion` 卡（服务的 `multiselect` 翻译成面板的 `multiSelect`；答复按问题文本映射回 `q0/q1` 字段键，多选按 `", "` 拆分——选项文案含该序列是已知边界）。跳过/拒绝=取消表单并附留言，模型继续而非整步作废。
 - `opencode-session-settings.ts`：权限模式映射——`plan`→只读 plan 角色+全部变更类 ask 规则；`acceptEdits`→仅 shell ask；`bypassPermissions`→无规则（引擎默认全放行）；`default`→全部变更类 ask。**引擎默认角色本身全放行，权限卡完全靠这些 ask 规则出现**；已应用的切换按会话缓存，避免每次发消息重复下发（切 plan 会附带一条系统提醒）。
-- `opencode-run-registry.ts`：活跃运行登记、事件分发、首结算生效；断线重连后按 `GET /api/session/:id` 的 `outcome`/`time.idle` 对账，补上错过的终态，避免会话卡在"处理中"。token 预算取自同一接口的 `tokens`，不再读 `opencode.db`。
+- `opencode-run-registry.ts`：活跃运行登记、事件分发、首结算生效；断线重连后按 `GET /api/session/:id` 的 `outcome`/`time.idle` 对账，补上错过的终态，避免会话卡在"处理中"。`OpenCodeTokenBudgetTracker` 消费 `session.step.ended` 的 per-step `tokens` 发回合中 `token_budget` 帧（1.5s 节流 + 值去重）；该接口的 `tokens` 是会话累计花费，不能当窗口占用用，权威占用读数走 `opencode.db` 的 `opencode-context-usage.ts`。
 - 附件：data-URI 文件块随 prompt 下发（模型真正看到内容），同时保留 `<images_input>`/`<files_input>` 路径标签供历史回读还原。
 - 历史、会话索引、模型目录、登录检测不变：仍读 `opencode.db`（双格式）与 CLI 探测。
-- **相对旧实现的缺口（待移植）**：消息编辑（`revert` 锚点/回滚）、会话 fork、回合中实时上下文补发、子代理卡片/审批桥的父会话归属、空交付自动重试、`/compact`、回合中途插话（`injectInput`）。配额卡片已移植（`opencode-quota.provider.ts`）。
+- `opencode-context-usage.ts`：上下文占用读取器（bridge 的 `step.ended` 令牌经 `OpenCodeTokenBudgetTracker` 变成实时 `token_budget` 帧；`/token-usage`、历史页与回合结束帧共用同一读数），语义与 v1/v2 布局差异见上方用量表。
+- **相对旧实现的缺口（待移植）**：消息编辑（`revert` 锚点/回滚）、会话 fork、子代理卡片/审批桥的父会话归属、空交付自动重试、`/compact`、回合中途插话（`injectInput`）。配额卡片已移植（`opencode-quota.provider.ts`）。
 
 
 ## 会话索引准入：哪些工作区能变成项目
