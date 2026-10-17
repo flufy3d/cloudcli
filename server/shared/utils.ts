@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import {
@@ -37,6 +37,11 @@ import type {
   SubagentActivity,
   WorkspacePathValidationResult,
 } from './types.js';
+
+/** Returns the lowercase SHA-256 hex digest for opaque tokens and content. */
+export function sha256Hex(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 //----------------- ENVIRONMENT UTILITIES ------------
 /**
@@ -837,6 +842,64 @@ export const isInfrastructureWorkspacePath = (projectPath: string): boolean => {
   const segments = normalized.split('/');
   return segments.includes('node_modules') || segments.includes('.pnpm');
 };
+
+/**
+ * Identifies a workspace path inside a system temporary directory (the root
+ * itself or anything nested below it), which is runtime staging space rather
+ * than a user workspace. The session admission and project-list modules use
+ * this check so engine sessions recorded inside `/tmp`, `$TMPDIR`, or — on
+ * macOS — `/var/folders` never become sidebar projects.
+ *
+ * Each root is compared in both its literal and its symlink-resolved spelling:
+ * macOS hands out `$TMPDIR` as `/var/folders/...` while engines record the
+ * same directory as `/private/var/folders/...`, and a literal prefix compare
+ * would miss the alias. Roots that do not exist on this machine contribute
+ * only their literal spelling.
+ */
+export function isSystemTemporaryWorkspacePath(projectPath: string): boolean {
+  const normalizedProjectPath = normalizeProjectPath(projectPath);
+  if (!normalizedProjectPath) {
+    return false;
+  }
+
+  return systemTemporaryDirectoryRoots().some(
+    (root) => normalizedProjectPath === root || normalizedProjectPath.startsWith(`${root}${path.sep}`),
+  );
+}
+
+/**
+ * Builds the root list for `isSystemTemporaryWorkspacePath`: the OS temporary
+ * directory plus the well-known staging roots, each expanded with its real
+ * path so `/var` and `/private/var` spellings both match. Evaluated per call
+ * because tests may run with a different `TMPDIR`; the handful of `realpath`
+ * syscalls is negligible next to the per-project I/O around the call sites.
+ */
+function systemTemporaryDirectoryRoots(): string[] {
+  const candidates = process.platform === 'win32'
+    ? [os.tmpdir()]
+    : process.platform === 'darwin'
+      ? [os.tmpdir(), '/var/folders', '/tmp', '/private/tmp']
+      : [os.tmpdir(), '/tmp', '/private/tmp'];
+
+  const roots = new Set<string>();
+  for (const candidate of candidates) {
+    const normalized = normalizeProjectPath(candidate);
+    if (normalized) {
+      roots.add(normalized);
+    }
+
+    try {
+      const resolved = normalizeProjectPath(fs.realpathSync(candidate));
+      if (resolved) {
+        roots.add(resolved);
+      }
+    } catch {
+      // A root absent from this machine only matches by its literal spelling.
+    }
+  }
+
+  return [...roots];
+}
 
 // ---------------------------
 //----------------- PROVIDER MODEL LOOKUP UTILITIES ------------
@@ -1845,4 +1908,41 @@ export function forwardToLoopbackService(
   }
 
   upstreamRequest.end();
+}
+
+/**
+ * Resolves the permission mode for Codex's app-server turn and any detached
+ * command that must inherit that same sandbox. The chat gateway and Codex
+ * adapter both use this mapping so task registration cannot claim a broader
+ * sandbox than the original turn received.
+ */
+export function resolveCodexExecutionPolicy(permissionMode: string): {
+  sandbox: 'workspace-write' | 'danger-full-access';
+  approvalPolicy: 'never' | 'on-request';
+  sandboxPolicy: {
+    type: 'workspaceWrite' | 'dangerFullAccess';
+    networkAccess: boolean;
+  };
+} {
+  if (permissionMode === 'bypassPermissions') {
+    return {
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess', networkAccess: true },
+    };
+  }
+
+  if (permissionMode === 'acceptEdits') {
+    return {
+      sandbox: 'workspace-write',
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    };
+  }
+
+  return {
+    sandbox: 'workspace-write',
+    approvalPolicy: 'on-request',
+    sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+  };
 }

@@ -310,6 +310,96 @@ test('ingestZCodeModelCatalog captures the engine-default reasoning level', () =
   assert.equal(resolveZCodeModelDefaultReasoningLevel('unknown-model'), undefined);
 });
 
+test('personal plan uses the native account provider and its own credential', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const cliDir = path.join(storageDir, 'cli');
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(cliDir, { recursive: true });
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(path.join(cliDir, 'config.json'), JSON.stringify({
+      provider: {
+        'bigmodel-coding-plan': {
+          kind: 'anthropic',
+          options: { apiKey: 'legacy-key', baseURL: 'https://example.invalid/api/anthropic' },
+          models: { 'GLM-5.3-Flash': {} },
+        },
+      },
+    }), 'utf8');
+    await writeFile(path.join(v2Dir, 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'personal-plan-key',
+      zcodejwttoken: 'trial-jwt',
+    }), 'utf8');
+
+    const catalog = await new ZCodeProviderModels(async () => null).getSupportedModels();
+    assert.equal(catalog.OPTIONS.find((option) => option.group === 'BigModel (个人)')?.value,
+      'account:bigmodel-individual-coding-plan/GLM-5.3-Flash');
+    assert.deepEqual(resolveZCodeModelRef('account:bigmodel-individual-coding-plan/GLM-5.3-Flash', 'high'), {
+      providerId: 'account:bigmodel-individual-coding-plan',
+      modelId: 'GLM-5.3-Flash',
+      variant: 'high',
+    });
+    for (const legacyRef of [
+      'bigmodel-coding-plan/GLM-5.3-Flash',
+      'builtin:bigmodel-coding-plan/GLM-5.3-Flash',
+    ]) {
+      assert.equal(resolveZCodeModelRef(legacyRef).providerId,
+        'account:bigmodel-individual-coding-plan');
+    }
+  });
+});
+
+test('native individual plan remains selectable without a legacy provider config', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(path.join(v2Dir, 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'personal-key',
+    }), 'utf8');
+    const catalog = await new ZCodeProviderModels(async () => null).getSupportedModels();
+    assert.equal(catalog.DEFAULT, 'account:bigmodel-individual-coding-plan/GLM-5.3');
+    assert.deepEqual(resolveZCodeModelRef('GLM-5.3-Flash'), {
+      providerId: 'account:bigmodel-individual-coding-plan', modelId: 'GLM-5.3-Flash',
+    });
+  });
+});
+
+test('bare personal models only route natively while the plan key is stored', async () => {
+  await withZCodeStorage(async () => {
+    // No credentials: the bare id keeps its builtin provider fallback.
+    assert.deepEqual(resolveZCodeModelRef('GLM-5.3-Flash'), {
+      providerId: 'builtin:bigmodel-coding-plan', modelId: 'GLM-5.3-Flash',
+    });
+    // Explicit account refs always pass through unchanged.
+    assert.deepEqual(resolveZCodeModelRef('account:bigmodel-start-plan/GLM-5.3-Flash'), {
+      providerId: 'account:bigmodel-start-plan', modelId: 'GLM-5.3-Flash',
+    });
+  });
+});
+
+test('a same-name custom model keeps its provider when an individual-plan key exists', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await mkdir(path.join(storageDir, 'cli'), { recursive: true });
+    await mkdir(path.join(storageDir, 'v2'), { recursive: true });
+    await writeFile(path.join(storageDir, 'cli', 'config.json'), JSON.stringify({ provider: {
+      'custom-provider': {
+        kind: 'anthropic', options: { apiKey: 'custom-key', baseURL: 'https://example.invalid/api' },
+        models: { 'GLM-5.3-Flash': {} },
+      },
+      'bigmodel-coding-plan': {
+        kind: 'anthropic', options: { apiKey: 'legacy-key', baseURL: 'https://example.invalid/api' },
+        models: { 'GLM-5.3-Flash': {} },
+      },
+    } }), 'utf8');
+    await writeFile(path.join(storageDir, 'v2', 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'personal-key',
+    }), 'utf8');
+    const catalog = await new ZCodeProviderModels(async () => null).getSupportedModels();
+    assert.equal(catalog.OPTIONS[0]?.group, 'custom-provider');
+    assert.equal(resolveZCodeModelRef(catalog.OPTIONS[0].value).providerId,
+      'custom-provider');
+  });
+});
+
 test('readZCodeSessionModelInfoFromDb preserves providerId when session ran on start-plan with providerID', async () => {
   await withZCodeStorage(async (storageDir) => {
     const dbDir = path.join(storageDir, 'cli', 'db');
@@ -348,5 +438,52 @@ test('readZCodeSessionModelInfoFromDb preserves providerId when session ran on s
       modelId: 'account:bigmodel-start-plan/GLM-5.3-Flash',
       variant: 'max',
     });
+  });
+});
+
+test('getSupportedModels enforces personal whitelist and keeps custom provider groups distinct', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const cliDir = path.join(storageDir, 'cli');
+    await mkdir(cliDir, { recursive: true });
+
+    await writeFile(
+      path.join(cliDir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'bigmodel-coding-plan': {
+            kind: 'anthropic',
+            models: {
+              'GLM-5.3': {},
+              'GLM-5.3-Flash': {},
+              'GLM-4.7': {},
+              'OBSOLETE-MODEL': {},
+            },
+          },
+          'custom-provider-id': {
+            name: 'Custom Provider',
+            kind: 'openai',
+            models: {
+              'custom-model-x': {},
+            },
+          },
+        },
+      }),
+      'utf8'
+    );
+
+    const models = new ZCodeProviderModels(async () => null);
+    const definition = await models.getSupportedModels();
+
+    // Whitelist blocks GLM-4.7 and OBSOLETE-MODEL from personal provider
+    const personalModels = definition.OPTIONS.filter((opt) => opt.group === 'BigModel (个人)');
+    assert.deepEqual(
+      personalModels.map((opt) => opt.value),
+      ['GLM-5.3', 'GLM-5.3-Flash']
+    );
+
+    // Custom provider keeps its own group name, NEVER labeled BigModel (个人)
+    const customModel = definition.OPTIONS.find((opt) => opt.value === 'custom-model-x');
+    assert.ok(customModel);
+    assert.equal(customModel.group, 'Custom Provider');
   });
 });

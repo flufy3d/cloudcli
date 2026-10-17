@@ -298,7 +298,10 @@ export type SubagentInfo = {
 };
 
 export type ActiveBackgroundTask = {
+  /** Stable identity of the tool call that launched the card. */
   id: string;
+  /** Engine stop handle, when available; tool-call ids cannot be used to stop tasks. */
+  taskId?: string;
   toolName: string;
   command?: string;
   description?: string;
@@ -487,6 +490,8 @@ export type NormalizedMessage = {
   summaryKey?: string;
   tokenBudget?: unknown;
   backgroundTasks?: ActiveBackgroundTask[];
+  /** True while background execution or its follow-up reply still blocks queued messages. */
+  backgroundWorkPending?: boolean;
   /**
    * Live background-work events (`task_status` rows): what a launched agent,
    * workflow or backgrounded command is doing while its turn has ended. The

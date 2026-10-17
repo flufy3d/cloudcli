@@ -23,6 +23,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   codexAppServer,
@@ -41,6 +44,7 @@ import {
   normalizeImageDescriptors,
   createCompleteMessage,
   createNormalizedMessage,
+  resolveCodexExecutionPolicy,
   resolveModelEffort,
 } from '@/shared/index.js';
 import type {
@@ -51,6 +55,58 @@ import type {
 } from '@/shared/index.js';
 import type { BackgroundTaskSummary } from '@/shared/types.js';
 import { readObjectRecord } from '@/shared/utils.js';
+
+const TASK_MCP_NAME = 'cloudcli_task_continuations';
+const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
+const TASK_API_KEY_ENV = 'CLOUDCLI_TASK_API_KEY';
+const TASK_RUN_CONTEXT_ENV = 'CLOUDCLI_TASK_RUN_CONTEXT';
+
+function getTaskMcpCommand(): { command: string; args: string[] } {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const compiledEntrypoint = path.resolve(moduleDirectory, '../../../task-continuations/cli/task-continuations-mcp.js');
+  if (existsSync(compiledEntrypoint)) {
+    return { command: process.execPath, args: [compiledEntrypoint] };
+  }
+
+  const repositoryRoot = path.resolve(moduleDirectory, '../../../../../');
+  const sourceEntrypoint = path.join(repositoryRoot, 'server', 'modules', 'task-continuations', 'cli', 'task-continuations-mcp.ts');
+  return {
+    command: path.join(repositoryRoot, 'node_modules', '.bin', 'tsx'),
+    args: ['--tsconfig', path.join(repositoryRoot, 'server', 'tsconfig.json'), sourceEntrypoint],
+  };
+}
+
+function getTaskMcpRuntimeOptions(input: {
+  token: string;
+}): { config: Record<string, unknown>; env: NodeJS.ProcessEnv } {
+  const apiUrl = process.env.CLOUDCLI_API_URL
+    || `http://127.0.0.1:${process.env.SERVER_PORT || process.env.PORT || '3001'}`;
+  return {
+    config: {
+      [`mcp_servers.${TASK_MCP_NAME}`]: {
+        ...getTaskMcpCommand(),
+        env_vars: [TASK_API_URL_ENV, TASK_API_KEY_ENV, TASK_RUN_CONTEXT_ENV],
+      },
+    },
+    env: {
+      [TASK_API_URL_ENV]: apiUrl.replace(/\/$/, ''),
+      [TASK_API_KEY_ENV]: process.env.API_KEY ?? '',
+      [TASK_RUN_CONTEXT_ENV]: input.token,
+    },
+  };
+}
+
+async function readEffectiveShellEnvironmentExcludes(
+  connection: CodexAppServerConnection,
+  cwd: string,
+): Promise<string[]> {
+  const response = readObjectRecord(await connection.call('config/read', { includeLayers: false, cwd }));
+  const config = readObjectRecord(response?.config);
+  const policy = readObjectRecord(config?.shell_environment_policy);
+  return Array.isArray(policy?.exclude)
+    ? policy.exclude.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+}
 
 type ActiveCodexSession = {
   connection: CodexAppServerConnection;
@@ -78,6 +134,19 @@ const activeCodexSessions = new Map<string, ActiveCodexSession>();
 const codexBackgroundWork = new Map<string, Map<string, BackgroundTaskSummary>>();
 
 const CODEX_BACKGROUND_TASK_TYPE = 'collab_agent';
+const DETACHED_COMMAND_ENV_ALLOWLIST = [
+  'PATH', 'HOME', 'CODEX_HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
+  'TERM', 'USER', 'LOGNAME', 'SHELL', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+] as const;
+const TASK_CREDENTIAL_ENV_NAMES = [
+  'API_KEY',
+  'CLOUDCLI_TASK_API_KEY',
+  'CLOUDCLI_TASK_RUN_CONTEXT',
+  'CLOUDCLI_REGISTRATION_TOKEN',
+  'CLOUDCLI_TASK_TOKEN',
+  'JWT_SECRET',
+] as const;
+const DETACHED_COMMAND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 function recordCodexBackgroundStart(appSessionId: string, item: { id: string; label: string; prompt?: string }): void {
   let tasks = codexBackgroundWork.get(appSessionId);
@@ -155,17 +224,8 @@ const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
  * setting the user made.
  */
 function mapPermissionModeToCodexOptions(permissionMode: string): { sandbox: string; approvalPolicy: string } {
-  switch (permissionMode) {
-    case 'acceptEdits':
-      return { sandbox: 'workspace-write', approvalPolicy: 'never' };
-    case 'bypassPermissions':
-      return { sandbox: 'danger-full-access', approvalPolicy: 'never' };
-    case 'default':
-    default:
-      // Codex 0.153 removed `untrusted`; `on-request` keeps a live approval
-      // gate in front of sandbox escalations.
-      return { sandbox: 'workspace-write', approvalPolicy: 'on-request' };
-  }
+  const policy = resolveCodexExecutionPolicy(permissionMode);
+  return { sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy };
 }
 
 /**
@@ -179,6 +239,7 @@ const CODEX_APPROVAL_METHODS = new Set([
   'item/fileChange/requestApproval',
   'item/permissions/requestApproval',
 ]);
+const TASK_MCP_ELICITATION_METHOD = 'mcpServer/elicitation/request';
 
 /**
  * Builds the reply one approval request expects.
@@ -227,6 +288,13 @@ function toAppServerInput(items: Array<AnyRecord>): AnyRecord[] {
 
 function readNonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function resolveCodexTerminalStatus(
+  status: 'completed' | 'failed' | 'interrupted' | 'unknown',
+  hasTerminalFailure: boolean,
+): 'completed' | 'failed' | 'interrupted' | 'unknown' {
+  return hasTerminalFailure && status === 'completed' ? 'failed' : status;
 }
 
 /** Reads the context budget out of a `thread/tokenUsage/updated` notification. */
@@ -290,22 +358,83 @@ async function queryCodex(
 
   // Callers pass the stable app session id; the thread is resumed with the
   // provider-native id recorded on the session row.
-  const providerSessionId = context.resolveProviderSessionId(sessionId);
+  const taskContinuationTarget = readObjectRecord(options.taskContinuationTarget);
+  const pinnedProviderThreadId = typeof taskContinuationTarget?.providerThreadId === 'string'
+    ? taskContinuationTarget.providerThreadId
+    : null;
+  const providerSessionId = pinnedProviderThreadId ?? context.resolveProviderSessionId(sessionId);
   const resolvedModel = await context.resolveResumeModel(sessionId, model);
-  const workingDirectory = cwd || projectPath || process.cwd();
-  const { sandbox, approvalPolicy } = mapPermissionModeToCodexOptions(permissionMode);
+  const workingDirectory = typeof taskContinuationTarget?.workingDirectory === 'string'
+    ? taskContinuationTarget.workingDirectory
+    : cwd || projectPath || process.cwd();
+  const taskSandboxPolicyType = taskContinuationTarget?.sandboxPolicyType;
+  const taskApprovalPolicy = taskContinuationTarget?.approvalPolicy;
+  const targetPermissionMode = taskSandboxPolicyType === 'dangerFullAccess'
+    ? 'bypassPermissions'
+    : taskApprovalPolicy === 'never' ? 'acceptEdits' : permissionMode;
+  const { sandbox, approvalPolicy } = mapPermissionModeToCodexOptions(targetPermissionMode);
+  const taskExecutionContext = readObjectRecord(options.taskExecutionContext);
+  const taskContinuationLifecycle = readObjectRecord(options.taskContinuationLifecycle);
+  const onEngineTurnStarted = typeof taskContinuationLifecycle?.onEngineTurnStarted === 'function'
+    ? taskContinuationLifecycle.onEngineTurnStarted as (engineTurnId: string) => unknown
+    : null;
+  const onNativeThreadResolved = typeof taskContinuationLifecycle?.onNativeThreadResolved === 'function'
+    ? taskContinuationLifecycle.onNativeThreadResolved as (threadId: string) => unknown
+    : null;
+  const taskRunToken = typeof taskExecutionContext?.token === 'string'
+    ? taskExecutionContext.token
+    : '';
+  const taskMcpOptions = taskRunToken
+    ? getTaskMcpRuntimeOptions({ token: taskRunToken })
+    : null;
   const catalog = await context.getProviderModels();
   const resolvedEffort = resolveModelEffort(resolvedModel, effort, catalog);
 
   let capturedSessionId: string | null = providerSessionId ?? null;
+  let runSession: ActiveCodexSession | null = null;
   let sessionCreatedSent = false;
   let terminalFailure: { message: string } | null = null;
   let errorSurfaced = false;
   let connection: CodexAppServerConnection | null = null;
+  let engineTurnId: string | null = null;
+  let terminalStatus: 'completed' | 'failed' | 'interrupted' | 'unknown' = 'unknown';
+  let acceptedTurnCallbackSent = false;
+
+  const recordStartedTurn = (turnId: string | null): void => {
+    if (!turnId) return;
+    if (engineTurnId && engineTurnId !== turnId) {
+      terminalFailure = { message: 'Codex reported different turn ids for one continuation.' };
+      terminalStatus = 'unknown';
+      return;
+    }
+    engineTurnId = turnId;
+    if (!acceptedTurnCallbackSent) {
+      acceptedTurnCallbackSent = true;
+      onEngineTurnStarted?.(turnId);
+    }
+  };
 
   /** Session-map key: the app session id, else the thread id once captured. */
   const sessionKey = () => sessionId || capturedSessionId || null;
-  const currentSession = () => activeCodexSessions.get(sessionKey() || '');
+  // Keep this run's identity. A newer run can replace the map entry while an
+  // aborted connection is still settling; the older run must not observe or
+  // mutate the newer run's state.
+  const currentSession = () => runSession;
+
+  // Both `error` and `turn/completed` can report the same terminal cause.
+  const surfaceFailure = (message: string): void => {
+    if (errorSurfaced && terminalFailure?.message === message) {
+      return;
+    }
+    terminalFailure = { message };
+    errorSurfaced = true;
+    sendMessage(ws, createNormalizedMessage({
+      kind: 'error',
+      content: message,
+      sessionId: capturedSessionId || sessionId || null,
+      provider: 'codex',
+    }));
+  };
 
   /** Resolves once the turn reaches a terminal state, or the child dies. */
   let settleTurn: (() => void) | null = null;
@@ -456,6 +585,13 @@ async function queryCodex(
         settle();
       },
       onRequest: async (method, params) => {
+        if (method === TASK_MCP_ELICITATION_METHOD) {
+          if (!taskMcpOptions || params.serverName !== TASK_MCP_NAME) {
+            return undefined;
+          }
+          // CloudCLI's current permission card cannot collect form answers or complete URL handshakes.
+          return { action: 'decline', content: null };
+        }
         if (!CODEX_APPROVAL_METHODS.has(method)) {
           return undefined;
         }
@@ -491,6 +627,9 @@ async function queryCodex(
           case 'turn/started': {
             const turn = readObjectRecord(params.turn);
             const turnId = typeof turn?.id === 'string' ? turn.id : null;
+            if (turnId) {
+              recordStartedTurn(turnId);
+            }
             const active = currentSession();
             if (active) {
               active.turnId = turnId;
@@ -547,31 +686,34 @@ async function queryCodex(
           }
 
           case 'error': {
-            errorSurfaced = true;
-            const message = typeof params.message === 'string' ? params.message : 'Codex reported an error.';
-            terminalFailure = terminalFailure ?? { message };
-            sendMessage(ws, createNormalizedMessage({
-              kind: 'error',
-              content: message,
-              sessionId: capturedSessionId || sessionId || null,
-              provider: 'codex',
-            }));
+            const error = readObjectRecord(params.error);
+            const message = readNonEmptyString(error?.message)?.trim()
+              || readNonEmptyString(params.message)?.trim()
+              || 'Codex reported an error.';
+            // A recoverable stream error is progress, not a failed turn. Keep
+            // its cause in logs without adding a permanent chat error row.
+            if (params.willRetry === true) {
+              console.warn('[Codex] Retrying turn:', message);
+              return;
+            }
+            surfaceFailure(message);
             return;
           }
 
           case 'turn/completed': {
             const turn = readObjectRecord(params.turn);
+            if (typeof turn?.id === 'string') engineTurnId = turn.id;
+            terminalStatus = turn?.status === 'completed'
+              ? 'completed'
+              : turn?.status === 'failed'
+                ? 'failed'
+                : turn?.status === 'interrupted'
+                  ? 'interrupted'
+                  : 'unknown';
             if (turn?.status === 'failed') {
               const error = readObjectRecord(turn.error);
-              const message = typeof error?.message === 'string' ? error.message : 'Turn failed';
-              terminalFailure = { message };
-              errorSurfaced = true;
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'error',
-                content: message,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
+              const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
+              surfaceFailure(message);
               notifyRunFailed({
                 userId: normalizedUserId,
                 provider: 'codex',
@@ -590,15 +732,8 @@ async function queryCodex(
               // invisible until history re-read it and diagnostics logged the run
               // as a success. A stop the user asked for (`abort` already flagged
               // the session) arrives as the same status and must stay silent.
-              const message = 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
-              terminalFailure = terminalFailure ?? { message };
-              errorSurfaced = true;
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'error',
-                content: message,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
+              const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
+              surfaceFailure(message);
               notifyRunFailed({
                 userId: normalizedUserId,
                 provider: 'codex',
@@ -615,24 +750,29 @@ async function queryCodex(
             return;
         }
       },
-    });
+    }, taskMcpOptions ? { env: taskMcpOptions.env } : undefined);
 
     const registerSession = (id: string | null) => {
       if (!id || !connection) {
         return;
       }
-      activeCodexSessions.set(id, {
+      runSession = {
         connection,
         threadId: capturedSessionId,
         turnId: null,
         status: 'running',
         startedAt: new Date().toISOString(),
-      });
+      };
+      activeCodexSessions.set(id, runSession);
     };
 
     if (sessionKey()) {
       registerSession(sessionKey());
     }
+
+    const effectiveShellExcludes = taskMcpOptions
+      ? await readEffectiveShellEnvironmentExcludes(connection, workingDirectory)
+      : [];
 
     // `config` carries the settings the protocol has no field of its own for.
     const threadSettings: AnyRecord = {
@@ -641,6 +781,14 @@ async function queryCodex(
       approvalPolicy,
       config: {
         'features.defer_mailbox_preemption': true,
+        ...(taskMcpOptions?.config ?? {}),
+        ...(taskMcpOptions ? {
+          'shell_environment_policy.exclude': [...new Set([
+            ...effectiveShellExcludes,
+            TASK_API_KEY_ENV,
+            TASK_RUN_CONTEXT_ENV,
+          ])],
+        } : {}),
       },
       ...(resolvedModel ? { model: resolvedModel } : {}),
     };
@@ -655,6 +803,7 @@ async function queryCodex(
     const threadRecord = readObjectRecord(thread?.thread);
     const discoveredSessionId = typeof threadRecord?.id === 'string' ? threadRecord.id : null;
     if (discoveredSessionId) {
+      onNativeThreadResolved?.(discoveredSessionId);
       const isNewThread = !capturedSessionId;
       capturedSessionId = discoveredSessionId;
       const existing = currentSession();
@@ -695,17 +844,30 @@ async function queryCodex(
       throw new Error('Codex app-server opened no thread to run the turn in.');
     }
 
-    await connection.call('turn/start', {
+    const toolOutputParam = options.toolOutput ?? (options.taskContinuation ? {
+      name: 'cloudcli_task_result',
+      output: typeof options.taskContinuation === 'string'
+        ? options.taskContinuation
+        : JSON.stringify(options.taskContinuation),
+    } : null);
+
+    const startResult = readObjectRecord(await connection.call('turn/start', {
       threadId: capturedSessionId,
-      input: toAppServerInput(inputItems as AnyRecord[]),
+      input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
+      ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
       ...(resolvedEffort ? { effort: resolvedEffort } : {}),
-    });
+    }));
+    const startedTurn = readObjectRecord(startResult?.turn);
+    recordStartedTurn(typeof startedTurn?.id === 'string' ? startedTurn.id : null);
 
     await turnSettled;
 
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session.
     const runAborted = currentSession()?.status === 'aborted';
+    if (runAborted) {
+      terminalStatus = 'interrupted';
+    }
     if (!runAborted) {
       sendMessage(ws, createCompleteMessage({
         provider: 'codex',
@@ -732,6 +894,7 @@ async function queryCodex(
       runError.message.toLowerCase().includes('aborted');
 
     if (!wasAborted) {
+      terminalStatus = 'failed';
       console.error('[Codex] Error:', error);
 
       if (!errorSurfaced) {
@@ -761,6 +924,8 @@ async function queryCodex(
           error,
         });
       }
+    } else {
+      terminalStatus = 'interrupted';
     }
 
   } finally {
@@ -771,6 +936,11 @@ async function queryCodex(
       session.status = session.status === 'aborted' ? 'aborted' : 'completed';
     }
   }
+
+  return {
+    engineTurnId,
+    terminalStatus: resolveCodexTerminalStatus(terminalStatus, Boolean(terminalFailure)),
+  };
 }
 
 /**
@@ -803,8 +973,10 @@ function abortCodexSession(sessionId: string) {
       });
   }
   // The connection is torn down on the next tick so the interrupt has a
-  // chance to leave the process before its pipes close.
-  setTimeout(() => session.connection.close(), 250).unref?.();
+  // chance to leave the process before its pipes close. The timer stays
+  // ref'd: a run settled only by this close must keep the loop alive until
+  // it fires (the test harness has no other handles to do it).
+  setTimeout(() => session.connection.close(), 250);
 
   return true;
 }
@@ -892,6 +1064,54 @@ export const codexRuntime = {
     return entries;
   },
 };
+
+/**
+ * Runs argv through an independent Codex app-server `command/exec` call.
+ * Consumed by task-continuations worker; the server process environment is
+ * reduced to local runtime paths, and task/auth credentials are explicitly
+ * removed from the command environment.
+ */
+export async function executeCodexSandboxCommand(input: {
+  command: string[];
+  cwd: string;
+  sandboxPolicy: { type: 'workspaceWrite' | 'dangerFullAccess'; networkAccess: boolean };
+  onStarted?: () => void;
+}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  if (!input.command.length || input.command.some((argument) => typeof argument !== 'string' || argument.includes('\0'))
+    || !path.isAbsolute(input.cwd)) {
+    throw new Error('Codex sandbox command input is invalid.');
+  }
+
+  const workerEnv: NodeJS.ProcessEnv = {};
+  for (const name of DETACHED_COMMAND_ENV_ALLOWLIST) {
+    if (process.env[name] !== undefined) {
+      workerEnv[name] = process.env[name];
+    }
+  }
+
+  const connection = await codexAppServerTransport.open({}, { inheritEnv: false, env: workerEnv });
+  try {
+    input.onStarted?.();
+    const response = readObjectRecord(await connection.call('command/exec', {
+      command: input.command,
+      cwd: input.cwd,
+      sandboxPolicy: input.sandboxPolicy,
+      env: Object.fromEntries(TASK_CREDENTIAL_ENV_NAMES.map((name) => [name, null])),
+      timeoutMs: DETACHED_COMMAND_TIMEOUT_MS,
+    }, { timeoutMs: DETACHED_COMMAND_TIMEOUT_MS }));
+    const exitCode = response?.exitCode;
+    if (!Number.isSafeInteger(exitCode)) {
+      throw new Error('Codex command/exec returned no valid exit code.');
+    }
+    return {
+      exitCode: exitCode as number,
+      stdout: typeof response?.stdout === 'string' ? response.stdout : '',
+      stderr: typeof response?.stderr === 'string' ? response.stderr : '',
+    };
+  } finally {
+    connection.close();
+  }
+}
 
 /** Kept so `thread/fork` stays reachable through this module's usual import site. */
 export { codexAppServer };

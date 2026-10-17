@@ -13,6 +13,8 @@ import { ZCodeSessionsProvider } from '@/modules/providers/list/zcode/zcode-sess
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { AppError } from '@/shared/utils.js';
 
+import { createWorkspaceFixture } from './workspace-fixture.js';
+
 /** Redirects ZCODE_STORAGE_DIR to a temp dir for fixture isolation. */
 const withZCodeStorage = async (runTest: (storageDir: string) => Promise<void>): Promise<void> => {
   const previous = process.env.ZCODE_STORAGE_DIR;
@@ -377,7 +379,7 @@ test('the real engine sequence ends with a scheduled re-announce that must not b
     'sess_1'
   ), []);
   const result = provider.normalizeMessage(
-    { type: 'tool_call_scheduled', payload: { kind: 'result', toolCallId: 'call_1', resultPartId: 'part_9' } },
+    { type: 'tool_call_scheduled', payload: { kind: 'result', toolCallId: 'call_1', result: { success: true, content: 'a.txt\nb.txt' } } },
     'sess_1'
   );
   assert.equal(result.length, 1);
@@ -579,7 +581,7 @@ test('normalizeMessage maps engine 0.16.5 dotted event names onto the 0.16.3 pat
       params: {
         type: 'tool.updated',
         sessionId: 'sess_new',
-        payload: { kind: 'result', toolCallId: 'call_1', resultPartId: 'part_7' },
+        payload: { kind: 'result', toolCallId: 'call_1', result: { success: true, content: 'file contents' } },
       },
     },
     'sess_new'
@@ -1276,10 +1278,10 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
   await withZCodeStorage(async (storageDir) => {
     await createFixtureDatabase(storageDir, 'sess_sync');
 
-    // Session indexing only admits a workspace that exists on disk, so the
-    // fixture's directory has to be a real one.
-    const workspaceDir = path.join(storageDir, 'workspace');
-    await mkdir(workspaceDir, { recursive: true });
+    // Session indexing only admits a workspace that exists on disk outside
+    // the system temporary directories, so the fixture's directory has to be
+    // a real one beside the tests.
+    const workspaceDir = await createWorkspaceFixture();
 
     // The synchronizer reads the session table, which the history fixture
     // does not create: add the top-level row plus a subagent row to filter.
@@ -1397,4 +1399,72 @@ test('an engine that omits assistantMessageId still keeps one key per text segme
   emit('text_start');
   const nextSegment = emit('text_delta', 'other')[0];
   assert.notEqual(nextSegment.providerRowKey, first.providerRowKey);
+});
+
+for (const type of ['tool.updated', 'tool_call_scheduled', 'model.streaming', 'model_streaming']) {
+  const resultKind = type.startsWith('model') ? 'tool_result' : 'result';
+  test(`${type} displays native tool output immediately without history`, () => {
+    const provider = new ZCodeSessionsProvider();
+    for (const [toolCallId, content] of [['call_bash', 'a.txt\nb.txt'], ['call_read', 'file contents'], ['call_edit', ''], ['call_mcp', [{ type: 'text', text: 'structured output' }]]] as const) {
+      const rows = provider.normalizeMessage({type, payload: {kind: resultKind, toolCallId, result: {success: true, content}}}, 'sess_live');
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].toolId, toolCallId);
+      assert.deepEqual(rows[0].toolResult, {content: typeof content === 'string' ? content : JSON.stringify(content, null, 2), isError: false});
+      assert.equal(rows[0].content, rows[0].toolResult?.content);
+      assert.equal(rows[0].isError, false);
+    }
+  });
+  test(`${type} preserves failed result content and status`, () => {
+    const rows = new ZCodeSessionsProvider().normalizeMessage({type, payload: {kind: resultKind, toolCallId:'call_failed', result:{success:false, content:'Permission denied'}}}, 'sess_live');
+    assert.deepEqual(rows[0]?.toolResult, {content:'Permission denied', isError:true});
+    assert.equal(rows[0]?.isError, true);
+  });
+  test(`${type} preserves native errors`, () => {
+    const kind = type.startsWith('model') ? 'tool_error' : 'error';
+    for (const error of ['command failed', {message:'command failed', code:'FAILED'}]) {
+      const rows = new ZCodeSessionsProvider().normalizeMessage({type, payload:{kind, toolCallId:'call_failed', error}}, 'sess_live');
+      assert.equal(rows[0]?.toolResult?.isError, true);
+      assert.equal(rows[0]?.isError, true);
+      assert.match(rows[0]?.toolResult?.content ?? '', /command failed/);
+    }
+  });
+}
+
+test('parallel live results and repeated notifications keep their native call and session identities', () => {
+  const provider = new ZCodeSessionsProvider();
+  for (const [sessionId, toolCallId, content] of [['sess_a','call_b','second'], ['sess_b','call_a','other session'], ['sess_a','call_a','first'], ['sess_a','call_b','second']]) {
+    const rows = provider.normalizeMessage({type:'tool.updated', payload:{kind:'result', toolCallId, result:{success:true, content}}}, sessionId);
+    assert.equal(rows[0]?.sessionId, sessionId);
+    assert.equal(rows[0]?.toolId, toolCallId);
+    assert.equal(rows[0]?.toolResult?.content, content);
+  }
+});
+
+test('missing result content warns instead of fabricating a successful output', (t) => {
+  const warnings: unknown[][] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args));
+  const provider = new ZCodeSessionsProvider();
+  assert.deepEqual(provider.normalizeMessage({type:'tool.updated', payload:{kind:'result', toolCallId:'call_missing', resultPartId:'part_missing'}}, 'sess_missing'), []);
+  const failure = provider.normalizeMessage({type:'tool.updated', payload:{kind:'error', toolCallId:'call_missing'}}, 'sess_missing');
+  assert.equal(failure[0]?.isError, true);
+  assert.deepEqual(failure[0]?.toolResult, {content:'', isError:true});
+  assert.equal(warnings.length, 2);
+  assert.match(String(warnings[0][0]), /no content/);
+});
+
+test('failed result without content preserves its nested error', () => {
+  const rows = new ZCodeSessionsProvider().normalizeMessage({type:'tool.updated', payload:{kind:'result', toolCallId:'call_failed', result:{success:false, error:{message:'tool failed'}}}}, 'sess_live');
+  assert.deepEqual(rows[0]?.toolResult, {content:JSON.stringify({message:'tool failed'}, null, 2), isError:true});
+});
+
+test('live native output matches the persisted result after refresh', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await createFixtureDatabase(storageDir, 'sess_output_parity');
+    const provider = new ZCodeSessionsProvider();
+    const history = await provider.fetchHistory('sess_output_parity', {limit:null});
+    const stored = history.messages.find((row) => row.kind === 'tool_use' && row.toolId === 'call_1');
+    const live = provider.normalizeMessage({type:'tool.updated', payload:{kind:'result', toolCallId:'call_1', result:{success:true, content:'a.txt\nb.txt'}}}, 'sess_output_parity');
+    assert.deepEqual(live[0]?.toolResult, stored?.toolResult);
+    assert.equal(live[0]?.content, stored?.toolResult?.content);
+  });
 });

@@ -82,7 +82,11 @@ test('a tab that subscribes during background work receives the run\'s later eve
     handleChatConnection(
       newTab as never,
       { user: { id: 1 } } as never,
-      { runtime: { hasBackgroundWork: (sessionId: string) => sessionId === SESSION_ID, getPendingApprovalsForSession: () => [] } as never },
+      { runtime: {
+        hasBackgroundWork: (sessionId: string) => sessionId === SESSION_ID,
+        isBackgroundWorkPending: (sessionId: string) => sessionId === SESSION_ID,
+        getPendingApprovalsForSession: () => [],
+      } as never },
     );
     newTab.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 0 }] }));
     await settle();
@@ -90,6 +94,7 @@ test('a tab that subscribes during background work receives the run\'s later eve
     // Not processing — the composer stays usable — but attached.
     assert.equal(newTab.frames[0]?.kind, 'chat_subscribed');
     assert.equal(newTab.frames[0]?.isProcessing, false);
+    assert.equal(newTab.frames[0]?.backgroundWorkPending, true);
 
     run.writer.send({ kind: 'task_status', provider: 'claude', sessionId: 'native-1', event: 'notification', taskId: 't1', status: 'completed' } as never);
     assert.ok(
@@ -164,4 +169,26 @@ test('a retained run\'s eviction timer cannot evict the session\'s next run earl
   } finally {
     mock.timers.reset();
   }
+});
+
+test('background work without a tracked reply phase does not mark the subscriber pending', async () => {
+  await withIsolatedDatabase(async () => {
+    startAndCompleteRun(createFakeSocket());
+    const newTab = createFakeSocket();
+    handleChatConnection(
+      newTab as never,
+      { user: { id: 1 } } as never,
+      { runtime: {
+        hasBackgroundWork: () => true,
+        isBackgroundWorkPending: () => false,
+        getPendingApprovalsForSession: () => [],
+      } as never },
+    );
+    newTab.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 0 }] }));
+    await settle();
+
+    // A provider that never broadcasts `background_tasks` could not clear it again.
+    assert.equal(newTab.frames[0]?.kind, 'chat_subscribed');
+    assert.equal(newTab.frames[0]?.backgroundWorkPending, false);
+  });
 });

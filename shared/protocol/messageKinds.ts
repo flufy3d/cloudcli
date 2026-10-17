@@ -124,6 +124,7 @@ export type MessageFieldsByKind = {
     status?: string;
     tokenBudget?: unknown;
     backgroundTasks?: ActiveBackgroundTask[];
+    backgroundWorkPending?: boolean;
   };
   permission_request: {
     requestId?: string;

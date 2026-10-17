@@ -33,9 +33,9 @@ export type ProviderCatalogEntry = {
   defaultPermissionMode: string;
   /**
    * Static fallback default model, shown before the model catalog loads.
-   * Must equal the provider's predefined models definition's `DEFAULT`
-   * (pinned by the capability tests); zcode/antigravity resolve dynamic
-   * catalogs at runtime and fall back to this same value.
+   * Static providers keep this equal to their models definition's `DEFAULT`.
+   * Codex uses the bundled CLI's discovered default once its catalog loads;
+   * zcode/antigravity resolve their own dynamic catalogs at runtime.
    */
   defaultModel: string;
   /** Whether image attachments can be included in a chat.send. */
@@ -113,10 +113,10 @@ export const PROVIDER_CATALOG = {
     inputWhileBusy: 'queue',
   },
   opencode: {
-    // Mapped by the runtime onto OpenCode's controls: the `plan` agent for plan,
-    // silent `once` approvals for bypassPermissions, and the user's own
-    // opencode config for default/acceptEdits. See the OpenCode runtime adapter
-    // (resolveOpenCodeAgent / shouldAutoApproveOpenCodePermission).
+    // Mapped by the runtime onto the service: the read-only `plan` agent
+    // (plan), session permission ask-rules (default), shell-ask only
+    // (acceptEdits) and no rules (bypassPermissions, the engine default).
+    // See resolveOpenCodeSessionSettings in the OpenCode session settings.
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
     defaultPermissionMode: 'default',
     defaultModel: 'opencode/gpt-5.6-terra',
@@ -125,10 +125,10 @@ export const PROVIDER_CATALOG = {
     supportsAbort: true,
     supportsEffort: true,
     supportsNativeScheduling: false,
-    editRevertsFiles: true,
-    // The server's prompt loop picks a message posted mid-turn up at its next
-    // step; a running tool or subagent is not interrupted.
-    inputWhileBusy: 'always',
+    // The service-client runtime has no message edit/rewind path yet, so the
+    // composer never opens the edit flow for this provider.
+    editRevertsFiles: false,
+    inputWhileBusy: 'queue',
   },
   zcode: {
     // Mapped by the runtime onto ZCode's session/setMode modes: build

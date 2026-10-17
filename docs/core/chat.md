@@ -1,6 +1,6 @@
 # 聊天链路（Chat Pipeline）
 
-> 基准：2.9.0 / 2026-10-04
+> 基准：2.9.0 / 2026-10-17
 > **核心文档**：改动 `server/modules/websocket/**` 或 `src/modules/chat/**` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -21,6 +21,13 @@
 | 出站写入 | `chat-session-writer.service.ts`（`ChatSessionWriter`）：**先过线上契约闸门**（`server/shared/normalized-message-contract.ts`：信封坏了整条丢、协议未声明的字段剥掉并点名记录，见 [providers.md](./providers.md)），再吞掉 `session_created`、把 provider 原生 id 重映射为 app session id、给每事件打**单调 `seq`**、扇出给所有 watching socket |
 | 终态 | 每次运行**恰好一个 `complete`**（成功/失败/中止都是）；`error` 是信息性行，不终止 run |
 
+### 非抢断式异步任务接续与定时消息对比
+
+服务端支持两种脱离用户直接点击的自主回合（Detached Chat Turn），两者在抢占策略上有着严格的架构边界：
+
+- **定时消息（Scheduled Messages）**：采用**显式抢断**策略（`interruptActiveRun: true`）。调度到期后直接抢占当前正在执行的交互回合，确保定时指令准时送达。
+- **异步任务接续（Task Continuation）**：采用**非抢断式空闲占用**策略（`interruptActiveRun: false`）。后台长耗时命令执行完成并原子落库后，派发器（`task-continuation-dispatcher.service.ts`）在领取事件时检查 `chatRunRegistry.isProcessing(sessionId)`。若用户正在输入或当前有正在进行的运行，派发器**主动释放租约并退回 pending**，等待下一次会话空闲轮询；仅当会话完全空闲时才启动唤醒回合，并将任务结果（`toolOutput`）送入引擎，转录落盘为 `status_note` 消息行。集中开关默认关闭；关闭后不领取新投递，但继续保存任务结果并核对已经发送的回合。
+
 ### 一次提交只产生一次发送
 
 从点击发送到消息被后端接收之间存在一段异步窗口：附件上传、以及新会话在 `POST /api/providers/sessions` 里分配 id。窗口期内会话 id 还不存在，因此一次提交被重放就会各自开出一个新会话。以下闸门共同保证"一次提交 = 一个会话 = 一次 run"：
@@ -28,7 +35,7 @@
 - **composer 闩**（`src/modules/chat/hooks/useChatComposerState.ts`）：`submitInFlightRef` 同步挡住窗口期内的任何重复提交（第二次点击、再按一次 Enter、排队草稿的 flush）。提交被接受的瞬间就清空输入框并把发送按钮切成 spinner，点击立刻可见。提交失败时在唯一的 catch 里把消息放回它来的地方——手动提交回输入框，排队消息回队列——并渲染一条 error 行，不允许静默丢消息。`handleSubmit` 返回「本次提交是否被受理」，排队草稿的 flush 据此决定保留还是清空；flush 只把草稿作为参数传入，从不写进输入框，用户正在输入的下一条消息因此不受影响。
 - **附件上传幂等**（`server/modules/assets/services/upload-replay.service.ts`）：一次上传生成一个标识，同一次上传的自动重试复用该标识；普通发送与排队发送走同一上传函数。后端在解析 multipart、写入文件前登记上传，按已鉴权用户和上传入口隔离，同标识的并发请求等待首次结果，成功响应丢失后也复用已存文件。
 - **会话网关幂等**（`sessionsService.createAppSession`）：每次提交携带一个 `clientRequestId`，短 TTL 内重复请求返回首次分配的同一个 session（若该会话已被删除则重新分配）。这挡的是前端闩看不见的重放——请求重试、另一个标签页。
-- **run 登记**（`chatRunRegistry.startRun`）：同一会话已有 run 在跑时，重复的 `chat.send` 得到 `RUN_IN_PROGRESS` 协议错误而不是第二次运行。唯一例外是能吸收回合中途输入的引擎（`inputWhileBusy: 'always'`，目前 opencode）：网关先把消息交给 runtime 的 `injectInput`，成功则不登记新 run——消息搭原 run 的 writer 输出、由原 run 的 `complete` 一并收尾，发送方 socket 补挂到该 run；runtime 返回 false（回合已结束/已中止）才回落到 `dispatchRun`。
+- **run 登记**（`chatRunRegistry.startRun`）：同一会话已有 run 在跑时，重复的 `chat.send` 得到 `RUN_IN_PROGRESS` 协议错误而不是第二次运行。唯一例外是带 `injectInput` 切面且 `inputWhileBusy: 'always'` 的引擎（当前无；opencode 迁移前曾如此）：网关先把消息交给 `injectInput`，成功则不登记新 run——消息搭原 run 的 writer 输出、由原 run 的 `complete` 一并收尾，发送方 socket 补挂到该 run；返回 false（回合已结束/已中止）才回落到 `dispatchRun`。
 
 `POST /api/providers/sessions` 的 `initialMessage` 只作标题来源，客户端只发前缀，不发整条消息——它正处在用户等待的那段窗口里。
 
@@ -75,18 +82,19 @@ flowchart TD
 
 ## 后台任务与输入排队
 
-- **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台任务（如 `Bash(run_in_background: true)` 或任务创建）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。
+- **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台执行（如后台 `Bash`、Agent 或定时唤醒）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。`TaskCreate` 只创建待办项，不属于后台执行。
 - **状态同步与广播**：
-  - 契约类型 `ActiveBackgroundTask`（`id`, `toolName`, `command?`, `description?`, `startedAt`）。
-  - `chat_subscribed` 握手帧携带 `backgroundTasks`，供断线重连或新标签页恢复状态。
-  - 任务启动或清理时，服务端通过 `kind: 'status', text: 'background_tasks'` 广播最新列表；归一化网关在 `NORMALIZED_MESSAGE_KEYS` 放行 `backgroundTasks` 字段。
+  - `ActiveBackgroundTask` 表示输入框需要展示的执行任务，具体字段以共享协议为准。
+  - `status(background_tasks)` 帧携带卡片列表 `backgroundTasks`；`chat_subscribed` 握手帧另带后台等待状态 `backgroundWorkPending`（由带 `backgroundTasks.isPending` 切面的引擎回答，claude 不实现该切面、报 false）。归一化网关放行两者。
+  - 卡片描述任务本身，等待状态还包括任务完成后的汇报回复。任务完成或唤醒到期时卡片立即消失，后续回复结束后才解除等待。未提供等待字段的引擎按卡片列表判断。
 - **输入防打断与智能排队**：
-  - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），用户发送新消息自动转入 `queuedDraft` 排队，阻止过早发送打断正在运行的后台子进程。是否排队由能力矩阵 `inputWhileBusy` 决定：`backgroundWorkQueuesInput` = 有后台任务且为 `queue`；`turnQueuesInput` = 回合进行中且不是 `always`；两者之或即 `queuesInput`，composer 的排队、flush 与按钮形态都只看它。claude（`background`）后台任务期间直接注入活进程、任务条照常显示但不排队；opencode（`always`）回合进行中有输入时按钮是发送而非停止，输入为空才回到停止。注意 `useChatSessionState` 的 `isProcessing`（即 composer 的 `isLoading`）只表示"正在产出回复"，只剩后台任务的 `background` 活动条目不算——否则 `background` 档永远被回合排队吞掉；`hasActiveBackgroundTasks` 同时认这种条目，保证 `queue` 档照旧排队。
+  - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），用户发送新消息自动转入 `queuedDraft` 排队，阻止过早发送打断正在运行的后台子进程。是否排队由能力矩阵 `inputWhileBusy` 决定：`backgroundWorkQueuesInput` = 有后台任务且为 `queue`；`turnQueuesInput` = 回合进行中且不是 `always`；两者之或即 `queuesInput`，composer 的排队、flush 与按钮形态都只看它。claude（`background`）后台任务期间直接注入活进程、任务条照常显示但不排队；opencode 随 client-mode 迁移后为 `queue`（回合中途插话暂缺），`always` 目前无引擎使用。注意 `useChatSessionState` 的 `isProcessing`（即 composer 的 `isLoading`）只表示"正在产出回复"，只剩后台任务的 `background` 活动条目不算——否则 `background` 档永远被回合排队吞掉；`hasActiveBackgroundTasks` 同时认这种条目，保证 `queue` 档照旧排队。
   - 停止语义对齐 Claude Code 的 Esc：停止按钮只打断回合，后台任务由任务条单独停（表头停全部、每行停一个，都走 `chat.stop-task`）。只剩后台工作（`background` 条目）时停止按钮也发 `chat.abort`：服务端没有 running 的 run 但 `hasBackgroundWork` 为真时仍转给 `runtime.abort`，用来打断任务完成后 CLI 自己推的 follow-up 回合。
   - **自动释放**：后台任务结束且无新状态阻塞时，composer 的 flush 效应自动解冻排队草稿并发出。
   - **强制中断逃生通道**：排队卡片提供 `forceSendQueuedDraft`（`isForced: true`），允许用户在需要时显式跳过等待立即发送；新 run 会顶替仍在保活的进程，后台任务随之结束（`forceInterrupt: true` 只是随消息带上的标记，服务端不读）。
+  - **停止失败**：找不到运行任务、缺少任务句柄、引擎拒绝停止和会话取消失败均保留现有活动，不解除排队。异常响应携带所属会话；`TASK_STOP_FAILED` 与 `ABORT_FAILED` 分别表示任务停止和会话取消的引擎异常，错误仍进入聊天记录。
   - **可视化呈现**：输入框上方通过 `BackgroundTaskIndicator` 实时展示运行中的后台任务（工具名、命令、动态已用时间）。
-  - **完工庆祝防误报**：`useChatRealtimeHandlers` 在收到 `complete` 时，若会话仍有活跃后台任务，则暂不触发完工音效（`playChatCompletionSound`）与窗口标题提示（`showCompletionTitleIndicator`）；待后台任务全部清空（通过 `status(background_tasks: [])`）时统一触发，防止用户误以为全部工作已结束。
+  - **完工庆祝防误报**：`useChatRealtimeHandlers` 在收到 `complete` 时，若会话仍有后台等待，则暂不触发完工音效与窗口标题提示；待后台等待解除时统一触发。卡片消失本身不表示汇报回复已结束。
 
 ## run 的结束原因（诊断契约）
 
@@ -167,11 +175,11 @@ flowchart LR
 
 因此剪枝阶段**必须保留乐观用户行**：它是回合边界的唯一记录，隐藏它是合并阶段的职责。两个锚点都不适用的行才退回时间戳排列。
 
-**`providerRowKey` 处理"同一行、两边正文不一样长"。** 流式缓冲从 delta 到 `__streaming_`、再到定稿占位行全程保留该 key；key 变化以及有 key/无 key 的切换都会先闭合旧段，避免相邻 provider 行或普通 stdout 被拼成一条。历史刷新只在 provider、会话、key 唯一对应时裁决：完整历史接管；历史明确截断而实时完整时实时接管；两边都明确截断时保留较长正文。正文不参与身份判断。Antigravity 的纯 assistant 正文使用原生 `step_index` 派生 key；zcode 与 opencode 的实时流只发 delta、不发行 id，分别用 `zcode-message:<message_id>` 与 `opencode-part:<part_id>` 对账。
+**`providerRowKey` 处理"同一行、两边正文不一样长"。** 流式缓冲从 delta 到 `__streaming_`、再到定稿占位行全程保留该 key；key 变化以及有 key/无 key 的切换都会先闭合旧段，避免相邻 provider 行或普通 stdout 被拼成一条。历史刷新只在 provider、会话、key 唯一对应时裁决：完整历史接管；历史明确截断而实时完整时实时接管；两边都明确截断时保留较长正文。正文不参与身份判断。Antigravity 的纯 assistant 正文使用原生 `step_index` 派生 key；zcode 的实时流只发 delta，用 `zcode-message:<message_id>` 对账；opencode 在 client-mode 下实时与历史行 id 不同源（见 [providers.md](./providers.md) 的身份表），工具行靠 toolId 指纹层配对。
 
 **工具卡：先 id，再原生 call id，最后才是指纹兜底。** 引擎在两路用同一 id 命名的调用由上面的 id 判重直接解决（codex 现在属于这一类：两路都读同一个 ThreadItem，`exec-<uuid>` 两边同值）；两路行 id 不同但原生 call id 相同的走 `toolIdentity.ts` 的精确匹配。两者都没有的引擎才落到"规范工具名 + 完整参数指纹"的一对一认领，且**只在已证明的同一回合内**生效：回合证明来自乐观行的已证明配对或非空 `transcriptAnchorId`，证明不了就两张卡都留着（宁可重复一张卡，不可吞掉用户真跑过的命令）。Edit/Write 的指纹包含修改内容；仅当实时 Edit/Write 的两侧 diff 都未到达、历史端有完整 diff 时，才按路径与顺序一对一认领。
 
-**已知缺口（不伪造，写在这里）**：zcode 的 thinking 行两路 id 不同（实时是开段事件的 `${id}_reasoning`，落盘是 `(message_id, part_id)`），目前仍靠 `sessionThinkingRows.ts` 的整段正文相等来判重。要彻底收口需要引擎在 reasoning 事件上带出 part id——它的 `tool_result` 事件已经带了 `resultPartId`，文本与推理事件没有对应字段。opencode 的 thinking 行同理（实时是 part id，落盘是 `(message_id, part_id)`）。zcode 的 assistant **正文**不受此影响：两路都发布 `zcode-message:<message_id>` 作为 `providerRowKey`，走身份对账。
+**已知缺口（不伪造，写在这里）**：zcode 的 thinking 行两路 id 不同（实时是开段事件的 `${id}_reasoning`，落盘是 `(message_id, part_id)`），目前仍靠 `sessionThinkingRows.ts` 的整段正文相等来判重。要彻底收口需要引擎在 reasoning 事件上带出 part id——它的 `tool_result` 事件已经带了 `resultPartId`，文本与推理事件没有对应字段。zcode 的 assistant **正文**不受此影响：两路都发布 `zcode-message:<message_id>` 作为 `providerRowKey`，走身份对账。
 
 ### 渲染性能优化
 
@@ -192,5 +200,5 @@ flowchart LR
 | 新增客户端 → 服务端帧 | `chat-websocket.service.ts` 的消息类型 switch；需要鉴权/限流语义时看 `resolveSendTarget` 的模式 |
 | 新增工具卡片渲染 | `src/modules/chat/tools/configs/toolConfigs.ts` 注册（配置驱动，**禁止散落条件分支**），复杂内容加 ContentRenderer；见 `src/modules/chat/tools/README.md`。工具别名/展示分类/命令提取统一在 `toolTaxonomy.ts`，别再拷贝名单 |
 | 新增权限相关能力 | 引擎 runtime 的 `permissions` 网关 → 矩阵自动推导 `supportsPermissionRequests` → 前端按矩阵渲染 |
-| 新增由能力矩阵驱动的 UI 差异 | 静态能力进 `provider-capabilities.catalog.ts`，前端只读矩阵、不写 provider 分支：`supportsCompaction` 决定 `/compact` 是否出现，`editRevertsFiles` 决定编辑横幅说"已修改的文件不会被还原"还是"会一并还原"（opencode 的 revert 会还原 snapshot 文件），`supportsNativeScheduling` 决定定时任务表单是否提示"引擎自带会话内调度"。提问卡（`AskUserQuestionPanel`）文案与引擎无关，用 `chat:misc.*` 中性串 |
+| 新增由能力矩阵驱动的 UI 差异 | 静态能力进 `provider-capabilities.catalog.ts`，前端只读矩阵、不写 provider 分支：`supportsCompaction` 决定 `/compact` 是否出现，`editRevertsFiles` 决定编辑横幅说"已修改的文件不会被还原"还是"会一并还原"（会还原文件类引擎标 true），`supportsNativeScheduling` 决定定时任务表单是否提示"引擎自带会话内调度"。提问卡（`AskUserQuestionPanel`）文案与引擎无关，用 `chat:misc.*` 中性串 |
 | 改历史分页 | `src/modules/chat/utils/sessionMessagePagination.ts` + store 的序列化测试（`sessionTimelineSequences.test.ts`）必须跟着改 |

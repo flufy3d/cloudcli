@@ -220,7 +220,7 @@
     }
   },
   "misc": {
-    "needsInput": "L'assistente attende una risposta",
+    "needsInput": "{{provider}} attende una risposta",
     "selectAllThatApply": "Seleziona tutte le opzioni applicabili",
     "other": "Altro...",
     "back": "Indietro",

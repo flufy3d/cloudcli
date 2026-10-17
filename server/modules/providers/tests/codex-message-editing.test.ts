@@ -11,6 +11,8 @@ import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.
 import { CodexSessionSynchronizer } from '@/modules/providers/list/codex/codex-session-synchronizer.provider.js';
 import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
 
+import { createWorkspaceFixture } from './workspace-fixture.js';
+
 /**
  * Codex rows carry no id of their own, so an edit addresses the enclosing
  * *turn*. These cover the two halves of that: that the reader can name the
@@ -97,8 +99,7 @@ async function withIndexedSession(
   runTest: (context: { sessionId: string; workspacePath: string; homeDir: string }) => Promise<void>,
 ): Promise<void> {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-edit-'));
-  const workspacePath = path.join(tempRoot, 'workspace');
-  await mkdir(workspacePath, { recursive: true });
+  const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
 
   try {
@@ -394,8 +395,7 @@ test('codex app-server forks a real thread at a turn', { concurrency: false }, a
     await mkdir(sessionsDir, { recursive: true });
     await writeFile(path.join(sessionsDir, path.basename(fixture)), transcript, 'utf8');
 
-    const workspacePath = path.join(tempRoot, 'workspace');
-    await mkdir(workspacePath, { recursive: true });
+    const workspacePath = await createWorkspaceFixture();
 
     const fork = await codexAppServer.forkThread({
       threadId: '01a02a80-dfb9-7882-8013-00e41955e656',

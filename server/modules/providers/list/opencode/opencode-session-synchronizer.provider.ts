@@ -1,13 +1,15 @@
-import fsSync from 'node:fs';
-
 import Database from 'better-sqlite3';
 
-import { sessionsDb } from '@/modules/database/index.js';
 import { readJsonRecord, readOptionalString, unwrapJsonStringLiteral } from '@/shared/utils.js';
+import { sessionsDb } from '@/modules/database/index.js';
 
 import { SqliteSessionSynchronizer } from '../../shared/sessions/sqlite-session-synchronizer.provider.js';
 
-import { getOpenCodeDatabasePath } from './opencode-data-root.js';
+import {
+  getOpenCodeDatabasePath,
+  resolveOpenCodeMessageLayout,
+  resolveOpenCodeSessionTableName,
+} from './opencode-data-root.js';
 
 type OpenCodeSessionRow = {
   id: string;
@@ -18,13 +20,14 @@ type OpenCodeSessionRow = {
   worktree: string | null;
 };
 
+type OpenCodeChildSessionRow = {
+  id: string;
+};
 /**
  * Session indexer for OpenCode's SQLite-backed session store.
  *
  * Contributes OpenCode's row mapping to the shared SQLite synchronizer
- * skeleton: active (non-archived) top-level sessions joined with their project
- * row (sub-agent sessions spawned by the task tool carry a `parent_id` and are
- * filtered out),
+ * skeleton: active (non-archived) sessions joined with their project row,
  * `directory` with `worktree` fallback as project path, and titles that fall
  * back to the session's first user text when OpenCode stored none.
  */
@@ -33,17 +36,42 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
   protected readonly logTag = '[OpenCodeProvider]';
   protected readonly watchedFileBasenames = ['opencode.db', 'opencode.db-wal'];
 
+  /** Cleared once: rows a pre-`parent_id`-aware version indexed are deleted. */
+  private childSessionsPruned = false;
+
   constructor() {
     super('opencode');
   }
 
-  protected getDatabasePath(): string {
-    return getOpenCodeDatabasePath();
+  async synchronize(since?: Date): Promise<number> {
+    // The first provider-wide scan also reconciles child rows indexed by
+    // older versions: subagent sessions must not surface in the sidebar.
+    // Best effort — no OpenCode database (or an unreadable one) simply means
+    // there are no child rows to prune, so the failure must not surface as a
+    // provider sync failure.
+    if (!this.childSessionsPruned) {
+      this.childSessionsPruned = true;
+      let db: Database.Database | null = null;
+      try {
+        db = new Database(this.getDatabasePath(), { readonly: true, fileMustExist: true });
+        const table = resolveOpenCodeSessionTableName(db);
+        const children = table
+          ? db.prepare(`SELECT id FROM ${table} WHERE parent_id IS NOT NULL`).all() as OpenCodeChildSessionRow[]
+          : [];
+        for (const child of children) {
+          sessionsDb.deleteSessionByProviderSessionId(child.id, 'opencode');
+        }
+      } catch {
+        // No database, or one that cannot be opened: nothing to prune.
+      } finally {
+        db?.close();
+      }
+    }
+    return super.synchronize(since);
   }
 
-  async synchronize(since?: Date): Promise<number> {
-    this.archiveIndexedSubagentSessions();
-    return super.synchronize(since);
+  protected getDatabasePath(): string {
+    return getOpenCodeDatabasePath();
   }
 
   protected selectSessionRows(
@@ -51,6 +79,11 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
     sinceMillis: number | null,
     limit: number | null,
   ): OpenCodeSessionRow[] {
+    const table = resolveOpenCodeSessionTableName(db);
+    if (!table) {
+      return [];
+    }
+
     return db.prepare(`
       SELECT
         s.id AS id,
@@ -59,7 +92,7 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
         s.time_created AS time_created,
         s.time_updated AS time_updated,
         p.worktree AS worktree
-      FROM session s
+      FROM ${table} s
       LEFT JOIN project p ON p.id = s.project_id
       WHERE s.time_archived IS NULL
         AND s.parent_id IS NULL
@@ -91,18 +124,30 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
    */
   private readFirstUserText(db: Database.Database, sessionId: string): string | undefined {
     try {
-      const row = db.prepare(`
-        SELECT p.data AS data
-        FROM message m
-        INNER JOIN part p
-          ON p.session_id = m.session_id
-         AND p.message_id = m.id
-        WHERE m.session_id = ?
-          AND json_extract(m.data, '$.role') = 'user'
-          AND json_extract(p.data, '$.type') = 'text'
-        ORDER BY COALESCE(m.time_created, 0), COALESCE(p.time_created, 0)
-        LIMIT 1
-      `).get(sessionId) as { data: string | null } | undefined;
+      let row: { data: string | null } | undefined;
+      if (resolveOpenCodeMessageLayout(db) === 'session_message') {
+        row = db.prepare(`
+          SELECT data AS data
+          FROM session_message
+          WHERE session_id = ?
+            AND type = 'user'
+          ORDER BY seq
+          LIMIT 1
+        `).get(sessionId) as { data: string | null } | undefined;
+      } else {
+        row = db.prepare(`
+          SELECT p.data AS data
+          FROM message m
+          INNER JOIN part p
+            ON p.session_id = m.session_id
+           AND p.message_id = m.id
+          WHERE m.session_id = ?
+            AND json_extract(m.data, '$.role') = 'user'
+            AND json_extract(p.data, '$.type') = 'text'
+          ORDER BY COALESCE(m.time_created, 0), COALESCE(p.time_created, 0)
+          LIMIT 1
+        `).get(sessionId) as { data: string | null } | undefined;
+      }
 
       const data = readJsonRecord(row?.data);
       const text = readOptionalString(data?.text);
@@ -111,39 +156,6 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
       return text === undefined ? undefined : unwrapJsonStringLiteral(text);
     } catch {
       return undefined;
-    }
-  }
-
-  /**
-   * Archives sub-agent sessions indexed before the `parent_id` filter existed.
-   *
-   * Runs on full scans only: the row SQL already keeps new sub-agent sessions
-   * out, so watcher-triggered syncs have nothing left to clean up.
-   */
-  private archiveIndexedSubagentSessions(): void {
-    const dbPath = this.getDatabasePath();
-    if (!fsSync.existsSync(dbPath)) {
-      return;
-    }
-
-    let db: Database.Database | null = null;
-    try {
-      db = new Database(dbPath, { readonly: true, fileMustExist: true });
-      const childRows = db.prepare(`
-        SELECT id FROM session WHERE parent_id IS NOT NULL
-      `).all() as Array<{ id: string }>;
-
-      for (const childRow of childRows) {
-        const indexed = sessionsDb.getSessionByProviderSessionId(childRow.id);
-        if (indexed && indexed.provider === 'opencode' && !indexed.isArchived) {
-          sessionsDb.updateSessionIsArchived(indexed.session_id, true);
-        }
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`${this.logTag} Failed to archive sub-agent sessions:`, message);
-    } finally {
-      db?.close();
     }
   }
 }

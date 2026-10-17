@@ -84,7 +84,8 @@ export type CodexThreadItem =
     agentThreadId?: string;
     agentPath?: string;
   }
-  | { kind: 'context_compaction'; id: string };
+  | { kind: 'context_compaction'; id: string }
+  | { kind: 'task_result'; id: string; name: string; output: string };
 
 // ---------------------------
 //----------------- ITEM READING ------------
@@ -428,6 +429,14 @@ export function readCodexRolloutItem(raw: unknown): CodexThreadItem | null {
     case 'ContextCompaction':
       return { kind: 'context_compaction', id };
 
+    case 'FunctionCallOutput': {
+      const name = readNonEmptyString(item.name) ?? '';
+      if (name !== 'cloudcli_task_result') return null;
+      const rawOutput = item.output;
+      const output = typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput ?? '');
+      return { kind: 'task_result', id, name, output };
+    }
+
     default:
       return null;
   }
@@ -541,6 +550,14 @@ export function readCodexAppServerItem(raw: unknown): CodexThreadItem | null {
 
     case 'contextCompaction':
       return { kind: 'context_compaction', id };
+
+    case 'functionCallOutput': {
+      const name = readNonEmptyString(item.name) ?? '';
+      if (name !== 'cloudcli_task_result') return null;
+      const rawOutput = item.output;
+      const output = typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput ?? '');
+      return { kind: 'task_result', id, name, output };
+    }
 
     default:
       return null;
@@ -786,5 +803,24 @@ export function codexThreadItemToRows(item: CodexThreadItem, timestamp: string):
 
     case 'context_compaction':
       return [{ uuid: item.id, type: 'status_note', timestamp, content: 'Context compacted' }];
+
+    case 'task_result': {
+      let parsedOutput: AnyRecord = {};
+      try {
+        parsedOutput = typeof item.output === 'string' ? JSON.parse(item.output) : (item.output ?? {});
+      } catch {
+        parsedOutput = { summary: item.output };
+      }
+      const summary = typeof parsedOutput.summary === 'string' && parsedOutput.summary.trim()
+        ? parsedOutput.summary
+        : '异步任务结果已投递';
+      return [{
+        uuid: item.id,
+        type: 'status_note',
+        timestamp,
+        content: summary,
+        taskContinuation: parsedOutput,
+      }];
+    }
   }
 }

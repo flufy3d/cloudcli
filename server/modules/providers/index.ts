@@ -10,6 +10,11 @@ export { providerRuntimeService } from './services/provider-runtime.service.js';
 export { providerModelsService } from './services/provider-models.service.js';
 export { providerTokenUsageService } from './services/provider-token-usage.service.js';
 
+// executeCodexSandboxCommand: the task-continuations worker uses Codex's
+// independent command/exec endpoint while keeping the original sandbox.
+export { executeCodexSandboxCommand } from './list/codex/codex-runtime.provider.js';
+export { listCodexThreadTurns } from './list/codex/codex-app-server.client.js';
+
 export { initializeSessionsWatcher } from './services/sessions-watcher.service.js';
 export { closeSessionsWatcher } from './services/sessions-watcher.service.js';
 
@@ -24,10 +29,6 @@ export {
 // shutdownZCodeRuntime: used by the server entrypoint (server/index.ts) to stop
 // the shared ZCode app-server subprocess during the shutdown flow.
 export { shutdownZCodeRuntime } from './list/zcode/index.js';
-
-// shutdownOpenCodeServer: used by the server entrypoint (server/index.ts) to stop
-// the shared `opencode serve` subprocess during the shutdown flow.
-export { shutdownOpenCodeServer } from './list/opencode/opencode-server.client.js';
 
 // getAntigravityBrainRoots: used by the File Tree composition root as the
 // read-only allowlist for workspace-external Antigravity plan documents.

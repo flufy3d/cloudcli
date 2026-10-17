@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Minus, Plus, RotateCcw, X } from 'lucide-react';
+import { Download, Minus, Plus, RotateCcw, X } from 'lucide-react';
 
+import { saveOrShareBlob } from '@/shared/utils';
 import {
   ImageViewerSurface,
   MAX_SCALE,
@@ -17,6 +18,23 @@ type UnifiedImageViewerProps = {
   onClose: () => void;
 };
 
+// Markdown labels may be descriptions or full URLs rather than filenames.
+function getDownloadFilename(src: string, label: string, filePath: string | undefined, mimeType: string): string {
+  const url = new URL(src, window.location.href);
+  let sourceName = /^https?:$/.test(url.protocol) ? url.pathname.split('/').pop() || '' : '';
+  try {
+    sourceName = decodeURIComponent(sourceName);
+  } catch {
+    // A literal '%' is valid in an image URL; retain its encoded name if decoding fails.
+  }
+  const name = filePath || (/^https?:\/\//i.test(label) ? sourceName : label) || sourceName || 'image';
+  const basename = name.split(/[\\/]/).pop()?.replace(/[<>:"|?*\u0000-\u001f]/g, '_') || 'image';
+  if (/\.[a-z0-9]+$/i.test(basename)) return basename;
+  const subtype = mimeType.split(';')[0].split('/')[1];
+  const extension = subtype === 'svg+xml' ? 'svg' : subtype === 'jpeg' ? 'jpg' : subtype;
+  return extension && /^[a-z0-9]+$/i.test(extension) ? `${basename}.${extension}` : basename;
+}
+
 /**
  * Shared modal for previewing images across chat messages, file tree, and tools
  * with pan, zoom, pinch-to-zoom, and high-contrast controls.
@@ -30,6 +48,12 @@ export function UnifiedImageViewer({
 }: UnifiedImageViewerProps) {
   /** Current zoom scale displayed in the floating header control. */
   const [scale, setScale] = useState<number>(1);
+
+  /** Prevent repeated clicks while image bytes are handed to the browser or share sheet. */
+  const [isDownloading, setIsDownloading] = useState(false);
+
+  /** Keep download failures visible without interrupting the image preview. */
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   /** Imperative handle to trigger zoomIn, zoomOut, and resetZoom on the inner viewer. */
   const viewerRef = useRef<ImageViewerHandle | null>(null);
@@ -49,6 +73,26 @@ export function UnifiedImageViewer({
   const canZoomOut = scale > MIN_SCALE + 0.01;
   const canZoomIn = scale < MAX_SCALE - 0.01;
   const displayName = title || alt || (filePath ? filePath.split('/').pop() : undefined) || 'Image Preview';
+
+  const downloadImage = async () => {
+    if (isDownloading) return;
+    setIsDownloading(true);
+    setDownloadError(null);
+    try {
+      // Read the original source; zoom/pan transforms must never affect saved bytes.
+      // Plain fetch avoids sending app credentials to remote Markdown images.
+      const response = await fetch(src);
+      if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      const blob = await response.blob();
+      const filename = getDownloadFilename(src, title || alt, filePath, blob.type);
+      await saveOrShareBlob(blob, filename);
+    } catch (error) {
+      console.error('Failed to download image:', error);
+      setDownloadError('图片下载失败，请重试；外链图片可能不允许下载。');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
 
   return createPortal(
     <div
@@ -132,6 +176,17 @@ export function UnifiedImageViewer({
 
           <div className="mx-1 h-3.5 w-px bg-white/20" />
 
+          <button
+            type="button"
+            onClick={() => void downloadImage()}
+            disabled={isDownloading}
+            className="flex items-center justify-center rounded-full p-1.5 text-white/80 transition-colors hover:bg-white/15 hover:text-white disabled:cursor-wait disabled:opacity-40"
+            title={isDownloading ? '正在下载图片' : '下载图片'}
+            aria-label={isDownloading ? '正在下载图片' : '下载图片'}
+          >
+            <Download className="h-4 w-4" aria-hidden="true" />
+          </button>
+
           {/* High-contrast close button with permanent background */}
           <button
             type="button"
@@ -144,6 +199,12 @@ export function UnifiedImageViewer({
           </button>
         </div>
       </header>
+
+      {downloadError && (
+        <p role="alert" className="shrink-0 px-4 pb-2 text-center text-sm text-red-300">
+          {downloadError}
+        </p>
+      )}
 
       {/* Main Image Body */}
       <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden">

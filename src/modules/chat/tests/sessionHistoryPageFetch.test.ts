@@ -79,8 +79,10 @@ test('emulated timeout aborts the request after the limit elapses', async () => 
 
     const pending = requestSessionHistoryPage('sess-a', {});
 
+    // Observe rejection before advancing time, so the timeout is never unhandled.
+    const rejection = assert.rejects(pending, /AbortError/);
     await vi.advanceTimersByTimeAsync(HISTORY_REQUEST_TIMEOUT_MS);
-    await assert.rejects(pending, /AbortError/);
+    await rejection;
     assert.equal(observedSignal?.aborted, true);
   });
 });

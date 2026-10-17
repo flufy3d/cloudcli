@@ -5,7 +5,7 @@ import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { sessionSynchronizerService } from '@/modules/providers/index.js';
 import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
 import type { RealtimeClientConnection } from '@/shared/types.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError, isSystemTemporaryWorkspacePath } from '@/shared/utils.js';
 
 type SessionSummary = {
   id: string;
@@ -22,6 +22,17 @@ type SessionRepositoryRow = {
   updated_at?: string | null;
   created_at?: string | null;
 };
+
+type ProjectRepositoryRow = {
+  project_id: string;
+  project_path: string;
+  custom_project_name?: string | null;
+  isStarred?: number;
+};
+
+function isVisibleProjectRow(project: ProjectRepositoryRow): boolean {
+  return !isSystemTemporaryWorkspacePath(project.project_path);
+}
 
 export type ProjectListItem = {
   projectId: string;
@@ -211,17 +222,16 @@ export async function getProjectsWithSessions(
     await synchronizeSessionsThrottled();
   }
 
-  const projectRows = projectsDb.getProjectPaths() as Array<{
-    project_id: string;
-    project_path: string;
-    custom_project_name?: string | null;
-    isStarred?: number;
-  }>;
-  const totalProjects = projectRows.length;
+  const projectRows = projectsDb.getProjectPaths() as ProjectRepositoryRow[];
+  // A past engine scan may already have persisted its staging cwd (for
+  // example `/tmp`). Keep that record recoverable in the database, but never
+  // surface it as a user project while the admission gate prevents new rows.
+  const visibleProjectRows = projectRows.filter(isVisibleProjectRow);
+  const totalProjects = visibleProjectRows.length;
   const projects: ProjectListItem[] = [];
   let processedProjects = 0;
 
-  for (const row of projectRows) {
+  for (const row of visibleProjectRows) {
     processedProjects += 1;
 
     const projectId = row.project_id;
@@ -279,16 +289,11 @@ export async function getArchivedProjectsWithSessions(
     await synchronizeSessionsThrottled();
   }
 
-  const projectRows = projectsDb.getArchivedProjectPaths() as Array<{
-    project_id: string;
-    project_path: string;
-    custom_project_name?: string | null;
-    isStarred?: number;
-  }>;
+  const projectRows = projectsDb.getArchivedProjectPaths() as ProjectRepositoryRow[];
 
   const archivedProjects: ArchivedProjectListItem[] = [];
 
-  for (const row of projectRows) {
+  for (const row of projectRows.filter(isVisibleProjectRow)) {
     const displayName =
       row.custom_project_name && row.custom_project_name.trim().length > 0
         ? row.custom_project_name

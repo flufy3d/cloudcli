@@ -21,6 +21,7 @@ import {
   hasWindowsCredentialManagerCredential,
 } from '../list/antigravity/antigravity-credential-store.js';
 import { getAntigravitySummariesDbPath } from '../list/antigravity/antigravity-data-root.js';
+import { clearEnginePathCache } from '../list/antigravity/antigravity-engine-path.js';
 import {
   ANTIGRAVITY_BUILTIN_MODELS,
   AntigravityProviderModels,
@@ -39,6 +40,8 @@ import { readCanonicalAntigravityTranscript } from '../list/antigravity/antigrav
 import { AntigravitySessionsProvider } from '../list/antigravity/antigravity-sessions.provider.js';
 import { providerRegistry } from '../provider.registry.js';
 import { providerCapabilitiesService } from '../services/provider-capabilities.service.js';
+
+import { createWorkspaceFixture } from './workspace-fixture.js';
 
 /**
  * Sets environment variable `name` to `value` and returns a restore function
@@ -100,6 +103,9 @@ test('AntigravityProviderAuth only reports authenticated with an OAuth token fil
   // test, even on a machine whose real store holds live agy credentials.
   const restoreSkipKeychain = withEnvValue('CLOUDCLI_ANTIGRAVITY_SKIP_CREDENTIAL_STORE', '1');
   await fs.writeFile(path.join(tempRoot, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
+  // A previous test may have cached a "not found" resolution for the real
+  // machine; clear it so this fixture's engine path is what resolves.
+  clearEnginePathCache();
   try {
     const auth = new AntigravityProviderAuth();
 
@@ -160,11 +166,26 @@ test('credential-store probes detect macOS keychain and Windows Credential Manag
 });
 
 test('AntigravityProviderModels returns builtin models fallback', async () => {
-  const models = new AntigravityProviderModels();
-  const definition = await models.getSupportedModels();
-  assert.ok(definition.OPTIONS.length > 0);
-  assert.ok(definition.DEFAULT);
-  assert.ok(definition.OPTIONS.some((m) => m.value === 'gemini-3.7-flash'));
+  // Isolate from the machine's real Antigravity install: the engine stub is
+  // an empty script, so `agy models` reports no entries and the provider must
+  // fall back to the builtin catalog even where the CLI is installed and
+  // logged in. The engine-path cache is process-wide, so it is cleared around
+  // the fixture or a previous test's resolution would win over the stub.
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'antigravity-models-'));
+  const restoreAgyPath = withEnvValue('CLOUDCLI_AGY_PATH', path.join(tempRoot, 'agy'));
+  await fs.writeFile(path.join(tempRoot, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
+  clearEnginePathCache();
+  try {
+    const models = new AntigravityProviderModels();
+    const definition = await models.getSupportedModels();
+    assert.ok(definition.OPTIONS.length > 0);
+    assert.ok(definition.DEFAULT);
+    assert.ok(definition.OPTIONS.some((m) => m.value === 'gemini-3.7-flash'));
+  } finally {
+    restoreAgyPath();
+    clearEnginePathCache();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test('ANTIGRAVITY_BUILTIN_MODELS collapses multi-tier families and keeps fixed models', () => {
@@ -1129,6 +1150,9 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   // A mocked, empty home proves the synchronizer resolves the db through the
   // shared data root instead of the historical ~/.gemini hardcode.
   const emptyHome = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-sync-home-'));
+  // The workspace the fixture conversations claim must exist outside the
+  // system temporary directories or the admission gate refuses to index it.
+  const workspaceDir = await createWorkspaceFixture();
   const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
   const restoreHomedir = mock.method(os, 'homedir', () => emptyHome);
   const previousDatabasePath = process.env.DATABASE_PATH;
@@ -1152,7 +1176,7 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   `).run(
     'fixture-conv-1',
     'Fixture Conversation',
-    JSON.stringify([`file://${tempRoot}/workspace`]),
+    JSON.stringify([`file://${workspaceDir}`]),
     new Date().toISOString(),
     'ACTIVE',
     '',
@@ -1165,7 +1189,7 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   `).run(
     'fixture-child-agent-1',
     'Child Agent Conversation',
-    JSON.stringify([`file://${tempRoot}/workspace`]),
+    JSON.stringify([`file://${workspaceDir}`]),
     new Date().toISOString(),
     'ACTIVE',
     'fixture-conv-1',
@@ -1178,7 +1202,7 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
   `).run(
     'fixture-child-agent-negative-depth',
     'Malformed Child Agent Conversation',
-    JSON.stringify([`file://${tempRoot}/workspace`]),
+    JSON.stringify([`file://${workspaceDir}`]),
     new Date().toISOString(),
     'ACTIVE',
     '',
@@ -1198,20 +1222,20 @@ test('AntigravitySessionSynchronizer indexes only top-level summaries and archiv
     sessionsDb.createAppSession(
       'fixture-other-provider-session',
       'zcode',
-      path.join(tempRoot, 'workspace'),
+      workspaceDir,
       'Unrelated Provider Session',
     );
     sessionsDb.assignProviderSessionId('fixture-other-provider-session', 'fixture-child-agent-1');
     sessionsDb.createSession(
       'fixture-child-agent-1',
       'antigravity',
-      path.join(tempRoot, 'workspace'),
+      workspaceDir,
       'Previously Indexed Child Agent',
     );
     sessionsDb.createSession(
       'fixture-child-agent-negative-depth',
       'antigravity',
-      path.join(tempRoot, 'workspace'),
+      workspaceDir,
       'Malformed Previously Indexed Child Agent',
     );
     const synchronizer = new AntigravitySessionSynchronizer();
@@ -1325,6 +1349,9 @@ test('AntigravityProviderAuth validates token expiry and extracts the account em
   // the verdict.
   const restoreSkipKeychain = withEnvValue('CLOUDCLI_ANTIGRAVITY_SKIP_CREDENTIAL_STORE', '1');
   await fs.writeFile(path.join(tempRoot, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
+  // A previous test may have cached a "not found" resolution for the real
+  // machine; clear it so this fixture's engine path is what resolves.
+  clearEnginePathCache();
   const jwtPayload = (payload: Record<string, unknown>) =>
     Buffer.from(JSON.stringify(payload)).toString('base64url');
 

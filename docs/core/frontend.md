@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.9.0 / 2026-10-08
+> 基准：2.9.0 / 2026-10-17
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -25,6 +25,8 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 聊天消息**不走 Context**：走 `SessionTimelineStore`（框架无关）+ `useSessionStore` 适配器，见 [chat.md](./chat.md) 的四层结构。
 
 composer 的定时卡片同样不走 Context，也不是实时状态：`useScheduledJobs` / `useScheduledMessages` 都是普通拉取，只在创建、删除、切换会话，以及**所在会话的 run 结束时**（`isProcessing` 落沿）重新拉取——仅一次任务跑完已自停用、定时消息已发出，都要靠这次刷新才会从输入框上方消失。
+
+`SessionProtectionContext` 的活动表用 `background` 标记区分"主轮"与"只剩后台任务"两种条目；只剩后台任务时消息是否排队由能力矩阵 `inputWhileBusy` 决定（见 [chat.md](./chat.md)），活动表本身不作排队判断。
 
 前后端共用的 `NormalizedMessage` 是聊天时间线的 wire contract；provider 给出的跨路行身份和历史正文完整度必须由 WebSocket 与历史接口原样传入 `SessionTimelineStore`，不能在视图模型层重新生成。身份的分段与对账规则见 [chat.md](./chat.md)。本地 Markdown 图片经授权端点转换为 Blob URL 后，组件换图或卸载必须中止请求并恰好释放一次 URL。
 

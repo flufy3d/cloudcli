@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.9.0 / 2026-10-01
+> 基准：2.9.0 / 2026-10-17
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -11,7 +11,22 @@
 
 `claude | codex | cursor | opencode | zcode | antigravity`，联合类型定义在 `shared/protocol/chatEvents.ts` 的 `LLMProvider`（前后端共用同一份，见下文「线上契约」）。注册表 `server/modules/providers/provider.registry.ts` 用 `Record<LLMProvider, IProvider>` 硬编码六家实例——漏一家直接编译报错。
 
-每家一个目录：`server/modules/providers/list/<name>/`，由 `<name>.provider.ts` 组装各切面。claude / cursor / opencode 的 runtime 是遗留 `.js` 适配器（`claude-runtime.provider.js` 等），codex、zcode / antigravity 是 TS（含协议客户端、配额、运行生命周期等更多切面文件）。
+每家一个目录：`server/modules/providers/list/<name>/`，由 `<name>.provider.ts` 组装各切面。claude / cursor 的 runtime 是遗留 `.js` 适配器；opencode、codex、zcode / antigravity 是 TS（含协议客户端、运行生命周期等更多切面文件）。
+
+## Codex 异步任务结果续开（Task Continuation）
+
+Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结果续开。当长耗时后台任务在宿主完成且原聊天处于空闲时，`codex-runtime.provider.ts` 在新连接上执行 `thread/resume`，并在 `turn/start` 中直接传入：
+```json
+{
+  "threadId": "<thread_id>",
+  "input": [],
+  "toolOutput": {
+    "name": "cloudcli_task_result",
+    "output": "<JSON 任务完成报告>"
+  }
+}
+```
+引擎以工具结果为契机唤醒新回合汇报。`codex-thread-items.ts` 只把名称为 `cloudcli_task_result` 的孤立 `FunctionCallOutput` / `functionCallOutput` 归一化为纯说明性质的 `status_note`，不生成缺失前置调用的残缺工具卡，也不伪造用户提问。其他工具的输出不会被误认成异步任务通知。其他引擎（Claude 等）保持其原生的输入流保持机制，第一版异步任务外部接续由 Codex 首发支持。
 
 ## IProvider 七切面
 
@@ -20,7 +35,7 @@
 | 切面 | 职责 | 关键成员 / 消费服务 |
 | --- | --- | --- |
 | `runtime` | 拉起/中止引擎执行 | `run(command, options, writer, context)`、`abort(sessionId)`；可选 `compact(options, writer, context)`（按需压缩，前端 `/compact` 的唯一开关）；可选 `permissions`（权限批准网关）、`backgroundTasks`（后台活跃任务列表）→ `providerRuntimeService` |
-| `models` | 模型目录 | `getSupportedModels()`（预置目录）、`getCurrentActiveModel()`（只读兜底）→ `providerModelsService` |
+| `models` | 模型目录 | `getSupportedModels()`（引擎目录或预置目录）、`getCurrentActiveModel()`（只读兜底）→ `providerModelsService` |
 | `auth` | 安装/登录状态 | `getStatus()`（"未安装/未登录"是数据不是异常）；可选 `getQuota()`（配额）→ `providerAuthService` |
 | `mcp` | 引擎原生 MCP 配置读写 | `McpProvider` 基类（scope/transport 校验）→ `providerMcpService` |
 | `skills` | 技能发现/写入 | `SkillsProvider` 基类（SKILL.md 扫描）→ `providerSkillsService` |
@@ -30,7 +45,7 @@
 
 **可选成员就是能力开关**，这是整个框架的核心设计。
 
-**模型目录特例（opencode）**：`models` 切面一般是 source-controlled 预置表；opencode 在上面叠加引擎自己的 live 目录——`list/opencode/opencode-models.provider.ts` 的 `OPENCODE_PREDEFINED_MODELS` 只作离线兜底与精选标签来源，`getSupportedModels()` 还会读 opencode 的模型缓存 `~/.cache/opencode/models.json`（按 path+mtime+size 记忆化）：对 `opencode` / `opencode-go` 两个网关以 live 为准（active 新模型自动补进并带 live 名称与 effort、deprecated/已移除的剔除、DEFAULT 失效时顺延），其余 provider 段落以及缓存缺失/损坏时保持 curated；两条路径最后都按本机已连接 provider 过滤。会话模型值统一是目录里的 `<providerID>/<modelID>`：`getCurrentActiveModel()` 读 opencode 自己的 `session.model`（`{id, providerID}`）时补回前缀，`providerModelsService` 的 `resolveSessionModel` / `resolveResumeModel` 再把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原——否则它会以 `--model <modelID>` 传给 CLI，被当成 providerID 而报 `Model not found: <id>/.`。
+**模型目录特例（opencode）**：`list/opencode/opencode-models.provider.ts` 以 `opencode models` CLI 的账号级清单为准（后台服务在时约百毫秒返回；超时不计票），id 为 `<providerID>/<modelID>`，再叠加 OpenCode 自己缓存于数据库 `kv` 的 models.dev 条目补全推理档位与说明；CLI 缺失/失败/空答案时回退 `OPENCODE_PREDEFINED_MODELS` 预置表并按本机已连接 provider 过滤。会话模型值同样以目录的 `<providerID>/<modelID>` 为准，`providerModelsService` 负责把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原。此前的「读 `~/.cache/opencode/models.json` 实时目录」叠加层随本轮 client-mode 迁移一并移除（见「OpenCode 服务客户端」）。
 
 **模型目录特例（zcode）**：新版本 ZCode 把用户自建 provider/模型从 `~/.zcode/v2/config.json` 迁到了 `~/.zcode/v2/provider_config.json` + 引擎自带目录（`zcode-provider-config.ts` 定位 runtime 刷新副本或安装目录 `resources/config/provider/zcode-builtin.json`），因此 `getSupportedModels()` 以引擎为准：调一次 `session/create` 取响应里的 `settings.model.available`（即引擎已合并用户 provider 后的完整目录，用完即 `session/close`），失败才回退磁盘解析。会话模型值同样是 `<providerID>/<modelID>`，并把每个模型的 `reasoning.defaultLevel` 记进 `zcode-models.provider.ts` 的 `engineReasoningDefaults`；`setModel` 的 schema 是严格校验，reasoning 档位必须放 `model.options.reasoningLevel`（旧的 `model.variant` 会被拒），缺省取上面记下的 defaultLevel，否则引擎报 “Reasoning level is required”。
 
@@ -40,7 +55,7 @@
 
 - `deriveCapabilities` 从注册表里的切面**推导**能力——`runtime.permissions` 存在 ⇒ `supportsPermissionRequests`；`sessions.resolveEditAnchor` 存在 ⇒ `supportsMessageEditing`；`fork` 存在 ⇒ `supportsSessionForking`；`sessions.getTokenUsage` 存在 ⇒ `supportsTokenUsage`；`runtime.compact` 存在 ⇒ `supportsCompaction`。
 - 静态部分（权限模式列表、图片/文件/中止/effort、编辑是否回滚文件 `editRevertsFiles`、引擎是否自带会话内调度 `supportsNativeScheduling`、会话忙时新消息能走多远 `inputWhileBusy`）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
-- **`inputWhileBusy: 'queue' | 'background' | 'always'`**（类型 `ProviderInputWhileBusy`）：会话忙时新消息能否直达引擎而不杀掉在跑的工作。`background`（claude）——回合结束、只剩后台任务时注入持有任务的活进程（见下文「保活与复用」），回合进行中仍排队；`always`（opencode）——回合进行中也直接发，引擎在下一步吸收（见下文 opencode 节「回合中途插话」）；`queue`（其余）——发送会重启进程杀掉工作，composer 一律排队。`always` 必须配 runtime 可选切面 `injectInput`，`provider-capabilities.test.ts` 钉住两者同在同缺。
+- **`inputWhileBusy: 'queue' | 'background' | 'always'`**（类型 `ProviderInputWhileBusy`）：会话忙时新消息能否直达引擎而不杀掉在跑的工作。`background`（claude）——回合结束、只剩后台任务时注入持有任务的活进程（见下文「保活与复用」），回合进行中仍排队；`queue`（其余，含本轮迁移后的 opencode）——发送会重启进程杀掉工作，composer 一律排队；`always` 目前无引擎使用。`always` 必须配 runtime 可选切面 `injectInput`，`provider-capabilities.test.ts` 钉住两者同在同缺。
 - `provider-capabilities.test.ts` 把推导结果钉在显式基线上：切面增删会以"评审过的测试差异"呈现，而不是静默改能力。
 - **`supportsNativeScheduling` 只是提示位，不参与启停**：CloudCLI 的循环定时任务（`scheduled-jobs`）对所有引擎可用；该位为 true（目前仅 claude 的 CronCreate/ScheduleWakeup）时，任务表单与 composer 重复入口提示"引擎自身也有会话内定时、冲突回合会被跳过"，行为不变。
 - **前端零 provider 分支**：composer/设置页完全按 `GET /api/providers/capabilities` 渲染。首屏与请求失败时的回退镜像在 `src/shared/providerCatalogFallback.ts`（`PROVIDER_FALLBACK_CATALOG`），由跨树 parity 测试（`server/modules/providers/tests/provider-catalog-parity.test.ts`）钉住与后端目录一致；**其 key 顺序就是全应用的引擎规范顺序**。
@@ -50,13 +65,13 @@
 
 `ProviderTokenUsageResult`（`server/shared/types.ts`）的语义是"**当前上下文占用**"而不是"会话累计花费"：`used` 是这一刻窗口里承载的量，`total` 是窗口大小；需要累计的引擎（codex/opencode）把会话累计放在 `cumulative`，claude 自报的百分比放在 `percentage`。前端 composer 徽章显示 `used`（有 `total` 时追加 `xx%`），`/cost` 弹窗画占用条并单列累计行。
 
-引擎只在回合结束时才报用量的引擎（zcode、opencode），runtime 会在**回合进行中**补发 `token_budget`：监听器每次收到一个 step 收尾的信号（zcode 是 `tool_result`；opencode 是 assistant 的 `message.updated` 或 `step-finish` part）就去引擎库读一次最新占用，距上次发送不足 1.5s 或读数没变则不发；帧的 payload 与 `/token-usage` 端点同形，长工具轮的徽章因此不必等到 `complete` 才动。
+引擎只在回合结束时才报用量的引擎（zcode），runtime 会在**回合进行中**补发 `token_budget`：监听器每次收到一个 step 收尾的信号（zcode 是 `tool_result`）就去引擎库读一次最新占用，距上次发送不足 1.5s 或读数没变则不发；帧的 payload 与 `/token-usage` 端点同形，长工具轮的徽章因此不必等到 `complete` 才动。opencode 的回合中预算来自服务 API 的会话快照（见「OpenCode 服务客户端」）。
 
 | 引擎 | `used` 来源 | `total` 来源 | 备注 |
 | --- | --- | --- | --- |
 | claude | 最新一条主线程 assistant 的 `input + cache_read + cache_creation + output`；每回合结束再用 SDK `Query.getContextUsage({detail:'summary'})` 覆盖（带 `percentage`） | **会话维度持久化的 SDK 真值**（见下）＞`CONTEXT_WINDOW` ＞ 模型启发式（先看会话行的 `model`（用户选的变体，带 `[1m]`），再看转录里的模型 id；命中 `[1m]` 定 1M，否则 200k），单一 resolver `resolveClaudeContextWindow`（`services/claude-usage.ts`） | SDK 会执行输入流里的 `/compact`，无需额外协议 |
 | codex | rollout `token_count.info.last_token_usage`（live 用 `turn.completed.usage`） | `model_context_window` | 旧的 `total_token_usage` 只作 `cumulative` |
-| opencode | 最新 assistant 消息的 `tokens.total` | `~/.cache/opencode/models.json` 的 `limit.context`（`list/opencode/opencode-context-usage.ts`，按 path+mtime+size 记忆化） | 会话列（`tokens_*`）是累计值，只作 `cumulative`；压缩摘要消息（`summary: true`）跳过 |
+| opencode | `opencode.db` 会话行 `tokens_*` 五列合计（推理/缓存计费同源；`GET /api/session/:id` 的 `tokens` 亦同值，驱动回合中 `token_budget` 帧） | 无窗口值（不显示百分比） | 语义是会话累计而非当前窗口占用；数据库早于 token 列时不支持（`unsupported: true`） |
 | antigravity | live usageRecord 的 total | 1M（硬编码） | 同值持久化到 brain `token_usage.json` |
 | zcode | 最新 step 的 `tokens.total`；旧行没有该字段时取 `input + output + reasoning`（持久化 prompt 已含 cache read，不能再加） | 引擎目录的 `contextWindow`（`resolveZCodeModelContextWindow`；用户自加 provider 只有引擎目录里有），缺失时回退 `v2/config.json` 的 `limit.context` | 全转录求和只作 `cumulative`（`list/zcode/zcode-context-usage.ts`）；压缩摘要行（`summary` 对象）跳过 → `compacted` + `summaryBytes` |
 | cursor | 无 `getTokenUsage` 切面 | — | `supportsTokenUsage: false` |
@@ -67,29 +82,9 @@
 
 `/token-usage` 与历史页共用 `summarizeClaudeTokenUsage` 这一个读取器（同样跳过 sidechain 与全零的 `<synthetic>` 行），两者只在取行范围上不同：历史页按 `sessionId` 过滤转录行，端点读整份文件。
 
-## 交互式权限与提问（opencode）
+**`/compact` 的引擎实现**（能力开关是 runtime 可选切面 `compact`）：claude 把 `/compact` 当输入流的一条用户消息（SDK 按 local slash command 执行，实测可通过 `Query.getContextUsage()` 复核）；codex 走 app-server JSON-RPC `thread/resume`（必须带出 turns，摘要器要读被替换的对话）+ `thread/compact/start`，并且**要等压缩回合完成通知**（`item/completed` 的 `contextCompaction` 或 `turn/completed`）才能杀掉子进程，否则摘要只存在于内存里（`list/codex/codex-app-server.client.ts`）。zcode 走 app-server 的 `session/compact`：引擎把它当一轮后台 `/compact` 提示跑（`turn.started` → `session.updated` 的压缩时间线 → `turn.completed`），所以 runtime 复用 run 的同一套流程（订阅 → 监听 → settle → 一个 `complete`），只是不设模型/权限模式（引擎用会话当前模型）；请求参数只发 `sessionId`（`expectedRevision` 可选，仅当传入且过期时才报 -32009，而应用不跟踪 revision），引擎回 `state: already_running` 时按错误上报而不是悄悄挂靠到别人的压缩上。antigravity 实测**不支持**：agy print 模式把 `/compact` 当普通 prompt 透传（"not a built-in slash command"），且 CLI 无压缩子命令。cursor 不实现，菜单按能力矩阵隐藏。opencode 的 compact 随 client-mode 迁移暂缺（见「OpenCode 服务客户端」遗留项）。
 
-`opencode run` 非交互模式对任何 `ask` 规则**直接拒绝**，没有把审批交给用户的通道。因此 opencode runtime 不再解析 `run --format json`，而是驱动一个**共享的 `opencode serve`**（`list/opencode/opencode-server.client.ts`）：单进程 + `/global/event` 事件流（各 run 按 `properties.sessionID` 过滤，审批类事件除外，见下），请求都带 `?directory=` 定位工程。live 事件翻译回既有 `sessions.normalizeMessage` 认识的信封（`text/reasoning/tool_use/step_finish/error`），历史与实时仍共用同一归一化器。
-
-**回合生命周期以引擎为权威（异步投递）**：prompt 走 `POST /session/:id/prompt_async`（`sendOpenCodeMessageAsync`，204 = accepted，毫秒级返回）——客户端不再用某个 HTTP 请求的生死代表一个回合。投递后先做"起步确认"（`confirmOpenCodePromptStarted`）：busy/retry、`session.error`、或接受后观察到 idle（超快回合可能在首次轮询前就结束）三者有一即算起步；窗口内全无信号则按"引擎丢弃了 prompt"判失败而不是静默空回合。随后 `awaitOpenCodeTurnSettled` 以 `session.idle`/`session.status` 事件为主、`/session/status` 轮询兜底（事件流断档不丢完成信号），并以"稳定 idle"结尾：`confirmOpenCodeSettledIdle` 在观察到 idle 后等 600ms 再查状态，仍非 busy 才算回合结束——在循环边界被引擎接走的消息会在毫秒内让会话重新 busy，这一步把交接误判挡在门外。**等待没有截止时间**：server 健康就一直等，只有连不上才抛错判失败（失败路径仍经 `resumeOpenCodeRun` 复核：会话还在跑就继续等，不把活着的回合报成传输错误）。引擎缺 `prompt_async`（404/405，按 baseUrl 缓存）时回退阻塞式 `POST /session/:id/message`，其响应仍是该路径的回合结束信号。`/global/event` 断线按 1s 自动重连（opencode 不重放历史事件，只会断档不会重复）。请求失败时把 undici 的 `fetch failed` 还原成带 `cause`（如 `UND_ERR_SOCKET`/`ECONNREFUSED`）的可读错误，并保留 server stderr 尾部供崩溃诊断。
-
-**空闲回收前先查引擎**：共享 server 按引用计数常驻，最后一个 run 释放 60s 后走 `attemptOpenCodeServerIdleShutdown`——先对最近活动过的目录逐个 `probeOpenCodeServerWork` 查 `/session/status`，`busy`/`retry`（或查询失败但 server 可达）就推迟复查（60s 一次，6h 上限兜底），只有确认全空闲、或 server 本身已死才杀。run 的结束不代表回合结束：客户端失败的 run 会把还在跑的 turn 留成"孤儿"，旧行为直接 taskkill 进程树、把引擎正在执行的工作（现场是一轮训练命令）一起杀掉；守卫存在的意义就是让引擎把活干完再说。**复用前仍先探 `/global/health`**（Windows 下 `cmd.exe` shim 可能比真正的 `opencode.exe` 活得久，child 的 `exit` 不再触发；探测失败且无 run 持有时才重启）。
-
-**传输层（`list/opencode/opencode-http.client.ts`）**：所有对 `opencode serve` 的请求（含 compact 的 summarize、事件流、健康探测）必须走 `openCodeFetch`——共享一个 undici `Agent`，`headersTimeout`/`bodyTimeout` 抬到 2.5h，高于 2h 的请求期限（`OPENCODE_SERVER_RESPONSE_TIMEOUT_MS`），per-request `AbortSignal` 才是唯一截止时间。Node 全局 `fetch` 的默认 5 分钟 headers/body 超时独立于 `AbortSignal`：阻塞式 prompt 要等整轮结束才回响应头，超过 5 分钟的正常长回合会被误杀成 `UND_ERR_HEADERS_TIMEOUT`，静默 5 分钟的事件流也会被掐断丢事件。异步投递路径下没有长请求（204 毫秒级返回），这套抬高的超时只兜底事件流静默与回退的阻塞路径。
-
-审批桥 `list/opencode/opencode-permissions.provider.ts` 就是 runtime 的 `permissions` 切面（`supportsPermissionRequests` 因此为 `true`）：`permission.asked` → `permission_request` 卡片 → `POST /permission/:id/reply`（`once/always/reject`）；`question.asked` → `AskUserQuestion` 卡片（`multiple → multiSelect`、`options` 原样映射）→ `POST /question/:id/reply`（跳过/拒绝走 `/reject`）。**子代理（task 子会话）的审批属于父 run**：子会话事件带的是自己的 session id，runtime 不再按 id 直接丢弃，而是先经 `parentID` 链（`GET /session/:id`）确认其为本 run 的后代再交给桥接（查询按 run+会话缓存，链查询失败不缓存、其余外来会话忽略）；否则子代理的审批卡片会因会话过滤永远不出现、整轮死等——`bypassPermissions` 下同样如此。权限模式映射：`plan` → `plan` agent、`bypassPermissions` → 静默回 `once`（等价 `--auto`）、`default` → 由用户 opencode 配置决定（`ask` 才出卡片）。`/compact` 仍走独立的短生命周期 server（`POST /session/:id/summarize`）。
-
-**回合中途插话**（`inputWhileBusy: 'always'`）：opencode server 的 prompt 循环每走完一步都重读会话，所以会话 busy 时再投一条消息不会打断在跑的工具或子代理，而是在当前步结束后被同一循环吸收（`scripts/probe/opencode-midturn-probe.mjs` 阻塞式、`scripts/probe/opencode-async-probe.mjs` 异步式实测，含 `--task` 子代理场景）。runtime 的 `injectInput`（`injectOpenCodeInput`）据此把消息投进正在跑的 run：沿用该 run 的 model/agent/effort（中途切换的设置下一轮才生效），输出走原 run 的 writer。异步投递下 204 只代表接受，"已答复"由空闲确认给出：`registerOpenCodeInjection` 记录接受时刻，观察到的 idle 经 `confirmOpenCodeSettledIdle` 稳定确认后，`resolveOpenCodeInjectionsAnsweredBefore` 释放所有早于该次观察的注入——接受瞬间恰好撞上旧循环结束的边界消息会让会话重新 busy，确认不会误放。run 在 `finally` 里经 `drainOpenCodeRun` 收尾：先等所有注入落定（`settleOpenCodeInjections`），再等本会话的 idle 事件（上限 3s），期间又有注入就重来；中止/失败/超上限（10 分钟）时 `forceResolveOpenCodeInjections` 释放剩余注入，drain 不会挂死在永远无人答复的消息上。run 结束时的事件尾巴（最终回复的后半段 delta、完成的 part、`session.idle`）仍在收尾窗口里流过，最后一次检查与清理之间没有 await，注入不会落在已结束的 run 外。run 已中止/已收尾时返回 false，网关按新 run 处理。
-
-**空交付兜底（`opencode-runtime.provider.js`）**：引擎会把"回复被输出上限截断"的空回合（整轮无助手文本、无工具调用）和带空 `<task_result>` 的子代理 task 卡都报成 `completed`——UI 上表现为"子代理跑完却没落盘"。runtime 在收尾时识别这两种空交付（`readOpenCodeTaskDelivery` 读 task part；会话归一化的实时与历史两条路径同样把空交付标成错误卡，刷新后不会变回成功），**不发 `complete`**，改为补一条带 `[cloudcli auto-retry]` 前缀的用户消息（点名空子代理的 `task_id`，父会话续跑并核对交付物），恢复轮的输出并入同一客户端回合；仅补发一次（`emptyResultResumeAttempt`），中止/失败/已尝试均不触发。deploy 侧可用环境变量 `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` 抬高引擎单回合上限（默认 32k，思考与输出共享），减少触发面。
-
-**编辑历史消息**：归一化消息把 provider 的 `msg_…` 暴露为 `transcriptAnchorId`；`sessions.resolveEditAnchor` 返回被编辑消息的前一条，`sessions.rewindSession` 对 server 调 `POST /session/:id/revert`（命名要丢弃的首条消息，即被编辑消息），所以 `supportsMessageEditing` 为 `true`。opencode 的 revert 是「丢弃该消息及其之后、下一条 prompt 时生效」，因此编辑是替换而非保留旧分支。该 revert 会按 snapshot **连同文件一起还原**（与 claude 的部分 resume、codex 的 fork 都不同——那两者不碰文件），所以能力矩阵给 opencode 标 `editRevertsFiles: true`，composer 据此把编辑横幅的「已修改的文件不会被还原」换成「会一并还原」。
-
-**fork**：`list/opencode/opencode-fork.provider.ts` 实现 `fork` 切面（`supportsSessionForking` 为 `true`），调 server `POST /session/:id/fork`。该接口是**排除式**切点（拷贝切点之前的消息，不带则全拷），所以把 anchor 之后的**第一条 user 消息**作为切点，得到「含 anchor 整轮」的结果；anchor 是最后一轮时省略切点、全量拷贝。opencode 转录在共享 DB 里没有文件，故 `requiresTranscriptFile=false`，`IProviderFork` 的 `jsonlPath` 允许为 `null`。fork 暂未接。
-
-**`/compact` 的引擎实现**（能力开关是 runtime 可选切面 `compact`）：claude 把 `/compact` 当输入流的一条用户消息（SDK 按 local slash command 执行，实测可通过 `Query.getContextUsage()` 复核）；opencode 临时拉起 `opencode serve`（回环随机端口），调用 CLI 自己的压缩原语 `POST /session/:id/summarize`（TUI `/compact` 用的同一条路；`run --command` 只认用户配置命令，实测内置 `/compact` 会 500），payload 取 opencode.db 里会话行 `model` 列的 providerID/modelID；codex 走 app-server JSON-RPC `thread/resume`（必须带出 turns，摘要器要读被替换的对话）+ `thread/compact/start`，并且**要等压缩回合完成通知**（`item/completed` 的 `contextCompaction` 或 `turn/completed`）才能杀掉子进程，否则摘要只存在于内存里（`list/codex/codex-app-server.client.ts`）。zcode 走 app-server 的 `session/compact`：引擎把它当一轮后台 `/compact` 提示跑（`turn.started` → `session.updated` 的压缩时间线 → `turn.completed`），所以 runtime 复用 run 的同一套流程（订阅 → 监听 → settle → 一个 `complete`），只是不设模型/权限模式（引擎用会话当前模型）；请求参数只发 `sessionId`（`expectedRevision` 可选，仅当传入且过期时才报 -32009，而应用不跟踪 revision），引擎回 `state: already_running` 时按错误上报而不是悄悄挂靠到别人的压缩上。antigravity 实测**不支持**：agy print 模式把 `/compact` 当普通 prompt 透传（"not a built-in slash command"），且 CLI 无压缩子命令。cursor 不实现，菜单按能力矩阵隐藏。
-
-压缩**刚结束的那一刻占用不可知**（opencode 的摘要消息带的是刚被压缩掉的旧对话用量，实测 319k；真实占用要等下一个回合；zcode 引擎自己压缩时把摘要写成带 `summary` 对象的 user 行，同样跳过），所以 `ProviderTokenUsageResult` 用 `compacted: true` + `used: 0` 表达"已重置、token 数未知"（前端 `readTokenBudgetFromUsage` 与实时 `token_budget` 帧都判这个标记，不会继续挂着旧数字）。唯一当下可测的量是**摘要本身的大小**：摘要的正文存在 `part` 表（`message.data` 里没有 `content`），`readOpenCodeMessageTextBytes` 累计其 `text` 分片的 UTF-8 字节数，作为 `summaryBytes` 随 `compacted` 一起给出（摘要消息自己的 `tokens` 是这次总结调用读进去的旧对话，不能用）。前端用它显示"压缩摘要 · 9.4KB"直到下一个回合拿到真实占用；`/cost` 经 `commands.routes.ts` 透传同样的标记与字节数，把误导性的 0 行换成摘要大小行。
+压缩**刚结束的那一刻占用不可知**（zcode 引擎自己压缩时把摘要写成带 `summary` 对象的 user 行，读数直接跳过），所以 `ProviderTokenUsageResult` 用 `compacted: true` + `used: 0` 表达"已重置、token 数未知"（前端 `readTokenBudgetFromUsage` 与实时 `token_budget` 帧都判这个标记，不会继续挂着旧数字）。zcode 的摘要大小经 `zcode-context-usage.ts` 作为 `summaryBytes` 随 `compacted` 一起给出，前端用它显示"压缩摘要 · 9.4KB"直到下一个回合拿到真实占用；`/cost` 经 `commands.routes.ts` 透传同样的标记与字节数，把误导性的 0 行换成摘要大小行。
 
 ## Claude 会话进程：保活与复用（`claude-live-session.ts`）
 
@@ -114,22 +109,41 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出。但**启
 - `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
 - `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类；受管技能写入目标由各引擎覆盖 `getGlobalSkillSource()` 决定（claude → `~/.claude/skills`；codex / cursor / zcode / antigravity → `~/.agents/skills`；opencode → `~/.config/opencode/skills`），不覆盖即拒绝写入。
+
+Codex 的模型目录由 `codex-models.provider.ts` 通过 `codex-app-server.client.ts` 的连接读取（`model/list` 全分页、过滤隐藏模型、按 id 去重；查询用对话运行时同一份内置 `@openai/codex`）。成功目录缓存五分钟、并发共用一次加载；失败保留最近成功目录、十秒后允许重试；首次加载失败/空目录/格式异常会报错，前端走模型加载失败的重试入口。自定义模型由 `provider-models.service.ts` 合并：同 ID 记录只显示一项（保留用户名称并继承引擎推理强度），删除仅存在于自定义记录中的型号才切回默认型号。
+
 - 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，这些请求产生的 item 通知流，以及反向的审批请求）。zcode supervisor 拉起 `app-server` 时先剥离环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留指向 App 自己的运行期文件），再注入 `zcode-provider-config.ts` 解析出的 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` / `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` / `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`——桌面端本来会传这三个变量，裸 spawn 缺了它引擎定位不到 provider 目录，`session/create` 会一直挂到超时（模型一个都用不了）。Codex 运行时开启 `features.defer_mailbox_preemption = true` 延缓 mailbox 抢占，避免子代理并发消息打断父会话推理；并在 `onNotification` 强制过滤非主会话 `threadId`，防止子代理事件流串线。
+- zcode 工具结果：实时事件的 `tool.updated`（旧名 `tool_call_scheduled`）在 `kind=result` 时直接携带 `result.content` 与 `result.success`，`kind=error` 携带 `error`。`ZCodeLiveEventNormalizer` 将它们与 `model_streaming` 的 `tool_result/tool_error` 共用一条转换路径，按原生 `toolCallId` 把输出或错误送回已有工具卡；空字符串是有效的成功输出，只有 resultPartId 而无正文的事件不生成残缺卡。实时显示不依赖历史拉取或 SQLite 落库时序。
 - zcode 附件通道：上传描述符在 runtime 内映射为 `session/send` 的原生 `attachments` 项（`{kind, filename, mimeType, sizeBytes, localPath}`，localPath 必须绝对；引擎静默丢弃无法映射的形状），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
-- zcode 发送链路（引擎 0.16.9）：引擎对 `session/create` / `session/resume` / `session/send` 做严格 schema 校验，多一个键就报 -32602（`runtimeModel` 正是被拒的那个），所以请求只带 schema 声明的字段——resume 只发 `sessionId`，create 只发 workspace 描述符；模型选择经 `session/setModel` 设在会话上（reasoning 档位必须放 `model.options.reasoningLevel`，缺省取引擎目录里的 `defaultLevel`，恢复会话时强制重选以清掉 "model unavailable"（-32031）警告）。会话工作区必须由 `workspacePath` / `cwd` 显式给出：runtime 不再回退 `process.cwd()`，否则部署目录会被同步器登记成项目。
-- zcode 体验套餐（Start Plan，`account:bigmodel-start-plan`）：引擎以 app-server 启动时对 `zhipu-account` 类 provider 默认 fail-closed（`entitled: false`），不进可执行注册表。`ZCodeProtocolClient` 在每个引擎进程的首个业务请求前（崩溃重启后重做）检测 `~/.zcode/v2/credentials.json` 的 `zcodejwttoken`，有则发 `provider/updateAccountConfig` 授予 entitlement；`basedOnZCodeBuiltinRevision` 为 `zcode-builtin:<revision>:<sha256(绝对路径)>`，必须对 spawn env 里实际交给引擎的那份 builtin 目录（`findActiveZCodeBuiltinConfig`：runtime ?? bundled）计算，否则引擎拒收。之后体验套餐模型由引擎目录 `settings.model.available` 自然列出（value 仍是 `providerId/modelId`），不在本地手工追加；运行期引擎经 `interaction/requestProviderRuntimeHeaders` 回调索取鉴权，`zcode-run-lifecycle.ts` 以解密后的 JWT 作 `requestAuth.apiKey` 应答。
-- 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession`）。
+- zcode 发送链路（引擎 0.16.9）：引擎对 `session/create` / `session/resume` / `session/send` 做严格 schema 校验，多一个键就报 -32602（`runtimeModel` 正是被拒的那个），所以请求只带 schema 声明的字段——resume 只发 `sessionId`，create 只发 workspace 描述符；模型选择经 `session/setModel` 设在会话上（reasoning 档位必须放 `model.options.reasoningLevel`，缺省取引擎目录里的 `defaultLevel`，恢复会话时强制重选以清掉 "model unavailable"（-32031）警告）。会话工作区必须由 `workspacePath` / `cwd` 显式给出：runtime 不再回退 `process.cwd()`，否则部署目录会被同步器登记成项目。引擎所需的 personal provider registry 由服务端从 `cli/config.json` 物化为 `~/.zcode/cli/cloudcli-provider-config.json` 并随 spawn env 注入。
+- zcode 账号套餐：模型目录按白名单提取 `GLM-5.3` 和 `GLM-5.3-Flash`。有唯一且可解密的个人套餐 API Key 时，个人分组的模型值使用 ZCode 原生 `account:bigmodel-individual-coding-plan/模型名`，`resolveZCodeModelRef` 把旧会话保存的 `bigmodel-coding-plan` / `builtin:bigmodel-coding-plan` 引用也解析到该账号；同名自定义 provider 保持自身路由，没有该凭证时保留本地 provider 路径。有可解密的 `zcodejwttoken` 时体验套餐以 `account:bigmodel-start-plan/GLM-5.3-Flash` 列出。引擎以 app-server 启动时对账号类 provider 默认 fail-closed（`entitled: false`）；`ZCodeProtocolClient` 在每个引擎进程的首个业务请求前（崩溃重启后重做）以 `provider/updateAccountConfig`（`buildZCodeAccountSyncPayload`，可同时授权两类账号）授予 entitlement，运行期经 `interaction/requestProviderRuntimeHeaders` 回调按 provider 分别以解密后的 JWT / 个人套餐 Key 应答鉴权。多份个人套餐 Key 无法确定账号时，不自动选择其中一份。
+- 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `compact` / `injectInput` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession`）。
+
+## OpenCode 服务客户端（v2）
+
+opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的常驻服务（官方 `run --standalone` 同款配方，针对 v2.0.31 实测钉契约）。各构件在 `list/opencode/` 下：
+
+- `opencode-service.ts`：监管器，懒启动 `opencode serve --stdio --port 0`，随机密码经 `OPENCODE_PASSWORD` 传入、Basic 认证（账号固定 `opencode`）；就绪行是 stdout 上的 `{"url":…}`；**stdin 就是所有权租约**——cloudcli 退出服务随之退场，崩溃退避重启。v1 引擎在聊天时报错（历史读取的双格式兼容不受影响）。
+- `opencode-api.client.ts`：会话创建（`location.directory` 锚定项目目录）、模型/角色/权限规则切换、prompt、interrupt、权限与表单答复。模型引用是对象 `{providerID, id, variant}`（variant 即推理力度，`provider/model#effort` 解析）。
+- `opencode-event-stream.ts`：一条全局 `GET /api/event` SSE，按 `data.sessionID` 分发；每次（重）连都重新解析端点，跟随重启换端口的服务；断线退避重连并广播重连事件。
+- `opencode-event-translator.ts`：会话事件 → 时间线帧（text.delta→stream_delta、reasoning.delta→同 id thinking、tool.*→tool_use/tool_result、execution.*→运行终态）。事件词表钉在测试夹具里，未知事件类型忽略，防版本漂移。
+- `opencode-interaction-bridge.ts`：`permission.asked` → 权限卡（Allow/记住/拒绝 → `once`/`always`/`reject`）；`form.created`（question 表单）→ `AskUserQuestion` 卡（服务的 `multiselect` 翻译成面板的 `multiSelect`；答复按问题文本映射回 `q0/q1` 字段键，多选按 `", "` 拆分——选项文案含该序列是已知边界）。跳过/拒绝=取消表单并附留言，模型继续而非整步作废。
+- `opencode-session-settings.ts`：权限模式映射——`plan`→只读 plan 角色+全部变更类 ask 规则；`acceptEdits`→仅 shell ask；`bypassPermissions`→无规则（引擎默认全放行）；`default`→全部变更类 ask。**引擎默认角色本身全放行，权限卡完全靠这些 ask 规则出现**；已应用的切换按会话缓存，避免每次发消息重复下发（切 plan 会附带一条系统提醒）。
+- `opencode-run-registry.ts`：活跃运行登记、事件分发、首结算生效；断线重连后按 `GET /api/session/:id` 的 `outcome`/`time.idle` 对账，补上错过的终态，避免会话卡在"处理中"。token 预算取自同一接口的 `tokens`，不再读 `opencode.db`。
+- 附件：data-URI 文件块随 prompt 下发（模型真正看到内容），同时保留 `<images_input>`/`<files_input>` 路径标签供历史回读还原。
+- 历史、会话索引、模型目录、登录检测不变：仍读 `opencode.db`（双格式）与 CLI 探测。
+- **相对旧实现的缺口（待移植）**：消息编辑（`revert` 锚点/回滚）、会话 fork、回合中实时上下文补发、子代理卡片/审批桥的父会话归属、空交付自动重试、`/compact`、回合中途插话（`injectInput`）。配额卡片已移植（`opencode-quota.provider.ts`）。
+
 
 ## 会话索引准入：哪些工作区能变成项目
 
-引擎各自记录会话的工作目录，同步器据此建项目行。判定统一走 `shared/sessions/workspace-admission.ts` 的 `admitsWorkspacePath`——六家引擎的同步器（SQLite 骨架一处 + claude / codex / cursor 各一处）都必须调用它，**新引擎接入时这是第 2 步的一部分**。两条拒绝规则：
+引擎各自记录会话的工作目录，同步器据此建项目行。判定统一走 `shared/sessions/workspace-admission.ts` 的 `admitsWorkspacePath`——六家引擎的同步器（SQLite 骨架一处 + claude / codex / cursor 各一处）都必须调用它，**新引擎接入时这是第 2 步的一部分**。三条拒绝规则：
 
 1. **包管理器与运行时内部**：路径含 `node_modules` 或 pnpm 的 `.pnpm` 段（`server/shared/utils.ts` 的 `isInfrastructureWorkspacePath`）。
-2. **已消失且从未登记过的目录**：`mktemp -d` 沙箱里跑过一次的引擎会长期把该目录记为工作区，目录被系统回收后，这类行每次重扫都会复活成同一批空项目。
+2. **已消失且从未登记过的目录**：引擎在事后被系统回收的目录里跑过一次，就会长期把该目录记为工作区，这类行每次重扫都会复活成同一批空项目。
+3. **系统临时目录之内（含根本身）**：`$TMPDIR`、`/tmp` 这类是运行期暂存区，引擎驱动的沙箱跑批（任务评审、测试夹具）会把工作目录记在这里，收进侧边栏只会是噪音（`server/shared/utils.ts` 的 `isSystemTemporaryWorkspacePath`；macOS 上每个根同时按 `/var/folders/...` 与 `/private/var/folders/...` 两种写法比对，因为引擎记录的是符号链接还原后的写法）。被挡的只是 CloudCLI 自己的项目行，会话本体与引擎侧记录不受影响；聊天里打开临时目录下的文件走 `file:` 链接白名单，与本项目准入无关。
 
-系统临时目录本身**不是**拒绝理由——`/tmp` 下的临时克隆、复现仓是正常工作现场，一刀切会让这些会话从项目列表里无声消失。区分真项目与一次性沙箱的是"目录是否还在"，不是"在不在 /tmp"。
-
-"已登记过"这一半同样不能省：外置盘或网络卷没挂载时目录暂时不存在，但项目行已在，会话照常更新。准入失败只阻止**新建**项目，永不删除既有数据。
+"已登记过"这一半对第 2 条同样不能省：外置盘或网络卷没挂载时目录暂时不存在，但项目行已在，会话照常更新。准入失败只阻止**新建**项目，永不删除既有数据；已经入库的临时目录项目行由项目列表的同一判断过滤隐藏（`projects-with-sessions-fetch.service.ts`），数据保留在库中。
 
 引擎解析不出工作区时同步器返回 `null` 跳过该行，不拿服务端自己的 cwd 顶替——那只会把会话记到服务恰好启动的目录名下。
 
@@ -298,8 +312,8 @@ id 必须字节相同。** 这条有两道闸门守着：
 | codex | ThreadItem 的 `id`（`msg_…`/`rs_…`/`exec-<uuid>`/`call_…`），一项多行时后缀 `_<n>` / `_result` | 两路读的是同一个 ThreadItem：app-server 实时推 `item/started`+`item/completed`，rollout 把同一项写进 `event_msg`→`item_completed`，id 逐字相同 |
 | antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id |
 | zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
-| opencode | `(message_id, part_id)`；其余切面未盘点 | 实时流不发行 id（只有 `message.part.delta` 片段），故 assistant 正文由 `providerRowKey: opencode-part:<part_id>` 对账。**按 part 而非 message 取 key**：一个回合"正文→工具→正文"会落两条正文行，共用一个 key 就成了二义匹配，两边都对不上 |
 | cursor | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
+| opencode | 两路不同源：实时行 id=引擎工具调用 id / `${消息id}_reasoning_${序号}`，历史行 id=`${消息id}_${块序号}`；工具行靠 toolId 指纹层配对 | 服务客户端化（2026-10-17，见「OpenCode 服务客户端」）后实时与历史读的是同一引擎记录的不同投影 |
 
 **引擎同时提供「原始记录」和「组装好的记录」时，两路都读组装的那一份。** codex 的 rollout 里
 既有 Responses API 的原始条目（`response_item`：`custom_tool_call` 及其输出、`function_call`、
@@ -331,9 +345,9 @@ id 必须字节相同。** 这条有两道闸门守着：
 
 - **一次性 CLI 的异步任务会被静默掐死**：`agy` 的一次性 print 模式（`agy -p "<prompt>"`）在 root agent 转入 idle 后只等几秒就关停整个 CLI，日志为 `root agent idle; waiting up to 5s for N background task(s)` → `terminating N background task(s) on exit`。子代理和被放到后台执行的 `run_command` 都在这里死掉，而 CLI 仍然吐出 `status: SUCCESS`，于是前端收到 complete、任务看着「做完了」，真正的结果永远不会回来。antigravity runtime 因此把这一轮的 prompt 作为一行 NDJSON（`{"event":"user","message":{"content":"…"}}`）写进 stdin 并用 `--input-format stream-json` 启动：stdin 保持打开 → CLI 不自行关停 → 异步任务跑完，结果照常从 stream 回流；收到 `result` 事件后再关闭 stdin 让进程退出。**prompt 一旦退回 argv，这个保护就没了。**
 
-  更进一步，当 root agent 产生子代理（`invoke_subagent`）或启动后台命令（`run_command`）时，`agy` 在主 turn 结束时仍会先吐出一个 `event: result`。若此时直接关闭 stdin 发送 `complete`，子代理与后台进程同样会被杀，且前端会误报任务已完成。antigravity runtime 通过 `extractAntigravityBackgroundTasks` 从 `step_update` 识别活跃任务；在 `event: result` 时若仍有任务在跑，则标记 `heldForBackgroundWork = true` 暂不关 stdin 且抑制 `complete`；直到检测到任务完成通知（`<SYSTEM_MESSAGE> sender=<taskId>` 或 `Task id ... finished`）且活跃任务清空后，才释放 stdin 并发出真正的 `complete`。同时 runtime 暴露 `backgroundTasks.list(sessionId)` 切面供状态查询与输入排队使用。
+  stream-json 模式下，`agy` 自己等子代理和后台 `run_command` 全部结束才发出 `result`：后台命令的 `tool` step 一直保持 `ACTIVE` 直到命令退出，子代理回报只是一条不带正文的 `system_message` step。所以 `result` 就是整轮的终点，runtime 收到它后清空子代理卡片、关 stdin、发 `complete`。子代理卡片取自 `invoke_subagent` 的 DONE step（`step_type: "subagent"`，`subagent_info.subagents[].conversation_id`），通过 `backgroundTasks.list(sessionId)` 切面供输入框展示。
 
-  代价是超时责任转移到了服务端：`--print-timeout` 在该模式下不生效（实测一轮带 `20s` 上限的 run 在 result 之后依然存活，直到 stdin 关闭才退出），而 stdin 又由我们持有，所以 result 事件一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住。runtime 因此自带一个**以 stdout 活动续期的看门狗**，取值就是 `printTimeout`，到期 SIGTERM 并按失败收尾。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 等于又一次把异步工作掐死，所以只有真正的 result 才关。
+  **绝不能给 agy 传 `--print-timeout`**：它限制的是整轮时长，到点时 agy 会在子代理仍在运行时提前吐出 `status: SUCCESS` 的 `result`，runtime 一关 stdin，agy 就把子代理连同工作一起掐掉，前端还显示完成。agy 的默认值 0 表示等这一轮跑完。防卡死由服务端负责：stdin 由我们持有，`result` 一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住，所以 runtime 自带一个**以 stdout 活动续期的看门狗**（`idleTimeout` / `CLOUDCLI_ANTIGRAVITY_IDLE_TIMEOUT`，默认 30 分钟），到期 SIGTERM 并按失败收尾。主 agent 等子代理期间主流完全静默，所以一个连续 30 分钟没有任何输出的子代理也会被看门狗结束。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 或发 `complete` 都会让前端以为这轮结束、甚至掐死异步工作，所以只有真正的 result 才收尾。
 
   接新的 CLI 引擎时先问两句：它的非交互模式在主循环 idle 之后如何处置未完成的后台任务；以及谁为「进程永远不退」兜底。
 

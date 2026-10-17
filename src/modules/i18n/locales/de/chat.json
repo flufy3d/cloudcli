@@ -220,7 +220,7 @@
     }
   },
   "misc": {
-    "needsInput": "Der Assistent benötigt deine Eingabe",
+    "needsInput": "{{provider}} benötigt deine Eingabe",
     "selectAllThatApply": "Mehrere auswählbar",
     "other": "Sonstiges...",
     "back": "Zurück",

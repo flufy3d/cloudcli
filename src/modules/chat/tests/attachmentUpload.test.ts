@@ -214,4 +214,58 @@ describe('uploadAttachmentFiles', () => {
 
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
+
+  it('retries when server returns HTTP 400 with "Request aborted" and succeeds on subsequent attempt', async () => {
+    const mockAttachments = [{ id: '1', name: 'img1.png' }];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        statusText: 'Bad Request',
+        json: async () => ({ error: 'Request aborted' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ attachments: mockAttachments }),
+      });
+
+    const file = createFile('img1.png');
+    const result = await uploadAttachmentFiles([file], {
+      fetchFn,
+      maxRetries: 2,
+      retryDelayMs: 10,
+    });
+
+    expect(result).toEqual(mockAttachments);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries when server returns HTTP 400 with "Upload interrupted" and succeeds on subsequent attempt', async () => {
+    const mockAttachments = [{ id: '1', name: 'img1.png' }];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        statusText: 'Bad Request',
+        json: async () => ({ error: 'Upload interrupted' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ attachments: mockAttachments }),
+      });
+
+    const file = createFile('img1.png');
+    const result = await uploadAttachmentFiles([file], {
+      fetchFn,
+      maxRetries: 2,
+      retryDelayMs: 10,
+    });
+
+    expect(result).toEqual(mockAttachments);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
 });

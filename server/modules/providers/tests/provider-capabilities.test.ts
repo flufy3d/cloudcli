@@ -124,9 +124,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
-    // The OpenCode runtime carries a permission bridge (server
-    // `permission.asked` → chat cards, `question.asked` → AskUserQuestion), so
-    // its runtime.permissions facet is present.
+    // The runtime mounts the permissions facet: permission asks and question
+    // forms surface as cards answered through the service API.
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
     // OpenCode Go exposes the official usage endpoint (5-hour/weekly/monthly
@@ -134,17 +133,14 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: false,
     supportsEffort: true,
-    // The sessions provider resolves an edit anchor and rewinds through the
-    // server's `revert` primitive, so editing an already-sent message works.
-    supportsMessageEditing: true,
-    // The fork facet branches a conversation through the server's `fork`.
-    supportsSessionForking: true,
-    // `opencode run --command compact` runs the CLI's own compaction command.
-    supportsCompaction: true,
+    // The service-client runtime carries no edit/rewind or fork path yet, so
+    // neither capability is derived for this provider.
+    supportsMessageEditing: false,
+    supportsSessionForking: false,
+    supportsCompaction: false,
     supportsNativeScheduling: false,
-    editRevertsFiles: true,
-    // The server absorbs a mid-turn message at the running turn's next step.
-    inputWhileBusy: 'always',
+    editRevertsFiles: false,
+    inputWhileBusy: 'queue',
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -240,7 +236,7 @@ test('the catalog covers exactly the registered providers with valid mode tables
 
 test('only providers whose runtime can inject input mid-turn declare inputWhileBusy always', () => {
   for (const provider of providerRegistry.listProviders()) {
-    const declaresAlways = PROVIDER_CATALOG[provider.id].inputWhileBusy === 'always';
+    const declaresAlways = String(PROVIDER_CATALOG[provider.id].inputWhileBusy) === 'always';
     const canInject = typeof provider.runtime.injectInput === 'function';
     assert.equal(
       declaresAlways,
@@ -250,9 +246,8 @@ test('only providers whose runtime can inject input mid-turn declare inputWhileB
   }
 });
 
-test('the catalog default model equals each provider models definition DEFAULT', async () => {
+test('the catalog fallback default matches each static provider models definition DEFAULT', async () => {
   const { CLAUDE_PREDEFINED_MODELS } = await import('../list/claude/claude-models.provider.js');
-  const { CODEX_PREDEFINED_MODELS } = await import('../list/codex/codex-models.provider.js');
   const { CURSOR_PREDEFINED_MODELS } = await import('../list/cursor/cursor-models.provider.js');
   const { OPENCODE_PREDEFINED_MODELS } = await import('../list/opencode/opencode-models.provider.js');
   const { ZCODE_BUILTIN_MODELS } = await import('../list/zcode/zcode-models.provider.js');
@@ -261,7 +256,6 @@ test('the catalog default model equals each provider models definition DEFAULT',
   const defaults = {
     claude: CLAUDE_PREDEFINED_MODELS.DEFAULT,
     cursor: CURSOR_PREDEFINED_MODELS.DEFAULT,
-    codex: CODEX_PREDEFINED_MODELS.DEFAULT,
     opencode: OPENCODE_PREDEFINED_MODELS.DEFAULT,
     zcode: ZCODE_BUILTIN_MODELS.DEFAULT,
     antigravity: ANTIGRAVITY_BUILTIN_MODELS.DEFAULT,

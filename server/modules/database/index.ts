@@ -37,3 +37,5 @@ export type {
   ScheduledJobStatus,
   ScheduledJobUpdate,
 } from './repositories/scheduled-jobs.db.js';
+// taskContinuationDb: used by Task Continuations module to persist async tasks and transactional outbox continuation events.
+export { taskContinuationDb } from '@/modules/database/repositories/task-continuation.repository.js';

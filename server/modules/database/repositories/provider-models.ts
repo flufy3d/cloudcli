@@ -146,13 +146,13 @@ export const providerModelsDb = {
         return null;
       }
 
-      // The effort is cleared alongside the model because it was chosen for the
-      // deleted model; replaced sessions resume on the fallback model's default.
+      // Clear effort only when switching models. Removing a custom name for an
+      // engine-discovered model leaves both the model and its effort intact.
       db.prepare(`
         UPDATE sessions
         SET model = ?, effort = NULL, updated_at = CURRENT_TIMESTAMP
-        WHERE provider = ? AND model = ?
-      `).run(fallbackModelId, provider, row.model_id);
+        WHERE provider = ? AND model = ? AND model <> ?
+      `).run(fallbackModelId, provider, row.model_id, fallbackModelId);
 
       db.prepare(`
         DELETE FROM provider_models

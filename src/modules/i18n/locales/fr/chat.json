@@ -222,7 +222,7 @@
     }
   },
   "misc": {
-    "needsInput": "L'assistant attend votre réponse",
+    "needsInput": "{{provider}} attend votre réponse",
     "selectAllThatApply": "Sélectionnez tout ce qui s'applique",
     "other": "Autre...",
     "back": "Retour",

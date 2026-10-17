@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook } from '@testing-library/react';
 import { beforeEach, afterEach, test, vi } from 'vitest';
 
 import type { ProviderModelsDefinition } from '@/shared/types';
@@ -75,8 +75,8 @@ test('retries after network failures and recovers when the server comes back', a
   const { result } = renderProviderState();
   await settleRetries();
 
-  // 1 failed attempt (all providers) + 1 successful retry round
-  assert.equal(modelsCalls().length, PROVIDER_COUNT * 2);
+  // The initial round loads all providers; only the failed provider retries.
+  assert.equal(modelsCalls().length, PROVIDER_COUNT + 1);
   assert.equal(result.current.providerModelsError, false);
   assert.equal(result.current.providerModelsLoading, false);
   assert.equal(result.current.providerModelCatalog.zcode?.DEFAULT, 'glm-a');
@@ -138,4 +138,76 @@ test('a single failing provider does not block the rest of the catalog', async (
   assert.equal(result.current.providerModelsError, false);
   assert.equal(result.current.providerModelCatalog.zcode, undefined);
   assert.equal(result.current.providerModelCatalog.claude?.DEFAULT, 'm-ok');
+});
+
+test('a Codex-only failure retries and exposes manual recovery when Codex is selected', async () => {
+  mockAuthenticatedFetch.mockImplementation((url) => Promise.resolve({
+    json: () => Promise.resolve(String(url).includes('/codex/') ? { success: false } : modelsPayload('ok')),
+  } as Response));
+  const { result } = renderProviderState();
+  await settleRetries();
+  await act(async () => { result.current.setProvider('codex'); });
+  assert.equal(result.current.providerModelsError, true);
+  assert.equal(result.current.providerModelsLoading, false);
+  assert.equal(result.current.providerModelCatalog.claude?.DEFAULT, 'ok');
+  assert.equal(modelsCalls().filter(([url]) => String(url).includes('/codex/')).length, 3);
+  await act(async () => { result.current.setProvider('claude'); });
+  assert.equal(result.current.providerModelsError, false);
+  mockAuthenticatedFetch.mockImplementation(() => Promise.resolve({ json: () => Promise.resolve(modelsPayload('recovered')) } as Response));
+  await act(async () => { await result.current.providerModelsReload(); });
+  await act(async () => { result.current.setProvider('codex'); });
+  assert.equal(result.current.providerModelsError, false);
+  assert.equal(result.current.providerModelCatalog.codex?.DEFAULT, 'recovered');
+});
+
+test('a new user follows the engine default while a stored model choice remains selected', async () => {
+  mockAuthenticatedFetch.mockImplementation(() => Promise.resolve({
+    json: () => Promise.resolve({ success: true, data: { models: {
+      DEFAULT: 'engine-default',
+      OPTIONS: [{ value: 'engine-default', label: 'New default' }, { value: 'gpt-6.1-sol', label: 'Previous default' }],
+    } } }),
+  } as Response));
+  const first = renderProviderState();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); first.result.current.setProvider('codex'); });
+  assert.equal(first.result.current.currentProviderModel, 'engine-default');
+  first.unmount();
+  localStorage.setItem('codex-model', 'gpt-6.1-sol');
+  const second = renderProviderState();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); second.result.current.setProvider('codex'); });
+  assert.equal(second.result.current.currentProviderModel, 'gpt-6.1-sol');
+});
+
+test('a slow Codex request does not delay an already loaded Claude catalog', async () => {
+  let finish: ((response: Response) => void) | undefined;
+  const slow = new Promise<Response>((resolve) => { finish = resolve; });
+  mockAuthenticatedFetch.mockImplementation((url) => String(url).includes('/codex/')
+    ? slow : Promise.resolve({ json: () => Promise.resolve(modelsPayload('ready')) } as Response));
+  const { result } = renderProviderState();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  assert.equal(result.current.providerModelCatalog.claude?.DEFAULT, 'ready');
+  assert.equal(result.current.providerModelsLoading, false);
+  await act(async () => { result.current.setProvider('codex'); });
+  assert.equal(result.current.providerModelsLoading, true);
+  await act(async () => { finish!({ json: () => Promise.resolve(modelsPayload('codex-ready')) } as Response); });
+  assert.equal(result.current.providerModelsLoading, false);
+});
+
+test('removing a custom entry still offered by the engine preserves the selected model and effort', async () => {
+  localStorage.setItem('codex-model', 'available');
+  localStorage.setItem('codex-effort', 'high');
+  const option = { value: 'available', label: 'My name', isCustom: true, recordId: 12,
+    effort: { default: 'low', values: [{ value: 'low' }, { value: 'high' }] } };
+  const models = { DEFAULT: 'other', OPTIONS: [{ value: 'other', label: 'Other' }, option] };
+  mockAuthenticatedFetch.mockImplementation((_url, init) => Promise.resolve({
+    ok: true,
+    json: () => Promise.resolve({ success: true, data: init?.method === 'DELETE'
+      ? { model: option, models: { ...models, OPTIONS: [models.OPTIONS[0], { ...option, label: 'Official', isCustom: false, recordId: undefined }] } }
+      : { models } }),
+  } as Response));
+  const { result } = renderProviderState();
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); result.current.setProvider('codex'); });
+  await act(async () => { await result.current.providerModelActions.remove('codex', option); });
+  assert.equal(result.current.currentProviderModel, 'available');
+  assert.equal(result.current.currentProviderEffort, 'high');
+  assert.equal(result.current.currentProviderModelOptions.find((item) => item.value === 'available')?.label, 'Official');
 });

@@ -675,8 +675,9 @@ export function shouldResendPromptForIdleTurn({ hasPrompt, sawTaskNotification, 
 // count when they are backgrounded; the rest defer or watch work by nature.
 // Workflow belongs here rather than in a branch of its own: its input schema has
 // no foreground option at all, so every call returns a task id immediately and
-// reports back in a later turn.
-const DEFERRED_WORK_TOOLS = new Set(['Monitor', 'ScheduleWakeup', 'CronCreate', 'TaskCreate', 'Workflow']);
+// reports back in a later turn. TaskCreate is not here: it writes a to-do item
+// and never pushes a follow-up turn, so it must not hold the process.
+const DEFERRED_WORK_TOOLS = new Set(['Monitor', 'ScheduleWakeup', 'CronCreate', 'Workflow']);
 
 /**
  * Extracts tool calls that keep working after the turn's `result` arrives.

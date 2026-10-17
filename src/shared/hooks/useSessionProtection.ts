@@ -73,12 +73,14 @@ export function useSessionProtection() {
       // A new turn on a session that was only doing background work starts
       // its own clock: the stale idle-ack guard compares against it, and the
       // tasks' start is not when this response began.
-      const continuing = existing && !existing.background ? existing : undefined;
+      const background = activity?.background === true;
+      const continuing = existing && Boolean(existing.background) === background ? existing : undefined;
       const next: SessionActivity = {
         statusText:
           activity?.statusText !== undefined ? activity.statusText : continuing?.statusText ?? null,
         canInterrupt: activity?.canInterrupt ?? continuing?.canInterrupt ?? true,
         startedAt: continuing?.startedAt ?? Date.now(),
+        ...(background ? { background: true } : {}),
         // The tasks keep running under the new turn; they are reported again
         // when it ends.
         ...(existing?.tasks ? { tasks: existing.tasks } : {}),
@@ -108,7 +110,7 @@ export function useSessionProtection() {
       // A background-only entry is not a response, so nothing that reports
       // "no response in flight" — an idle subscribe ack, a rejected send —
       // has anything to say about it.
-      if (!existing || existing.background) {
+      if (!existing || (opts?.backgroundOnly ? !existing.background : existing.background)) {
         return prev;
       }
 

@@ -241,7 +241,7 @@
     }
   },
   "misc": {
-    "needsInput": "어시스턴트가 입력을 기다리고 있습니다",
+    "needsInput": "{{provider}}가 입력을 기다리고 있습니다",
     "selectAllThatApply": "해당하는 항목을 모두 선택하세요",
     "other": "기타...",
     "back": "뒤로",

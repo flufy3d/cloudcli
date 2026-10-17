@@ -300,18 +300,7 @@ export class ZCodeLiveEventNormalizer {
       return [];
     }
     if (stage === 'result' || stage === 'error') {
-      const resultPartId = readOptionalString(payload.resultPartId);
-      const content = resultPartId ? `Result stored in part ${resultPartId}` : '';
-      return [createNormalizedMessage({
-        id: baseId,
-        sessionId,
-        timestamp,
-        provider: PROVIDER,
-        kind: 'tool_result',
-        toolId: readOptionalString(payload.toolCallId) ?? baseId,
-        content,
-        toolResult: { content, isError: stage === 'error' },
-      })];
+      return this.normalizeToolResult(payload, sessionId, timestamp, baseId, stage === 'error');
     }
 
     // Announce (`tool.updated` kind=scheduled) arrives AFTER the call's
@@ -432,22 +421,49 @@ export class ZCodeLiveEventNormalizer {
       })];
     }
 
-    if (kind === 'tool_result') {
-      const resultPartId = readOptionalString(payload.resultPartId);
-      const content = resultPartId ? `Result stored in part ${resultPartId}` : '';
-      return [createNormalizedMessage({
-        id: baseId,
-        sessionId,
-        timestamp,
-        provider: PROVIDER,
-        kind: 'tool_result',
-        toolId: readOptionalString(payload.toolCallId) ?? baseId,
-        content,
-        toolResult: { content, isError: false },
-      })];
+    if (kind === 'tool_result' || kind === 'tool_error') {
+      return this.normalizeToolResult(payload, sessionId, timestamp, baseId, kind === 'tool_error');
     }
 
     return [];
+  }
+
+  /** Both event families carry the output on the event, not in resultPartId. */
+  private normalizeToolResult(
+    payload: AnyRecord,
+    sessionId: string | null,
+    timestamp: string,
+    baseId: string,
+    reportedError: boolean,
+  ): NormalizedMessage[] {
+    const result = readObjectRecord(payload.result);
+    const isError = reportedError || result?.success === false;
+    const value = result?.content ?? (isError ? payload.error ?? result?.error : undefined);
+    // A result reference alone is not output. Do not mark a malformed event
+    // completed with fabricated text; a later full result/history can fill it.
+    if (value === undefined) {
+      console.warn('[ZCodeProvider] Tool result event has no content', {
+        sessionId, toolCallId: readOptionalString(payload.toolCallId),
+        resultPartId: readOptionalString(payload.resultPartId),
+      });
+      if (!isError) return [];
+    }
+    // Even an error without a body must reach the card as failed, so the
+    // client's end-of-turn cleanup cannot settle it as a successful call.
+    const content = value === undefined ? '' : typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    return [createNormalizedMessage({
+      id: baseId,
+      sessionId,
+      timestamp,
+      provider: PROVIDER,
+      kind: 'tool_result',
+      toolId: readOptionalString(payload.toolCallId) ?? baseId,
+      content,
+      // The frontend pairs a standalone result by its top-level fields;
+      // persisted tool cards instead read the nested result directly.
+      isError,
+      toolResult: { content, isError },
+    })];
   }
 
   /**

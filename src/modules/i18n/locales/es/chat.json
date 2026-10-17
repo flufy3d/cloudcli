@@ -147,7 +147,7 @@
     }
   },
   "misc": {
-    "needsInput": "El asistente necesita tu respuesta",
+    "needsInput": "{{provider}} necesita tu respuesta",
     "selectAllThatApply": "Selecciona todo lo que corresponda",
     "other": "Otro...",
     "back": "Atrás",

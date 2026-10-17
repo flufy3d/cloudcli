@@ -377,7 +377,7 @@
     "copyCommand": "Copy command",
     "runningTask": "Running task",
     "userAskedRevise": "User asked to revise the plan",
-    "needsInput": "The assistant needs your input",
+    "needsInput": "{{provider}} needs your input",
     "selectAllThatApply": "Select all that apply",
     "other": "Other...",
     "back": "Back",

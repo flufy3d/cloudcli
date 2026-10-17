@@ -38,6 +38,7 @@ async function withGateway(
     stops: StopCall[];
     aborts: Array<{ provider: string; sessionId: string }>;
   }) => Promise<void>,
+  stopError?: Error,
 ): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'chat-stop-task-'));
@@ -60,6 +61,7 @@ async function withGateway(
         runtime: {
           stopBackgroundTask: async (provider: string, sessionId: string, taskId: string) => {
             stops.push({ provider, sessionId, taskId });
+            if (stopError) throw stopError;
             return taskId === knownTaskId;
           },
           hasBackgroundWork: (sessionId: string) => sessionId === SESSION_ID,
@@ -142,4 +144,14 @@ test('chat.abort with only background work running still reaches the provider ru
     assert.deepEqual(aborts, [{ provider: 'claude', sessionId: SESSION_ID }]);
     assert.deepEqual(socket.frames, []);
   });
+});
+
+test('an engine stop exception is reported against the task session', async () => {
+  await withGateway('task-1', async ({ socket }) => {
+    socket.emit('message', JSON.stringify({ type: 'chat.stop-task', sessionId: SESSION_ID, taskId: 'task-1' }));
+    await settle();
+    assert.equal(socket.frames[0]?.code, 'TASK_STOP_FAILED');
+    assert.equal(socket.frames[0]?.sessionId, SESSION_ID);
+    assert.equal(socket.frames[0]?.error, 'Engine refused stop');
+  }, new Error('Engine refused stop'));
 });

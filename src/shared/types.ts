@@ -362,16 +362,16 @@ export type SessionActivity = {
 /** Every busy session, keyed by session id. Read it to tell whether a session is busy; check `background` to tell how. */
 export type SessionActivityMap = ReadonlyMap<string, SessionActivity>;
 
-/** Marks a session as producing a response; call it as soon as a send is dispatched so the UI reacts immediately. */
+/** Marks a response or background phase as active; a new send starts a response phase immediately. */
 export type MarkSessionProcessing = (
   sessionId?: string | null,
-  activity?: { statusText?: string | null; canInterrupt?: boolean },
+  activity?: { statusText?: string | null; canInterrupt?: boolean; background?: boolean },
 ) => void;
 
-/** Marks a session's response as finished; `ifStartedBefore` lets a late acknowledgement clear only a stale run. Leaves background-only work alone, which it says nothing about. */
+/** Clears the response phase by default, or only the background phase with `backgroundOnly`. `ifStartedBefore` guards stale response acknowledgements. */
 export type MarkSessionIdle = (
   sessionId?: string | null,
-  opts?: { ifStartedBefore?: number },
+  opts?: { ifStartedBefore?: number; backgroundOnly?: boolean },
 ) => void;
 
 /** Records the background tasks a session still has once its turn ended; an empty list marks it idle. */
@@ -770,6 +770,8 @@ export type ToolStatus = 'running' | 'completed' | 'error' | 'denied';
 /** Props contract that every interactive permission panel implements, giving the panel the pending request and the callback it calls to allow or deny that request; use it when registering a panel in the permission panel registry. */
 export type PermissionPanelProps = {
   request: PendingPermissionRequest;
+  /** Display name of the provider that raised the request ("OpenCode"); panels show it in their titles instead of a hardcoded engine name. */
+  providerLabel?: string;
   onDecision: (
     requestIds: string | string[],
     decision: { allow?: boolean; message?: string; updatedInput?: unknown },

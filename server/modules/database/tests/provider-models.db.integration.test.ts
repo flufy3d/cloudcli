@@ -78,6 +78,12 @@ test('provider model repository stores custom rows only and maintains session re
     // fallback, which has its own default.
     assert.equal(sessionsDb.getSessionById('session-1')?.effort, null);
     assert.equal(providerModelsDb.getCustomProviderModel('codex', custom.recordId), null);
+
+    const override = providerModelsDb.createCustomProviderModel('codex', { id: 'gpt-default', model: 'My name' });
+    sessionsDb.setSessionEffort('session-1', 'high');
+    providerModelsDb.deleteCustomProviderModel('codex', override.recordId, 'gpt-default');
+    assert.equal(sessionsDb.getSessionById('session-1')?.model, 'gpt-default');
+    assert.equal(sessionsDb.getSessionById('session-1')?.effort, 'high');
   } finally {
     closeConnection();
     if (previousDatabasePath === undefined) {

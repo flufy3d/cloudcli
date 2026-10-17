@@ -17,7 +17,7 @@ import { Tooltip } from '@/shared/ui/Tooltip';
 import { useVoiceInput } from '@/modules/chat/hooks/useVoiceInput';
 import { useVoiceAvailable } from '@/modules/chat/hooks/useVoiceAvailable';
 import type { QueuedDraft } from '@/modules/chat/hooks/useChatComposerState';
-import type { SessionActivity, ScheduledJob, ScheduledMessage } from '@/shared/types';
+import type { LLMProvider, SessionActivity, ScheduledJob, ScheduledMessage } from '@/shared/types';
 import type { PendingPermissionRequest, PermissionMode } from '@/shared/types';
 import type { ProviderModelOption } from '@/shared/types';
 import {
@@ -74,6 +74,8 @@ type ChatComposerProps = {
   permissionMode: PermissionMode | string;
   availablePermissionModes: (PermissionMode | string)[];
   onSelectPermissionMode: (mode: PermissionMode | string) => void;
+  /** The session's engine id; the permission banner uses it to decide whether a persistent allow rule exists. */
+  provider: LLMProvider;
   providerLabel: string;
   effort: string;
   availableEffortOptions: NonNullable<ProviderModelOption['effort']>['values'];
@@ -178,6 +180,7 @@ function ChatComposer({
   permissionMode,
   availablePermissionModes,
   onSelectPermissionMode,
+  provider,
   providerLabel,
   effort,
   availableEffortOptions,
@@ -243,7 +246,7 @@ function ChatComposer({
   onInputFocusChange,
   placeholder,
   isTextareaExpanded,
-  sendByCtrlEnter,
+  sendByCtrlEnter = false,
   backgroundTasks = [],
   onStopBackgroundTasks,
   hasActiveBackgroundTasks = false,
@@ -323,11 +326,20 @@ function ChatComposer({
   const canSendDuringTurn = isLoading && !queuesInput && hasDraftContent;
   const submitHint = canQueueDraft
     ? hasQueuedDraft
-      ? t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' })
-      : t('input.hintText.queue', { defaultValue: 'Enter to queue your next message' })
+      ? sendByCtrlEnter
+        ? t('input.hintText.updateQueuedCtrl', {
+            defaultValue: t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' }).replace(/^Enter/, 'Ctrl+Enter'),
+          })
+        : t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' })
+      : sendByCtrlEnter
+        ? t('input.hintText.queueCtrl', {
+            defaultValue: t('input.hintText.queue', { defaultValue: 'Enter to queue your next message' }).replace(/^Enter/, 'Ctrl+Enter'),
+          })
+        : t('input.hintText.queue', { defaultValue: 'Enter to queue your next message' })
     : sendByCtrlEnter
       ? t('input.hintText.ctrlEnter')
       : t('input.hintText.enter');
+  const sendButtonLabel = `${t('input.send')} (${sendByCtrlEnter ? 'Ctrl+Enter' : 'Enter'})`;
   const submitAriaLabel = isSubmitting
     ? t('input.sending')
     : canQueueDraft
@@ -336,7 +348,7 @@ function ChatComposer({
       : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
     : isLoading && !canSendDuringTurn
       ? t('input.stop')
-      : t('input.send');
+      : sendButtonLabel;
 
   return (
     <div className="chat-composer-shell relative flex-shrink-0 px-2 pb-2 pt-0 sm:px-4 sm:pb-4 md:px-4 md:pb-6">
@@ -349,6 +361,8 @@ function ChatComposer({
       {pendingPermissionRequests.length > 0 && (
         <div className="mx-auto mb-3 max-w-[54.25rem]">
           <PermissionRequestsBanner
+            provider={provider}
+            providerLabel={providerLabel}
             pendingPermissionRequests={pendingPermissionRequests}
             handlePermissionDecision={handlePermissionDecision}
             handleGrantToolPermission={handleGrantToolPermission}

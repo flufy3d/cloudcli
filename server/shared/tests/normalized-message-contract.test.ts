@@ -14,6 +14,16 @@ import test from 'node:test';
 import { enforceNormalizedMessageContract } from '@/shared/normalized-message-contract.js';
 import { generateMessageId } from '@/shared/utils.js';
 
+test('background reply state survives the gateway even after task cards are gone', () => {
+  const result = enforceNormalizedMessageContract({
+    kind: 'status', provider: 'claude', sessionId: 's1',
+    text: 'background_tasks', backgroundTasks: [], backgroundWorkPending: true,
+  });
+  assert.ok(result.ok);
+  assert.equal(result.message.backgroundWorkPending, true);
+  assert.deepEqual(result.strippedKeys, []);
+});
+
 test('a conforming message passes through untouched', () => {
   const payload = {
     id: 'msg-1',

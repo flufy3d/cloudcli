@@ -14,12 +14,12 @@
 import fsSync from 'node:fs';
 
 import { projectsDb } from '@/modules/database/index.js';
-import { isInfrastructureWorkspacePath } from '@/shared/utils.js';
+import { isInfrastructureWorkspacePath, isSystemTemporaryWorkspacePath } from '@/shared/utils.js';
 
 /**
  * Decides whether sessions recorded against `projectPath` may be indexed.
  *
- * Two rejection rules, both aimed at directories that are runtime artifacts
+ * Three rejection rules, all aimed at directories that are runtime artifacts
  * rather than places the user works:
  *
  * 1. Package-manager and runtime internals (`node_modules`, pnpm's `.pnpm`
@@ -30,18 +30,23 @@ import { isInfrastructureWorkspacePath } from '@/shared/utils.js';
  *    engine's own session index still names it, so every restart used to
  *    resurrect the same ghost projects — including ones the user had just
  *    deleted.
+ * 3. Anything inside the operating system's temporary directories. Engine
+ *    runtimes stage scratch work there (task review sandboxes, test
+ *    fixtures), and those runs used to land in the sidebar as projects; the
+ *    directories stay out of project indexing entirely. The sessions and
+ *    their engine-side records are untouched — only CloudCLI's own project
+ *    row and its sidebar visibility are affected.
  *
- * The "and was never registered" half is what keeps this from repeating the
- * mistake 1ff5a900 fixed: a temp root is not disqualifying by itself (a
- * scratch clone or bug repro there is real work), and an existing project row
- * whose volume is merely unmounted keeps syncing. Rejection only ever blocks
- * creating a project, never removes one.
+ * The "and was never registered" half is what keeps an unmounted volume or a
+ * detached network share syncing: an existing project row whose directory is
+ * merely absent keeps updating. Rejection only ever blocks creating a
+ * project, never removes one.
  *
  * Consumers: the SQLite session synchronizer skeleton and the claude, codex,
  * and cursor session synchronizers.
  */
 export function admitsWorkspacePath(projectPath: string): boolean {
-  if (isInfrastructureWorkspacePath(projectPath)) {
+  if (isInfrastructureWorkspacePath(projectPath) || isSystemTemporaryWorkspacePath(projectPath)) {
     return false;
   }
 

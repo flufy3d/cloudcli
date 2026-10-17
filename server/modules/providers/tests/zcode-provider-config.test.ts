@@ -155,3 +155,25 @@ test('buildZCodeAccountSyncPayload returns null without a stored JWT', async () 
     assert.equal(buildZCodeAccountSyncPayload(configPath), null);
   });
 });
+
+test('account sync activates the native individual provider when its plan key is available', async () => {
+  await withFixture(async ({ storageDir, bundledDir }) => {
+    const configPath = path.join(bundledDir, 'zcode-builtin.json');
+    await writeFile(configPath, JSON.stringify({ revision: 30 }), 'utf8');
+    await mkdir(path.join(storageDir, 'v2'), { recursive: true });
+    await writeFile(path.join(storageDir, 'v2', 'credentials.json'), JSON.stringify({
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': 'individual-key',
+    }), 'utf8');
+
+    const payload = buildZCodeAccountSyncPayload(configPath);
+    assert.ok(payload);
+    assert.deepEqual((payload.providers as Record<string, unknown>)['account:bigmodel-individual-coding-plan'], {
+      access: { type: 'zhipu-account', entitled: true },
+    });
+    assert.deepEqual((payload.states as Record<string, unknown>)['account:bigmodel-individual-coding-plan'], {
+      availability: 'available', entitled: true, current: true,
+    });
+    // No JWT stored, so the trial provider stays out of the payload.
+    assert.equal((payload.providers as Record<string, unknown>)['account:bigmodel-start-plan'], undefined);
+  });
+});

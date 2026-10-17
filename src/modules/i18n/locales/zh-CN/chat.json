@@ -248,7 +248,7 @@
     }
   },
   "misc": {
-    "needsInput": "需要你的输入",
+    "needsInput": "{{provider}} 需要你的输入",
     "selectAllThatApply": "可多选",
     "other": "其他…",
     "back": "上一步",
