@@ -24,6 +24,11 @@ import { SessionTimelineStore } from '@/modules/chat/utils/sessionTimelineStore'
 import antigravityTurn from '@/modules/chat/tests/fixtures/antigravity-turn.json';
 import claudeTurn from '@/modules/chat/tests/fixtures/claude-turn.json';
 import codexTurn from '@/modules/chat/tests/fixtures/codex-turn.json';
+// opencode's fixture is assembled by hand, but its ids and bodies come from a
+// real v2.0.31 session (ses_eb565a2c…, the reported duplicate). It proves the
+// store merges when the two transports agree; the translator↔history-reader
+// cross-check that keeps them agreeing lives in opencode-sessions.test.ts.
+import opencodeTurn from '@/modules/chat/tests/fixtures/opencode-turn.json';
 
 type Fixture = {
   provider: string;
@@ -82,7 +87,7 @@ function describeRow(row: NormalizedMessage): string {
   return '';
 }
 
-for (const fixture of [antigravityTurn as Fixture, claudeTurn as Fixture, codexTurn as Fixture]) {
+for (const fixture of [antigravityTurn as Fixture, claudeTurn as Fixture, codexTurn as Fixture, opencodeTurn as Fixture]) {
   test(`${fixture.provider}: a live turn and its own history render one transcript`, async () => {
     const rows = await playTurn(fixture);
 

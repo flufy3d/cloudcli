@@ -199,13 +199,19 @@ test('first send creates the session in the project directory, applies mode and 
     assert.deepEqual(service.requests[4].body, { text: 'hello there' });
 
     assert.deepEqual(sessionIds, ['ses_new']);
-    assert.deepEqual(frames.map((frame) => frame.kind), ['session_created', 'stream_delta', 'stream_end', 'status', 'complete']);
+    assert.deepEqual(frames.map((frame) => frame.kind), ['session_created', 'stream_delta', 'text', 'stream_end', 'status', 'complete']);
     assert.equal(frames[0].newSessionId, 'ses_new');
     assert.equal(frames[1].content, 'Hi!');
     assert.equal(frames[1].sessionId, 'app-1');
-    assert.deepEqual(frames[3].tokenBudget, { used: 18, inputTokens: 12, outputTokens: 5, breakdown: { input: 12, output: 5 } });
-    assert.equal(frames[4].success, true);
-    assert.equal(frames[4].exitCode, 0);
+    // The finished text row carries the engine-derived id the history reader
+    // will re-derive, so the streamed placeholder is adopted and later
+    // refreshes cannot render the reply twice.
+    assert.equal(frames[2].id, 'msg_a_text_0');
+    assert.equal(frames[2].role, 'assistant');
+    assert.equal(frames[2].content, 'Hi!');
+    assert.deepEqual(frames[4].tokenBudget, { used: 18, inputTokens: 12, outputTokens: 5, breakdown: { input: 12, output: 5 } });
+    assert.equal(frames[5].success, true);
+    assert.equal(frames[5].exitCode, 0);
   });
 });
 

@@ -5,7 +5,8 @@
  * frames the chat timeline already understands. Event names and payloads
  * are pinned to what v2.0.31 emits (captured live; see the tests' fixtures):
  *
- * - `session.text.delta` → `stream_delta`; `session.text.ended` → `stream_end`
+ * - `session.text.delta` → `stream_delta`; `session.text.ended` → the finished
+ *   `text` row (engine-named, so the streamed placeholder is adopted) + `stream_end`
  * - `session.reasoning.delta` → `thinking` deltas under one stable block id
  *   (the timeline appends same-id thinking frames, so deltas, not totals)
  * - `session.tool.input.started` / `tool.called` → `tool_use` snapshots that
@@ -14,11 +15,12 @@
  *   (`session.step.ended` carries token totals, but the runtime reads the
  *   authoritative session totals from the API snapshot instead)
  *
- * Ids on transcript rows (thinking / tool_use / tool_result) derive from the
- * engine's own identifiers (assistant message id + ordinal, tool call id) so
- * the same record never arrives under two ids. Unknown event types are
- * ignored on purpose: the service is young and adds events between patch
- * releases.
+ * Ids on transcript rows (text / thinking / tool_use / tool_result) derive
+ * from the engine's own identifiers (assistant message id + per-type part
+ * ordinal, tool call id) so the same record never arrives under two ids —
+ * the history reader renumbers its content blocks the same way. Unknown
+ * event types are ignored on purpose: the service is young and adds events
+ * between patch releases.
  *
  * @module opencode-event-translator
  */
@@ -149,16 +151,36 @@ export class OpenCodeSessionEventTranslator {
         };
       }
 
-      case 'session.text.ended':
-        return {
-          frames: [createNormalizedMessage({
-            id: `${messageId}_text_${ordinal}_end`,
+      case 'session.text.ended': {
+        // The finished segment must land as a real transcript row: the streamed
+        // deltas live in a client-side placeholder that only an engine-named
+        // row can retire, and the history reader derives the very same id
+        // (per-type ordinal within the message — see the v2 history flattener).
+        const text = readVerbatimString(data.text);
+        const frames: NormalizedMessage[] = [];
+        // Whitespace-only bodies are skipped by the history reader too; a row
+        // for one would survive every refresh as an orphan with no persisted
+        // copy to retire it.
+        if (text?.trim()) {
+          frames.push(createNormalizedMessage({
+            id: `${messageId}_text_${ordinal}`,
             sessionId: this.sessionId,
             timestamp,
             provider: PROVIDER,
-            kind: 'stream_end',
-          })],
-        };
+            kind: 'text',
+            role: 'assistant',
+            content: text,
+          }));
+        }
+        frames.push(createNormalizedMessage({
+          id: `${messageId}_text_${ordinal}_end`,
+          sessionId: this.sessionId,
+          timestamp,
+          provider: PROVIDER,
+          kind: 'stream_end',
+        }));
+        return { frames };
+      }
 
       case 'session.reasoning.delta': {
         const delta = readVerbatimString(data.delta);

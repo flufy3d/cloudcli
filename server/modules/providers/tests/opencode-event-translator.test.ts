@@ -35,9 +35,35 @@ test('streams text as stream_delta frames and closes each segment with stream_en
   assert.equal(delta.frames[0].timestamp, new Date(1792203579833).toISOString());
 
   const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: 'cloudcli-probe-123' }));
-  assert.equal(ended.frames.length, 1);
-  assert.equal(ended.frames[0].kind, 'stream_end');
+  assert.equal(ended.frames.length, 2);
+  assert.equal(ended.frames[0].kind, 'text');
+  assert.equal(ended.frames[0].role, 'assistant');
+  assert.equal(ended.frames[0].content, 'cloudcli-probe-123');
+  assert.equal(ended.frames[1].kind, 'stream_end');
   assert.equal(ended.terminal, undefined);
+});
+
+test('names the finished text row after the streamed segment id, so the client placeholder can be adopted', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+
+  // Block 1 is a text part that follows a reasoning part; per-type ordinals
+  // count text parts only, so this block streams and lands as ordinal 0.
+  translator.translate(event('session.reasoning.delta', { assistantMessageID: MESSAGE, ordinal: 0, delta: 'thinking' }));
+  const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: 'cloudcli-probe-123' }));
+
+  const textRow = ended.frames[0];
+  assert.equal(textRow.kind, 'text');
+  assert.equal(textRow.id, `${MESSAGE}_text_0`);
+  assert.ok(!isVolatileMessageId(textRow.id), 'transcript rows need deterministic ids');
+});
+
+test('an ended text segment with no body still closes the stream but emits no empty row', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  for (const text of ['', '   ']) {
+    const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text }));
+    assert.equal(ended.frames.length, 1);
+    assert.equal(ended.frames[0].kind, 'stream_end');
+  }
 });
 
 test('emits reasoning deltas under one stable block id and does not repeat the block on ended', () => {

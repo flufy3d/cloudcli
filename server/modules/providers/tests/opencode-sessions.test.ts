@@ -7,6 +7,7 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { OpenCodeSessionEventTranslator } from '@/modules/providers/list/opencode/opencode-event-translator.js';
 import { OpenCodeSessionSynchronizer } from '@/modules/providers/list/opencode/opencode-session-synchronizer.provider.js';
 import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
 import { appendImagesInputTag } from '@/shared/image-attachments.js';
@@ -696,11 +697,13 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
     assert.equal(history.messages[0]?.content, 'Build it');
     assert.equal(history.messages[1]?.kind, 'thinking');
     assert.equal(history.messages[1]?.content, 'thinking');
+    assert.equal(history.messages[1]?.id, 'msg_a_reasoning_0');
     assert.equal(history.messages[2]?.kind, 'tool_use');
     assert.equal(history.messages[2]?.toolName, 'write');
     assert.deepEqual(history.messages[2]?.toolInput, { path: '/tmp/x' });
     assert.deepEqual(history.messages[2]?.toolResult, { content: 'ok', isError: false });
     assert.equal(history.messages[3]?.content, 'done');
+    assert.equal(history.messages[3]?.id, 'msg_a_text_0');
     // Totals come from the session_v2 token columns: 100+20+5+8+2.
     assert.deepEqual(history.tokenUsage, {
       used: 135,
@@ -708,6 +711,90 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
       outputTokens: 20,
       breakdown: { input: 108, output: 20 },
     });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('v2 history rows carry the same ids the live translator produces for the same message', { concurrency: false }, async () => {
+  // The cross-transport identity contract: the SSE stream names a part
+  // `${assistantMessageID}_text_${ordinal}` / `${assistantMessageID}_reasoning_${ordinal}`,
+  // where ordinal counts that type's parts within the message (v2.0.31
+  // initializes the counter per message). The history reader flattens the
+  // same message's content blocks, so it must renumber by type the same way
+  // — otherwise the timeline renders the live copy beside its persisted copy.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-ids-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY, project_id text NOT NULL, slug text NOT NULL,
+          directory text NOT NULL, title text, version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL, tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL, tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL, time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,
+          seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+          VALUES ('ses_ids', 'proj_1', 's', '/tmp/proj', 'S', '2.0.31', 1000, 2000);
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_a', 'ses_ids', 'assistant', 1, 1100, 1200,
+            '{"time":{"created":1100},"content":[{"type":"reasoning","text":"why"},{"type":"text","text":"first prose"},{"type":"tool","id":"call_9","name":"write","state":{"status":"completed","input":{},"output":"ok"}},{"type":"reasoning","text":"more why"},{"type":"text","text":"second prose"}]}');
+      `);
+    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('ses_ids');
+    const historyId = (kind: string, content: string) =>
+      history.messages.find((row) => row.kind === kind && row.content === content)?.id;
+
+    // The live events the same message produces, normalized by the translator.
+    const translator = new OpenCodeSessionEventTranslator('app-session');
+    const liveId = (type: string, data: Record<string, unknown>) =>
+      translator.translate({
+        id: `evt_${type}`, created: 1792203579833, type,
+        location: { directory: '/tmp/proj' },
+        data: { sessionID: 'ses_ids', assistantMessageID: 'msg_a', ...data },
+      }).frames[0]?.id;
+
+    assert.equal(
+      historyId('thinking', 'why'),
+      liveId('session.reasoning.delta', { ordinal: 0, delta: 'why' }),
+      'first reasoning part must carry the same id on both transports',
+    );
+    assert.equal(
+      historyId('text', 'first prose'),
+      liveId('session.text.delta', { ordinal: 0, delta: 'first prose' }),
+      'first text part must carry the same id on both transports',
+    );
+    assert.equal(
+      historyId('thinking', 'more why'),
+      liveId('session.reasoning.delta', { ordinal: 1, delta: 'more why' }),
+      'the second reasoning part counts its own type, not the block index',
+    );
+    assert.equal(
+      historyId('text', 'second prose'),
+      liveId('session.text.delta', { ordinal: 1, delta: 'second prose' }),
+      'the second text part counts its own type, not the block index',
+    );
+
+    // Tool rows already reconcile through the native call id (toolId), which
+    // the history rows keep publishing.
+    const toolRow = history.messages.find((row) => row.kind === 'tool_use');
+    assert.equal(toolRow?.toolId, 'call_9');
   } finally {
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });

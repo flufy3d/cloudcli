@@ -195,6 +195,13 @@ const flattenOpenCodeV2HistoryRows = (
     }
 
     const content = Array.isArray(data.content) ? data.content : [];
+    // The SSE stream names a part `${messageID}_text_${ordinal}` /
+    // `${messageID}_reasoning_${ordinal}`, where ordinal counts that type's
+    // parts within the message (the engine initializes the counter per
+    // message). Renumber blocks the same way so both transports name one
+    // record identically — the timeline deduplicates on that id.
+    let textOrdinal = 0;
+    let reasoningOrdinal = 0;
     content.forEach((block, index) => {
       const blockRecord = readObjectRecord(block);
       if (!blockRecord) {
@@ -203,8 +210,12 @@ const flattenOpenCodeV2HistoryRows = (
 
       const blockType = readOptionalString(blockRecord.type);
       let partData: Record<string, unknown> | null = null;
+      let partId = `${messageRow.id}_${index}`;
       if (blockType === 'text' || blockType === 'reasoning') {
         partData = { type: blockType, text: readOptionalString(blockRecord.text) ?? '' };
+        partId = blockType === 'text'
+          ? `text_${textOrdinal++}`
+          : `reasoning_${reasoningOrdinal++}`;
       } else if (blockType === 'tool') {
         partData = {
           type: 'tool',
@@ -221,7 +232,7 @@ const flattenOpenCodeV2HistoryRows = (
         message_id: messageRow.id,
         message_time_created: messageRow.time_created,
         message_data: messageData,
-        part_id: `${messageRow.id}_${index}`,
+        part_id: partId,
         part_time_created: messageRow.time_updated ?? messageRow.time_created,
         part_data: JSON.stringify(partData),
       });
