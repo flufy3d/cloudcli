@@ -175,6 +175,26 @@ test('maps execution terminals: succeeded, failed (message for the runtime), int
   assert.deepEqual(interrupted, { frames: [], terminal: { outcome: 'interrupted', reason: 'user' } });
 });
 
+test('reports a failed compaction through the result, not as a frame or terminal', () => {
+  // Payload captured live from v2.0.32. The engine keeps running after this
+  // (execution.succeeded follows), so only a run that asked for the
+  // compaction may treat it as the run's failure — that decision rides the
+  // result, not a frame.
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+
+  const started = translator.translate(event('session.compaction.started', {
+    reason: 'manual', recent: '', inputID: 'msg_147a85cab001uo8epROih4QC82',
+  }, { location: undefined }));
+  assert.deepEqual(started, { frames: [] });
+
+  const failed = translator.translate(event('session.compaction.failed', {
+    reason: 'manual',
+    inputID: 'msg_147a85cab001uo8epROih4QC82',
+    error: { type: 'provider.no-route', message: 'Model unavailable: opencode/gpt-5.6-terra' },
+  }, { location: undefined }));
+  assert.deepEqual(failed, { frames: [], compactionError: 'Model unavailable: opencode/gpt-5.6-terra' });
+});
+
 test('ignores lifecycle chatter and unknown event types', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
   for (const type of [
@@ -182,6 +202,10 @@ test('ignores lifecycle chatter and unknown event types', () => {
     'session.inbox.enqueued', 'session.inbox.delivered', 'session.instructions.updated',
     'session.execution.started', 'session.step.started', 'session.step.streamed',
     'session.step.failed', 'session.usage.updated', 'session.text.started', 'session.reasoning.started',
+    // The compaction lifecycle itself (its summary reaches the transcript
+    // through history, not through live frames);
+    // `session.compaction.failed` is handled above.
+    'session.compaction.delta', 'session.compaction.ended',
     'session.something.new',
   ]) {
     assert.deepEqual(translator.translate(event(type, { anything: true })), { frames: [] }, type);

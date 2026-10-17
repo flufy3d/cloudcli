@@ -15,6 +15,10 @@
  *   it — that request's whole prompt plus what it generated — i.e. what the
  *   context window held when that turn ran. That is the occupancy the composer
  *   badge must show.
+ * - A compaction (v2.0.32 writes it as a `compaction` message row) replaces
+ *   that conversation: its own tokens describe the summarization request, so
+ *   the reader reports `compacted` with the summary's byte size instead of an
+ *   occupancy until the next turn runs.
  *
  * Both the history reader (`opencode-sessions.provider.ts`) and the runtime's
  * token-budget frames (`opencode-run-registry.ts`) consume this, so a reloaded
@@ -37,9 +41,9 @@ import {
 
 import {
   getOpenCodeModelsCachePath,
-  readOpenCodeAssistantMessages,
   readOpenCodeSessionModelKey,
   readOpenCodeSessionTokenTotals,
+  readOpenCodeUsageMessageRows,
   resolveOpenCodeMessageLayout,
 } from './opencode-data-root.js';
 
@@ -154,13 +158,13 @@ export function resolveOpenCodeContextWindow(providerId: string, modelId: string
 function readOpenCodeCumulativeUsage(
   db: Database.Database,
   sessionId: string,
-  assistantMessages: Array<{ data: AnyRecord | null }>,
+  messageRows: Array<{ data: AnyRecord | null }>,
 ): { used: number; inputTokens: number; outputTokens: number } | undefined {
   // v2 keeps the lifetime totals on the session row; v1 only has them across
   // the per-message payloads. Both are normalized to the row's raw shape
   // (input WITHOUT cache) before formatting.
   const sessionTotals = readOpenCodeSessionTokenTotals(db, sessionId);
-  const totals = sessionTotals ?? assistantMessages.reduce(
+  const totals = sessionTotals ?? messageRows.reduce(
     (sum, row) => {
       const raw = readObjectRecord(row.data?.tokens);
       if (!raw) {
@@ -197,18 +201,38 @@ function readOpenCodeCumulativeUsage(
 // ---------------------------
 
 /**
+ * Whether one usage-bearing row says the conversation was replaced by a
+ * summary.
+ *
+ * v2.0.32 writes the compaction as a message row of its own — `status:
+ * 'completed'` with the summary text in `summary` — while builds that folded
+ * it into an assistant message flag that message with `summary: true`. A
+ * failed or in-flight compaction leaves the conversation alone and must not
+ * mark it as replaced.
+ */
+function isCompactionSummaryRow(data: AnyRecord | null): boolean {
+  if (!data) {
+    return false;
+  }
+  if (data.summary === true) {
+    return true;
+  }
+  return data.status === 'completed' && typeof data.summary === 'string';
+}
+
+/**
  * Newest per-message context occupancy of one OpenCode session.
  *
  * Rows arrive newest-first; the first assistant record with usable tokens
- * wins. Compaction summaries (`summary: true` on the payload) are skipped —
- * their tokens describe the summarization request, i.e. the whole
- * PRE-compaction conversation, so reporting them as current occupancy is
- * exactly wrong. When such a summary is the newest record, `compacted` is set:
- * OpenCode only learns the post-compaction occupancy once the next turn runs,
- * so there is no number to report yet.
+ * wins. Compaction summaries are skipped (either shape — see
+ * `isCompactionSummaryRow`): their tokens describe the summarization request,
+ * i.e. the whole PRE-compaction conversation, so reporting them as current
+ * occupancy is exactly wrong. When such a summary is the newest record,
+ * `compacted` is set: OpenCode only learns the post-compaction occupancy once
+ * the next turn runs, so there is no number to report yet.
  */
 function readLatestOpenCodeMessageUsage(
-  assistantMessages: Array<{ id: string; data: AnyRecord | null }>,
+  messageRows: Array<{ id: string; data: AnyRecord | null }>,
 ): {
   compacted: boolean;
   /** Id of the newest compaction summary, whose text is the post-compaction context. */
@@ -220,8 +244,8 @@ function readLatestOpenCodeMessageUsage(
   let summaryMessageId: string | null = null;
   let latest = null as { modelKey: string | null; tokens: OpenCodeStepTokens } | null;
 
-  for (const row of assistantMessages) {
-    if (row.data?.summary === true) {
+  for (const row of messageRows) {
+    if (isCompactionSummaryRow(row.data)) {
       sawNewerCompaction = true;
       summaryMessageId = summaryMessageId ?? row.id;
       continue;
@@ -319,15 +343,18 @@ function readOpenCodeMessageTextBytes(db: Database.Database, messageId: string):
   return 0;
 }
 
-/** Reads a v2 `session_message` row's inline `content` text blocks. */
+/** Reads a v2 `session_message` row's inline text: its `content` text blocks plus the summarization a compaction row keeps beside them. */
 function readInlineMessageTextBytes(db: Database.Database, messageId: string): number {
   try {
     const row = db.prepare('SELECT data FROM session_message WHERE id = ?').get(messageId) as { data: string } | undefined;
-    const content = readObjectRecord(readJsonRecord(row?.data ?? null))?.content;
+    const data = readJsonRecord(row?.data ?? null);
+    // v2.0.32 compaction rows hold the whole post-compaction context as a
+    // top-level string instead of content blocks.
+    let bytes = typeof data?.summary === 'string' ? Buffer.byteLength(data.summary, 'utf8') : 0;
+    const content = data?.content;
     if (!Array.isArray(content)) {
-      return 0;
+      return bytes;
     }
-    let bytes = 0;
     for (const block of content) {
       const part = readObjectRecord(block);
       if (readOptionalString(part?.type) !== 'text' || typeof part?.text !== 'string') {
@@ -353,7 +380,8 @@ function readInlineMessageTextBytes(db: Database.Database, messageId: string): n
  *
  * Right after a compaction the window carries `compacted: true` and no
  * occupancy: the newest record is the summary of the conversation that was
- * just replaced, so any number taken from it describes the context the user
+ * just replaced (either a v2 `compaction` row or an assistant message flagged
+ * `summary: true`), so any number taken from it describes the context the user
  * just got rid of. What CAN be measured is the summary text itself, which is
  * what the next turn feeds back in, so the payload carries its byte size as
  * `summaryBytes` until a real turn lands.
@@ -365,8 +393,8 @@ export function readOpenCodeContextUsage(
   db: Database.Database,
   sessionId: string,
 ): ProviderTokenUsageResult | undefined {
-  const assistantMessages = readOpenCodeAssistantMessages(db, sessionId);
-  const latest = readLatestOpenCodeMessageUsage(assistantMessages);
+  const messageRows = readOpenCodeUsageMessageRows(db, sessionId);
+  const latest = readLatestOpenCodeMessageUsage(messageRows);
   if (!latest) {
     return undefined;
   }
@@ -377,7 +405,7 @@ export function readOpenCodeContextUsage(
     ? resolveOpenCodeContextWindow(modelKey.slice(0, slash), modelKey.slice(slash + 1))
     : undefined;
 
-  const cumulative = readOpenCodeCumulativeUsage(db, sessionId, assistantMessages);
+  const cumulative = readOpenCodeCumulativeUsage(db, sessionId, messageRows);
   const cumulativePayload = cumulative ? { cumulative } : {};
 
   if (latest.compacted) {

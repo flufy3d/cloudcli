@@ -7,6 +7,7 @@ import { parseFilesInputTag, parseImagesInputTag } from '@/shared/image-attachme
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import type {
   AnyRecord,
+  CompactionInfo,
   FetchHistoryOptions,
   FetchHistoryResult,
   NormalizedMessage,
@@ -87,6 +88,31 @@ const hasUserRole = (value: unknown): boolean => {
   return readOptionalString(record?.role) === 'user';
 };
 
+/**
+ * Reads the `compact` annotation a compaction's virtual text row carries
+ * (`{phase, trigger?, error?}`); malformed values are dropped rather than
+ * rendered as a half-empty row. Only the v2 flatten produces one.
+ */
+const readCompactionAnnotation = (value: unknown): CompactionInfo | undefined => {
+  const record = readObjectRecord(value);
+  const phase = readOptionalString(record?.phase);
+  if (phase !== 'running' && phase !== 'done' && phase !== 'failed') {
+    return undefined;
+  }
+
+  const rawTrigger = readOptionalString(record?.trigger);
+  const trigger = rawTrigger === 'auto' || rawTrigger === 'manual' ? rawTrigger : undefined;
+  const error = record?.error === null || record?.error === undefined
+    ? undefined
+    : readOptionalString(record.error) ?? null;
+
+  return {
+    phase,
+    ...(trigger ? { trigger } : {}),
+    ...(error !== undefined ? { error } : {}),
+  };
+};
+
 const isUserTextEcho = (raw: AnyRecord): boolean => {
   return readOptionalString(raw.role) === 'user'
     || hasUserRole(raw.message)
@@ -96,14 +122,83 @@ const isUserTextEcho = (raw: AnyRecord): boolean => {
 // ---------------------------
 
 /**
+ * Turns one v2 `compaction` message row into the transcript rows it stands
+ * for.
+ *
+ * v2.0.32 keeps a compaction beside the conversation instead of folding it
+ * into an assistant message: the row has `status` completed/failed, the
+ * summary text under `summary`, and the trigger under `reason`. It becomes
+ * the same pair the other engines produce — a row saying what happened, plus
+ * the summary itself flagged `isCompactSummary` so the client folds it behind
+ * a disclosure. Rows still running, or from a build that wrote no text, yield
+ * nothing.
+ */
+const buildOpenCodeV2CompactionRows = (messageRow: {
+  id: string;
+  time_created: number | null;
+  time_updated: number | null;
+  data: string;
+}): OpenCodeHistoryRow[] => {
+  const data = readJsonRecord(messageRow.data) ?? {};
+  const messageData = JSON.stringify({ role: 'assistant', error: null });
+  const base = {
+    message_id: messageRow.id,
+    message_time_created: messageRow.time_created,
+    message_data: messageData,
+    part_time_created: messageRow.time_updated ?? messageRow.time_created,
+  };
+
+  if (readOptionalString(data.status) === 'failed') {
+    const errorRecord = readObjectRecord(data.error);
+    const detail = readOptionalString(errorRecord?.message) ?? readOptionalString(data.error) ?? null;
+    const compact: CompactionInfo = { phase: 'failed', error: detail };
+    return [{
+      ...base,
+      part_id: `${messageRow.id}_compaction`,
+      part_data: JSON.stringify({
+        type: 'text',
+        text: `Compaction failed${detail ? `: ${detail}` : ''}`,
+        compact,
+      }),
+    }];
+  }
+
+  if (readOptionalString(data.status) !== 'completed') {
+    return [];
+  }
+
+  const trigger: CompactionInfo['trigger'] = readOptionalString(data.reason) === 'auto' ? 'auto' : 'manual';
+  const rows: OpenCodeHistoryRow[] = [{
+    ...base,
+    part_id: `${messageRow.id}_compaction`,
+    part_data: JSON.stringify({
+      type: 'text',
+      text: `Compacted · ${trigger}`,
+      compact: { phase: 'done', trigger } satisfies CompactionInfo,
+    }),
+  }];
+
+  const summary = readOptionalString(data.summary);
+  if (summary) {
+    rows.push({
+      ...base,
+      part_id: `${messageRow.id}_summary`,
+      part_data: JSON.stringify({ type: 'text', text: summary, isCompactSummary: true }),
+    });
+  }
+  return rows;
+};
+
+/**
  * Flattens v2 `session_message` rows into the (message, part) row shape the
  * history normalizer consumes.
  *
  * v2 event-sources one row per message and carries its content blocks inline
  * (`user` rows hold the prompt text; `assistant` rows hold a `content` array
  * of text/reasoning/tool blocks), so each row expands into one virtual
- * message plus one virtual part per block. Compaction, idle, and system rows
- * carry no user-visible transcript content and are skipped.
+ * message plus one virtual part per block. Compaction rows are rendered (see
+ * `buildOpenCodeV2CompactionRows`); idle and system rows carry no
+ * user-visible transcript content and are skipped.
  */
 const flattenOpenCodeV2HistoryRows = (
   db: Database.Database,
@@ -124,6 +219,10 @@ const flattenOpenCodeV2HistoryRows = (
 
   const rows: OpenCodeHistoryRow[] = [];
   for (const messageRow of messageRows) {
+    if (messageRow.type === 'compaction') {
+      rows.push(...buildOpenCodeV2CompactionRows(messageRow));
+      continue;
+    }
     if (messageRow.type !== 'user' && messageRow.type !== 'assistant') {
       continue;
     }
@@ -439,6 +538,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         const parsedFiles = messageRole === 'user'
           ? parseFilesInputTag(parsedImages.text)
           : { text: rawContent, attachments: [] };
+        const compactAnnotation = readCompactionAnnotation(partData.compact);
         if (
           parsedFiles.text.trim()
           || parsedImages.attachments.length > 0
@@ -454,6 +554,11 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
             content: parsedFiles.text,
             images: parsedImages.attachments.length > 0 ? parsedImages.attachments : undefined,
             files: parsedFiles.attachments.length > 0 ? parsedFiles.attachments : undefined,
+            // A compaction's two virtual rows carry their annotations here:
+            // the summary is flagged so the client folds it behind a
+            // disclosure, and the row above it says what the compaction was.
+            ...(partData.isCompactSummary === true ? { isCompactSummary: true } : {}),
+            ...(compactAnnotation ? { compact: compactAnnotation } : {}),
           }));
         }
         continue;

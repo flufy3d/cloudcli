@@ -29,6 +29,38 @@ test('dispatch routes events by provider session and settles on the first termin
   assert.deepEqual(await runA.settled, outcome, 'first settlement wins over later terminals');
 });
 
+test('dispatch fails a compact run on a failed compaction, and leaves a chat run alone', async () => {
+  const registry = new OpenCodeRunRegistry();
+  const compactWriter = writerOf();
+  const compactRun = registry.create('app-compact', 'ses_1', compactWriter.writer, 'compact');
+  const chatWriter = writerOf();
+  const chatRun = registry.create('app-chat', 'ses_2', chatWriter.writer);
+
+  const failedEvent = {
+    type: 'session.compaction.failed',
+    data: {
+      sessionID: 'ses_1',
+      reason: 'manual',
+      inputID: 'msg_1',
+      error: { type: 'provider.no-route', message: 'Model unavailable: opencode/gpt-5.6-terra' },
+    },
+  };
+  registry.dispatch(failedEvent);
+  assert.deepEqual(await compactRun.settled, {
+    outcome: 'failed',
+    error: 'Model unavailable: opencode/gpt-5.6-terra',
+  });
+  assert.equal(compactWriter.frames.length, 0, 'the runtime renders the failure, not the registry');
+
+  // The same event for an ordinary turn (the engine compacted its own
+  // context) must not fail the user's run — it ends on its execution
+  // terminal like any other.
+  registry.dispatch({ ...failedEvent, data: { ...failedEvent.data, sessionID: 'ses_2' } });
+  assert.equal(await Promise.race([chatRun.settled, Promise.resolve('still-open')]), 'still-open');
+  registry.dispatch({ type: 'session.execution.succeeded', data: { sessionID: 'ses_2' } });
+  assert.deepEqual(await chatRun.settled, { outcome: 'succeeded' });
+});
+
 test('reconcile settles a run whose session went idle after the prompt', async () => {
   const registry = new OpenCodeRunRegistry();
   const { writer } = writerOf();

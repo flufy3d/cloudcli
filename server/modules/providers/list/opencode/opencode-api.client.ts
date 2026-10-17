@@ -2,9 +2,10 @@
  * OpenCode Service API Client
  *
  * Thin typed wrapper over the handful of `opencode serve` HTTP endpoints the
- * runtime drives (verified against v2.0.31 with live probes): session
- * creation, model/agent/permission switches, prompting, interruption, and
- * the permission/form replies that answer the interactive cards.
+ * runtime drives (verified against v2.0.31 with live probes; compaction
+ * against v2.0.32): session creation, model/agent/permission switches,
+ * prompting, compaction, interruption, and the permission/form replies that
+ * answer the interactive cards.
  *
  * Every call authenticates with HTTP Basic (`opencode:<password>`) — the
  * scheme the CLI's own standalone server uses — and surfaces non-2xx answers
@@ -190,6 +191,24 @@ export class OpenCodeApiClient {
       'POST',
       `/api/session/${encodeURIComponent(sessionId)}/prompt`,
       body,
+    );
+    const messageId = result?.data?.id;
+    return { messageId: typeof messageId === 'string' ? messageId : null };
+  }
+
+  /**
+   * `POST /api/session/:id/compact` — admits a synthetic `compaction` message
+   * into the session's queue (verified against v2.0.32), which the engine then
+   * runs as a turn of its own: the summary streams over the service's
+   * `session.compaction.*` events and the turn ends with the usual
+   * `session.execution.*` terminal. The response only reports the admitted
+   * message, so the run's outcome comes from the event feed — not from here.
+   */
+  async compactSession(sessionId: string): Promise<{ messageId: string | null }> {
+    const result = await this.request<{ data?: { id?: unknown } }>(
+      'POST',
+      `/api/session/${encodeURIComponent(sessionId)}/compact`,
+      {},
     );
     const messageId = result?.data?.id;
     return { messageId: typeof messageId === 'string' ? messageId : null };

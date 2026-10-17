@@ -8,7 +8,13 @@ import test, { after, before } from 'node:test';
 
 import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
 import { createOpenCodeRuntime } from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
-import type { NormalizedMessage, ProviderModelsDefinition, ProviderRuntimeContext } from '@/shared/types.js';
+import type {
+  AnyRecord,
+  NormalizedMessage,
+  ProviderModelsDefinition,
+  ProviderRuntimeContext,
+  ProviderRuntimeWriter,
+} from '@/shared/types.js';
 
 // Run notifications consult the app database; give the suite a throwaway one.
 // The home directory is redirected too: token-budget frames read opencode's
@@ -163,6 +169,21 @@ const session = (type: string, data: Record<string, unknown>) => ({
   id: `evt_${type}_${Math.random()}`, created: Date.now(), type, data: { sessionID: 'ses_new', ...data },
 });
 
+/**
+ * Invokes the runtime's compaction facet. It is optional on the interface —
+ * and present here, which is the capability that puts `/compact` in the
+ * composer menu — so the test asserts it before calling.
+ */
+const compactSession = (
+  runtime: ReturnType<typeof createOpenCodeRuntime>,
+  options: AnyRecord,
+  writer: ProviderRuntimeWriter,
+  context: ProviderRuntimeContext,
+): Promise<unknown> => {
+  assert.ok(runtime.compact, 'the opencode runtime must expose the compact facet');
+  return runtime.compact(options, writer, context);
+};
+
 const withRuntime = async (run: (input: { service: FakeService; runtime: ReturnType<typeof createOpenCodeRuntime> }) => Promise<void>) => {
   const service = await startFakeService();
   const endpoint = { url: service.url, authorization: 'Basic dGVzdA==' };
@@ -298,6 +319,62 @@ test('abort interrupts the service, retracts cards, and resolves without its own
     assert.ok(!kinds.includes('complete'), 'the gateway emits the aborted complete');
     assert.ok(kinds.includes('permission_request'));
     assert.ok(kinds.includes('permission_cancelled'));
+  });
+});
+
+test('compact posts the service compaction request and ends on the execution terminal', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const compacting = compactSession(runtime, { sessionId: 'app-1' }, writer, makeContext('ses_new'));
+    const request = await service.waitForRequest((candidate) => candidate.path.endsWith('/compact'));
+    assert.equal(request.method, 'POST');
+    // No prompt, model or permission mode: the engine compacts the stored
+    // conversation with whatever model the session already runs with.
+    assert.deepEqual(request.body, {});
+
+    service.emit(session('session.compaction.started', { reason: 'manual', recent: '', inputID: 'msg_compact' }));
+    service.emit(session('session.execution.succeeded', {}));
+    await compacting;
+
+    assert.deepEqual(frames.map((frame) => frame.kind), ['complete']);
+    assert.equal(frames[0].success, true);
+    assert.equal(frames[0].exitCode, 0);
+  });
+});
+
+test('compact fails the run when the engine reports the compaction failed', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const compacting = compactSession(runtime, { sessionId: 'app-1' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((candidate) => candidate.path.endsWith('/compact'));
+
+    service.emit(session('session.compaction.failed', {
+      reason: 'manual',
+      inputID: 'msg_compact',
+      error: { type: 'provider.no-route', message: 'Model unavailable: opencode/gpt-5.6-terra' },
+    }));
+    // The engine still ends that execution normally; the run must neither
+    // wait for it nor paint success over the failure it was told about.
+    service.emit(session('session.execution.succeeded', {}));
+
+    await assert.rejects(compacting, /Model unavailable/);
+    // Like a failed turn, the run ends with a failed `complete` and the
+    // notification; the transcript's own failed-compaction row is what says
+    // why (the gateway renders the thrown reason as its fallback card).
+    assert.deepEqual(frames.map((frame) => frame.kind), ['complete']);
+    assert.equal(frames[0].success, false);
+  });
+});
+
+test('compact refuses a session that has no stored conversation yet', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    await assert.rejects(
+      compactSession(runtime, { sessionId: 'app-1' }, writer, makeContext(null)),
+      /no stored conversation/,
+    );
+    assert.deepEqual(frames.map((frame) => frame.kind), ['error', 'complete']);
+    assert.equal(service.requests.length, 0, 'nothing is asked of the service');
   });
 });
 

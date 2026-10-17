@@ -219,7 +219,7 @@ export function readOpenCodeSessionModelKey(
   return resolvedProvider ? `${resolvedProvider}/${bare}` : bare;
 }
 
-export type OpenCodeAssistantMessageRecord = {
+export type OpenCodeUsageMessageRecord = {
   /** Message row id; identifies the newest compaction summary for the size reading. */
   id: string;
   /** Parsed message payload (raw row data can also be a plain string). */
@@ -227,26 +227,32 @@ export type OpenCodeAssistantMessageRecord = {
 };
 
 /**
- * Reads one session's assistant message rows, newest first.
+ * Reads one session's usage-bearing message rows, newest first.
  *
  * Blind to the storage layout: v2 folds messages into `session_message` rows
  * (with the payload inline), v1 splits them across `message` and `part`. Both
  * carry per-message token usage on the assistant payload, which is what the
  * context-usage reader needs; timeline rendering uses the layout-aware
- * fetchers instead. Returns an empty list when neither layout exists.
+ * fetchers instead.
+ *
+ * v2 `compaction` rows ride along: they carry no usable occupancy (their
+ * tokens describe the whole pre-compaction conversation), but their position
+ * relative to the newest assistant message is what tells the reader the
+ * conversation was replaced. Returns an empty list when neither layout
+ * exists.
  *
  * Consumer: opencode context usage.
  */
-export function readOpenCodeAssistantMessages(
+export function readOpenCodeUsageMessageRows(
   db: OpenCodeReadableDatabase,
   sessionId: string,
-): OpenCodeAssistantMessageRecord[] {
+): OpenCodeUsageMessageRecord[] {
   const layout = resolveOpenCodeMessageLayout(db);
   if (layout === 'session_message') {
     const rows = db.prepare(`
       SELECT id, data
       FROM session_message
-      WHERE session_id = ? AND type = 'assistant'
+      WHERE session_id = ? AND type IN ('assistant', 'compaction')
       ORDER BY seq DESC
     `).all(sessionId) as Array<{ id: string; data: string }>;
     return rows.map((row) => ({ id: row.id, data: readJsonRecord(row.data) }));

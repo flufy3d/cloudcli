@@ -14,6 +14,9 @@
  *   result so the runtime can publish the live context-occupancy frame
  *   (session-lifetime totals live on the API snapshot and are a different
  *   number — see `opencode-context-usage.ts`)
+ * - `session.compaction.*` → no frames; a `.failed` carries the reason on the
+ *   result, which the runtime's own `/compact` run turns into a failure (an
+ *   automatic compaction inside a normal turn changes nothing)
  * - `session.execution.{succeeded,failed,interrupted}` → run terminal
  *
  * Ids on transcript rows (thinking / tool_use / tool_result) derive from the
@@ -46,7 +49,8 @@ export type OpenCodeRunOutcome =
  * Frames to forward plus, on execution-terminal events, how the run ended;
  * `stepTokens` rides on `session.step.ended`, whose `tokens` describe that
  * step's context occupancy (the runtime turns it into the live
- * `token_budget` frame).
+ * `token_budget` frame), and `compactionError` on `session.compaction.failed`,
+ * which only a run that asked for the compaction treats as its own failure.
  *
  * Consumer: opencode runtime.
  */
@@ -54,6 +58,7 @@ export type OpenCodeTranslatedEvent = {
   frames: NormalizedMessage[];
   terminal?: OpenCodeRunOutcome;
   stepTokens?: OpenCodeStepTokens;
+  compactionError?: string;
 };
 
 /** A tool call the translator has seen; the interaction bridge labels permission cards with it. */
@@ -252,6 +257,13 @@ export class OpenCodeSessionEventTranslator {
         return { frames: [], ...(stepTokens ? { stepTokens } : {}) };
       }
 
+      case 'session.compaction.failed':
+        // The engine still ends the execution normally after this (the probe
+        // shows `execution.succeeded` right behind it), so the run's own
+        // terminal stays with the execution; the reason rides along for the
+        // compaction run that must report it — see the run registry.
+        return { frames: [], compactionError: readErrorMessage(data.error) };
+
       case 'session.execution.succeeded':
         return { frames: [], terminal: { outcome: 'succeeded' } };
 
@@ -268,8 +280,10 @@ export class OpenCodeSessionEventTranslator {
 
       default:
         // step.started/streamed/failed, text/reasoning.started, usage.updated,
-        // inbox.*, model/agent.selected, permissions, instructions.updated and
-        // anything newer carry nothing the timeline renders on its own.
+        // inbox.*, model/agent.selected, permissions, instructions.updated,
+        // the compaction lifecycle itself (started/delta/ended — its summary
+        // reaches the transcript through history, not through live frames)
+        // and anything newer carry nothing the timeline renders on its own.
         return { frames: [] };
     }
   }

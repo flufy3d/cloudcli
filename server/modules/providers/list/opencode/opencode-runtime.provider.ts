@@ -12,10 +12,12 @@
  * One `run()` = ensure the service → create/reuse the provider session
  * anchored to the project directory → apply the permission mode → switch
  * the model (variant = reasoning effort) → POST the prompt → forward
- * translated events until an execution terminal. `abort()` POSTs interrupt
- * and retracts pending cards; the gateway owns the aborted `complete`, so
- * none is sent here. The `permissions` facet answers permission/question
- * cards and replays them after a reload.
+ * translated events until an execution terminal. `compact()` rides the same
+ * plumbing: the service admits a synthetic compaction message and runs the
+ * summarization as a turn of its own, whose execution terminal ends the run.
+ * `abort()` POSTs interrupt and retracts pending cards; the gateway owns the
+ * aborted `complete`, so none is sent here. The `permissions` facet answers
+ * permission/question cards and replays them after a reload.
  *
  * @module opencode-runtime.provider
  */
@@ -49,7 +51,7 @@ import { getOpenCodeDatabasePath } from './opencode-data-root.js';
 import { OpenCodeEventStream } from './opencode-event-stream.js';
 import { OpenCodeInteractionBridge } from './opencode-interaction-bridge.js';
 import { buildOpenCodePromptFiles, buildOpenCodePromptText } from './opencode-prompt-attachments.js';
-import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker } from './opencode-run-registry.js';
+import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker, type OpenCodeRunSettlement } from './opencode-run-registry.js';
 import { OpenCodeServiceError, OpenCodeServiceSupervisor } from './opencode-service.js';
 import {
   OpenCodeSessionSettingsApplier,
@@ -130,7 +132,10 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       const db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
       try {
         const usage = readOpenCodeContextUsage(db, providerSessionId);
-        if (!usage || usage.used <= 0) {
+        // A session that just compacted has no occupancy to report yet. Its
+        // `compacted` marker (plus the summary's size) still goes out: it is
+        // what clears the composer's pre-compaction percentage.
+        if (!usage || (usage.used <= 0 && usage.compacted !== true)) {
           return;
         }
         const tracker = new OpenCodeTokenBudgetTracker(modelRef?.providerID ?? null, modelRef?.id ?? null);
@@ -141,6 +146,47 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     } catch (error) {
       console.warn('[OpenCode] failed to read the token budget:', error);
     }
+  };
+
+  /**
+   * One run's identifiers, as much as its failure path needs to address the
+   * user with: the app session the frames belong to and the notifications.
+   */
+  type RunIdentity = {
+    appSessionId: string;
+    sessionSummary: string | undefined;
+    userId: string | null;
+  };
+
+  const describeError = (error: unknown): string => (
+    error instanceof OpenCodeServiceError || error instanceof OpenCodeApiError
+      ? error.message
+      : error instanceof Error ? error.message : String(error)
+  );
+
+  /**
+   * Ends a run that never got going (or failed): one error frame, one failed
+   * `complete`, a notification, and a rejection the gateway logs. Shared by
+   * `run` and `compact` so both surfaces say failures the same way.
+   */
+  const failRun = (identity: RunIdentity, writer: ProviderRuntimeWriter, message: string): never => {
+    writer.send(createNormalizedMessage({
+      id: generateMessageId(PROVIDER),
+      sessionId: identity.appSessionId,
+      provider: PROVIDER,
+      kind: 'error',
+      content: message,
+      isError: true,
+    }));
+    writer.send(createCompleteMessage({ provider: PROVIDER, sessionId: identity.appSessionId, exitCode: 1 }));
+    notifyRunFailed({
+      userId: identity.userId,
+      provider: PROVIDER,
+      sessionId: identity.appSessionId,
+      sessionName: identity.sessionSummary,
+      error: message,
+    });
+    throw new Error(message);
   };
 
   const run = async (
@@ -156,31 +202,13 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     const workingDir = readOptionalString(options.cwd) ?? readOptionalString(options.projectPath) ?? process.cwd();
     const sessionSummary = readOptionalString(options.sessionSummary);
     const userId = writer.userId === undefined || writer.userId === null ? null : String(writer.userId);
-
-    const describeError = (error: unknown): string => (
-      error instanceof OpenCodeServiceError || error instanceof OpenCodeApiError
-        ? error.message
-        : error instanceof Error ? error.message : String(error)
-    );
-    const failRun = (message: string): never => {
-      writer.send(createNormalizedMessage({
-        id: generateMessageId(PROVIDER),
-        sessionId: appSessionId,
-        provider: PROVIDER,
-        kind: 'error',
-        content: message,
-        isError: true,
-      }));
-      writer.send(createCompleteMessage({ provider: PROVIDER, sessionId: appSessionId, exitCode: 1 }));
-      notifyRunFailed({ userId, provider: PROVIDER, sessionId: appSessionId, sessionName: sessionSummary, error: message });
-      throw new Error(message);
-    };
+    const identity: RunIdentity = { appSessionId, sessionSummary, userId };
 
     let endpoint: OpenCodeServiceEndpoint;
     try {
       endpoint = await supervisor.ensureEndpoint();
     } catch (error) {
-      return failRun(describeError(error));
+      return failRun(identity, writer, describeError(error));
     }
     eventStream.start();
     const activeClient = createClient(endpoint);
@@ -222,13 +250,13 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
         }
       }
     } catch (error) {
-      return failRun(describeError(error));
+      return failRun(identity, writer, describeError(error));
     }
 
     const text = buildOpenCodePromptText(command, options);
     const files = await buildOpenCodePromptFiles(options, workingDir);
     if (!text.trim() && files.length === 0) {
-      return failRun('Nothing to send: the message is empty.');
+      return failRun(identity, writer, 'Nothing to send: the message is empty.');
     }
 
     // One tracker per run: the window comes from the model this run switched
@@ -253,7 +281,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       runs.release(activeRun);
       bridge.cancelSession(appSessionId, 'The message was rejected by the OpenCode service.');
       bridge.detach(providerSessionId);
-      return failRun(`OpenCode rejected the message: ${describeError(error)}`);
+      return failRun(identity, writer, `OpenCode rejected the message: ${describeError(error)}`);
     }
 
     const settlement = await activeRun.settled;
@@ -265,13 +293,29 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     budgetTracker = null;
 
     sendFinalTokenBudget(budgetTrackerModel, appSessionId, providerSessionId, writer);
+    finishRun(identity, writer, settlement, activeRun.aborted);
+  };
 
-    if (activeRun.aborted) {
+  /**
+   * Ends a settled run: the abort hand-off, or exactly one terminal `complete`
+   * plus the notification that outcome deserves. A failure is rethrown so the
+   * gateway logs it and the caller sees a rejected promise.
+   *
+   * Shared by `run` and `compact` so both end the same way.
+   */
+  const finishRun = (
+    identity: RunIdentity,
+    writer: ProviderRuntimeWriter,
+    settlement: OpenCodeRunSettlement,
+    aborted: boolean,
+  ): void => {
+    if (aborted) {
       // The user stopped this run: the gateway's abort handler already
       // emitted the aborted complete, and a racing terminal event must not
       // paint a second, contradictory outcome over it.
       return;
     }
+    const { appSessionId, sessionSummary, userId } = identity;
     if (settlement.outcome === 'succeeded') {
       writer.send(createCompleteMessage({ provider: PROVIDER, sessionId: appSessionId, exitCode: 0 }));
       notifyRunStopped({
@@ -291,6 +335,72 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       userId, provider: PROVIDER, sessionId: appSessionId, sessionName: sessionSummary, error: settlement.error,
     });
     throw new Error(settlement.error);
+  };
+
+  /**
+   * Compacts a session's carried conversation into a summary the next turn
+   * builds on (`/compact`).
+   *
+   * The service admits the request as a synthetic `compaction` message
+   * (`POST /api/session/:id/compact`, v2.0.32) and then runs the
+   * summarization as a turn of its own, so the run rides the same plumbing as
+   * `run` — registry entry, event translation, one terminal `complete` —
+   * rather than treating the POST's acknowledgement as the outcome. The
+   * engine summarizes with whatever model the session already runs with, so no
+   * model switch, permission mode or prompt content is applied; the summary
+   * itself reaches the transcript through the history refresh the terminal
+   * `complete` triggers.
+   */
+  const compact = async (
+    options: AnyRecord,
+    writer: ProviderRuntimeWriter,
+    context: ProviderRuntimeContext,
+  ): Promise<void> => {
+    const appSessionId = readOptionalString(options.sessionId);
+    if (!appSessionId) {
+      throw new Error('OpenCode runtime requires the app session id');
+    }
+    const sessionSummary = readOptionalString(options.sessionSummary);
+    const userId = writer.userId === undefined || writer.userId === null ? null : String(writer.userId);
+    const identity: RunIdentity = { appSessionId, sessionSummary, userId };
+
+    const providerSessionId = context.resolveProviderSessionId(appSessionId);
+    if (!providerSessionId) {
+      return failRun(identity, writer, 'This OpenCode session has no stored conversation to compact yet.');
+    }
+
+    let endpoint: OpenCodeServiceEndpoint;
+    try {
+      endpoint = await supervisor.ensureEndpoint();
+    } catch (error) {
+      return failRun(identity, writer, describeError(error));
+    }
+    eventStream.start();
+    const activeClient = createClient(endpoint);
+    client = activeClient;
+
+    const activeRun = runs.create(appSessionId, providerSessionId, writer, 'compact');
+
+    // The feed must be live before the request: the compaction turn runs on
+    // the service, and the events that report it (start, deltas, terminal)
+    // would otherwise be missed for good.
+    try {
+      await eventStream.connected();
+      await activeClient.compactSession(providerSessionId);
+      activeRun.promptAccepted = true;
+    } catch (error) {
+      runs.release(activeRun);
+      return failRun(identity, writer, `OpenCode refused to compact this session: ${describeError(error)}`);
+    }
+
+    const settlement = await activeRun.settled;
+    runs.release(activeRun);
+
+    // The reading after a compaction: the session row cannot report the new
+    // occupancy yet (only the next turn can), which is exactly what the
+    // `compacted` payload says — the composer then shows the summary size.
+    sendFinalTokenBudget(null, appSessionId, providerSessionId, writer);
+    finishRun(identity, writer, settlement, activeRun.aborted);
   };
 
   const abort = (sessionId: string): boolean => {
@@ -330,6 +440,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   return {
     run,
     abort,
+    compact,
     permissions: {
       resolve(requestId: string, decision: ProviderPermissionDecision): void {
         bridge.resolve(requestId, decision);

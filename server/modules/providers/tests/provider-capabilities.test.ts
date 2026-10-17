@@ -137,7 +137,10 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // neither capability is derived for this provider.
     supportsMessageEditing: false,
     supportsSessionForking: false,
-    supportsCompaction: false,
+    // The runtime's `compact` facet drives the service's compaction request
+    // (a synthetic message the engine runs as a summarization turn), which is
+    // what puts `/compact` in the composer menu for this provider.
+    supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
     inputWhileBusy: 'queue',

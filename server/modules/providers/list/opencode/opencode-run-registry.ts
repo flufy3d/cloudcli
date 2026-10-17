@@ -92,6 +92,13 @@ export type OpenCodeActiveRun = {
   providerSessionId: string;
   writer: ProviderRuntimeWriter;
   translator: OpenCodeSessionEventTranslator;
+  /**
+   * What the run was asked to do: an ordinary turn, or a `/compact`. A
+   * compaction the user asked for must report its own failure, while the
+   * engine compacting a normal turn's context on its own must not fail that
+   * turn — see `dispatch`.
+   */
+  purpose: 'chat' | 'compact';
   /** Epoch ms right before the prompt was posted; `time.idle` at or after it means the run finished. */
   startedAt: number;
   aborted: boolean;
@@ -111,7 +118,12 @@ export class OpenCodeRunRegistry {
   private readonly byApp = new Map<string, OpenCodeActiveRun>();
   private readonly byProvider = new Map<string, OpenCodeActiveRun>();
 
-  create(appSessionId: string, providerSessionId: string, writer: ProviderRuntimeWriter): OpenCodeActiveRun {
+  create(
+    appSessionId: string,
+    providerSessionId: string,
+    writer: ProviderRuntimeWriter,
+    purpose: OpenCodeActiveRun['purpose'] = 'chat',
+  ): OpenCodeActiveRun {
     let settle!: (settlement: OpenCodeRunSettlement) => void;
     const settled = new Promise<OpenCodeRunSettlement>((resolve) => {
       settle = resolve;
@@ -121,6 +133,7 @@ export class OpenCodeRunRegistry {
       providerSessionId,
       writer,
       translator: new OpenCodeSessionEventTranslator(appSessionId),
+      purpose,
       startedAt: Date.now(),
       aborted: false,
       promptAccepted: false,
@@ -160,6 +173,12 @@ export class OpenCodeRunRegistry {
    * Routes one service event to the run that owns its session: frames to the
    * writer, step occupancy to the budget tracker when one is registered, and
    * terminals to settle.
+   *
+   * A `session.compaction.failed` is the run's own failure only when the run
+   * asked for it: an explicit `/compact` has nothing else to report it
+   * through, while a normal turn that auto-compacted carries on — the engine
+   * reports that turn's outcome separately, and a compaction it decided to run
+   * must not fail the user's turn.
    */
   dispatch(event: OpenCodeEventEnvelope, budgetTracker?: OpenCodeTokenBudgetTracker): void {
     const providerSessionId = readOptionalString(readObjectRecord(event.data)?.sessionID);
@@ -167,12 +186,16 @@ export class OpenCodeRunRegistry {
     if (!run) {
       return;
     }
-    const { frames, terminal, stepTokens } = run.translator.translate(event);
+    const { frames, terminal, stepTokens, compactionError } = run.translator.translate(event);
     for (const frame of frames) {
       run.writer.send(frame);
     }
     if (stepTokens && budgetTracker) {
       budgetTracker.report(stepTokens, run.writer, run.appSessionId);
+    }
+    if (compactionError && run.purpose === 'compact') {
+      run.settle({ outcome: 'failed', error: compactionError });
+      return;
     }
     if (terminal) {
       run.settle(terminal);

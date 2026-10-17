@@ -839,3 +839,190 @@ test('a v2 compaction summary resets the reading to compacted with its byte size
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+test('a v2 compaction message renders as its own row with the summary flagged', { concurrency: false }, async () => {
+  // v2.0.32 keeps a compaction beside the conversation — a `compaction`
+  // message row (status completed/failed, the summary text in `summary`)
+  // instead of folding it into an assistant message — so the transcript
+  // reader turns it into what the other engines produce: a row saying what
+  // happened plus the summary itself, flagged for the client's disclosure.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-compaction-row-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const cacheDir = path.join(tempRoot, '.cache', 'opencode');
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(
+      path.join(cacheDir, 'models.json'),
+      JSON.stringify({ 'opencode-go': { models: { 'glm-5.3': { limit: { context: 200_000 } } } } }),
+    );
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          model text,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (
+          id, project_id, slug, directory, title, version,
+          tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          model, time_created, time_updated
+        ) VALUES (
+          'ses_v2_compacted', 'proj_1', 'v2-compacted', '/tmp/proj', 'Compacted session', '2.0.32',
+          500, 50, 10, 400000, 0,
+          '{"providerID":"opencode-go","id":"glm-5.3"}', 1000, 3000
+        );
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_u', 'ses_v2_compacted', 'user', 1, 1000, 1000, '{"time":{"created":1000},"text":"Build it"}'),
+          ('msg_a', 'ses_v2_compacted', 'assistant', 2, 1100, 1200, '{"time":{"created":1100},"tokens":{"input":30,"output":10,"reasoning":5,"cache":{"read":2000,"write":0}},"content":[{"type":"text","text":"done"}]}'),
+          ('msg_c', 'ses_v2_compacted', 'compaction', 3, 2000, 2100, '{"time":{"created":2000},"status":"completed","reason":"manual","summary":"The conversation so far, summarized.","tokens":{"input":600,"output":90,"reasoning":50,"cache":{"read":6500,"write":0}}}');
+      `);
+    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('ses_v2_compacted');
+
+    const compactRow = history.messages.find((message) => message.compact);
+    assert.equal(compactRow?.role, 'assistant');
+    assert.equal(compactRow?.content, 'Compacted · manual');
+    assert.deepEqual(compactRow?.compact, { phase: 'done', trigger: 'manual' });
+
+    const summaryRow = history.messages.find((message) => message.isCompactSummary === true);
+    assert.equal(summaryRow?.role, 'assistant', 'the summary is assistant-authored, never a user bubble');
+    assert.equal(summaryRow?.content, 'The conversation so far, summarized.');
+    assert.ok(
+      history.messages.indexOf(compactRow!) < history.messages.indexOf(summaryRow!),
+      'the row saying what happened comes before the summary itself',
+    );
+
+    // The compaction's own tokens describe the summarization request — the
+    // whole conversation that was just replaced — so the reading is
+    // `compacted` with the summary's byte size, never that occupancy.
+    assert.deepEqual(history.tokenUsage, {
+      used: 0,
+      total: 200_000,
+      inputTokens: 0,
+      outputTokens: 0,
+      breakdown: { input: 0, output: 0 },
+      compacted: true,
+      summaryBytes: Buffer.byteLength('The conversation so far, summarized.', 'utf8'),
+      cumulative: { used: 400560, inputTokens: 400500, outputTokens: 50 },
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('a failed v2 compaction says so and leaves the occupancy reading alone', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-compaction-failed-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const cacheDir = path.join(tempRoot, '.cache', 'opencode');
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(
+      path.join(cacheDir, 'models.json'),
+      JSON.stringify({ 'opencode-go': { models: { 'glm-5.3': { limit: { context: 200_000 } } } } }),
+    );
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          model text,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (
+          id, project_id, slug, directory, title, version,
+          tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          model, time_created, time_updated
+        ) VALUES (
+          'ses_v2_failed', 'proj_1', 'v2-failed', '/tmp/proj', 'Failed compaction', '2.0.32',
+          100, 20, 5, 8, 2,
+          '{"providerID":"opencode-go","id":"glm-5.3"}', 1000, 3000
+        );
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_a', 'ses_v2_failed', 'assistant', 1, 1100, 1200, '{"time":{"created":1100},"tokens":{"input":30,"output":10,"reasoning":5,"cache":{"read":2000,"write":0}},"content":[{"type":"text","text":"done"}]}'),
+          ('msg_c', 'ses_v2_failed', 'compaction', 2, 2000, 2000, '{"time":{"created":2000},"status":"failed","reason":"manual","error":{"type":"provider.no-route","message":"Model unavailable: opencode/gpt-5.6-terra"}}');
+      `);
+    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('ses_v2_failed');
+
+    const compactRow = history.messages.find((message) => message.compact);
+    assert.equal(compactRow?.content, 'Compaction failed: Model unavailable: opencode/gpt-5.6-terra');
+    assert.deepEqual(compactRow?.compact, {
+      phase: 'failed',
+      error: 'Model unavailable: opencode/gpt-5.6-terra',
+    });
+    assert.ok(
+      !history.messages.some((message) => message.isCompactSummary === true),
+      'a failed compaction replaced nothing, so there is no summary to fold',
+    );
+
+    // The conversation is untouched: the newest real turn still reports its
+    // occupancy instead of the `compacted` marker.
+    assert.deepEqual(history.tokenUsage, {
+      used: 2045,
+      total: 200_000,
+      inputTokens: 2030,
+      outputTokens: 15,
+      breakdown: { input: 2030, output: 15 },
+      cumulative: { used: 135, inputTokens: 108, outputTokens: 20 },
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
