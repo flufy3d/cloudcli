@@ -15,7 +15,7 @@ import { PaperclipIcon, MessageSquareIcon, XIcon, Loader2, ArrowUpIcon, PencilIc
 import { useVoiceInput } from '@/modules/chat/hooks/useVoiceInput';
 import { useVoiceAvailable } from '@/modules/chat/hooks/useVoiceAvailable';
 import type { QueuedDraft } from '@/modules/chat/hooks/useChatComposerState';
-import type { SessionActivity, ScheduledMessage } from '@/shared/types';
+import type { LLMProvider, SessionActivity, ScheduledMessage } from '@/shared/types';
 import type { PendingPermissionRequest, PermissionMode } from '@/shared/types';
 import type { ProviderModelOption } from '@/shared/types';
 import {
@@ -72,6 +72,8 @@ type ChatComposerProps = {
   permissionMode: PermissionMode | string;
   availablePermissionModes: (PermissionMode | string)[];
   onSelectPermissionMode: (mode: PermissionMode | string) => void;
+  /** The session's engine id; the permission banner uses it to decide whether a persistent allow rule exists. */
+  provider: LLMProvider;
   providerLabel: string;
   effort: string;
   availableEffortOptions: NonNullable<ProviderModelOption['effort']>['values'];
@@ -155,6 +157,7 @@ function ChatComposer({
   permissionMode,
   availablePermissionModes,
   onSelectPermissionMode,
+  provider,
   providerLabel,
   effort,
   availableEffortOptions,
@@ -321,6 +324,8 @@ function ChatComposer({
       {pendingPermissionRequests.length > 0 && (
         <div className="mx-auto mb-3 max-w-[54.25rem]">
           <PermissionRequestsBanner
+            provider={provider}
+            providerLabel={providerLabel}
             pendingPermissionRequests={pendingPermissionRequests}
             handlePermissionDecision={handlePermissionDecision}
             handleGrantToolPermission={handleGrantToolPermission}
