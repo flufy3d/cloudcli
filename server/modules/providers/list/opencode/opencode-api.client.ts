@@ -214,15 +214,16 @@ export class OpenCodeApiClient {
   }
 
   /**
-   * `DELETE /api/session/:id/form/:formId` — dismisses the form. A message
-   * turns the dismissal into model-facing feedback (the model continues);
-   * without one the question tool treats it as a hard cancel.
+   * `DELETE /api/session/:id/form/:formId[?message=…]` — dismisses the form.
+   * A message (query string, per the server handler) turns the dismissal into
+   * model-facing feedback so the model continues; without one the question
+   * tool treats it as a hard cancel.
    */
   async cancelForm(sessionId: string, formId: string, message?: string): Promise<void> {
+    const query = message ? `?message=${encodeURIComponent(message)}` : '';
     await this.request(
       'DELETE',
-      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}`,
-      message ? { message } : undefined,
+      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}${query}`,
     );
   }
 

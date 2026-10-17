@@ -92,7 +92,7 @@ test('sends the verified wire shapes with Basic auth on every call', async () =>
     assert.equal(await client.interrupt('ses_fake'), true);
     await client.replyPermission('ses_fake', 'per_1', { decision: 'reject', message: 'nope' });
     await client.replyForm('ses_fake', 'frm_1', { q0: 'Blue', q1: ['a', 'b'] });
-    await client.cancelForm('ses_fake', 'frm_2', 'skipped');
+    await client.cancelForm('ses_fake', 'frm_2', 'skipped by user');
     await client.cancelForm('ses_fake', 'frm_3');
     assert.deepEqual(await client.listActiveSessionIds(), ['ses_a', 'ses_b']);
 
@@ -106,7 +106,7 @@ test('sends the verified wire shapes with Basic auth on every call', async () =>
       ['POST', '/api/session/ses_fake/interrupt'],
       ['POST', '/api/session/ses_fake/permission/per_1/reply'],
       ['POST', '/api/session/ses_fake/form/frm_1/reply'],
-      ['DELETE', '/api/session/ses_fake/form/frm_2'],
+      ['DELETE', '/api/session/ses_fake/form/frm_2?message=skipped%20by%20user'],
       ['DELETE', '/api/session/ses_fake/form/frm_3'],
       ['GET', '/api/session/active'],
     ]);
@@ -125,7 +125,7 @@ test('sends the verified wire shapes with Basic auth on every call', async () =>
     assert.equal(requests[5].body, undefined);
     assert.deepEqual(requests[6].body, { decision: 'reject', message: 'nope' });
     assert.deepEqual(requests[7].body, { answer: { q0: 'Blue', q1: ['a', 'b'] } });
-    assert.deepEqual(requests[8].body, { message: 'skipped' });
+    assert.equal(requests[8].body, undefined, 'the cancel message travels in the query string');
     assert.equal(requests[9].body, undefined);
   });
 });
