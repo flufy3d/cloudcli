@@ -2,6 +2,7 @@ import { Database } from 'better-sqlite3';
 
 import {
   APP_CONFIG_TABLE_SCHEMA_SQL,
+  ASYNC_TASKS_TABLE_SCHEMA_SQL,
   LAST_SCANNED_AT_SQL,
   NOTIFICATION_CHANNEL_ENDPOINTS_TABLE_SCHEMA_SQL,
   PROJECTS_TABLE_SCHEMA_SQL,
@@ -11,6 +12,8 @@ import {
   SUPERSEDED_PROVIDER_SESSIONS_TABLE_SCHEMA_SQL,
   SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL,
   SESSIONS_TABLE_SCHEMA_SQL,
+  TASK_CONTINUATION_EVENTS_TABLE_SCHEMA_SQL,
+  TASK_CONTINUATION_MANUAL_ACTIONS_TABLE_SCHEMA_SQL,
   USER_PREFERENCES_TABLE_SCHEMA_SQL,
   USER_NOTIFICATION_PREFERENCES_TABLE_SCHEMA_SQL,
   VAPID_KEYS_TABLE_SCHEMA_SQL,
@@ -580,6 +583,54 @@ export const runMigrations = (db: Database) => {
     }
 
     db.exec(LAST_SCANNED_AT_SQL);
+
+    db.exec(ASYNC_TASKS_TABLE_SCHEMA_SQL);
+    const asyncTaskColumns = getTableInfo(db, 'async_tasks').map(({ name }) => name);
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'last_error', 'TEXT');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'registration_key', 'TEXT');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'provider_thread_id', 'TEXT');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'session_project_path', 'TEXT');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'working_directory', 'TEXT');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'sandbox_policy_type', 'TEXT');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'network_access', 'BOOLEAN');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'approval_policy', 'TEXT');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'notification_cancelled_at', 'DATETIME');
+    addColumnToTableIfNotExists(db, 'async_tasks', asyncTaskColumns, 'notification_cancelled_reason', 'TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_async_tasks_session_id ON async_tasks(session_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_async_tasks_status ON async_tasks(status)');
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_async_tasks_registration_key
+      ON async_tasks(registration_key) WHERE registration_key IS NOT NULL`);
+
+    db.exec(TASK_CONTINUATION_EVENTS_TABLE_SCHEMA_SQL);
+    db.exec(TASK_CONTINUATION_MANUAL_ACTIONS_TABLE_SCHEMA_SQL);
+    const manualActionColumns = getTableInfo(db, 'task_continuation_manual_actions').map(({ name }) => name);
+    addColumnToTableIfNotExists(
+      db,
+      'task_continuation_manual_actions',
+      manualActionColumns,
+      'previous_receipt_json',
+      'TEXT',
+    );
+    const continuationEventColumns = getTableInfo(db, 'task_continuation_events').map(({ name }) => name);
+    addColumnToTableIfNotExists(
+      db,
+      'task_continuation_events',
+      continuationEventColumns,
+      'lease_expires_at_ms',
+      'INTEGER',
+    );
+    db.exec(`
+      UPDATE task_continuation_events
+      SET lease_expires_at_ms = CASE
+        WHEN julianday(lease_expires_at) IS NULL THEN 0
+        ELSE CAST((julianday(lease_expires_at) - 2440587.5) * 86400000 AS INTEGER)
+      END
+      WHERE lease_expires_at_ms IS NULL AND lease_expires_at IS NOT NULL
+    `);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_continuation_events_status_lease ON task_continuation_events(status, lease_expires_at)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_continuation_events_status_lease_ms ON task_continuation_events(status, lease_expires_at_ms)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_continuation_events_session ON task_continuation_events(session_id)');
+
     console.log('Database migrations completed successfully');
   } catch (error: any) {
     console.error('Error running migrations:', error.message);

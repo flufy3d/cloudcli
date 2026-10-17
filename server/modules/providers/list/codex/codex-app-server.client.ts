@@ -71,7 +71,7 @@ function resolveCodexLauncher(): string {
  */
 export type CodexAppServerConnection = {
   /** Sends a JSON-RPC request and resolves with its result. */
-  call(method: string, params: unknown): Promise<unknown>;
+  call(method: string, params: unknown, options?: { timeoutMs?: number }): Promise<unknown>;
   /** Kills the child. Safe to call more than once. */
   close(): void;
 };
@@ -93,6 +93,15 @@ export type CodexAppServerHandlers = {
   onExit?: (reason: string) => void;
 };
 
+/** Per-connection environment values that must not mutate the server process. */
+export type CodexAppServerOptions = {
+  env?: NodeJS.ProcessEnv;
+  /** Starts a detached worker server from its explicit allowlisted environment. */
+  inheritEnv?: boolean;
+  /** Enables protocol methods marked experimental by Codex. */
+  experimentalApi?: boolean;
+};
+
 /**
  * Spawns `codex app-server`, completes the handshake, and returns the open
  * connection.
@@ -101,10 +110,11 @@ export type CodexAppServerHandlers = {
  */
 export async function openCodexAppServer(
   handlers: CodexAppServerHandlers = {},
+  options: CodexAppServerOptions = {},
 ): Promise<CodexAppServerConnection> {
   const launcher = resolveCodexLauncher();
   const child = spawn(process.execPath, [launcher, 'app-server'], {
-    env: process.env,
+    env: { ...(options.inheritEnv === false ? {} : process.env), ...options.env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -211,7 +221,7 @@ export async function openCodexAppServer(
   child.stdout?.on('error', (error) => failPending(error.message));
   child.stderr?.on('error', () => {});
 
-  const call = (method: string, params: unknown): Promise<unknown> =>
+  const call: CodexAppServerConnection['call'] = (method, params, options) =>
     new Promise((resolve, reject) => {
       if (exitReason) {
         reject(new AppError(`Codex app-server is not running: ${exitReason}`, {
@@ -221,14 +231,17 @@ export async function openCodexAppServer(
         return;
       }
 
+      const timeoutMs = Number.isSafeInteger(options?.timeoutMs) && (options?.timeoutMs ?? 0) > 0
+        ? options!.timeoutMs!
+        : REQUEST_TIMEOUT_MS;
       const id = nextRequestId++;
       const timer = setTimeout(() => {
         pending.delete(id);
-        reject(new AppError(`Codex app-server did not answer "${method}" within ${REQUEST_TIMEOUT_MS}ms.`, {
+        reject(new AppError(`Codex app-server did not answer "${method}" within ${timeoutMs}ms.`, {
           code: 'CODEX_APP_SERVER_TIMEOUT',
           statusCode: 504,
         }));
-      }, REQUEST_TIMEOUT_MS);
+      }, timeoutMs);
 
       pending.set(id, (response) => {
         clearTimeout(timer);
@@ -258,13 +271,9 @@ export async function openCodexAppServer(
   };
 
   try {
-    // `capabilities` is deliberately empty. `thread/fork` with `lastTurnId`,
-    // `turn/start` and the item notifications are all in the stable protocol;
-    // only `beforeTurnId` and the turn-listing methods are gated behind
-    // `experimentalApi`, and none of those is needed here.
     await call('initialize', {
       clientInfo: { name: 'cloudcli', title: 'CloudCLI', version: '1' },
-      capabilities: {},
+      capabilities: options.experimentalApi ? { experimentalApi: true } : {},
     });
     write({ jsonrpc: '2.0', method: 'initialized', params: {} });
   } catch (error) {
@@ -284,6 +293,64 @@ export async function openCodexAppServer(
  * Production never replaces it.
  */
 export const codexAppServerTransport = { open: openCodexAppServer };
+
+/** Reads every persisted turn for one Codex thread using the paginated app-server API. */
+export async function listCodexThreadTurns(threadId: string): Promise<unknown[]> {
+  if (!threadId.trim()) {
+    throw new AppError('A Codex thread id is required to read conversation history.', {
+      code: 'CODEX_HISTORY_THREAD_REQUIRED',
+      statusCode: 400,
+    });
+  }
+  const connection = await codexAppServerTransport.open({}, { experimentalApi: true });
+  try {
+    const resumed = await connection.call('thread/resume', { threadId, excludeTurns: true }) as {
+      thread?: { id?: unknown };
+    } | undefined;
+    if (resumed?.thread?.id !== threadId) {
+      throw new AppError('Codex resumed a different thread while checking task history.', {
+        code: 'CODEX_HISTORY_THREAD_MISMATCH',
+        statusCode: 502,
+      });
+    }
+
+    const turns: unknown[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 1000; page += 1) {
+      const response = await connection.call('thread/turns/list', {
+        threadId,
+        ...(cursor ? { cursor } : {}),
+        limit: 100,
+        itemsView: 'full',
+      }) as { data?: unknown; nextCursor?: unknown } | undefined;
+      if (!response || !Array.isArray(response.data)) {
+        throw new AppError('Codex returned an invalid thread history page.', {
+          code: 'CODEX_HISTORY_INVALID_PAGE',
+          statusCode: 502,
+        });
+      }
+      turns.push(...response.data);
+      if (response.nextCursor === null || response.nextCursor === undefined || response.nextCursor === '') {
+        return turns;
+      }
+      if (typeof response.nextCursor !== 'string' || seenCursors.has(response.nextCursor)) {
+        throw new AppError('Codex returned a repeated or invalid history cursor.', {
+          code: 'CODEX_HISTORY_INVALID_CURSOR',
+          statusCode: 502,
+        });
+      }
+      cursor = response.nextCursor;
+      seenCursors.add(cursor);
+    }
+    throw new AppError('Codex history exceeded the supported page limit.', {
+      code: 'CODEX_HISTORY_PAGE_LIMIT',
+      statusCode: 502,
+    });
+  } finally {
+    connection.close();
+  }
+}
 
 /**
  * Runs one exchange against a freshly spawned `codex app-server`.
