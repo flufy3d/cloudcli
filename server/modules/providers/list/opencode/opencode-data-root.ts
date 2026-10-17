@@ -12,11 +12,13 @@
 import os from 'node:os';
 import path from 'node:path';
 
+import Database from 'better-sqlite3';
 import type { Database as SqliteDatabase } from 'better-sqlite3';
 
 import type { AnyRecord } from '@/shared/types.js';
 import {
   readJsonRecord,
+  readObjectRecord,
   readOptionalString,
 } from '@/shared/utils.js';
 
@@ -41,12 +43,61 @@ export function getOpenCodeDatabasePath(): string {
   return path.join(getOpenCodeDataDirectory(), 'opencode.db');
 }
 
+/** One active credential row decoded from OpenCode's v2 SQLite store. */
+export type OpenCodeActiveCredential = {
+  /** Human-readable account label OpenCode wrote for the row. */
+  label: string;
+  /** Parsed `value` column (`{ type, key }` for API-key credentials). */
+  value: AnyRecord | null;
+};
+
+/**
+ * Reads the newest active row from OpenCode's v2 `credential` table.
+ *
+ * `integrationId` narrows the read to one connected provider (for example
+ * `opencode-go`); omitting it returns the most recently updated active
+ * credential, which is what the auth status check needs. A missing database,
+ * an older schema without the table, or an unreadable row resolves to null.
+ * The connection is read-only so it never blocks the CLI's WAL writes.
+ *
+ * Consumers: opencode auth (status label) and quota (OpenCode Go API key).
+ */
+export function readOpenCodeActiveCredential(
+  integrationId?: string,
+): OpenCodeActiveCredential | null {
+  let db: Database.Database;
+  try {
+    db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
+  } catch {
+    return null;
+  }
+
+  try {
+    const selection = 'SELECT label, value FROM credential WHERE active = 1';
+    const ordering = 'ORDER BY time_updated DESC, time_created DESC LIMIT 1';
+    const row = integrationId
+      ? db.prepare(`${selection} AND integration_id = ? ${ordering}`).get(integrationId)
+      : db.prepare(`${selection} ${ordering}`).get();
+    const record = readObjectRecord(row);
+    const label = readOptionalString(record?.label);
+    if (!label) {
+      return null;
+    }
+    return { label, value: readJsonRecord(record?.value) };
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
 /**
  * Resolves the OpenCode credential store path.
  *
- * OpenCode writes every connected provider credential - including the
- * `opencode-go` subscription API key - into one `auth.json` under its XDG
- * data directory.
+ * v1 OpenCode kept every connected provider credential - including the
+ * `opencode-go` subscription API key - in one `auth.json` under its XDG data
+ * directory; v2 moved them to the `credential` table, so this file is only
+ * the legacy fallback.
  *
  * Consumers: opencode auth and quota providers.
  */

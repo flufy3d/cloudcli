@@ -3,8 +3,9 @@
  *
  * Fetches OpenCode Go subscription usage (rolling 5-hour, weekly, and monthly
  * windows) from OpenCode's official usage endpoint using the `opencode-go` API
- * key stored in the OpenCode auth store. Zen pay-as-you-go accounts expose no
- * usage endpoint, so they resolve to null and simply show no quota card.
+ * key stored in OpenCode's credential store (v2 `opencode.db`, falling back to
+ * the v1 `auth.json`). Zen pay-as-you-go accounts expose no usage endpoint, so
+ * they resolve to null and simply show no quota card.
  *
  * Consumers:
  * - `OpenCodeProviderAuth.getQuota` in `opencode-auth.provider.ts`
@@ -18,7 +19,7 @@ import { readFile } from 'node:fs/promises';
 import type { ProviderQuotaBucket, ProviderQuotaData } from '@/shared/types.js';
 import { createProviderQuotaCache, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
-import { getOpenCodeAuthPath } from './opencode-data-root.js';
+import { getOpenCodeAuthPath, readOpenCodeActiveCredential } from './opencode-data-root.js';
 
 type OpenCodeQuotaDependencies = {
   fetch: typeof globalThis.fetch;
@@ -40,13 +41,22 @@ export function clearOpenCodeQuotaCache(): void {
 }
 
 /**
- * Reads the `opencode-go` API key from the OpenCode auth store.
+ * Reads the `opencode-go` API key from OpenCode's credential store.
  *
- * OpenCode keeps every connected provider credential in one `auth.json`, with
- * the Go subscription key under the `opencode-go` entry. Missing, unreadable,
- * or Zen-only stores resolve to null rather than throwing.
+ * OpenCode v2 stores every connected provider credential in the `credential`
+ * table of `opencode.db`; rotating a key through `opencode auth login` only
+ * updates that row and leaves any v1-era `auth.json` stale. The database is
+ * therefore authoritative, with `auth.json` kept as the v1 fallback. Missing,
+ * unreadable, or Zen-only stores resolve to null rather than throwing.
  */
 async function readOpenCodeGoApiKey(): Promise<string | null> {
+  const databaseKey = readOptionalString(
+    readOpenCodeActiveCredential('opencode-go')?.value?.key,
+  );
+  if (databaseKey) {
+    return databaseKey;
+  }
+
   try {
     const auth = readObjectRecord(JSON.parse(await readFile(getOpenCodeAuthPath(), 'utf8')));
     const goCredential = readObjectRecord(auth?.['opencode-go']);

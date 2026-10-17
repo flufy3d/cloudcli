@@ -59,7 +59,7 @@ Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结�
 - `provider-capabilities.test.ts` 把推导结果钉在显式基线上：切面增删会以"评审过的测试差异"呈现，而不是静默改能力。
 - **`supportsNativeScheduling` 只是提示位，不参与启停**：CloudCLI 的循环定时任务（`scheduled-jobs`）对所有引擎可用；该位为 true（目前仅 claude 的 CronCreate/ScheduleWakeup）时，任务表单与 composer 重复入口提示"引擎自身也有会话内定时、冲突回合会被跳过"，行为不变。
 - **前端零 provider 分支**：composer/设置页完全按 `GET /api/providers/capabilities` 渲染。首屏与请求失败时的回退镜像在 `src/shared/providerCatalogFallback.ts`（`PROVIDER_FALLBACK_CATALOG`），由跨树 parity 测试（`server/modules/providers/tests/provider-catalog-parity.test.ts`）钉住与后端目录一致；**其 key 顺序就是全应用的引擎规范顺序**。
-- **账号配额（`auth.getQuota`）现状**：antigravity（`agy` CLI）、codex（app-server JSON-RPC）、zcode（BigModel / Z.AI HTTP）、opencode（OpenCode Go 官方 `GET /zen/go/v1/usage`，`list/opencode/opencode-quota.provider.ts`；Zen 按量账号无公开端点，返回 null 即不渲染卡片）。前端按 `supportsQuota` 能力位渲染配额卡片，不再维护同名名单。
+- **账号配额（`auth.getQuota`）现状**：antigravity（`agy` CLI）、codex（app-server JSON-RPC）、zcode（BigModel / Z.AI HTTP）、opencode（OpenCode Go 官方 `GET /zen/go/v1/usage`，`list/opencode/opencode-quota.provider.ts`；key 优先读 v2 `opencode.db` 的 `credential` 表，v1 `auth.json` 仅作回退，避免轮换后的旧 key 遮蔽新 key；Zen 按量账号无公开端点，返回 null 即不渲染卡片）。前端按 `supportsQuota` 能力位渲染配额卡片，不再维护同名名单。
 
 ## 上下文占用与按需压缩
 

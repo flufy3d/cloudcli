@@ -2,9 +2,7 @@ import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import Database from 'better-sqlite3';
-
-import { getOpenCodeDatabasePath } from '@/modules/providers/list/opencode/opencode-data-root.js';
+import { readOpenCodeActiveCredential } from '@/modules/providers/list/opencode/opencode-data-root.js';
 import { tryResolveOpenCodeEnginePath } from '@/modules/providers/list/opencode/opencode-engine-path.js';
 import { fetchOpenCodeQuota } from '@/modules/providers/list/opencode/opencode-quota.provider.js';
 import { createCliInstallationProbe } from '@/modules/providers/shared/installation/cli-installation-probe.js';
@@ -139,28 +137,9 @@ export class OpenCodeProviderAuth implements IProviderAuth {
 
   /**
    * Returns the label of the most recently updated active credential row, or
-   * null when the database is absent, unreadable, or has no active row. A
-   * read-only connection never blocks against the CLI's WAL writes, and a
-   * database without the credential table (older v2 layouts) just means "no
-   * database credential" rather than an error.
+   * null when the database is absent, unreadable, or has no active row.
    */
   private readActiveDatabaseCredential(): string | null {
-    let db: Database.Database;
-    try {
-      db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
-    } catch {
-      return null;
-    }
-
-    try {
-      const row = db.prepare(
-        'SELECT label FROM credential WHERE active = 1 ORDER BY time_updated DESC, time_created DESC LIMIT 1',
-      ).get() as { label?: string } | undefined;
-      return row?.label?.trim() || null;
-    } catch {
-      return null;
-    } finally {
-      db.close();
-    }
+    return readOpenCodeActiveCredential()?.label ?? null;
   }
 }

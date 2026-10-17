@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { afterEach, beforeEach, describe } from 'node:test';
 
+import Database from 'better-sqlite3';
+
 import { OpenCodeProviderAuth } from '../list/opencode/opencode-auth.provider.js';
 import {
   clearOpenCodeQuotaCache,
@@ -52,6 +54,63 @@ const withOpenCodeAuthStore = async (
 
     (os as any).homedir = () => homeDir;
     await runTest();
+  } finally {
+    (os as any).homedir = originalHomedir;
+    await rm(homeDir, { recursive: true, force: true });
+  }
+};
+
+/**
+ * Writes OpenCode's v2 credential database under a throwaway home directory.
+ * Values carry the same `{ type, key }` shape the CLI stores for API keys.
+ */
+const withOpenCodeCredentialDatabase = async (
+  rows: Array<{ integrationId: string; label: string; active: number; key: string }>,
+  runTest: (homeDir: string) => Promise<void>,
+): Promise<void> => {
+  const homeDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-quota-'));
+  const originalHomedir = os.homedir;
+
+  try {
+    const dataDir = path.join(homeDir, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE credential (
+          id text PRIMARY KEY,
+          integration_id text,
+          label text NOT NULL,
+          value text NOT NULL,
+          connector_id text,
+          method_id text,
+          active integer,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+      `);
+      const insert = db.prepare(`
+        INSERT INTO credential
+          (id, integration_id, label, value, active, time_created, time_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      rows.forEach((row, index) => {
+        insert.run(
+          `cred_${index}`,
+          row.integrationId,
+          row.label,
+          JSON.stringify({ type: 'api', key: row.key }),
+          row.active,
+          1000 + index,
+          2000 + index,
+        );
+      });
+    } finally {
+      db.close();
+    }
+
+    (os as any).homedir = () => homeDir;
+    await runTest(homeDir);
   } finally {
     (os as any).homedir = originalHomedir;
     await rm(homeDir, { recursive: true, force: true });
@@ -219,6 +278,50 @@ describe('OpenCode Go Quota Provider', () => {
 
     await fetchOpenCodeQuota({ forceRefresh: true }, dependencies);
     assert.equal(fetchCount, 3);
+  });
+
+  test('prefers the current v2 database key over a stale auth.json', async () => {
+    await withOpenCodeCredentialDatabase(
+      [{ integrationId: 'opencode-go', label: 'OpenCode Go', active: 1, key: 'go-current-key' }],
+      async (homeDir) => {
+        // Rotating a key through `opencode auth login` updates opencode.db only;
+        // a v1-era auth.json keeps the previous, now-rejected key.
+        await writeFile(
+          path.join(homeDir, '.local', 'share', 'opencode', 'auth.json'),
+          JSON.stringify({ 'opencode-go': { type: 'api', key: 'go-stale-key' } }),
+          'utf8',
+        );
+
+        const capture: FetchCapture = {};
+        const quota = await fetchOpenCodeQuota({ forceRefresh: true }, {
+          fetch: createMockFetch({ usage: { rolling: { status: 'ok', percent: 5 } } }, capture),
+        });
+
+        assert.equal(capture.authorization, 'Bearer go-current-key');
+        assert.ok(quota);
+      },
+    );
+  });
+
+  test('falls back to auth.json when the database has no active Go row', async () => {
+    await withOpenCodeCredentialDatabase(
+      [{ integrationId: 'opencode', label: 'Zen', active: 1, key: 'zen-key' }],
+      async (homeDir) => {
+        await writeFile(
+          path.join(homeDir, '.local', 'share', 'opencode', 'auth.json'),
+          JSON.stringify({ 'opencode-go': { type: 'api', key: 'go-legacy-key' } }),
+          'utf8',
+        );
+
+        const capture: FetchCapture = {};
+        const quota = await fetchOpenCodeQuota({ forceRefresh: true }, {
+          fetch: createMockFetch({ usage: { rolling: { status: 'ok', percent: 5 } } }, capture),
+        });
+
+        assert.equal(capture.authorization, 'Bearer go-legacy-key');
+        assert.ok(quota);
+      },
+    );
   });
 
   test('reads the opencode-go key from the real auth store', async () => {
