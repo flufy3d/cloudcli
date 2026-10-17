@@ -3,7 +3,7 @@ import { AlertTriangle, Plus, Shield, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { Button, Input } from '@/shared/ui';
-import type { AntigravityPermissionMode, CodexPermissionMode, PermissionMode, ZcodePermissionMode } from '@/shared/types';
+import type { AntigravityPermissionMode, CodexPermissionMode, OpencodePermissionMode, PermissionMode, ZcodePermissionMode } from '@/shared/types';
 
 const COMMON_CLAUDE_TOOLS = [
   'Bash(git log:*)',
@@ -829,12 +829,93 @@ function ZcodePermissions({ permissionMode, onPermissionModeChange }: Omit<Zcode
   );
 }
 
+type OpencodePermissionsProps = {
+  agent: 'opencode';
+  permissionMode: OpencodePermissionMode;
+  onPermissionModeChange: (value: OpencodePermissionMode) => void;
+};
+
+/**
+ * OpenCode has one toggle per mode rather than Claude-style tool lists: the
+ * runtime maps the mode onto the engine's plan agent and per-action ask rules
+ * (shell/edit/write/patch), so there is nothing finer-grained to configure here.
+ */
+function OpencodePermissions({ permissionMode, onPermissionModeChange }: Omit<OpencodePermissionsProps, 'agent'>) {
+  const { t } = useTranslation('settings');
+
+  return (
+    <div className="space-y-6">
+      <div className="space-y-4">
+        <div className="flex items-center gap-3">
+          <Shield className="h-5 w-5 text-green-500" />
+          <h3 className="text-lg font-medium text-foreground">{t('permissions.opencode.permissionMode')}</h3>
+        </div>
+        <p className="text-sm text-muted-foreground">{t('permissions.opencode.description')}</p>
+
+        <PermissionModeRadioCard
+          name="opencodePermissionMode"
+          value="default"
+          currentValue={permissionMode}
+          onChange={onPermissionModeChange}
+          title={t('permissions.opencode.modes.default.title')}
+          description={t('permissions.opencode.modes.default.description')}
+        />
+
+        <PermissionModeRadioCard
+          name="opencodePermissionMode"
+          value="acceptEdits"
+          currentValue={permissionMode}
+          onChange={onPermissionModeChange}
+          variant="success"
+          title={t('permissions.opencode.modes.acceptEdits.title')}
+          description={t('permissions.opencode.modes.acceptEdits.description')}
+        />
+
+        <PermissionModeRadioCard
+          name="opencodePermissionMode"
+          value="plan"
+          currentValue={permissionMode}
+          onChange={onPermissionModeChange}
+          variant="info"
+          title={t('permissions.opencode.modes.plan.title')}
+          description={t('permissions.opencode.modes.plan.description')}
+        />
+
+        <PermissionModeRadioCard
+          name="opencodePermissionMode"
+          value="bypassPermissions"
+          currentValue={permissionMode}
+          onChange={onPermissionModeChange}
+          variant="warning"
+          hasWarningIcon
+          title={t('permissions.opencode.modes.bypassPermissions.title')}
+          description={t('permissions.opencode.modes.bypassPermissions.description')}
+        />
+
+        <details className="text-sm">
+          <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+            {t('permissions.opencode.technicalDetails')}
+          </summary>
+          <div className="mt-2 space-y-2 rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground">
+            <p><strong>{t('permissions.opencode.modes.default.title')}:</strong> {t('permissions.opencode.technicalInfo.default')}</p>
+            <p><strong>{t('permissions.opencode.modes.acceptEdits.title')}:</strong> {t('permissions.opencode.technicalInfo.acceptEdits')}</p>
+            <p><strong>{t('permissions.opencode.modes.plan.title')}:</strong> {t('permissions.opencode.technicalInfo.plan')}</p>
+            <p><strong>{t('permissions.opencode.modes.bypassPermissions.title')}:</strong> {t('permissions.opencode.technicalInfo.bypassPermissions')}</p>
+            <p className="text-xs opacity-75">{t('permissions.opencode.technicalInfo.overrideNote')}</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+}
+
 type PermissionsContentProps =
   | ClaudePermissionsProps
   | CursorPermissionsProps
   | CodexPermissionsProps
   | AntigravityPermissionsProps
-  | ZcodePermissionsProps;
+  | ZcodePermissionsProps
+  | OpencodePermissionsProps;
 
 /** Rendered by AgentCategoryContentSection for the "permissions" category, one variant per agent provider. */
 export default function PermissionsContent(props: PermissionsContentProps) {
@@ -852,6 +933,10 @@ export default function PermissionsContent(props: PermissionsContentProps) {
 
   if (props.agent === 'zcode') {
     return <ZcodePermissions {...props} />;
+  }
+
+  if (props.agent === 'opencode') {
+    return <OpencodePermissions {...props} />;
   }
 
   return <CodexPermissions {...props} />;

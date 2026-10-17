@@ -20,7 +20,9 @@ import type {
   CodexPermissionMode,
   CursorPermissionsState,
   NotificationPreferencesState,
+  OpencodePermissionMode,
   ProjectSortOrder,
+  SessionScopedPermissionMode,
   SettingsMainTab,
   ZcodePermissionMode,
 } from '@/shared/types';
@@ -61,15 +63,7 @@ const toCodexPermissionMode = (value: unknown): CodexPermissionMode => {
   return 'default';
 };
 
-const toAntigravityPermissionMode = (value: unknown): AntigravityPermissionMode => {
-  if (value === 'acceptEdits' || value === 'plan' || value === 'bypassPermissions') {
-    return value;
-  }
-
-  return 'default';
-};
-
-const toZcodePermissionMode = (value: unknown): ZcodePermissionMode => {
+const toSessionScopedPermissionMode = (value: unknown): SessionScopedPermissionMode => {
   if (value === 'acceptEdits' || value === 'plan' || value === 'bypassPermissions') {
     return value;
   }
@@ -146,6 +140,9 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
   const [codexPermissionMode, setCodexPermissionMode] = useState<CodexPermissionMode>('default');
   const [antigravityPermissionMode, setAntigravityPermissionMode] = useState<AntigravityPermissionMode>('default');
   const [zcodePermissionMode, setZcodePermissionMode] = useState<ZcodePermissionMode>('default');
+  // Same read/write channel as the other providers' permission modes: the mode
+  // a new OpenCode session starts in, stored under the opencodePermissions key.
+  const [opencodePermissionMode, setOpencodePermissionMode] = useState<OpencodePermissionMode>('default');
 
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [loginProvider, setLoginProvider] = useState<ActiveLoginProvider>('');
@@ -187,10 +184,13 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
       setCodexPermissionMode(toCodexPermissionMode(storedCodexSettings.permissionMode));
 
       const storedAntigravitySettings = readProviderToolsSettings('antigravity');
-      setAntigravityPermissionMode(toAntigravityPermissionMode(storedAntigravitySettings.permissionMode));
+      setAntigravityPermissionMode(toSessionScopedPermissionMode(storedAntigravitySettings.permissionMode));
 
       const storedZcodeSettings = readProviderToolsSettings('zcode');
-      setZcodePermissionMode(toZcodePermissionMode(storedZcodeSettings.permissionMode));
+      setZcodePermissionMode(toSessionScopedPermissionMode(storedZcodeSettings.permissionMode));
+
+      const storedOpencodeSettings = readProviderToolsSettings('opencode');
+      setOpencodePermissionMode(toSessionScopedPermissionMode(storedOpencodeSettings.permissionMode));
 
       try {
         const notificationResponse = await authenticatedFetch('/api/settings/notification-preferences');
@@ -270,6 +270,8 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
 
       writeUserPreference('zcodePermissions', { permissionMode: zcodePermissionMode });
 
+      writeUserPreference('opencodePermissions', { permissionMode: opencodePermissionMode });
+
       const notificationResponse = await authenticatedFetch('/api/settings/notification-preferences', {
         method: 'PUT',
         body: JSON.stringify(notificationPreferences),
@@ -293,6 +295,7 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
     cursorPermissions.disallowedCommands,
     cursorPermissions.skipPermissions,
     notificationPreferences,
+    opencodePermissionMode,
     projectSortOrder,
     zcodePermissionMode,
   ]);
@@ -399,6 +402,8 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
     setCodexPermissionMode,
     antigravityPermissionMode,
     setAntigravityPermissionMode,
+    opencodePermissionMode,
+    setOpencodePermissionMode,
     zcodePermissionMode,
     setZcodePermissionMode,
     providerAuthStatus,

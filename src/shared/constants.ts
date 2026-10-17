@@ -213,9 +213,9 @@ export const CODE_EDITOR_DEFAULTS = {
  * Per-provider preference key holding that provider's tool-permission
  * settings, sent with every `chat.send`.
  *
- * `opencode` intentionally maps to its own key even though no settings UI
- * writes it yet: without the entry the lookup would fall through to Claude's
- * key and OpenCode sessions would silently inherit Claude's `skipPermissions`.
+ * `opencode` maps to its own key rather than falling through to Claude's:
+ * without the entry the lookup would hit Claude's key and OpenCode sessions
+ * would silently inherit Claude's `skipPermissions`.
  */
 export const PROVIDER_PERMISSION_PREFERENCE_KEYS: Record<LLMProvider, UserPreferenceKey> = {
   claude: 'claudePermissions',

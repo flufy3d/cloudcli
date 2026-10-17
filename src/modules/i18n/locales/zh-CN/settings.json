@@ -484,7 +484,7 @@
     },
     "codex": {
       "permissionMode": "权限模式",
-      "description": "控制 Codex 如何处理文件修改和命令执行",
+      "description": "控制 Codex 如何处理文件修改和命令执行；新会话默认从此模式开始。",
       "modes": {
         "default": {
           "title": "默认",
@@ -509,7 +509,7 @@
     },
     "antigravity": {
       "permissionMode": "权限模式",
-      "description": "控制 Antigravity 如何处理文件编辑、计划生成及工具命令执行",
+      "description": "控制 Antigravity 如何处理文件编辑、计划生成及工具命令执行；新会话默认从此模式开始。",
       "modes": {
         "default": {
           "title": "默认模式",
@@ -538,7 +538,7 @@
     },
     "zcode": {
       "permissionMode": "权限模式",
-      "description": "控制 ZCode 如何处理文件编辑、计划生成及工具命令执行",
+      "description": "控制 ZCode 如何处理文件编辑、计划生成及工具命令执行；新会话默认从此模式开始。",
       "modes": {
         "default": {
           "title": "默认模式",
@@ -564,6 +564,36 @@
         "plan": "映射到引擎的 plan 模式，只读分析并输出计划。",
         "bypassPermissions": "映射到引擎的 yolo 模式，所有操作跳过权限确认。",
         "overrideNote": "聊天输入框旁的会话权限选择器可为当前回合覆盖此默认值。"
+      }
+    },
+    "opencode": {
+      "permissionMode": "权限模式",
+      "description": "控制 OpenCode 的哪些操作需要先经你确认；新会话默认从此模式开始。",
+      "modes": {
+        "default": {
+          "title": "默认模式",
+          "description": "每次改动文件、执行命令都先问你。"
+        },
+        "acceptEdits": {
+          "title": "接受编辑",
+          "description": "改动文件直接应用，不再询问；执行命令仍然先问你。"
+        },
+        "plan": {
+          "title": "计划模式",
+          "description": "只读规划：只给出方案，需要动手时会先经你同意。"
+        },
+        "bypassPermissions": {
+          "title": "跳过权限（危险）",
+          "description": "任何操作都不再询问。命令和文件改动全部自动执行，请谨慎使用。"
+        }
+      },
+      "technicalDetails": "技术详情",
+      "technicalInfo": {
+        "default": "为 shell、edit、write、patch 四类动作加 ask 规则；只读工具始终放行。",
+        "acceptEdits": "只给 shell 加 ask 规则；edit、write、patch 直接执行。",
+        "plan": "切到只读的 plan 智能体，并对四类改动动作都加 ask 规则。",
+        "bypassPermissions": "不设任何权限规则，走引擎默认的 build 智能体，所有工具放行。",
+        "overrideNote": "聊天输入框旁的权限选择器可按会话覆盖这个默认值。"
       }
     },
     "claude": {

@@ -514,7 +514,7 @@
     },
     "codex": {
       "permissionMode": "Permission Mode",
-      "description": "Controls how Codex handles file modifications and command execution",
+      "description": "Controls how Codex handles file modifications and command execution; new sessions start in this mode.",
       "modes": {
         "default": {
           "title": "Default",
@@ -539,7 +539,7 @@
     },
     "antigravity": {
       "permissionMode": "Permission Mode",
-      "description": "Controls how Antigravity handles file edits, plan generation, and command execution",
+      "description": "Controls how Antigravity handles file edits, plan generation, and command execution; new sessions start in this mode.",
       "modes": {
         "default": {
           "title": "Default",
@@ -568,7 +568,7 @@
     },
     "zcode": {
       "permissionMode": "Permission Mode",
-      "description": "Controls how ZCode handles file edits, plan generation, and command execution",
+      "description": "Controls how ZCode handles file edits, plan generation, and command execution; new sessions start in this mode.",
       "modes": {
         "default": {
           "title": "Default",
@@ -594,6 +594,36 @@
         "plan": "Maps to the engine's plan mode: read-only planning without modifications.",
         "bypassPermissions": "Maps to the engine's yolo mode: everything runs without approval prompts.",
         "overrideNote": "The per-session permission selector in the chat composer overrides this default for the current turn."
+      }
+    },
+    "opencode": {
+      "permissionMode": "Permission Mode",
+      "description": "Controls which OpenCode actions need your approval before they run; new sessions start in this mode.",
+      "modes": {
+        "default": {
+          "title": "Default",
+          "description": "Every file change and every command asks for your approval first."
+        },
+        "acceptEdits": {
+          "title": "Accept Edits",
+          "description": "File changes are applied without asking; commands still ask first."
+        },
+        "plan": {
+          "title": "Plan Mode",
+          "description": "Read-only planning: OpenCode only proposes the steps and asks before running anything."
+        },
+        "bypassPermissions": {
+          "title": "Bypass Permissions",
+          "description": "Nothing asks for approval. Every command and file change runs automatically. Use with caution."
+        }
+      },
+      "technicalDetails": "Technical details",
+      "technicalInfo": {
+        "default": "Adds an ask rule for shell, edit, write and patch; read-only tools stay allowed.",
+        "acceptEdits": "Ask rule on shell only; edit, write and patch run without approval.",
+        "plan": "Switches the session to the read-only plan agent and asks for every mutating action.",
+        "bypassPermissions": "No permission rules; the engine's default build agent allows every tool.",
+        "overrideNote": "The permission picker beside the chat input overrides this default for one session."
       }
     },
     "claude": {

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 
-import type { AgentCategory, AgentContextByProvider, AgentProvider, AgentSettingsProject, AntigravityPermissionMode, ClaudePermissionsState, CodexPermissionMode, CursorPermissionsState, ProviderAuthStatus, ZcodePermissionMode } from '@/shared/types';
+import type { AgentCategory, AgentContextByProvider, AgentProvider, AgentSettingsProject, AntigravityPermissionMode, ClaudePermissionsState, CodexPermissionMode, CursorPermissionsState, OpencodePermissionMode, ProviderAuthStatus, ZcodePermissionMode } from '@/shared/types';
 import AgentCategoryContentSection from '@/modules/settings/tabs/agents-settings/sections/AgentCategoryContentSection';
 import AgentCategoryTabsSection from '@/modules/settings/tabs/agents-settings/sections/AgentCategoryTabsSection';
 import AgentSelectorSection from '@/modules/settings/tabs/agents-settings/sections/AgentSelectorSection';
@@ -18,6 +18,8 @@ type AgentsSettingsTabProps = {
   onCodexPermissionModeChange: (value: CodexPermissionMode) => void;
   antigravityPermissionMode?: AntigravityPermissionMode;
   onAntigravityPermissionModeChange?: (value: AntigravityPermissionMode) => void;
+  opencodePermissionMode?: OpencodePermissionMode;
+  onOpencodePermissionModeChange?: (value: OpencodePermissionMode) => void;
   zcodePermissionMode?: ZcodePermissionMode;
   onZcodePermissionModeChange?: (value: ZcodePermissionMode) => void;
   projects: AgentSettingsProject[];
@@ -35,6 +37,8 @@ export default function AgentsSettingsTab({
   onCodexPermissionModeChange,
   antigravityPermissionMode,
   onAntigravityPermissionModeChange,
+  opencodePermissionMode,
+  onOpencodePermissionModeChange,
   zcodePermissionMode,
   onZcodePermissionModeChange,
   projects,
@@ -129,6 +133,8 @@ export default function AgentsSettingsTab({
           onCodexPermissionModeChange={onCodexPermissionModeChange}
           antigravityPermissionMode={antigravityPermissionMode}
           onAntigravityPermissionModeChange={onAntigravityPermissionModeChange}
+          opencodePermissionMode={opencodePermissionMode}
+          onOpencodePermissionModeChange={onOpencodePermissionModeChange}
           zcodePermissionMode={zcodePermissionMode}
           onZcodePermissionModeChange={onZcodePermissionModeChange}
           projects={projects}

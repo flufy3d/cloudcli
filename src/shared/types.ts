@@ -1661,9 +1661,17 @@ type TaskStatus =
 type TaskPriority = 'high' | 'medium' | 'low' | string;
 
 // ─── Fork additions consolidated from src/types/app, chat/types, settings/types ───
-export type AntigravityPermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+/** The four permission modes every plan-and-edit engine accepts: prompt for everything (default), auto-approve edits, read-only plan agent, or skip every check. Each provider alias below names the engine whose setting stores it. */
+export type SessionScopedPermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 
-export type ZcodePermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+/** How much Google Antigravity may do without asking; the settings dialog stores it under `antigravityPermissions`. */
+export type AntigravityPermissionMode = SessionScopedPermissionMode;
+
+/** How much OpenCode may do without asking; the settings dialog stores it under `opencodePermissions` and the OpenCode runtime maps it onto the plan agent and per-action ask rules. */
+export type OpencodePermissionMode = SessionScopedPermissionMode;
+
+/** How much ZCode may do without asking; the settings dialog stores it under `zcodePermissions`. */
+export type ZcodePermissionMode = SessionScopedPermissionMode;
 
 export type AuthStatus = ProviderAuthStatus;
 

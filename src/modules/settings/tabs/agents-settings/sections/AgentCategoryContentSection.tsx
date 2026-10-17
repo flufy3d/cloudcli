@@ -1,4 +1,4 @@
-import type { AgentCategory, AgentContextByProvider, AgentProvider, AgentSettingsProject, ClaudePermissionsState, CodexPermissionMode, CursorPermissionsState, McpProject, SkillsProject, AntigravityPermissionMode, ZcodePermissionMode } from '@/shared/types';
+import type { AgentCategory, AgentContextByProvider, AgentProvider, AgentSettingsProject, ClaudePermissionsState, CodexPermissionMode, CursorPermissionsState, McpProject, SkillsProject, AntigravityPermissionMode, OpencodePermissionMode, ZcodePermissionMode } from '@/shared/types';
 import { McpServers } from '@/modules/mcp';
 import { ProviderSkills } from '@/modules/skills';
 import AccountContent from '@/modules/settings/tabs/agents-settings/sections/content/AccountContent';
@@ -16,6 +16,8 @@ type AgentCategoryContentSectionProps = {
   onCodexPermissionModeChange: (value: CodexPermissionMode) => void;
   antigravityPermissionMode?: AntigravityPermissionMode;
   onAntigravityPermissionModeChange?: (value: AntigravityPermissionMode) => void;
+  opencodePermissionMode?: OpencodePermissionMode;
+  onOpencodePermissionModeChange?: (value: OpencodePermissionMode) => void;
   zcodePermissionMode?: ZcodePermissionMode;
   onZcodePermissionModeChange?: (value: ZcodePermissionMode) => void;
   projects: AgentSettingsProject[];
@@ -34,12 +36,19 @@ export default function AgentCategoryContentSection({
   onCodexPermissionModeChange,
   antigravityPermissionMode,
   onAntigravityPermissionModeChange,
+  opencodePermissionMode,
+  onOpencodePermissionModeChange,
   zcodePermissionMode,
   onZcodePermissionModeChange,
   projects,
 }: AgentCategoryContentSectionProps) {
   return (
-    <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 md:p-4">
+    <div
+      // The settings tests key off this container to catch a provider/category
+      // combination that renders nothing (see agentsPermissionsTabs.test.tsx).
+      data-testid="agent-category-content"
+      className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 md:p-4"
+    >
       {selectedCategory === 'account' && (
         <AccountContent
           agent={selectedAgent}
@@ -105,6 +114,14 @@ export default function AgentCategoryContentSection({
           agent="zcode"
           permissionMode={zcodePermissionMode!}
           onPermissionModeChange={onZcodePermissionModeChange!}
+        />
+      )}
+
+      {selectedCategory === 'permissions' && selectedAgent === 'opencode' && (
+        <PermissionsContent
+          agent="opencode"
+          permissionMode={opencodePermissionMode!}
+          onPermissionModeChange={onOpencodePermissionModeChange!}
         />
       )}
 
