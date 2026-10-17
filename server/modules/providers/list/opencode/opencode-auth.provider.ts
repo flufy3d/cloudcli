@@ -5,6 +5,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 import { getOpenCodeDatabasePath } from '@/modules/providers/list/opencode/opencode-data-root.js';
+import { tryResolveOpenCodeEnginePath } from '@/modules/providers/list/opencode/opencode-engine-path.js';
 import { createCliInstallationProbe } from '@/modules/providers/shared/installation/cli-installation-probe.js';
 import type { IProviderAuth } from '@/shared/interfaces.js';
 import type { ProviderAuthStatus } from '@/shared/types.js';
@@ -25,7 +26,11 @@ const OPENCODE_ENV_CREDENTIAL_KEYS = [
   'OPENROUTER_API_KEY',
 ];
 
-const installationProbe = createCliInstallationProbe({ command: () => 'opencode' });
+// The override is read per probe (tests swap it between cases); otherwise the
+// shared resolver finds the binary even when PATH lacks the install location.
+const installationProbe = createCliInstallationProbe({
+  command: () => process.env.CLOUDCLI_OPENCODE_CLI?.trim() || tryResolveOpenCodeEnginePath() || 'opencode',
+});
 
 export class OpenCodeProviderAuth implements IProviderAuth {
   /**
