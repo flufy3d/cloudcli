@@ -103,7 +103,9 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
-    supportsPermissionRequests: false,
+    // The runtime mounts the permissions facet: permission asks and question
+    // forms surface as cards answered through the service API.
+    supportsPermissionRequests: true,
     supportsTokenUsage: true,
     supportsQuota: false,
     supportsQuotaReset: false,
