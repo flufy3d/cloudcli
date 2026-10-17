@@ -96,6 +96,15 @@ export type OpenCodePermissionReply = {
 /** Form answers keyed by field key (`q0`, `q1`, …); multiselect values are arrays. */
 export type OpenCodeFormAnswer = Record<string, string | string[]>;
 
+/** What `GET /api/session/:id` tells the runtime (verified against v2.0.31). */
+export type OpenCodeSessionSnapshot = {
+  /** `succeeded` / `failed` / `interrupted` once a run finished; null while running or before any run. */
+  outcome: string | null;
+  /** Epoch ms when the session last went idle; null while a run is in flight. */
+  idleAt: number | null;
+  tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number } | null;
+};
+
 // ---------------------------
 
 /**
@@ -227,13 +236,35 @@ export class OpenCodeApiClient {
     );
   }
 
-  /** `GET /api/session/active` — ids of sessions with a run in flight. */
-  async listActiveSessionIds(): Promise<string[]> {
-    const result = await this.request<{ data?: unknown }>('GET', '/api/session/active');
-    const data = Array.isArray(result?.data) ? result.data : [];
-    return data
-      .map((entry) => (typeof entry === 'string' ? entry : (entry as { id?: unknown })?.id))
-      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+  /**
+   * `GET /api/session/:id` — the session row. `outcome` and `time.idle` are
+   * set once a run has finished (the runtime uses them to reconcile a run
+   * whose terminal event was missed during a stream drop); `tokens` are the
+   * session's running totals.
+   */
+  async getSession(sessionId: string): Promise<OpenCodeSessionSnapshot> {
+    const result = await this.request<{ data?: Record<string, unknown> }>(
+      'GET',
+      `/api/session/${encodeURIComponent(sessionId)}`,
+    );
+    const data = result?.data ?? {};
+    const time = (data.time ?? {}) as Record<string, unknown>;
+    const tokens = (data.tokens ?? null) as Record<string, unknown> | null;
+    const cache = (tokens?.cache ?? {}) as Record<string, unknown>;
+    const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+    return {
+      outcome: typeof data.outcome === 'string' ? data.outcome : null,
+      idleAt: typeof time.idle === 'number' ? time.idle : null,
+      tokens: tokens
+        ? {
+          input: num(tokens.input),
+          output: num(tokens.output),
+          reasoning: num(tokens.reasoning),
+          cacheRead: num(cache.read),
+          cacheWrite: num(cache.write),
+        }
+        : null,
+    };
   }
 
   private async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {

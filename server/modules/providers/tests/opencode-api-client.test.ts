@@ -47,8 +47,17 @@ const withFakeService = async (
         reply(200, { interrupted: true });
         return;
       }
-      if (request.method === 'GET' && path === '/api/session/active') {
-        reply(200, { data: [{ id: 'ses_a' }, 'ses_b', { nope: true }] });
+      if (request.method === 'GET' && path === '/api/session/ses_fake') {
+        reply(200, {
+          data: {
+            id: 'ses_fake', outcome: 'succeeded', time: { created: 1, updated: 2, idle: 1792208248938 },
+            tokens: { input: 19154, output: 10, reasoning: 435, cache: { read: 2048, write: 0 } },
+          },
+        });
+        return;
+      }
+      if (request.method === 'GET' && path === '/api/session/ses_running') {
+        reply(200, { data: { id: 'ses_running', time: { created: 1, updated: 2 } } });
         return;
       }
       reply(204);
@@ -94,7 +103,12 @@ test('sends the verified wire shapes with Basic auth on every call', async () =>
     await client.replyForm('ses_fake', 'frm_1', { q0: 'Blue', q1: ['a', 'b'] });
     await client.cancelForm('ses_fake', 'frm_2', 'skipped by user');
     await client.cancelForm('ses_fake', 'frm_3');
-    assert.deepEqual(await client.listActiveSessionIds(), ['ses_a', 'ses_b']);
+    assert.deepEqual(await client.getSession('ses_fake'), {
+      outcome: 'succeeded',
+      idleAt: 1792208248938,
+      tokens: { input: 19154, output: 10, reasoning: 435, cacheRead: 2048, cacheWrite: 0 },
+    });
+    assert.deepEqual(await client.getSession('ses_running'), { outcome: null, idleAt: null, tokens: null });
 
     assert.ok(requests.every((request) => request.authorization === 'Basic dGVzdA=='));
     assert.deepEqual(requests.map((request) => [request.method, request.path]), [
@@ -108,7 +122,8 @@ test('sends the verified wire shapes with Basic auth on every call', async () =>
       ['POST', '/api/session/ses_fake/form/frm_1/reply'],
       ['DELETE', '/api/session/ses_fake/form/frm_2?message=skipped%20by%20user'],
       ['DELETE', '/api/session/ses_fake/form/frm_3'],
-      ['GET', '/api/session/active'],
+      ['GET', '/api/session/ses_fake'],
+      ['GET', '/api/session/ses_running'],
     ]);
     assert.deepEqual(requests[0].body, {
       location: { directory: '/tmp/project' },
