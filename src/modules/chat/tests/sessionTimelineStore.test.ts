@@ -1534,19 +1534,20 @@ function emitOpenCode(store: SessionTimelineStore, frame: Record<string, unknown
 /**
  * The reported OpenCode duplicate.
  *
- * OpenCode streams a reply as `message.part.delta` fragments and never sends
+ * OpenCode streams a reply as `session.text.delta` fragments and never sends
  * the finished row, so the bubble the client assembles from them has no
- * engine id its persisted copy could be recognised by. The part id is the one
- * identity both transports carry; published as the row key it lets the
- * persisted row claim the stream. Without it the reply stood beside its own
- * persisted copy for the rest of the session.
+ * engine id its persisted copy could be recognised by. The engine's text-part
+ * coordinates — the message id plus the part's ordinal — are the one identity
+ * both transports carry; published as the row key they let the persisted row
+ * claim the stream. Without it the reply stood beside its own persisted copy
+ * until the session was reloaded.
  */
 test('a streamed OpenCode reply is claimed by the persisted row for its part', async () => {
-  const providerRowKey = 'opencode-part:prt_reply';
+  const providerRowKey = 'opencode-part:msg_reply_text_0';
   const reply = 'No problem — say the word if the console flashes anywhere else.';
   const prompt = msg(1, { provider: 'opencode', content: 'thanks, the flicker is gone' });
   const persistedReply = msg(2, {
-    id: 'msg_turn_prt_reply',
+    id: 'msg_turn_reply',
     provider: 'opencode',
     content: reply,
     providerRowKey,
@@ -1573,7 +1574,7 @@ test('a streamed OpenCode reply is claimed by the persisted row for its part', a
 
   assert.deepEqual(
     store.getMessages(SESSION_ID).filter((row) => row.content === reply).map((row) => row.id),
-    ['msg_turn_prt_reply'],
+    ['msg_turn_reply'],
     'the reply must render once, as its persisted row',
   );
   assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 0);
@@ -1581,26 +1582,27 @@ test('a streamed OpenCode reply is claimed by the persisted row for its part', a
 
 /**
  * One OpenCode turn that writes, calls a tool, then writes again persists two
- * text rows. Keying the stream per part is what lets each persisted row claim
- * its own segment: a key shared by both segments matches two rows, which is
- * ambiguous, and an ambiguous key reconciles nothing — both streamed copies
- * would stay on screen.
+ * text rows, each under the message of its own step. Keying the stream per
+ * text part is what lets each persisted row claim its own segment: a key
+ * shared by both segments matches two rows, which is ambiguous, and an
+ * ambiguous key reconciles nothing — both streamed copies would stay on
+ * screen.
  */
 test('two text parts of one OpenCode turn are each claimed by their own persisted row', async () => {
   const first = 'Checking the runtime first.';
   const second = 'Done — the console no longer flashes.';
   const prompt = msg(1, { provider: 'opencode', content: 'fix the console flash' });
   const persistedFirst = msg(2, {
-    id: 'msg_turn_prt_a',
+    id: 'msg_turn_first',
     provider: 'opencode',
     content: first,
-    providerRowKey: 'opencode-part:prt_a',
+    providerRowKey: 'opencode-part:msg_first_text_0',
   });
   const persistedSecond = msg(4, {
-    id: 'msg_turn_prt_b',
+    id: 'msg_turn_second',
     provider: 'opencode',
     content: second,
-    providerRowKey: 'opencode-part:prt_b',
+    providerRowKey: 'opencode-part:msg_second_text_0',
   });
   const fetchPage = scriptedFetcher([
     {
@@ -1619,13 +1621,13 @@ test('two text parts of one OpenCode turn are each claimed by their own persiste
     kind: 'stream_delta',
     sessionId: SESSION_ID,
     content: first,
-    providerRowKey: 'opencode-part:prt_a',
+    providerRowKey: 'opencode-part:msg_first_text_0',
   });
   emitOpenCode(store, {
     kind: 'stream_delta',
     sessionId: SESSION_ID,
     content: second,
-    providerRowKey: 'opencode-part:prt_b',
+    providerRowKey: 'opencode-part:msg_second_text_0',
   });
   emitOpenCode(store, { kind: 'stream_end', sessionId: SESSION_ID });
   emitOpenCode(store, { kind: 'complete', sessionId: SESSION_ID });
@@ -1636,7 +1638,7 @@ test('two text parts of one OpenCode turn are each claimed by their own persiste
     store.getMessages(SESSION_ID)
       .filter((row) => row.content === first || row.content === second)
       .map((row) => row.id),
-    ['msg_turn_prt_a', 'msg_turn_prt_b'],
+    ['msg_turn_first', 'msg_turn_second'],
     'each segment must render once, as its own persisted row',
   );
   assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 0);

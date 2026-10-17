@@ -34,6 +34,7 @@ import {
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
 import { readOpenCodeContextUsage } from './opencode-context-usage.js';
+import { buildOpenCodeTextRowKey } from './opencode-event-translator.js';
 
 const PROVIDER = 'opencode';
 
@@ -494,6 +495,15 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
   private normalizeHistoryRows(rows: OpenCodeHistoryRow[], sessionId: string): NormalizedMessage[] {
     const normalized: NormalizedMessage[] = [];
     const emittedMessageErrors = new Set<string>();
+    /**
+     * How many text parts this walk has passed per message. The live events
+     * name a text part by its ordinal among the message's text parts, so the
+     * row key both paths publish derives from that same count — see
+     * `buildOpenCodeTextRowKey`, which the client reconciles the streamed
+     * reply against. Counted per part, not per emitted row: a part that
+     * renders nothing still occupies its ordinal.
+     */
+    const textPartCounts = new Map<string, number>();
 
     for (const row of rows) {
       const timestamp = normalizeProviderTimestamp(row.part_time_created ?? row.message_time_created);
@@ -529,6 +539,8 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       }
 
       if (partType === 'text') {
+        const textPartOrdinal = textPartCounts.get(row.message_id) ?? 0;
+        textPartCounts.set(row.message_id, textPartOrdinal + 1);
         const rawContent = extractText(partData);
         // User prompts sent with attachments carry an <images_input> path
         // list; strip it for display and surface the paths as images.
@@ -554,6 +566,17 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
             content: parsedFiles.text,
             images: parsedImages.attachments.length > 0 ? parsedImages.attachments : undefined,
             files: parsedFiles.attachments.length > 0 ? parsedFiles.attachments : undefined,
+            // The live stream never announces this row — it sends fragments
+            // of it — so the part coordinates are the only identity the two
+            // paths share. A compaction's virtual rows have no live
+            // counterpart to reconcile with, so they stay unkeyed.
+            ...(
+              messageRole !== 'user'
+              && partData.isCompactSummary !== true
+              && compactAnnotation === undefined
+                ? { providerRowKey: buildOpenCodeTextRowKey(row.message_id, textPartOrdinal) }
+                : {}
+            ),
             // A compaction's two virtual rows carry their annotations here:
             // the summary is flagged so the client folds it behind a
             // disclosure, and the row above it says what the compaction was.

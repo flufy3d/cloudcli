@@ -21,9 +21,12 @@
  *
  * Ids on transcript rows (thinking / tool_use / tool_result) derive from the
  * engine's own identifiers (assistant message id + ordinal, tool call id) so
- * the same record never arrives under two ids. Unknown event types are
- * ignored on purpose: the service is young and adds events between patch
- * releases.
+ * the same record never arrives under two ids. Assistant *text* has no row id
+ * on the live path — the service streams fragments of a row it never
+ * announces — so each text part also publishes the cross-transport
+ * `providerRowKey` its persisted row carries; see `buildOpenCodeTextRowKey`.
+ * Unknown event types are ignored on purpose: the service is young and adds
+ * events between patch releases.
  *
  * @module opencode-event-translator
  */
@@ -117,6 +120,33 @@ const readErrorMessage = (error: unknown): string => {
 };
 
 /**
+ * The cross-transport identity of one assistant text part.
+ *
+ * The service streams a reply as fragments of a row it never announces, and
+ * the persisted copy lives in the message's `content` array — two row ids
+ * that cannot match. What both transports do carry is the engine's own text
+ * part coordinates: the message id plus the part's ordinal within that
+ * message's text parts (`session.text.*` events publish exactly that
+ * ordinal; the database stores the blocks in that order). Publishing them as
+ * the row key is what lets a persisted reply retire the streamed bubble
+ * instead of rendering beside it — see `reconcileProviderRowText` in the
+ * client timeline store.
+ *
+ * The ordinal counts text parts only, not content blocks: a message holding
+ * `[reasoning, text]` has text ordinal 0, so reasoning parts must never be
+ * folded into this counter. Reasoning keeps the client's content-equality
+ * path (`sessionThinkingRows.ts`); it has no key.
+ *
+ * Consumers: this module (live `session.text.delta` frames) and
+ * `opencode-sessions.provider.ts` (the persisted row for the same part).
+ * Both must derive the key the same way, or the streamed reply renders beside
+ * its persisted copy until the session is reloaded.
+ */
+export function buildOpenCodeTextRowKey(messageId: string, textPartOrdinal: number): string {
+  return `opencode-part:${messageId}_text_${textPartOrdinal}`;
+}
+
+/**
  * Per-session translator. One instance lives for the life of a run (or a
  * session's attachment) because tool names and reasoning block ids are
  * remembered across events.
@@ -158,6 +188,7 @@ export class OpenCodeSessionEventTranslator {
             provider: PROVIDER,
             kind: 'stream_delta',
             content: delta,
+            providerRowKey: buildOpenCodeTextRowKey(messageId, ordinal),
           })],
         };
       }

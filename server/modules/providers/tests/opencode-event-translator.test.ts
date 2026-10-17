@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { OpenCodeSessionEventTranslator } from '@/modules/providers/list/opencode/opencode-event-translator.js';
+import { OpenCodeSessionEventTranslator, buildOpenCodeTextRowKey } from '@/modules/providers/list/opencode/opencode-event-translator.js';
 import type { OpenCodeEventEnvelope } from '@/modules/providers/list/opencode/opencode-event-stream.js';
 import { isVolatileMessageId } from '../../../../shared/protocol/messageKinds.js';
 
@@ -38,6 +38,27 @@ test('streams text as stream_delta frames and closes each segment with stream_en
   assert.equal(ended.frames.length, 1);
   assert.equal(ended.frames[0].kind, 'stream_end');
   assert.equal(ended.terminal, undefined);
+});
+
+test('each streamed text part publishes the row key its persisted copy carries', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+
+  const first = translator.translate(event('session.text.delta', { assistantMessageID: MESSAGE, ordinal: 0, delta: 'one ' }));
+  const second = translator.translate(event('session.text.delta', { assistantMessageID: MESSAGE, ordinal: 1, delta: 'two' }));
+
+  assert.equal(first.frames[0].providerRowKey, buildOpenCodeTextRowKey(MESSAGE, 0));
+  assert.equal(second.frames[0].providerRowKey, buildOpenCodeTextRowKey(MESSAGE, 1));
+  assert.notEqual(
+    first.frames[0].providerRowKey,
+    second.frames[0].providerRowKey,
+    'two text parts of one message must not share a key — the client reconciles nothing when a key matches two rows',
+  );
+
+  // The ordinal counts text parts only: a reasoning part of the same message
+  // opens at ordinal 0 too, and reasoning reconciles by content (the client's
+  // sessionThinkingRows path), so it must stay unkeyed.
+  const reasoning = translator.translate(event('session.reasoning.delta', { assistantMessageID: MESSAGE, ordinal: 0, delta: 'hmm' }));
+  assert.equal(reasoning.frames[0].providerRowKey, undefined);
 });
 
 test('emits reasoning deltas under one stable block id and does not repeat the block on ended', () => {

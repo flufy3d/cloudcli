@@ -7,6 +7,10 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import {
+  OpenCodeSessionEventTranslator,
+  buildOpenCodeTextRowKey,
+} from '@/modules/providers/list/opencode/opencode-event-translator.js';
 import { OpenCodeSessionSynchronizer } from '@/modules/providers/list/opencode/opencode-session-synchronizer.provider.js';
 import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
 import { appendImagesInputTag } from '@/shared/image-attachments.js';
@@ -767,6 +771,102 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
   }
 });
 
+test('persisted OpenCode text parts carry the row key the live stream publishes', { concurrency: false }, async () => {
+  // A streamed bubble and its persisted row share no row id (the service
+  // streams fragments of a row it never announces), so the client retires the
+  // streamed copy through `providerRowKey`. Both paths must derive it from the
+  // same native coordinates — the message id plus the part's ordinal among
+  // that message's text parts — or every reply renders twice until the
+  // session is reloaded (the duplicate reported from a live session).
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-text-keys-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (
+          id, project_id, slug, directory, title, version,
+          tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          time_created, time_updated
+        ) VALUES (
+          'ses_v2_text', 'proj_1', 'v2-text', '/tmp/proj', 'Text keys', '2.0.32',
+          0, 0, 0, 0, 0, 1000, 3000
+        );
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_u', 'ses_v2_text', 'user', 1, 1000, 1000, '{"time":{"created":1000},"text":"Write it"}'),
+          ('msg_a', 'ses_v2_text', 'assistant', 2, 1100, 1200, '{"time":{"created":1100},"content":[{"type":"reasoning","text":"thinking"},{"type":"text","text":"first answer"}]}'),
+          ('msg_b', 'ses_v2_text', 'assistant', 3, 1300, 1400, '{"time":{"created":1300},"content":[{"type":"text","text":"before the tool"},{"type":"tool","id":"call_1","name":"write","state":{"status":"completed","input":{"path":"/tmp/x"},"output":"ok"}},{"type":"text","text":"after the tool"}]}');
+      `);
+    } finally {
+      db.close();
+    }
+
+    const history = await new OpenCodeSessionsProvider().fetchHistory('ses_v2_text');
+
+    assert.deepEqual(
+      history.messages
+        .filter((message) => message.kind === 'text' && message.role === 'assistant')
+        .map((row) => [row.content, row.providerRowKey]),
+      [
+        ['first answer', buildOpenCodeTextRowKey('msg_a', 0)],
+        ['before the tool', buildOpenCodeTextRowKey('msg_b', 0)],
+        ['after the tool', buildOpenCodeTextRowKey('msg_b', 1)],
+      ],
+      'the ordinal counts text parts within the message, never content blocks',
+    );
+    assert.equal(
+      history.messages.find((message) => message.role === 'user')?.providerRowKey,
+      undefined,
+      'a prompt is not a streamed part; the client pairs it through its own anchor',
+    );
+
+    // The cross-path proof: the live frames for the same coordinates publish
+    // exactly the keys those persisted rows carry.
+    const translator = new OpenCodeSessionEventTranslator('app-session-1');
+    for (const [messageId, ordinal] of [['msg_a', 0], ['msg_b', 0], ['msg_b', 1]] as const) {
+      const frame = translator.translate({
+        type: 'session.text.delta',
+        data: { sessionID: 'ses_v2_text', assistantMessageID: messageId, ordinal, delta: 'x' },
+      }).frames[0];
+      assert.equal(
+        frame?.providerRowKey,
+        buildOpenCodeTextRowKey(messageId, ordinal),
+        `${messageId}/${ordinal}: the two transports disagree about the row key`,
+      );
+    }
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('a v2 compaction summary resets the reading to compacted with its byte size', { concurrency: false }, async () => {
   // The summary's own tokens describe the summarization request (the whole
   // pre-compaction conversation), so it must never be reported as occupancy;
@@ -915,6 +1015,11 @@ test('a v2 compaction message renders as its own row with the summary flagged', 
     const summaryRow = history.messages.find((message) => message.isCompactSummary === true);
     assert.equal(summaryRow?.role, 'assistant', 'the summary is assistant-authored, never a user bubble');
     assert.equal(summaryRow?.content, 'The conversation so far, summarized.');
+    assert.equal(
+      summaryRow?.providerRowKey,
+      undefined,
+      'the summary is written by the engine, not streamed as a text part; it has no live copy to reconcile with',
+    );
     assert.ok(
       history.messages.indexOf(compactRow!) < history.messages.indexOf(summaryRow!),
       'the row saying what happened comes before the summary itself',

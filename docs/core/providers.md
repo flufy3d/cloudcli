@@ -126,7 +126,7 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 - `opencode-service.ts`：监管器，懒启动 `opencode serve --stdio --port 0`，随机密码经 `OPENCODE_PASSWORD` 传入、Basic 认证（账号固定 `opencode`）；就绪行是 stdout 上的 `{"url":…}`；**stdin 就是所有权租约**——cloudcli 退出服务随之退场，崩溃退避重启。v1 引擎在聊天时报错（历史读取的双格式兼容不受影响）。
 - `opencode-api.client.ts`：会话创建（`location.directory` 锚定项目目录）、模型/角色/权限规则切换、prompt、压缩请求（`POST /api/session/:id/compact`，v2.0.32）、interrupt、权限与表单答复。模型引用是对象 `{providerID, id, variant}`（variant 即推理力度，`provider/model#effort` 解析）。
 - `opencode-event-stream.ts`：一条全局 `GET /api/event` SSE，按 `data.sessionID` 分发；每次（重）连都重新解析端点，跟随重启换端口的服务；断线退避重连并广播重连事件。
-- `opencode-event-translator.ts`：会话事件 → 时间线帧（text.delta→stream_delta、reasoning.delta→同 id thinking、tool.*→tool_use/tool_result、execution.*→运行终态）。事件词表钉在测试夹具里，未知事件类型忽略，防版本漂移。
+- `opencode-event-translator.ts`：会话事件 → 时间线帧（text.delta→stream_delta、reasoning.delta→同 id thinking、tool.*→tool_use/tool_result、execution.*→运行终态）。assistant 正文帧另带 `providerRowKey`（`opencode-part:${消息id}_text_${序号}`，序号取事件自带的正文段序号；与历史行同一推导，见身份表），否则流式气泡没有可被持久化行认领的身份。事件词表钉在测试夹具里，未知事件类型忽略，防版本漂移。
 - `opencode-interaction-bridge.ts`：`permission.asked` → 权限卡（Allow/记住/拒绝 → `once`/`always`/`reject`）；`form.created`（question 表单）→ `AskUserQuestion` 卡（服务的 `multiselect` 翻译成面板的 `multiSelect`；答复按问题文本映射回 `q0/q1` 字段键，多选按 `", "` 拆分——选项文案含该序列是已知边界）。跳过/拒绝=取消表单并附留言，模型继续而非整步作废。
 - `opencode-session-settings.ts`：权限模式映射——`plan`→只读 plan 角色+全部变更类 ask 规则；`acceptEdits`→仅 shell ask；`bypassPermissions`→无规则（引擎默认全放行）；`default`→全部变更类 ask。**引擎默认角色本身全放行，权限卡完全靠这些 ask 规则出现**；已应用的切换按会话缓存，避免每次发消息重复下发（切 plan 会附带一条系统提醒）。
 - `opencode-run-registry.ts`：活跃运行登记、事件分发、首结算生效；断线重连后按 `GET /api/session/:id` 的 `outcome`/`time.idle` 对账，补上错过的终态，避免会话卡在"处理中"。`OpenCodeTokenBudgetTracker` 消费 `session.step.ended` 的 per-step `tokens` 发回合中 `token_budget` 帧（1.5s 节流 + 值去重）；该接口的 `tokens` 是会话累计花费，不能当窗口占用用，权威占用读数走 `opencode.db` 的 `opencode-context-usage.ts`。登记时声明 run 的 `purpose`（`chat` / `compact`）：`session.compaction.failed` 只结算主动压缩的那个 run，普通回合里的自动压缩失败不影响该回合。
@@ -314,7 +314,7 @@ id 必须字节相同。** 这条有两道闸门守着：
 | antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id |
 | zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
 | cursor | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
-| opencode | 两路不同源：实时行 id=引擎工具调用 id / `${消息id}_reasoning_${序号}`，历史行 id=`${消息id}_${块序号}`；工具行靠 toolId 指纹层配对 | 服务客户端化（2026-10-17，见「OpenCode 服务客户端」）后实时与历史读的是同一引擎记录的不同投影 |
+| opencode | 两路 id 不同源：实时行 id=引擎工具调用 id / `${消息id}_text_${序号}`、`${消息id}_reasoning_${序号}`，历史行 id=`${消息id}_${块序号}`；**assistant 正文**由 `providerRowKey: opencode-part:${消息id}_text_${序号}` 对账；工具行靠 toolId 指纹层配对 | 服务客户端化（2026-10-17，见「OpenCode 服务客户端」）后实时与历史是同一引擎记录的两个投影：`session.text.*` 事件自带 `assistantMessageID` 与**正文段序号**（按正文块计数，reasoning 另计），落盘的 `content` 数组按同一顺序排块，故两路可各自复建同一推导。序号缺失（事件无 `assistantMessageID`）时 key 不与任何持久化行相等，正文仍留在屏幕上，不会误删 |
 
 **引擎同时提供「原始记录」和「组装好的记录」时，两路都读组装的那一份。** codex 的 rollout 里
 既有 Responses API 的原始条目（`response_item`：`custom_tool_call` 及其输出、`function_call`、
