@@ -1,4 +1,4 @@
-import type { ActiveBackgroundTask, BackgroundTaskSummary } from '@/shared/types.js';
+import type { ActiveBackgroundTask, BackgroundTaskSummary, SessionBackgroundWork } from '@/shared/types.js';
 import { SUBAGENT_TOOL_NAME, canonicalClaudeSubagentToolName } from '@/shared/utils.js';
 
 // TaskCreate writes a to-do item; it does not launch an execution task.
@@ -270,7 +270,7 @@ export function createBackgroundWorkTracker() {
       sessions.delete(sessionKey);
     },
 
-    list(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
+    list(): SessionBackgroundWork[] {
       return Array.from(sessions).flatMap(([sessionId, state]) => {
         const tasks = Array.from(state.records.values()).flatMap((record) => record.summary ? [record.summary] : []);
         return tasks.length ? [{ sessionId, tasks }] : [];

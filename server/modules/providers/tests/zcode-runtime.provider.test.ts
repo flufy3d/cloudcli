@@ -177,6 +177,20 @@ rl.on('line', (line) => {
     return;
   }
 
+  // mode "handover-window": answers session/subscribe only after emitting a
+  // text delta and the stop of the background agent an earlier turn left
+  // running, so both land while the runtime is still setting a new run up —
+  // between its start and the moment it sends the prompt.
+  if (msg.method === 'session/subscribe' && readMode() === 'handover-window') {
+    const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
+    ev('model_streaming', { kind: 'text_delta', delta: 'window text' });
+    ev('subagent_stopped', { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg', status: 'completed', totalDurationMs: 1500, totalToolUseCount: 2, totalTokens: 300 });
+    // A turn-ending event of the earlier turn, straggling in.
+    ev('turn_complete', { usage: { inputTokens: 1, outputTokens: 1 } });
+    send({ id: msg.id, result: {} });
+    return;
+  }
+
   if (msg.method === 'session/create') {
     // A create always starts a fresh engine session: reset the event session
     // id a previous resume-driven test may have changed.
@@ -233,6 +247,20 @@ rl.on('line', (line) => {
     }
     if (readMode() === 'send-fail') {
       send({ method: 'session/event', params: { sessionId, type: 'turn.failed', payload: { error: { message: 'provider auth failed', attribution: { statusCode: 401, reason: 'auth_failed' } } } } });
+      return;
+    }
+    if (readMode() === 'subagent-run-crash') {
+      // The engine dies while a turn is still in flight with an agent running.
+      const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
+      const agent = { agentId: 'agent_run_1', agentType: 'general-purpose', background: false, childSessionId: 'sess_subagent_agent_run_1', parentToolCallId: 'call_agent_run' };
+      ev('model_streaming', { kind: 'tool_call', toolCallId: 'call_agent_run', toolName: 'Agent', input: { description: 'Audit', prompt: 'look', subagent_type: 'general-purpose' } });
+      ev('subagent_spawned', { ...agent, description: 'Audit', prompt: 'look', status: 'running' });
+      setTimeout(() => process.exit(1), 100);
+      return;
+    }
+    if (readMode() === 'handover-window') {
+      send({ method: 'session/event', params: { sessionId, type: 'model_streaming', payload: { kind: 'text_delta', delta: 'hi there' } } });
+      send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
       return;
     }
     if (readMode() === 'subagent-bg' || readMode() === 'subagent-bg-crash') {
@@ -1159,7 +1187,58 @@ test('a new run takes the session over from the lifecycle watcher: a late stop i
   );
 });
 
-test('an engine crash retires the agents it was running and stands the watcher down', async () => {
+test('a stop landing while a new run is still setting up reaches only the new run, once', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const first = createWriter();
+  await runtime.run('review it', { sessionId: 'app-sess-window', cwd: stubDir }, first.writer, context);
+  assert.equal(runtime.listBackgroundWork().length, 1, 'the agent outlives the first turn');
+  const firstCount = first.messages.length;
+
+  // The engine reports the stop while the next run is between its start and
+  // its prompt; the first turn's watcher must not take it.
+  fsSync.writeFileSync(modeFilePath, 'handover-window\n');
+  const second = createWriter();
+  await runtime.run('and again', { sessionId: 'app-sess-window', cwd: stubDir }, second.writer, context);
+
+  assert.equal(first.messages.length, firstCount, 'the finished turn\'s writer hears nothing after the handover');
+  // The straggling turn-end belongs to the earlier turn: the new run still
+  // waits for its own, so its reply arrives before its completion.
+  const replyAt = second.messages.findIndex((message) => message.content === 'hi there');
+  const completeAt = second.messages.findIndex((message) => message.kind === 'complete');
+  assert.ok(replyAt >= 0 && replyAt < completeAt, 'the new run completes on its own turn, not on the earlier one');
+  const settled = second.messages.filter((message) => message.kind === 'task_status' && message.status === 'completed');
+  assert.equal(settled.length, 1, 'the stop reaches the new run\'s writer exactly once');
+  assert.deepEqual(runtime.listBackgroundWork(), []);
+});
+
+test('a superseded run forwards nothing from the stream once a newer run owns the session', async () => {
+  fsSync.writeFileSync(modeFilePath, 'abort-ok\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const first = createWriter();
+  // The superseded run ends with an error; collect it where it happens.
+  const firstRun = runtime.run('stream', { sessionId: 'app-sess-superseded', cwd: stubDir }, first.writer, context)
+    .then(() => null, (error: unknown) => error);
+  for (let i = 0; i < 100 && !first.messages.some((message) => message.kind === 'stream_delta'); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(first.messages.some((message) => message.kind === 'stream_delta'), 'the first run must be streaming');
+
+  fsSync.writeFileSync(modeFilePath, 'handover-window\n');
+  const second = createWriter();
+  await runtime.run('take over', { sessionId: 'app-sess-superseded', cwd: stubDir }, second.writer, context);
+  assert.match(String(await firstRun), /superseded/);
+
+  const windowText = (messages: NormalizedMessage[]) => messages.filter((message) => message.content === 'window text').length;
+  assert.equal(windowText(second.messages), 1, 'the new run forwards what arrived during its setup');
+  assert.equal(windowText(first.messages), 0, 'the superseded run must not forward a second copy');
+
+  // Stops the stub's ticking stream so it does not outlive the test.
+  await protocolClient.sendRequest('session/stop', { sessionId: 'sess_stub_1' });
+});
+
+// Last: both crash modes kill the shared stub subprocess.
+test('an engine crash settles the agents the watcher was waiting on as stopped, so no card spins', async () => {
   fsSync.writeFileSync(modeFilePath, 'subagent-bg-crash\n');
   const runtime = new ZCodeRuntimeProvider();
   const { messages, writer } = createWriter();
@@ -1167,11 +1246,31 @@ test('an engine crash retires the agents it was running and stands the watcher d
   assert.equal(runtime.listBackgroundWork().length, 1, 'the agent is tracked once the turn ends');
 
   // The engine dies with the agent still running. Nothing can report it any
-  // more, so it must leave the background list instead of spinning forever.
+  // more, so the page must be told it stopped and it must leave the list.
   const deadline = Date.now() + 4000;
   while (runtime.listBackgroundWork().length > 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.deepEqual(runtime.listBackgroundWork(), [], 'the dead engine\'s agent is retired');
-  assert.ok(!messages.some((message) => message.kind === 'task_status' && message.status === 'completed'), 'no completion is fabricated');
+  const settled = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(settled.map((message) => [message.toolUseId, message.taskId, message.status]), [
+    ['call_agent_bg', 'agent_bg_1', 'stopped'],
+  ]);
+  assert.equal(settled[0].usage, undefined, 'no usage is invented for an agent that never reported');
+});
+
+test('an engine crash mid-turn settles the agents the run was waiting on as stopped', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-run-crash\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+  const result = await runtime.run('audit it', { sessionId: 'app-sess-run-crash', cwd: stubDir }, writer, context);
+  assert.equal((result as { success: boolean }).success, false);
+
+  const settled = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(settled.map((message) => [message.toolUseId, message.status]), [['call_agent_run', 'stopped']]);
+  assert.ok(
+    messages.indexOf(settled[0]) < messages.findIndex((message) => message.kind === 'complete'),
+    'the card settles before the page sees the run complete',
+  );
+  assert.deepEqual(runtime.listBackgroundWork(), []);
 });

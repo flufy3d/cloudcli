@@ -1,4 +1,7 @@
-import { LOCAL_AGENT_TASK_TYPE } from '@/modules/providers/shared/background-work/task-status.js';
+import {
+  LOCAL_AGENT_TASK_TYPE,
+  createTaskStatusMessage,
+} from '@/modules/providers/shared/background-work/task-status.js';
 import type { AnyRecord, NormalizedMessage, TaskUsage } from '@/shared/types.js';
 import {
   compactProviderPayload,
@@ -221,28 +224,26 @@ export function isZCodeSubagentLifecycleEvent(type: string): boolean {
   return type === 'subagent_spawned' || type === 'subagent_stopped';
 }
 
-/** An engine-reported total as a usage figure: missing, invalid or negative reads as 0. */
-const readReportedTotal = (value: unknown): number => {
+/** An engine-reported total, or undefined when the engine did not report one (or reported nonsense). */
+const readReportedTotal = (value: unknown): number | undefined => {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  return value !== undefined && value !== null && Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 };
 
 /**
  * Translates the engine's subagent lifecycle events — emitted on the PARENT
  * session when an `Agent` call's child session is ready and when it stops —
- * into the `task_status` events the client folds onto the launching `Agent`
+ * into the `task_status` events the client folds onto the launching Agent
  * card. Both events name the launching call (`parentToolCallId`); one that
  * does not is dropped, because an unattached status has no card to land on.
  *
  * `subagent_spawned` marks the card running. `subagent_stopped` settles it:
- * the engine reports `completed` or `failed` with its totals (which become
- * the card's usage line) and, on failure, the error as the summary.
- *
- * Consumers: `normalize` (events that arrive during a run) and the runtime's
- * lifecycle watcher (a background agent's stop, which lands after the turn
- * that launched it has already settled).
+ * the engine reports `completed` or `failed` and, on failure, the error as the
+ * summary. Its totals become the card's usage line, but only the ones the
+ * engine sent: a failure stop carries no token or tool-call totals, and a
+ * missing figure stays missing instead of reading as a measured zero.
  */
-export function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): NormalizedMessage | null {
+function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): NormalizedMessage | null {
   const { payload } = event;
   const taskId = readOptionalString(payload.agentId);
   const toolUseId = readOptionalString(payload.parentToolCallId);
@@ -250,21 +251,18 @@ export function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): 
     return null;
   }
 
-  const build = (fields: Pick<NormalizedMessage, 'event' | 'description' | 'status' | 'summary' | 'usage' | 'outputFile'>): NormalizedMessage =>
-    createNormalizedMessage({
-      id: event.id,
-      sessionId: event.sessionId,
-      timestamp: event.timestamp,
-      provider: PROVIDER,
-      kind: 'task_status',
-      taskId,
-      toolUseId,
-      taskType: LOCAL_AGENT_TASK_TYPE,
-      ...fields,
-    });
+  const subject = {
+    provider: PROVIDER,
+    sessionId: event.sessionId,
+    taskId,
+    toolUseId,
+    taskType: LOCAL_AGENT_TASK_TYPE,
+  } as const;
+  const timing = { id: event.id, timestamp: event.timestamp };
 
   if (event.type === 'subagent_spawned') {
-    return build({
+    return createTaskStatusMessage(subject, {
+      ...timing,
       event: 'started',
       description: readOptionalString(payload.description) ?? readOptionalString(payload.prompt),
     });
@@ -272,16 +270,22 @@ export function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): 
 
   const reported = readOptionalString(payload.status);
   const status = reported === 'completed' || reported === 'failed' ? reported : 'stopped';
-  const usage: TaskUsage = {
+  const reportedUsage: Record<keyof TaskUsage, number | undefined> = {
     totalTokens: readReportedTotal(payload.totalTokens),
     toolUses: readReportedTotal(payload.totalToolUseCount),
     durationMs: readReportedTotal(payload.totalDurationMs),
   };
-  return build({
+  // Keep only the figures the engine sent.
+  const usage = Object.fromEntries(
+    Object.entries(reportedUsage).filter(([, value]) => value !== undefined),
+  ) as TaskUsage;
+  const hasUsage = Object.keys(usage).length > 0;
+  return createTaskStatusMessage(subject, {
+    ...timing,
     event: 'notification',
     status,
     summary: readOptionalString(payload.error),
-    usage,
+    usage: hasUsage ? usage : undefined,
     outputFile: readOptionalString(payload.outputFile),
   });
 }

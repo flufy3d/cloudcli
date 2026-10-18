@@ -29,6 +29,8 @@ type FakeServer = {
   calls: Array<{ method: string; params: any; options?: unknown }>;
   handlers: CodexAppServerHandlers;
   openOptions?: { env?: NodeJS.ProcessEnv; inheritEnv?: boolean };
+  /** Whether the run closed the connection, which kills the real app-server process. */
+  closed?: boolean;
 };
 
 /**
@@ -67,7 +69,7 @@ function installFakeAppServer(
         }
         return {};
       },
-      close() {},
+      close() { server.closed = true; },
     };
   });
 
@@ -889,13 +891,14 @@ test('subagent notifications with different threadId are ignored and do not sett
 const spawnActivity = { type: 'subAgentActivity', id: 'call_spawn_1', kind: 'started', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
 const doneActivity = { type: 'subAgentActivity', id: 'call_done_1', kind: 'completed', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
 
-test('a spawned agent builds its Agent card from its activity record and is tracked as background work', async (t) => {
-  installFakeAppServer(t, (server) => {
-    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+test('an agent still running when the turn ends is settled as stopped, because closing the connection kills it', async (t) => {
+  const midTurn: Array<ReturnType<typeof codexRuntime.listBackgroundWork>> = [];
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
-    // The agent starts; no terminal event arrives before the turn settles —
-    // the agent outlives the turn, which is the whole point.
+    // The agent starts; no terminal event arrives before the turn settles.
     notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    midTurn.push(codexRuntime.listBackgroundWork());
     notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
   });
 
@@ -918,32 +921,68 @@ test('a spawned agent builds its Agent card from its activity record and is trac
   assert.equal(started?.toolUseId, 'call_spawn_1');
   assert.equal(started?.taskType, 'collab_agent');
 
-  const listed = codexRuntime.listBackgroundWork();
-  assert.equal(listed.length, 1, 'the session appears on the background-work list');
-  assert.equal(listed[0].sessionId, 'app-session');
-  assert.deepEqual(listed[0].tasks.map((task) => [task.taskId, task.toolUseId, task.taskType, task.description]), [
+  // While the turn runs, the agent is listed as background work.
+  assert.equal(midTurn[0].length, 1, 'the session appears on the background-work list');
+  assert.equal(midTurn[0][0].sessionId, 'app-session');
+  assert.deepEqual(midTurn[0][0].tasks.map((task) => [task.taskId, task.toolUseId, task.taskType, task.description]), [
     ['thread_child_1', 'call_spawn_1', 'collab_agent', 'Standards'],
   ]);
-  assert.equal(typeof listed[0].tasks[0].startedAt, 'number');
 
-  // The agent reports back in a later turn under a different item id. That
-  // settles the card it started — it does not open a second one — and
-  // retires the background-work entry.
-  installFakeAppServer(t, (fake) => {
-    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+  // The run closed the connection, which kills the app-server and the agent
+  // with it: no completion will ever arrive, so the card settles as stopped
+  // and nothing stays listed.
+  assert.equal(server.closed, true);
+  const stopped = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(stopped.map((message) => [message.toolUseId, message.taskId, message.status]), [
+    ['call_spawn_1', 'thread_child_1', 'stopped'],
+  ]);
+  assert.ok(
+    messages.indexOf(stopped[0]) < messages.findIndex((message) => message.kind === 'complete'),
+    'the card settles before the page sees the turn complete',
+  );
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('an agent that reports back during the turn is settled once, as completed', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
     notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: doneActivity });
     notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
   });
-  const later: any[] = [];
-  await codexRuntime.run('again', {
-    sessionId: 'app-session',
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', {
+    sessionId: 'app-session-completed',
     cwd: process.cwd(),
-  }, { isWebSocketWriter: true, send: (message) => later.push(message) }, runtimeContext(true));
-  assert.deepEqual(codexRuntime.listBackgroundWork(), [], 'the completed agent is retired');
-  const settled = later.find((message) => message.kind === 'task_status' && message.status === 'completed');
-  assert.equal(settled?.toolUseId, 'call_spawn_1');
-  assert.equal(later.filter((message) => message.type === 'tool_use').length, 0);
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const settled = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(settled.map((message) => message.status), ['completed']);
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('an aborted run settles its running agents as stopped', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    // The user stops the run; the aborted-session guard swallows every later
+    // notification, and the run settles through the connection teardown.
+    codexRuntime.abort('app-session-aborted');
+    server.handlers.onExit?.('connection closed after abort');
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', {
+    sessionId: 'app-session-aborted',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const settled = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(settled.map((message) => message.status), ['stopped']);
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
 });
 
 test('an interrupted agent settles its card as stopped', async (t) => {

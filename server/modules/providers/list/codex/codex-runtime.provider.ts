@@ -32,6 +32,7 @@ import {
   codexAppServerTransport,
   type CodexAppServerConnection,
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
+import { CODEX_BACKGROUND_TASK_TYPE, codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import {
   buildCodexSubagentAgentRow,
   codexThreadItemToRows,
@@ -40,7 +41,7 @@ import {
   readCodexSubagentLabel,
   type CodexThreadItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
-import { BackgroundWorkRegistry } from '@/modules/providers/shared/background-work/background-work-registry.js';
+import { createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import {
   appendFilesInputTag,
@@ -57,7 +58,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
-import type { BackgroundTaskSummary, NormalizedMessage } from '@/shared/types.js';
+import type { NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
 import { readObjectRecord } from '@/shared/utils.js';
 
 const TASK_MCP_NAME = 'cloudcli_task_continuations';
@@ -123,22 +124,6 @@ type ActiveCodexSession = {
 
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
 
-/**
- * Collab agents still running, keyed by app session id, then by the agent's
- * thread id (or the spawning item id for engines that announce a spawn as a
- * tool call).
- *
- * Unlike Claude — where one CLI process owns a turn and dies with it — the
- * codex engine outlives turns, so an agent spawned mid-turn keeps working
- * after the turn's `result`. This registry is what the running-sessions poll
- * reads (through `listBackgroundWork`) so the composer's background-work
- * strip can show and name that work while it runs. A terminal activity
- * (completed, interrupted) retires the entry; a session the cleanup timer
- * removes takes its entries with it.
- */
-const codexBackgroundWork = new BackgroundWorkRegistry();
-
-const CODEX_BACKGROUND_TASK_TYPE = 'collab_agent';
 const DETACHED_COMMAND_ENV_ALLOWLIST = [
   'PATH', 'HOME', 'CODEX_HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
   'TERM', 'USER', 'LOGNAME', 'SHELL', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
@@ -152,23 +137,6 @@ const TASK_CREDENTIAL_ENV_NAMES = [
   'JWT_SECRET',
 ] as const;
 const DETACHED_COMMAND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-
-/**
- * One `task_status` frame for a collab agent, in the shape the client folds
- * onto the Agent card that launched it (`toolUseId` is that card's call id).
- */
-function createCodexTaskStatus(
-  sessionId: string | null,
-  fields: Pick<NormalizedMessage, 'event' | 'taskId' | 'toolUseId' | 'description' | 'status'>,
-): NormalizedMessage {
-  return createNormalizedMessage({
-    kind: 'task_status',
-    sessionId,
-    provider: 'codex',
-    taskType: CODEX_BACKGROUND_TASK_TYPE,
-    ...fields,
-  });
-}
 
 /**
  * One approval Codex is blocked on, waiting for a human.
@@ -455,6 +423,17 @@ async function queryCodex(
    */
   const approvalSubjects = new Map<string, { toolName: string; input: unknown }>();
 
+  /** One `task_status` frame for a collab agent, folded by the client onto the card of `toolUseId`. */
+  const codexTaskStatus = (
+    messageSessionId: string | null,
+    taskId: string,
+    toolUseId: string,
+    fields: Parameters<typeof createTaskStatusMessage>[1],
+  ) => createTaskStatusMessage(
+    { provider: 'codex', sessionId: messageSessionId, taskId, toolUseId, taskType: CODEX_BACKGROUND_TASK_TYPE },
+    fields,
+  );
+
   /**
    * Draws and settles the Agent card of an agent announced only through its
    * activity record (the shape real engines use; see
@@ -489,7 +468,7 @@ async function queryCodex(
           description,
         });
       }
-      sendMessage(ws, createCodexTaskStatus(messageSessionId, { event: 'started', taskId, toolUseId: item.id, description }));
+      sendMessage(ws, codexTaskStatus(messageSessionId, taskId, item.id, { event: 'started', description }));
       return;
     }
 
@@ -502,12 +481,31 @@ async function queryCodex(
     if (!tracked) {
       return;
     }
-    sendMessage(ws, createCodexTaskStatus(messageSessionId, {
+    sendMessage(ws, codexTaskStatus(messageSessionId, tracked.taskId, tracked.toolUseId, {
       event: 'notification',
-      taskId: tracked.taskId,
-      toolUseId: tracked.toolUseId,
       status: item.activity === 'completed' ? 'completed' : 'stopped',
     }));
+  };
+
+  /**
+   * Settles every agent this run still tracks as `stopped`. The app-server is
+   * a child process that `connection.close()` kills when the turn ends, and
+   * the agents it ran die with it, so an agent still registered here will
+   * never report: its card would spin forever. Called before the terminal
+   * `complete` so the page never sees a finished turn with a running card;
+   * a second call finds the registry already empty.
+   */
+  const settleOutstandingAgents = (): void => {
+    const backgroundWorkKey = sessionId || capturedSessionId;
+    if (!backgroundWorkKey) {
+      return;
+    }
+    for (const task of codexBackgroundWork.clearSession(backgroundWorkKey)) {
+      sendMessage(ws, codexTaskStatus(capturedSessionId || sessionId || null, task.taskId, task.toolUseId, {
+        event: 'notification',
+        status: 'stopped',
+      }));
+    }
   };
 
   const emitItem = (rawItem: unknown, timestamp: string, source: 'started' | 'completed'): void => {
@@ -515,12 +513,12 @@ async function queryCodex(
     if (!item) {
       return;
     }
-    // A collab agent's lifecycle feeds the background-work tracker: the agent
-    // outlives the turn, and the running-sessions poll needs to know it is
-    // still going after the composer's own indicator has handed the session
-    // over from "responding" to "background work". Keyed like Claude's
-    // tracker: the app session id when the run knows one, the native thread
-    // id as the fallback for a brand-new session's first turn. Which event
+    // A collab agent's lifecycle feeds the background-work tracker, so the
+    // running-sessions poll and the composer's strip name the agents the turn
+    // in flight is waiting on. Keyed like Claude's tracker: the app session
+    // id when the run knows one, the native thread id as the fallback for a
+    // brand-new session's first turn. The turn's end settles whatever is
+    // still tracked (`settleOutstandingAgents`). Which event
     // announced the item — not the item's own status field, which `started`
     // events may omit — decides between tracked and retired: an unrecognized
     // status parses as `completed`, and trusting it on `started` would drop
@@ -925,6 +923,7 @@ async function queryCodex(
     recordStartedTurn(typeof startedTurn?.id === 'string' ? startedTurn.id : null);
 
     await turnSettled;
+    settleOutstandingAgents();
 
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session.
@@ -952,6 +951,7 @@ async function queryCodex(
 
   } catch (error) {
     const runError = error instanceof Error ? error : new Error(String(error));
+    settleOutstandingAgents();
     const wasAborted =
       currentSession()?.status === 'aborted' ||
       runError.name === 'AbortError' ||
@@ -994,6 +994,7 @@ async function queryCodex(
 
   } finally {
     cancelOpenApprovals('The run ended before this was answered.');
+    settleOutstandingAgents();
     connection?.close();
     const session = currentSession();
     if (session) {
@@ -1079,10 +1080,10 @@ export const codexRuntime = {
   },
   /**
    * Sessions with collab agents still running, for the running-sessions poll.
-   * The engine outlives turns, so an agent spawned mid-turn keeps working
-   * after the turn's `result` — this is how the UI learns it is still going.
+   * The app-server dies with the turn, so these are the agents of turns still
+   * in flight; the turn's end settles and removes the rest.
    */
-  listBackgroundWork(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
+  listBackgroundWork(): SessionBackgroundWork[] {
     return codexBackgroundWork.list();
   },
 };
@@ -1148,8 +1149,8 @@ const completedSessionCleanupTimer = setInterval(() => {
       const startedAt = new Date(session.startedAt).getTime();
       if (now - startedAt > maxAge) {
         activeCodexSessions.delete(id);
-        // The session's tracked agents went with its connection; entries left
-        // here would keep a dead task on the background-work strip forever.
+        // A run settles its own agents when its turn ends; this only drops
+        // entries a run that never reached its end left behind.
         codexBackgroundWork.clearSession(id);
       }
     }

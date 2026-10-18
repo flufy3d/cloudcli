@@ -1,7 +1,7 @@
 import type {
   ActiveBackgroundTask,
   AnyRecord,
-  BackgroundTaskSummary,
+  SessionBackgroundWork,
   FetchHistoryOptions,
   FetchHistoryResult,
   LLMProvider,
@@ -58,7 +58,7 @@ export interface IProviderRuntime {
    * such work has anything to report; the others leave this undefined and the
    * running-sessions list falls back to chat runs alone.
    */
-  listBackgroundWork?(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }>;
+  listBackgroundWork?(): SessionBackgroundWork[];
   /**
    * Stops one outstanding background task. Resolves false when the session has
    * no live process or that process is not tracking the task — it already

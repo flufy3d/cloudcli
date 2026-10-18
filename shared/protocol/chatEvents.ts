@@ -127,13 +127,15 @@ export type CompactionInfo = {
 };
 
 /**
- * What a background task has spent so far, as the CLI reports it on
- * `task_progress` and `task_notification`.
+ * What a background task has spent so far, as the engine reports it. Claude's
+ * `task_progress` and `task_notification` carry all three; an engine that
+ * leaves a figure out (ZCode's failure stop has no token or tool-call totals)
+ * leaves it undefined, which means "not reported", not zero.
  */
 export type TaskUsage = {
-  totalTokens: number;
-  toolUses: number;
-  durationMs: number;
+  totalTokens?: number;
+  toolUses?: number;
+  durationMs?: number;
 };
 
 /**

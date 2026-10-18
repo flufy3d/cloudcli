@@ -6,6 +6,7 @@ import readline from 'node:readline';
 
 import { sessionsDb } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
+import { codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import {
   buildCodexSubagentAgentRow,
   codexThreadItemToRows,
@@ -694,7 +695,12 @@ async function attachCodexSubagentTranscripts(
     const subagent: SubagentInfo = {
       id: record.agentThreadId ?? record.toolCallId,
       description: readNonEmptyString(parsedInput.description as string | undefined) ?? agentName,
-      status: record.isComplete ? 'completed' : 'running',
+      // An agent with no end record is running only while the runtime still
+      // tracks it (its turn is in flight); otherwise the app-server that ran it
+      // is gone and it can never report, so the card must not spin forever.
+      status: record.isComplete
+        ? 'completed'
+        : codexBackgroundWork.has(record.agentThreadId ?? record.toolCallId) ? 'running' : 'stopped',
     };
 
     if (record.agentThreadId) {

@@ -62,19 +62,19 @@ flowchart LR
 | 引擎 | 原生形态 | 适配层做什么 | 结算点 |
 | --- | --- | --- | --- |
 | Claude | `Agent` 工具；老记录里叫 `Task` | 历史与实时共用 `canonicalClaudeSubagentToolName`，把老名字 `Task` 翻成 `Agent`；`claude-background-work.ts` 认两个名字；历史按调用结果里的 `agentId` 挂 `subagent` 和子时间线 | 同步 agent 用调用结果；后台 agent 用 SDK 的任务通知；进程没了读作 `stopped` |
-| ZCode | `Agent` 工具，名字原样透传 | 引擎在父会话上发 `subagent_spawned` / `subagent_stopped`，翻成 `task_status`；历史读 agent 旁车 `cli/agents/<父会话>/<agentId>/metadata.json` | `subagent_stopped`（`completed` / `failed` / `stopped`）；旁车里仍写 `running` 的，只有登记簿里还有该 agent 才算运行中，否则读作 `stopped` |
-| Codex | 只有 `SubAgentActivity` 记录，没有任何派 agent 的工具调用条目 | `buildCodexSubagentAgentRow` 从 `started` 记录合成 `Agent` 行；同一 agent 的开始与结束条目 id 不同，靠 `agent_thread_id` 配对 | `completed` / `interrupted` 活动 |
+| ZCode | `Agent` 工具，名字原样透传 | 引擎在父会话上发 `subagent_spawned` / `subagent_stopped`，翻成 `task_status`；历史读 agent 旁车 `cli/agents/<父会话>/<agentId>/metadata.json` | `subagent_stopped`（`completed` / `failed` / `stopped`）；引擎进程死掉（`SESSION_LOST_METHOD`）时对登记簿里每个 agent 补发 `stopped`；旁车里仍写 `running` 的，只有登记簿里还有该 agent 才算运行中，否则读作 `stopped` |
+| Codex | 只有 `SubAgentActivity` 记录，没有任何派 agent 的工具调用条目 | `buildCodexSubagentAgentRow` 从 `started` 记录合成 `Agent` 行；同一 agent 的开始与结束条目 id 不同，靠 `agent_thread_id` 配对 | `completed` / `interrupted` 活动；app-server 随每一轮结束被杀，轮次结束时仍登记的 agent 一律结算为 `stopped`；历史里没有结束记录的 agent，只有登记簿里还有它才算 `running`，否则读作 `stopped` |
 | OpenCode | `subagent` 工具，输入 `{agent, description, prompt, sessionID?}`，结果 metadata 带子会话 id | 实时翻译器和历史读取共用 `opencode-subagent.ts`：名字翻成 `Agent`，`agent` 翻成 `subagent_type`；历史有子会话 id 时读子会话的 `session_message` 作子时间线 | 工具自身的状态（`completed` / `error`）；运行结束时翻译器对没等到结果的调用补 `stopped`；历史里停在 `pending` / `running` 的调用，只有所属会话还没进入 idle 才算运行中，否则读作 `stopped` |
 | Antigravity | `invoke_subagent`，一次调用派 N 个 agent | 一次调用拆成 N 条 `Agent` 行，`toolId` 为 `<调用 id>:<conversation_id>`，每个 agent 一张卡；实时取 `step_type: "subagent"` 的 DONE 步骤，历史取规划条目里的角色与提示词、再从下一步的回执文本取 `conversationId`；子时间线读 agent 自己的 transcript | agy 在所有 agent 汇报完之后才给出 `result`，结果到达时一起结算为 `completed`；进程退出或中止时一律 `stopped`；历史里 agent 给父会话发的汇报即完成凭证，没有汇报且进程里已无登记的读作 `stopped` |
 | Cursor | 本机没有 Cursor 转录，不能确认有派 agent 的工具 | 未接入；若转录里出现派 agent 的工具，按上面的方式翻成 `Agent` 行 | — |
 
 `agent` part 在 OpenCode 里是用户在提示框里 @ 某个 agent 的标记（提示文本已含这段 @ 文字），不是派发，所以不画成卡片。
 
-Codex、ZCode、Antigravity 共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent。Codex 与 ZCode 的运行时切面 `listBackgroundWork()` 直接返回它，供运行中会话轮询给输入框的后台工作条和侧栏使用；Antigravity 的 `backgroundTasks.list` 从它推出输入框卡片。`shared/background-work/task-status.ts` 的 `createTaskStatusMessage` 是 `task_status` 事件的唯一构造函数。
+Codex、ZCode、Antigravity 共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent。运行时切面的 `listBackgroundWork()`（返回 `SessionBackgroundWork[]`）直接读它，供运行中会话轮询给输入框的后台工作条和侧栏使用；历史读取用 `has` 区分"进程还活着的 agent"和"进程已死、永远等不到结束记录的 agent"；Antigravity 的 `backgroundTasks.list` 从它推出输入框卡片。`clearSession` 返回被清掉的登记项，调用方据此给每张卡补发结算。三家各有一个模块级实例（`codex-background-work.ts`、`zcode-background-work.ts`、`antigravity-subagent.ts`），因为同一进程里只有它们自己的引擎子进程能产生这些 agent，登记簿里没有的 agent 不可能还在跑。`shared/background-work/task-status.ts` 的 `createTaskStatusMessage` 是 `task_status` 事件的唯一构造函数，`TaskUsage` 的三个字段都可缺省：引擎没上报的数字留空，不填 0。
 
-**Codex** 的实时流在 `started` 时发卡、发 `task_status started`、按线程 id 登记；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。`interacted` 是 agent 之间的往来，不画。
+**Codex** 的进程模型决定了它的结算点：`queryCodex` 在轮次结束时 `connection.close()` 会杀掉 app-server，它派出的 agent 随之消失，完成事件永远到不了。所以 agent 只在轮次进行中被登记：实时流在 `started` 时发卡、发 `task_status started`、按线程 id 登记；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。轮次结束时（正常完成、报错、被中止，三条路径都经过 `settleOutstandingAgents`）对还登记着的 agent 逐个补发 `stopped` 并清空，且发在终态 `complete` 之前，页面不会看到轮次已结束而卡片还在转。`interacted` 是 agent 之间的往来，不画。
 
-**ZCode** 一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认这两种事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记；下一轮开始先撤掉它，由新一轮的监听器接管。载荷里不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。
+**ZCode** 的引擎进程比一轮对话活得久，后台 agent 在 `complete` 之后还在跑。一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认 subagent 生命周期事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记。窄监听器和运行中监听器走同一个出口 `context.normalizeMessage`，载荷里不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。下一轮开始时，`run()` 在第一个 await 之前就撤掉窄监听器、挂上本轮监听器，所以订阅、设模式、解析模型这三次异步等待期间到达的事件只进本轮的 writer；本轮在发出提示词之前不接受 `complete` / `error`，因为那时到达的终态只可能属于上一轮。被新一轮取代的旧监听器在旧轮次的 100ms 轮询发现自己被取代之前，除引擎死亡通知外一律不转发。引擎死亡时，运行中监听器和窄监听器都调用 `settleAgentsOfLostEngine`，先对登记簿里每个 agent 发 `stopped` 再清空。引擎的失败 stop 不带 token 和工具调用总数，这两个字段在 `task_status.usage` 里直接缺省。
 
 ## IProvider 七切面
 

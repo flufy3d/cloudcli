@@ -77,7 +77,16 @@ test('subagent_stopped settles the task with the agent totals', () => {
   );
   assert.equal(failed.status, 'failed');
   assert.equal(failed.summary, 'child runtime failed');
-  assert.deepEqual(failed.usage, { totalTokens: 0, toolUses: 0, durationMs: 854566 });
+  // The engine's failure stop carries no token or tool-call totals; leaving
+  // them out says "not reported", where a 0 would claim a measured zero.
+  assert.deepEqual(failed.usage, { durationMs: 854566 });
+
+  const [bare] = provider.normalizeMessage(
+    liveEvent('subagent_stopped', { agentId: 'agent_a', parentToolCallId: 'call_agent', status: 'stopped' }),
+    'sess_1',
+  );
+  assert.equal(bare.status, 'stopped');
+  assert.equal(bare.usage, undefined, 'a stop that reports no totals at all carries no usage');
 });
 
 test('a subagent event without the launching call is dropped rather than sent unattached', () => {
@@ -276,5 +285,40 @@ test('an Agent row without a sidecar keeps rendering from its own input and resu
     assert.equal(task?.toolName, 'Agent');
     assert.equal(task?.subagent, undefined);
     assert.equal(task?.toolResult?.content, 'The review found no blockers.');
+  });
+});
+
+test('an unreadable agent sidecar directory is logged, and the row still renders without agent metadata', async (t) => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: 'The review found no blockers.' });
+    // A file where the directory should be: readdir fails with ENOTDIR, which
+    // is not the "no sidecars yet" case (ENOENT) and must not pass silently.
+    const agentsDir = path.join(storageDir, 'cli', 'agents');
+    await mkdir(agentsDir, { recursive: true });
+    await writeFile(path.join(agentsDir, 'sess_parent'), 'not a directory');
+
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+
+    const { messages } = await new ZCodeSessionsProvider().fetchHistory('sess_parent');
+    const task = messages.find((message) => message.kind === 'tool_use');
+
+    assert.equal(task?.subagent, undefined);
+    assert.equal(task?.toolResult?.content, 'The review found no blockers.');
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /sess_parent/);
+    assert.match(logged[0], /ENOTDIR/);
+  });
+});
+
+test('a session that never spawned an agent has no sidecar directory and logs nothing', async (t) => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: 'ok' });
+
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+
+    await new ZCodeSessionsProvider().fetchHistory('sess_parent');
+    assert.deepEqual(logged, []);
   });
 });

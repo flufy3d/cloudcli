@@ -116,6 +116,16 @@ export type {
 };
 
 
+/**
+ * One session's outstanding background work, the unit a runtime's
+ * `listBackgroundWork()` returns and the background-work registry lists:
+ * `sessionId` is the app session id, `tasks` what it still waits on.
+ */
+export type SessionBackgroundWork = {
+  sessionId: string;
+  tasks: BackgroundTaskSummary[];
+};
+
 export type {
   McpScope,
   McpTransport,

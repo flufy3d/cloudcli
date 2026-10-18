@@ -122,6 +122,13 @@ export type RunHandle = {
   /** Set when a delivered session/stop confirmed the user's abort. */
   abortRequested: boolean;
   /**
+   * Set right before the run's prompt goes to the engine. A run listens to
+   * the engine session from the moment it starts, but a turn-ending event
+   * seen before its own prompt was sent belongs to an earlier turn and must
+   * not end this one.
+   */
+  promptDispatched: boolean;
+  /**
    * Who performs terminal handling and cleanup: the run coroutine until the
    * silence watchdog hands off, the detached watcher afterwards. A handle
    * whose owner is the watcher must not be disposed by the run's finally.
@@ -247,6 +254,7 @@ export class ZCodeRunLifecycle {
       appSessionId: start.appSessionId,
       writer: start.writer,
       abortRequested: false,
+      promptDispatched: false,
       owner: 'run',
       state: { completed: false, lastActivityAt: Date.now() },
     };

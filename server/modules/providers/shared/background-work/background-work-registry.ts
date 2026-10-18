@@ -1,18 +1,19 @@
-import type { BackgroundTaskSummary } from '@/shared/types.js';
+import type { BackgroundTaskSummary, SessionBackgroundWork } from '@/shared/types.js';
 
 /**
  * The background work a provider runtime still has outstanding, keyed by app
  * session id and then by task id.
  *
- * Engines whose process outlives a turn (Codex app-server, the ZCode engine)
- * keep running agents after the turn's `complete`; this registry is what their
- * `listBackgroundWork()` answers the running-sessions poll from, so the
- * composer's background-work strip and the sidebar keep naming that work
- * until the engine reports it done.
+ * It is what a runtime's `listBackgroundWork()` answers the running-sessions
+ * poll from, and what a history reader asks (`has`) to tell an agent whose
+ * process is still alive from one whose process is gone. An engine whose
+ * process outlives a turn (the ZCode engine) keeps agents here after the
+ * turn's `complete`; an engine whose process dies with the turn (Codex's
+ * app-server, Antigravity's `agy`) empties it when the process ends, settling
+ * each leftover card.
  *
- * Consumers: the Codex and ZCode runtime providers (start/end/list/clear) and
- * the ZCode sessions provider (`has`, to tell a still-running agent from one
- * whose process is gone when it replays history).
+ * Consumers: the Codex, ZCode and Antigravity runtime providers
+ * (start/end/list/clear) and their sessions providers (`has`).
  */
 export class BackgroundWorkRegistry {
   private readonly bySession = new Map<string, Map<string, BackgroundTaskSummary>>();
@@ -76,14 +77,20 @@ export class BackgroundWorkRegistry {
     return (this.bySession.get(sessionKey)?.size ?? 0) > 0;
   }
 
-  /** Drops every task of a session whose process is gone. */
-  clearSession(sessionKey: string): void {
+  /**
+   * Drops every task of a session whose process is gone and returns what was
+   * outstanding, so the caller can settle the cards of work that will never
+   * report.
+   */
+  clearSession(sessionKey: string): BackgroundTaskSummary[] {
+    const outstanding = Array.from(this.bySession.get(sessionKey)?.values() ?? []);
     this.bySession.delete(sessionKey);
+    return outstanding;
   }
 
   /** Every session with work outstanding, in the shape `listBackgroundWork` returns. */
-  list(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
-    const entries: Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> = [];
+  list(): SessionBackgroundWork[] {
+    const entries: SessionBackgroundWork[] = [];
     for (const [sessionId, tasks] of this.bySession) {
       if (tasks.size > 0) {
         entries.push({ sessionId, tasks: Array.from(tasks.values()) });

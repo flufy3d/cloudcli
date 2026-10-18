@@ -379,7 +379,12 @@ async function readZCodeAgentSidecars(parentSessionId: string): Promise<Map<stri
   let entries: string[];
   try {
     entries = await fsp.readdir(dir);
-  } catch {
+  } catch (error) {
+    // No directory simply means the session spawned no agent. Anything else
+    // (permissions, a file in the way) hides every agent's outcome, so say so.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.error(`[ZCodeSessions] Could not read the agent sidecar directory ${dir}:`, error);
+    }
     return byToolUseId;
   }
 
@@ -399,8 +404,13 @@ async function readZCodeAgentSidecars(parentSessionId: string): Promise<Map<stri
         description: readOptionalString(parsed.description),
         status: readOptionalString(parsed.status),
       });
-    } catch {
-      // Not every entry is an agent directory with a finished sidecar.
+    } catch (error) {
+      // Not every entry is an agent directory with a finished sidecar; a
+      // missing metadata.json is that ordinary case, anything else is not.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        console.error(`[ZCodeSessions] Could not read the agent sidecar ${path.join(dir, entry)}:`, error);
+      }
     }
   }
 

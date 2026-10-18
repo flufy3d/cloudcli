@@ -7,6 +7,7 @@ import test from 'node:test';
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { CodexSessionSynchronizer } from '@/modules/providers/list/codex/codex-session-synchronizer.provider.js';
 import { AppError } from '@/shared/utils.js';
+import { codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
 import { readCodexProposedPlan } from '@/modules/providers/list/codex/codex-thread-items.js';
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
@@ -486,6 +487,69 @@ test('Codex history closes a still-running subagent when its turn was aborted', 
       assert.equal(task.toolResult?.isError, true, 'an agent the abort cut off did not finish its work');
     });
   } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+/** Writes a rollout whose only agent has a start record and no end record. */
+async function writeUnfinishedAgentRollout(tempRoot: string, workspacePath: string, providerSessionId: string): Promise<void> {
+  const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
+  await writeFile(transcriptPath, `${[
+    JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+    JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        item: { type: 'SubAgentActivity', id: 'spawn-open', kind: 'started', agent_thread_id: 'codex-agent-open', agent_path: '/root/open_agent' },
+      },
+    }),
+  ].join('\n')}\n`, 'utf8');
+}
+
+test('Codex history reads an agent with no end record as stopped when no run tracks it', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-open-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeUnfinishedAgentRollout(tempRoot, workspacePath, 'codex-parent-open');
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-parent-open', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-parent-open', 'codex-parent-open');
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-parent-open');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
+      assert.equal(task?.subagent?.status, 'stopped', 'the app-server that ran it is gone, so it can never report');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex history reads an agent with no end record as running while the runtime tracks it', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-live-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeUnfinishedAgentRollout(tempRoot, workspacePath, 'codex-parent-live');
+    codexBackgroundWork.start('app-parent-live', {
+      taskId: 'codex-agent-open', toolUseId: 'spawn-open', taskType: 'collab_agent', description: 'Open agent',
+    });
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-parent-live', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-parent-live', 'codex-parent-live');
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-parent-live');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
+      assert.equal(task?.subagent?.status, 'running');
+    });
+  } finally {
+    codexBackgroundWork.clearSession('app-parent-live');
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });
   }
