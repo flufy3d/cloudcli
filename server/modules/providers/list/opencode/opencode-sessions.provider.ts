@@ -69,6 +69,7 @@ type OpenCodeChildSessionRow = {
   title: string | null;
   agent: string | null;
   model: string | null;
+  time_updated: number | null;
   time_idle: number | null;
   idle_outcome: string | null;
 };
@@ -445,6 +446,16 @@ const collectSubagentSessionIds = (rows: OpenCodeHistoryRow[]): Set<string> => {
 };
 
 /**
+ * How long after its idle stamp a child row may still count as settled.
+ *
+ * The engine writes the session row and the idle stamp in the same settle
+ * transaction (observed within a few milliseconds of each other), so any
+ * larger gap means the session was written to after it settled — work that
+ * began since, not noise from the settle itself.
+ */
+const SUBAGENT_SETTLE_SLACK_MS = 1_000;
+
+/**
  * The subagent status the child's own session row reports.
  *
  * The child row is authoritative — its `idle_outcome`/`time_idle` settle the
@@ -452,25 +463,44 @@ const collectSubagentSessionIds = (rows: OpenCodeHistoryRow[]): Set<string> => {
  * launch keeps `metadata.status: "running"` in the parent transcript forever).
  * The parent metadata is only the fallback for a child row an older database
  * cannot describe.
+ *
+ * The idle stamps describe the child's LAST settle, and nothing clears them
+ * when the session is woken again: an agent that was prompted a second time
+ * and is mid-turn still carries the previous turn's `succeeded`/`time_idle`
+ * (reading those as the current state made a resumed, plainly-working agent
+ * render as completed while its processes ran). They are therefore only read
+ * while the session row shows no activity newer than the settle; a child
+ * written to after its idle stamp has been running since.
  */
 const resolveSubagentStatus = (
   child: OpenCodeChildSessionRow | undefined,
   metadataStatus: string | undefined,
   toolStatus: string | undefined,
 ): SubagentInfo['status'] => {
-  const outcome = readOptionalString(child?.idle_outcome);
-  if (outcome === 'succeeded' || outcome === 'completed') {
-    return 'completed';
+  const settledAt = child?.time_idle ?? null;
+  const hasActivityAfterSettle = settledAt !== null
+    && child?.time_updated != null
+    && child.time_updated > settledAt + SUBAGENT_SETTLE_SLACK_MS;
+
+  if (!hasActivityAfterSettle) {
+    const outcome = readOptionalString(child?.idle_outcome);
+    if (outcome === 'succeeded' || outcome === 'completed') {
+      return 'completed';
+    }
+    if (outcome === 'failed') {
+      return 'failed';
+    }
+    if (outcome === 'interrupted' || outcome === 'stopped') {
+      return 'stopped';
+    }
+    if (settledAt !== null) {
+      return 'completed';
+    }
+  } else if (child && child.time_idle !== null) {
+    // The child settled once, was resumed, and has been working since.
+    return 'running';
   }
-  if (outcome === 'failed') {
-    return 'failed';
-  }
-  if (outcome === 'interrupted' || outcome === 'stopped') {
-    return 'stopped';
-  }
-  if (child && child.time_idle !== null) {
-    return 'completed';
-  }
+
   if (metadataStatus === 'completed') {
     return 'completed';
   }
@@ -755,6 +785,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         ${column('title')},
         ${column('agent')},
         ${column('model')},
+        ${column('time_updated')},
         ${column('time_idle')},
         ${column('idle_outcome')}
       FROM ${table}

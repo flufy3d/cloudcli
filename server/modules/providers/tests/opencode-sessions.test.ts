@@ -1177,6 +1177,141 @@ test('a v2 subagent launch carries the child session timeline, agent and settled
   }
 });
 
+test('a resumed v2 child that is mid-turn reads as running, not as its last settle', { concurrency: false }, async () => {
+  // The engine does not clear a session's idle stamps when it is woken again:
+  // a child that settled once and was prompted a second time keeps the old
+  // `succeeded`/`time_idle` while it works, so the row's newer `time_updated`
+  // is what proves it is running. Reading the stamps blindly made a plainly
+  // alive background agent render as completed.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-subagent-resumed-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          parent_id text,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          agent text,
+          model text,
+          idle_outcome text,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          time_idle integer
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+      `);
+      const insertSession = db.prepare(`
+        INSERT INTO session_v2 (
+          id, project_id, parent_id, slug, directory, title, version, agent, model,
+          idle_outcome, time_created, time_updated, time_idle
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      insertSession.run(
+        'ses_parent', 'proj_1', null, 'parent', '/tmp/proj', 'Parent', '2.0.32',
+        'build', null, 'succeeded', 1000, 9000, 9000,
+      );
+      // Settled once at t=3400, prompted again at t=5000, still working at t=9000.
+      insertSession.run(
+        'ses_child_resumed', 'proj_1', 'ses_parent', 'child-a', '/tmp/proj', 'Watch the batch', '2.0.32',
+        'general', '{"providerID":"opencode-go","id":"glm-5.3"}', 'succeeded',
+        1100, 9000, 3400,
+      );
+      // Settled at t=3400 and untouched since: genuinely completed.
+      insertSession.run(
+        'ses_child_settled', 'proj_1', 'ses_parent', 'child-b', '/tmp/proj', 'Echo the marker', '2.0.32',
+        'general', '{"providerID":"opencode-go","id":"glm-5.3"}', 'succeeded',
+        1100, 3400, 3400,
+      );
+
+      const insertMessage = db.prepare(`
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const [callId, childId, description] of [
+        ['call_resumed', 'ses_child_resumed', 'Watch the batch'],
+        ['call_settled', 'ses_child_settled', 'Echo the marker'],
+      ] as const) {
+        insertMessage.run(`msg_parent_${callId}`, 'ses_parent', 'assistant', 1, 1200, 1300, JSON.stringify({
+          time: { created: 1200 },
+          content: [{
+            type: 'tool',
+            id: callId,
+            name: 'subagent',
+            state: {
+              status: 'completed',
+              input: { agent: 'general', description, background: true },
+              metadata: { sessionID: childId, status: 'running', truncated: false },
+              content: [{
+                type: 'text',
+                text: `The subagent is working in the background (sessionID: ${childId}). You will be notified automatically when it finishes.`,
+              }],
+            },
+          }],
+        }));
+      }
+      insertMessage.run('msg_child_running', 'ses_child_resumed', 'assistant', 1, 5000, 9000, JSON.stringify({
+        time: { created: 5000 },
+        content: [
+          { type: 'text', text: 'Tools are ready. Now waiting for batch 23 to finish' },
+          {
+            type: 'tool',
+            id: 'call_child_wait',
+            name: 'bash',
+            state: { status: 'running', input: { command: 'while true; do grep -q DRIVE_OK drive23.log && break; sleep 30; done' } },
+          },
+        ],
+      }));
+      insertMessage.run('msg_child_settled', 'ses_child_settled', 'assistant', 1, 3000, 3400, JSON.stringify({
+        time: { created: 3000 },
+        content: [{ type: 'text', text: 'DONE' }],
+      }));
+    } finally {
+      db.close();
+    }
+
+    const history = await new OpenCodeSessionsProvider().fetchHistory('ses_parent');
+    const resumed = history.messages.find((message) => message.toolId === 'call_resumed');
+    const settled = history.messages.find((message) => message.toolId === 'call_settled');
+
+    assert.equal(
+      resumed?.subagent?.status,
+      'running',
+      'activity after the idle stamp means the child was resumed and is still working',
+    );
+    assert.equal(resumed?.subagent?.activityCount, 2);
+    assert.equal(
+      resumed?.subagentTools?.at(-1)?.toolName,
+      'bash',
+      'the running shell the agent is waiting on is part of its timeline',
+    );
+    assert.equal(
+      settled?.subagent?.status,
+      'completed',
+      'a child whose last write is its settle still reads as completed',
+    );
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('a failed v2 compaction says so and leaves the occupancy reading alone', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-compaction-failed-'));
   const restoreHomeDir = patchHomeDir(tempRoot);
