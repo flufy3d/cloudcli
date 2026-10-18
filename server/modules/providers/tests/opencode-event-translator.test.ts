@@ -219,3 +219,95 @@ test('ignores lifecycle chatter and unknown event types', () => {
     assert.deepEqual(translator.translate(event(type, { anything: true })), { frames: [] }, type);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Subagent spawns: OpenCode's `subagent` tool is the client's `Agent` card.
+// ---------------------------------------------------------------------------
+
+const SUBAGENT_CALL = 'call_subagent_1';
+const SUBAGENT_INPUT = { agent: 'general', description: 'Review the diff', prompt: 'Read the diff and report problems.' };
+
+test('a subagent tool call reaches the page as an Agent row whose input the card can read', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+
+  const announced = translator.translate(event('session.tool.input.started', {
+    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, name: 'subagent',
+  }));
+  assert.equal(announced.frames[0].toolName, 'Agent');
+
+  const called = translator.translate(event('session.tool.called', {
+    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, input: SUBAGENT_INPUT,
+  }));
+  assert.equal(called.frames[0].kind, 'tool_use');
+  assert.equal(called.frames[0].toolName, 'Agent');
+  assert.equal(called.frames[0].toolId, SUBAGENT_CALL);
+  assert.deepEqual(called.frames[0].toolInput, {
+    subagent_type: 'general',
+    description: 'Review the diff',
+    prompt: 'Read the diff and report problems.',
+  });
+  // The permission bridge labels cards by the engine's own name.
+  assert.equal(translator.getToolCall(SUBAGENT_CALL)?.name, 'subagent');
+});
+
+test('other OpenCode tools keep their engine names', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  const result = translator.translate(event('session.tool.called', {
+    assistantMessageID: MESSAGE, id: CALL, name: 'shell', input: { command: 'ls' },
+  }));
+  assert.equal(result.frames[0].toolName, 'shell');
+});
+
+test('a finished subagent call settles its card as completed, naming the child session', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  translator.translate(event('session.tool.called', {
+    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, name: 'subagent', input: SUBAGENT_INPUT,
+  }));
+
+  const { frames } = translator.translate(event('session.tool.success', {
+    assistantMessageID: MESSAGE,
+    id: SUBAGENT_CALL,
+    content: [{ type: 'text', text: 'Found two problems.' }],
+    metadata: { sessionID: 'ses_child_1', status: 'completed', truncated: false },
+  }));
+
+  assert.deepEqual(frames.map((frame) => frame.kind), ['tool_result', 'task_status']);
+  assert.equal(frames[1].toolUseId, SUBAGENT_CALL);
+  assert.equal(frames[1].taskId, 'ses_child_1');
+  assert.equal(frames[1].status, 'completed');
+  assert.equal(frames[1].event, 'notification');
+  assert.deepEqual(translator.settleOpenSubagents(), [], 'nothing is left to settle');
+});
+
+test('a failed subagent call settles its card as failed', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  translator.translate(event('session.tool.called', {
+    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, name: 'subagent', input: SUBAGENT_INPUT,
+  }));
+
+  const { frames } = translator.translate(event('session.tool.failed', {
+    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, error: { type: 'tool.error', message: 'child crashed' },
+  }));
+
+  assert.deepEqual(frames.map((frame) => frame.kind), ['tool_result', 'task_status']);
+  assert.equal(frames[1].status, 'failed');
+  assert.equal(frames[1].toolUseId, SUBAGENT_CALL);
+});
+
+test('a subagent call the run ended on is settled as stopped', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  translator.translate(event('session.tool.called', {
+    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, name: 'subagent', input: SUBAGENT_INPUT,
+  }));
+  translator.translate(event('session.tool.called', {
+    assistantMessageID: MESSAGE, id: CALL, name: 'shell', input: { command: 'ls' },
+  }));
+
+  const frames = translator.settleOpenSubagents();
+
+  assert.equal(frames.length, 1, 'only the subagent call has a card to settle');
+  assert.equal(frames[0].kind, 'task_status');
+  assert.equal(frames[0].status, 'stopped');
+  assert.equal(frames[0].toolUseId, SUBAGENT_CALL);
+  assert.deepEqual(translator.settleOpenSubagents(), [], 'settling twice sends nothing new');
+});

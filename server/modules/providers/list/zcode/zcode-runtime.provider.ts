@@ -39,8 +39,9 @@ import type {
 import { createCompleteMessage, createNormalizedMessage, generateMessageId, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
+import { LOCAL_AGENT_TASK_TYPE } from '@/modules/providers/shared/background-work/task-status.js';
 
-import { ZCODE_AGENT_TASK_TYPE, zcodeBackgroundWork } from './zcode-background-work.js';
+import { zcodeBackgroundWork } from './zcode-background-work.js';
 import { SESSION_LOST_METHOD } from './zcode-codec.js';
 import { protocolClient } from './zcode-protocol.client.js';
 import {
@@ -500,7 +501,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       zcodeBackgroundWork.start(appSessionKey, {
         taskId: message.taskId,
         toolUseId: message.toolUseId,
-        taskType: message.taskType ?? ZCODE_AGENT_TASK_TYPE,
+        taskType: message.taskType ?? LOCAL_AGENT_TASK_TYPE,
         description: message.description ?? '',
       });
       return;

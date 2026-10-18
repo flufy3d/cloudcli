@@ -889,7 +889,7 @@ test('subagent notifications with different threadId are ignored and do not sett
 const spawnActivity = { type: 'subAgentActivity', id: 'call_spawn_1', kind: 'started', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
 const doneActivity = { type: 'subAgentActivity', id: 'call_done_1', kind: 'completed', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
 
-test('a spawned agent builds its Task card from its activity record and is tracked as background work', async (t) => {
+test('a spawned agent builds its Agent card from its activity record and is tracked as background work', async (t) => {
   installFakeAppServer(t, (server) => {
     const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
@@ -910,7 +910,7 @@ test('a spawned agent builds its Task card from its activity record and is track
   // The harness passes rows through un-normalized, so the card is the raw
   // `tool_use` row the renderer would receive.
   const launch = messages.find((message) => message.type === 'tool_use');
-  assert.equal(launch?.toolName, 'Task', 'the activity record becomes the subagent card');
+  assert.equal(launch?.toolName, 'Agent', 'the activity record becomes the subagent card');
   assert.equal(launch?.toolCallId, 'call_spawn_1');
   assert.match(JSON.stringify(launch?.toolInput), /Standards/);
   const started = messages.find((message) => message.kind === 'task_status' && message.event === 'started');

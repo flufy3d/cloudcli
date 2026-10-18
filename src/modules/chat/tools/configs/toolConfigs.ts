@@ -608,33 +608,6 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
     }
   },
 
-  invoke_subagent: {
-    input: {
-      type: 'collapsible',
-      label: 'Subagent',
-      title: (input) => {
-        const first = input.Subagents?.[0];
-        const role = first?.Role || first?.TypeName || 'Agent';
-        const prompt = first?.Prompt ? String(first.Prompt).slice(0, 60) : '';
-        return `Subagent / ${role}${prompt ? `: ${prompt}` : ''}`;
-      },
-      defaultOpen: false,
-      contentType: 'markdown',
-      getContentProps: (input) => {
-        const first = input.Subagents?.[0];
-        return {
-          content: first?.Prompt || input.Prompt || ''
-        };
-      },
-      colorScheme: {
-        border: 'border-purple-500 dark:border-purple-400'
-      }
-    },
-    result: {
-      hideOnSuccess: true
-    }
-  },
-
   manage_subagents: {
     input: {
       type: 'one-line',
@@ -887,23 +860,11 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
   // SUBAGENT TASK TOOL
   // ============================================================================
 
-  // Claude's async subagent tool. A row that actually spawned an agent is
-  // rendered by SubagentPanel; this config only supplies the name and preview
-  // used by tool grouping.
+  // The one subagent card config. Every engine's spawn reaches the client as an
+  // `Agent` row (see shared/protocol/subagent.ts); a row that actually spawned
+  // an agent is rendered by SubagentPanel, and this config supplies the name
+  // and preview used by tool grouping.
   Agent: {
-    input: {
-      type: 'collapsible',
-      title: (input) => input.description || input.subagent_type || 'Subagent',
-      defaultOpen: false,
-      contentType: 'markdown',
-      getContentProps: (input) => ({ content: input.prompt || '' })
-    },
-    result: {
-      hideOnSuccess: true
-    }
-  },
-
-  Task: {
     input: {
       type: 'collapsible',
       title: (input) => {

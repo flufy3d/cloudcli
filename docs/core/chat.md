@@ -64,6 +64,10 @@ flowchart TD
 - 输入框底部的模型菜单按 `ProviderModelOption` 呈现；当选项带有 `group` 字段时，前端以 `ComposerMenuHeading` 划分展示区块（如个人套餐与体验套餐分组），消除同名模型混淆。
 - 选项标识与展示解耦：底层 `value` 允许包含 Provider 前缀（例如 `account:bigmodel-start-plan/GLM-5.3-Flash`）以保障后端唯一路由；触发器与折叠标题通过友好前缀截断与 `label` 解析，保证用户可见区域始终展示人类可读的友好名称，绝不泄露底层内部原始 ID。
 
+### 子 agent 卡片只认 `Agent`
+
+前端把工具名等于 `Agent` 的 `tool_use` 行渲染成子 agent 面板（`useChatMessages` 的 `isSubagentContainer`，常量来自 `shared/protocol/subagent.ts`），不按引擎分支，也不看 `Task`：`Task` 只指任务清单类工具。面板的状态先看历史行上的 `subagent`：它给出 `running` 以外的状态就是定论；否则看 `task_status` 事件（实时，按 `toolUseId` 折回这张卡）；两者都没有时才看工具结果。各引擎怎样把自家的派 agent 形态翻成 `Agent` 行、怎样保证结算，见 [providers.md](./providers.md)「子 agent 卡片」。
+
 ## 断线恢复
 
 - `seq` 由 run registry 按 session 维护单调水位：跨 run 续数、不随缓冲驱逐失效，服务端单方定义，客户端只透传（取 max 对账）。重连后发 `chat.subscribe`（带 `lastSeq`）→ 活跃 run 从缓冲精确补发；ack 带权威 `lastSeq` 与 `stale` 标志——`stale: true` 表示需要的事件已被条数、字节预算或保留期限驱逐，客户端补一次 REST 刷新。完成态 run 不 replay，走 REST。

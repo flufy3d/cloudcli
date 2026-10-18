@@ -33,7 +33,7 @@ import {
   type CodexAppServerConnection,
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import {
-  buildCodexSubagentTaskRow,
+  buildCodexSubagentAgentRow,
   codexThreadItemToRows,
   readCodexAppServerItem,
   readCodexCommandLine,
@@ -155,7 +155,7 @@ const DETACHED_COMMAND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 /**
  * One `task_status` frame for a collab agent, in the shape the client folds
- * onto the Task card that launched it (`toolUseId` is that card's call id).
+ * onto the Agent card that launched it (`toolUseId` is that card's call id).
  */
 function createCodexTaskStatus(
   sessionId: string | null,
@@ -456,9 +456,9 @@ async function queryCodex(
   const approvalSubjects = new Map<string, { toolName: string; input: unknown }>();
 
   /**
-   * Draws and settles the Task card of an agent announced only through its
+   * Draws and settles the Agent card of an agent announced only through its
    * activity record (the shape real engines use; see
-   * `buildCodexSubagentTaskRow`). `started` opens the card, marks it running
+   * `buildCodexSubagentAgentRow`). `started` opens the card, marks it running
    * and tracks the agent as background work under its thread id; `completed`
    * and `interrupted` settle the card they started — found through that
    * thread id, since the item id differs between the two — and retire the
@@ -477,7 +477,7 @@ async function queryCodex(
       if (backgroundWorkKey && codexBackgroundWork.get(backgroundWorkKey, taskId)) {
         return;
       }
-      for (const message of context.normalizeMessage(buildCodexSubagentTaskRow(item, timestamp), messageSessionId)) {
+      for (const message of context.normalizeMessage(buildCodexSubagentAgentRow(item, timestamp), messageSessionId)) {
         sendMessage(ws, message);
       }
       const description = readCodexSubagentLabel(item);

@@ -38,7 +38,7 @@ import {
   notifyUserIfEnabled
 } from '@/modules/notifications/index.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
-import { createCompleteMessage, createNormalizedMessage, resolveModelEffort } from '@/shared/utils.js';
+import { canonicalClaudeSubagentToolName, createCompleteMessage, createNormalizedMessage, resolveModelEffort } from '@/shared/utils.js';
 
 export { createBackgroundWorkTracker, extractBackgroundTasks, startsBackgroundWork } from '@/modules/providers/list/claude/claude-background-work.js';
 
@@ -184,12 +184,15 @@ function resolveToolApproval(requestId, decision) {
 // This only supports exact tool names and the Bash(command:*) shorthand
 // used by the UI; it intentionally does not implement full glob semantics,
 // introduced to stay consistent with the UI's "Allow rule" format.
-function matchesToolPermission(entry, toolName, input) {
+/** Used by the tool-permission tests; the matcher itself only serves `canUseTool` below. */
+export function matchesToolPermission(entry, toolName, input) {
   if (!entry || !toolName) {
     return false;
   }
 
-  if (entry === toolName) {
+  // A rule saved as `Task` (the subagent tool's old name) must keep matching
+  // the `Agent` the CLI asks about now, and the reverse.
+  if (entry === toolName || canonicalClaudeSubagentToolName(entry) === canonicalClaudeSubagentToolName(toolName)) {
     return true;
   }
 
@@ -253,7 +256,10 @@ function mapCliOptionsToSDK(options = {}) {
   let allowedTools = [...(settings.allowedTools || [])];
 
   if (permissionMode === 'plan') {
-    const planModeTools = ['Read', 'Task', 'exit_plan_mode', 'TodoRead', 'TodoWrite', 'WebFetch', 'WebSearch'];
+    // `Agent` is the CLI's current subagent tool; `Task` is its legacy name,
+    // which the CLI still resolves to `Agent` in permission rules (its legacy
+    // tool-name map), kept so rules written for older CLIs keep matching.
+    const planModeTools = ['Read', 'Agent', 'Task', 'exit_plan_mode', 'TodoRead', 'TodoWrite', 'WebFetch', 'WebSearch'];
     for (const tool of planModeTools) {
       if (!allowedTools.includes(tool)) {
         allowedTools.push(tool);

@@ -10,6 +10,8 @@ import type {
   FetchHistoryOptions,
   FetchHistoryResult,
   NormalizedMessage,
+  SubagentActivity,
+  SubagentInfo,
   ProviderSessionUsageInput,
   ProviderTokenUsageResult,
 } from '@/shared/types.js';
@@ -28,15 +30,24 @@ import {
   readUsageNumber,
   removePathIfExists,
   sliceTailPage,
+  truncateSubagentActivity,
   unwrapJsonStringLiteral,
 } from '@/shared/utils.js';
 
+import { formatToolOutput } from './opencode-event-translator.js';
 import {
   getOpenCodeDatabasePath,
+  readOpenCodeSessionIdleAt,
   readOpenCodeSessionTokenTotals,
   resolveOpenCodeMessageLayout,
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
+import {
+  isOpenCodeSubagentTool,
+  readSubagentChildSessionId,
+  toAgentCardInput,
+  toClientToolName,
+} from './opencode-subagent.js';
 
 const PROVIDER = 'opencode';
 
@@ -47,6 +58,18 @@ type OpenCodeHistoryRow = {
   part_id: string | null;
   part_time_created: number | null;
   part_data: string | null;
+};
+
+/**
+ * What the history normalizer needs beyond the rows themselves: the open
+ * database (a spawn call's child session is read from it) and the layout
+ * that tells how to read that child.
+ */
+type OpenCodeHistoryContext = {
+  db: Database.Database;
+  layout: 'session_message' | 'message_part';
+  /** The session being read, whose idle time says whether a call left `running` can still finish. */
+  providerSessionId: string;
 };
 
 type OpenCodeTokenTotals = {
@@ -453,7 +476,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       const window: NormalizedMessage[] = [];
       let total = 0;
       let head = 0;
-      for (const message of this.normalizeHistoryRows(rows, sessionId)) {
+      for (const message of this.normalizeHistoryRows(rows, sessionId, { db, layout, providerSessionId })) {
         total += 1;
         if (capacity === 0) continue;
         if (window.length < capacity) window.push(message);
@@ -504,7 +527,11 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
     `).iterate(providerSessionId) as Iterable<OpenCodeHistoryRow>;
   }
 
-  private *normalizeHistoryRows(rows: Iterable<OpenCodeHistoryRow>, sessionId: string): Generator<NormalizedMessage> {
+  private *normalizeHistoryRows(
+    rows: Iterable<OpenCodeHistoryRow>,
+    sessionId: string,
+    context: OpenCodeHistoryContext,
+  ): Generator<NormalizedMessage> {
     let rowOrdinal = 0;
     const emittedMessageErrors = new Set<string>();
 
@@ -590,22 +617,32 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       if (partType === 'tool') {
         const state = readObjectRecord(partData.state) ?? {};
         const status = readOptionalString(state.status);
+        const engineToolName = readOptionalString(partData.tool) ?? 'Tool';
+        const isSubagent = isOpenCodeSubagentTool(engineToolName);
+        const engineInput = state.input ?? partData.input ?? {};
         const toolMessage = createNormalizedMessage({
           id: baseId,
           sessionId,
           timestamp,
           provider: PROVIDER,
           kind: 'tool_use',
-          toolName: readOptionalString(partData.tool) ?? 'Tool',
-          toolInput: state.input ?? partData.input ?? {},
+          toolName: toClientToolName(engineToolName),
+          toolInput: isSubagent ? toAgentCardInput(engineInput) : engineInput,
           toolId: readOptionalString(partData.callID) ?? row.part_id,
         });
 
         if (status === 'completed' || status === 'error') {
+          // v1 states carry the output as a string; v2 states carry result
+          // blocks under `content`.
+          const output = state.output ?? (state.content === undefined ? undefined : formatToolOutput(state.content));
           toolMessage.toolResult = {
-            content: formatToolContent(state.output ?? state.error),
+            content: formatToolContent(output ?? state.error),
             isError: status === 'error',
           };
+        }
+
+        if (isSubagent) {
+          this.attachSubagent(toolMessage, state, engineInput, row.part_time_created ?? row.message_time_created, context);
         }
 
         yield toolMessage;
@@ -623,20 +660,107 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         continue;
       }
 
-      if (partType === 'patch' || partType === 'agent') {
+      // An `agent` part is the user's @-mention of an agent, not a spawn (the
+      // prompt text already holds the mention), so it draws nothing.
+      if (partType === 'patch') {
         yield createNormalizedMessage({
           id: baseId,
           sessionId,
           timestamp,
           provider: PROVIDER,
           kind: 'tool_use',
-          toolName: partType === 'patch' ? 'Patch' : 'Agent',
+          toolName: 'Patch',
           toolInput: partData,
           toolId: row.part_id,
         });
       }
     }
 
+  }
+
+  /**
+   * Publishes a spawn call's outcome and its child session's work on its
+   * `Agent` row.
+   *
+   * The call's own status is the agent's outcome (`completed`, `error`). A
+   * call persisted as `pending` or `running` can only still be running while
+   * the session has a run in flight; once the session is idle the run that
+   * owned the call is gone and the agent can never finish, so it reads as
+   * `stopped`.
+   */
+  private attachSubagent(
+    toolMessage: NormalizedMessage,
+    state: AnyRecord,
+    engineInput: unknown,
+    callTime: number | null,
+    context: OpenCodeHistoryContext,
+  ): void {
+    const input = readObjectRecord(engineInput);
+    const childSessionId = readSubagentChildSessionId(state.metadata)
+      ?? readOptionalString(input?.sessionID);
+    const agentType = readOptionalString(input?.agent);
+    const description = readOptionalString(input?.description);
+    const subagent: SubagentInfo = {
+      id: childSessionId ?? String(toolMessage.toolId),
+      name: agentType,
+      type: agentType,
+      description,
+      status: this.resolveSubagentStatus(readOptionalString(state.status), callTime, context),
+    };
+
+    if (childSessionId) {
+      const activity = this.readChildSessionActivity(childSessionId, context);
+      if (activity.length > 0) {
+        toolMessage.subagentTools = activity.map(truncateSubagentActivity);
+        subagent.activityCount = activity.length;
+      }
+    }
+    toolMessage.subagent = subagent;
+  }
+
+  private resolveSubagentStatus(
+    callStatus: string | undefined,
+    callTime: number | null,
+    context: OpenCodeHistoryContext,
+  ): SubagentInfo['status'] {
+    if (callStatus === 'completed') {
+      return 'completed';
+    }
+    if (callStatus === 'error') {
+      return 'failed';
+    }
+    const idleAt = readOpenCodeSessionIdleAt(context.db, context.providerSessionId);
+    // `undefined`: this database cannot say whether a run is in flight, so a
+    // call left unresolved is not claimed to be running. `null`: a run is
+    // still in flight. A number: the session went idle at that time, which
+    // ends every call begun before it.
+    const stillInFlight = idleAt === null || (idleAt !== undefined && (callTime ?? 0) > idleAt);
+    return stillInFlight ? 'running' : 'stopped';
+  }
+
+  /** The child session's text, reasoning and tool calls as a subagent timeline. */
+  private readChildSessionActivity(childSessionId: string, context: OpenCodeHistoryContext): SubagentActivity[] {
+    const rows = context.layout === 'session_message'
+      ? flattenOpenCodeV2HistoryRows(context.db, childSessionId)
+      : this.readV1HistoryRows(context.db, childSessionId);
+    const activity: SubagentActivity[] = [];
+    for (const message of this.normalizeHistoryRows(rows, childSessionId, { ...context, providerSessionId: childSessionId })) {
+      if (message.kind === 'tool_use') {
+        activity.push({
+          kind: 'tool',
+          timestamp: message.timestamp,
+          toolId: message.toolId,
+          toolName: message.toolName,
+          toolInput: message.toolInput,
+          toolResult: message.toolResult ?? null,
+        });
+      } else if (message.kind === 'text' && message.role !== 'user') {
+        activity.push({ kind: 'text', timestamp: message.timestamp, content: message.content });
+      } else if (message.kind === 'thinking') {
+        activity.push({ kind: 'thinking', timestamp: message.timestamp, content: message.content });
+      }
+    }
+    return activity;
   }
 
   /**

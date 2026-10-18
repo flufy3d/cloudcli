@@ -354,3 +354,24 @@ test('attachments ride along as data-URI file parts next to the path tags', asyn
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('a run that ends on an unfinished subagent call settles the card as stopped before it completes', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('delegate', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    service.emit(session('session.tool.called', {
+      assistantMessageID: 'm', id: 'call-sub', name: 'subagent',
+      input: { agent: 'general', description: 'Review', prompt: 'go' },
+    }));
+    service.emit(session('session.execution.interrupted', { reason: 'user' }));
+    await running;
+
+    const launch = frames.find((frame) => frame.kind === 'tool_use');
+    assert.equal(launch?.toolName, 'Agent');
+    const settle = frames.find((frame) => frame.kind === 'task_status');
+    assert.equal(settle?.toolUseId, 'call-sub');
+    assert.equal(settle?.status, 'stopped');
+    assert.ok(frames.indexOf(settle!) < frames.findIndex((frame) => frame.kind === 'complete' || frame.kind === 'status'));
+  });
+});

@@ -245,6 +245,10 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     // bridge so finished sessions do not pin memory forever.
     bridge.cancelSession(appSessionId, 'The run ended with cards still pending.');
     bridge.detach(providerSessionId);
+    // A spawn call the run never resolved would spin on its card forever.
+    for (const frame of activeRun.translator.settleOpenSubagents()) {
+      writer.send(frame);
+    }
 
     await sendTokenBudget(appSessionId, providerSessionId, writer);
 

@@ -28,7 +28,6 @@ const TOOL_ALIASES: Record<string, string> = {
   read_url_content: 'WebFetch',
   manage_task: 'Task',
   manage_subagents: 'Subagent',
-  invoke_subagent: 'Subagent',
   ExitPlanMode: 'Plan',
   exit_plan_mode: 'Plan',
   Plan: 'Plan',
@@ -63,7 +62,7 @@ export function isFilePreviewTool(toolName: string): boolean {
 
 /**
  * Display category for the collapsible card. Explicit and ordered — the
- * categories cross alias families (`manage_task` is 'task' while `Task` is
+ * categories cross alias families (`manage_task` is 'task' while `Agent` is
  * 'agent'), so this must not be derived from the canonical name.
  */
 const DISPLAY_CATEGORIES: ReadonlyArray<readonly [string, ReadonlySet<string>]> = [
@@ -72,7 +71,7 @@ const DISPLAY_CATEGORIES: ReadonlyArray<readonly [string, ReadonlySet<string>]> 
   ['bash', new Set(['Bash', 'run_command'])],
   ['todo', new Set(['TodoWrite', 'TodoRead'])],
   ['task', new Set(['TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'manage_task'])],
-  ['agent', new Set(['Task', 'invoke_subagent', 'manage_subagents', 'send_message'])],
+  ['agent', new Set(['Agent', 'manage_subagents', 'send_message'])],
   ['plan', new Set(['exit_plan_mode', 'ExitPlanMode'])],
   ['question', new Set(['AskUserQuestion'])],
 ];

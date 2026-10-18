@@ -35,7 +35,6 @@ test('every engine alias resolves to its canonical name', () => {
   assert.equal(canonicalToolName('read_url_content'), 'WebFetch');
   assert.equal(canonicalToolName('manage_task'), 'Task');
   assert.equal(canonicalToolName('manage_subagents'), 'Subagent');
-  assert.equal(canonicalToolName('invoke_subagent'), 'Subagent');
   assert.equal(canonicalToolName('ExitPlanMode'), 'Plan');
   assert.equal(canonicalToolName('update_plan'), 'Plan');
 });
@@ -84,7 +83,7 @@ test('display categories keep their explicit mapping, including cross-family nam
   assert.equal(getToolDisplayCategory('run_command'), 'bash');
   assert.equal(getToolDisplayCategory('TodoWrite'), 'todo');
   assert.equal(getToolDisplayCategory('manage_task'), 'task', 'manage_task is task work');
-  assert.equal(getToolDisplayCategory('Task'), 'agent', 'while Task is subagent delegation');
+  assert.equal(getToolDisplayCategory('Agent'), 'agent', 'while Agent is subagent delegation');
   assert.equal(getToolDisplayCategory('exit_plan_mode'), 'plan');
   assert.equal(getToolDisplayCategory('AskUserQuestion'), 'question');
   assert.equal(getToolDisplayCategory('mcp__something__do_thing'), 'default');

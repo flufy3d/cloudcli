@@ -22,6 +22,7 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
 import type { MessageInputForKind, VolatileMessageId } from '../../shared/protocol/messageKinds.js';
 import { VOLATILE_MESSAGE_ID_PREFIX } from '../../shared/protocol/messageKinds.js';
+import { SUBAGENT_TOOL_NAME } from '../../shared/protocol/subagent.js';
 
 import { parseFrontMatter } from './frontmatter.js';
 import { getGlobalImageAssetsDir } from './image-attachments.js';
@@ -756,6 +757,32 @@ export function truncateSubagentActivity(activity: SubagentActivity): SubagentAc
   }
 
   return { ...activity, content: truncatedContent, toolResult: truncatedResult };
+}
+
+// ---------------------------
+//----------------- SUBAGENT TOOL NAME UTILITIES ------------
+export { SUBAGENT_TOOL_NAME };
+
+/**
+ * The tool name older Claude CLIs gave the subagent spawn call. Current CLIs
+ * name it `Agent` and still resolve this name to `Agent` in permission rules.
+ */
+const LEGACY_CLAUDE_SUBAGENT_TOOL_NAME = 'Task';
+
+/**
+ * Translates Claude's legacy subagent tool name (`Task`) into the protocol's
+ * `Agent`; every other name, including the task-list tools (`TaskCreate`,
+ * `TaskUpdate`), passes through unchanged.
+ *
+ * Used by Claude's history reader and live normalizer (so old transcripts and
+ * live calls draw the same card), its background-work tracker (so both names
+ * count as a launch that outlives the turn) and its permission matcher (so a
+ * rule saved as `Task` still allows `Agent`). Do not apply it to the name in a
+ * `permission_request`: the client writes always-allow rules under the name the
+ * CLI asked about.
+ */
+export function canonicalClaudeSubagentToolName(toolName: string): string {
+  return toolName === LEGACY_CLAUDE_SUBAGENT_TOOL_NAME ? SUBAGENT_TOOL_NAME : toolName;
 }
 
 // ---------------------------

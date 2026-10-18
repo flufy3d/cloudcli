@@ -15,7 +15,8 @@ const COMMON_CLAUDE_TOOLS = [
   'Glob',
   'Grep',
   'MultiEdit',
-  'Task',
+  // The CLI still resolves a saved legacy `Task` rule to `Agent`.
+  'Agent',
   'TodoWrite',
   'TodoRead',
   'WebFetch',

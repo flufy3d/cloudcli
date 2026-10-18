@@ -44,7 +44,7 @@ export function getZCodeDatabasePath(): string {
  * outcome and its totals; it is the only durable record of how an agent
  * ended, because the lifecycle events are not persisted anywhere else.
  *
- * Consumers: zcode sessions provider (history replay of Task cards).
+ * Consumers: zcode sessions provider (history replay of Agent cards).
  */
 export function getZCodeAgentSidecarDir(parentSessionId: string): string {
   return path.join(getZCodeStorageDir(), 'cli', 'agents', parentSessionId);

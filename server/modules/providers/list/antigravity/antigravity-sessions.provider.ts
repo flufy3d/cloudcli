@@ -23,6 +23,8 @@ import type {
   NormalizedMessage,
   ProviderSessionUsageInput,
   ProviderTokenUsageResult,
+  SubagentActivity,
+  SubagentInfo,
 } from '@/shared/types.js';
 import {
   ProviderDisplayAssetError,
@@ -38,7 +40,9 @@ import {
   readUsageNumber,
   removePathIfExists,
   sanitizeLeafDirectoryName,
+  SUBAGENT_TOOL_NAME,
   sliceTailPage,
+  truncateSubagentActivity,
 } from '@/shared/utils.js';
 
 import {
@@ -47,6 +51,18 @@ import {
   getAntigravitySummariesDbPath,
   getAntigravityTranscriptCandidates,
 } from './antigravity-data-root.js';
+import {
+  ANTIGRAVITY_SPAWN_TOOL,
+  antigravityBackgroundWork,
+  buildAntigravityAgentToolId,
+  buildAntigravityToolId,
+  buildAntigravityToolRowId,
+  createAntigravityAgentRow,
+  extractAntigravitySubagents,
+  parseCreatedSubagentIds,
+  readAgentReports,
+  readInvokedAgentSpecs,
+} from './antigravity-subagent.js';
 import { readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
 
 const PROVIDER = 'antigravity';
@@ -56,38 +72,6 @@ const PROVIDER = 'antigravity';
  * eventual PLANNER_RESPONSE transcript row. Missing native step indexes stay
  * unidentified so clients can fall back to their legacy reconciliation rules.
  */
-/**
- * The id both transports must give one tool call.
- *
- * Live reports a tool at its own step index; the transcript declares it on the
- * planner entry one step earlier, with its position in that entry's
- * `tool_calls`. `declaringStepIndex` is that planner step and is offset here,
- * while the live side passes the execution step it already has. An index the
- * engine did not supply falls back to a per-process value, which cannot pair —
- * that is the honest outcome, better than two rows sharing a made-up id.
- */
-function buildAntigravityToolId(stepIndex: number | undefined, positionInEntry: number | null): string {
-  if (stepIndex === undefined) {
-    return `tool_unindexed_${Date.now()}`;
-  }
-  return positionInEntry === null
-    ? `tool_${stepIndex}`
-    : `tool_${stepIndex + 1 + positionInEntry}`;
-}
-
-/**
- * The row id both transports must produce for one tool call.
- *
- * Antigravity reports a call twice — live at its own step, and in history on
- * the planner entry one step earlier — so the step number alone names two
- * different rows. `buildAntigravityToolId` already reconciles that into one
- * call identity; deriving the row id from it is what lets the client see the
- * live card and the persisted card as the same row instead of rendering both.
- */
-function buildAntigravityToolRowId(sessionId: string | null, toolId: string): string {
-  return `msg_${sessionId ?? ''}_${toolId}`;
-}
-
 function buildAntigravityAssistantRowKey(stepIndex: number | undefined): string | undefined {
   return stepIndex === undefined ? undefined : `assistant-step:${stepIndex}`;
 }
@@ -340,6 +324,16 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         }));
       }
 
+      // An invocation that created agents: one `Agent` card per agent.
+      for (const agent of extractAntigravitySubagents(step)) {
+        messages.push(createAntigravityAgentRow({
+          sessionId,
+          toolId: agent.toolUseId,
+          spec: agent,
+          sequence: stepIndex,
+        }));
+      }
+
       // Tool use initiation
       if (stepType === 'tool' && state === 'ACTIVE') {
         const toolName = readOptionalString(step.tool_name) || 'tool';
@@ -425,6 +419,10 @@ export class AntigravitySessionsProvider implements IProviderSessions {
     try {
       const canonicalRows = await readCanonicalAntigravityTranscript(providerSessionId);
       const normalizedMessages: NormalizedMessage[] = [];
+      // Agents each `invoke_subagent` call created, by the call's id. The
+      // call declares roles and prompts; the conversation ids (which name
+      // the cards) only arrive with the receipt on the following step.
+      const spawnCalls = new Map<string, { rows: NormalizedMessage[]; receipt?: string }>();
 
       for (let i = 0; i < canonicalRows.length; i++) {
         try {
@@ -507,6 +505,21 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                 // total should that ever change.
                 const toolId = buildAntigravityToolId(nativeStepIndex, t);
 
+                if (toolName === ANTIGRAVITY_SPAWN_TOOL) {
+                  // Provisional ids by position; `settleSpawnCalls` swaps in
+                  // the conversation ids once the receipt names them.
+                  const rows = readInvokedAgentSpecs(tc?.args).map((spec, position) => createAntigravityAgentRow({
+                    sessionId,
+                    toolId: buildAntigravityAgentToolId(toolId, String(position)),
+                    spec,
+                    timestamp: createdAt,
+                    sequence: stepIndex,
+                  }));
+                  normalizedMessages.push(...rows);
+                  spawnCalls.set(toolId, { rows });
+                  continue;
+                }
+
                 normalizedMessages.push(createNormalizedMessage({
                   id: buildAntigravityToolRowId(sessionId, toolId),
                   sessionId,
@@ -528,8 +541,18 @@ export class AntigravitySessionsProvider implements IProviderSessions {
           // background-task output. Rows reach here in step order, so pairing
           // each with the oldest tool_use still missing its result is exact.
           if (source === 'MODEL' && rawContent) {
+            // The receipt of an `invoke_subagent` call belongs to its agents'
+            // cards, never to another call as its result.
+            const spawnCall = nativeStepIndex === undefined
+              ? undefined
+              : spawnCalls.get(buildAntigravityToolId(nativeStepIndex, null));
+            if (spawnCall) {
+              spawnCall.receipt = rawContent;
+              continue;
+            }
+
             const pendingToolUse = normalizedMessages.find(
-              (msg) => msg.kind === 'tool_use' && !msg.toolResult,
+              (msg) => msg.kind === 'tool_use' && !msg.toolResult && msg.toolName !== SUBAGENT_TOOL_NAME,
             );
             if (pendingToolUse) {
               pendingToolUse.toolResult = {
@@ -563,6 +586,8 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         }
       }
 
+      await this.settleSpawnCalls(sessionId, spawnCalls, canonicalRows.map((row) => readOptionalString(row.entry.content) ?? ''));
+
       const total = normalizedMessages.length;
       const { page, hasMore } = sliceTailPage(normalizedMessages, limit, offset);
 
@@ -591,6 +616,81 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       console.warn(`[AntigravitySessions] Failed to load history for ${sessionId}:`, error);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
     }
+  }
+
+  /**
+   * Names each agent card after its conversation and publishes the agent's
+   * outcome and work on it.
+   *
+   * The engine records an agent finishing only as the report the agent sends
+   * its parent, so a report means `completed` and carries the agent's answer.
+   * An agent with no report is `running` only while this server's `agy`
+   * process still tracks it; otherwise the process that ran it is gone and the
+   * card must not spin forever, so it reads `stopped`.
+   */
+  private async settleSpawnCalls(
+    sessionId: string,
+    spawnCalls: Map<string, { rows: NormalizedMessage[]; receipt?: string }>,
+    rawContents: string[],
+  ): Promise<void> {
+    if (spawnCalls.size === 0) {
+      return;
+    }
+    const reports = readAgentReports(rawContents);
+    for (const [callToolId, call] of spawnCalls) {
+      const conversationIds = parseCreatedSubagentIds(call.receipt ?? '');
+      for (const [position, row] of call.rows.entries()) {
+        const conversationId = conversationIds[position];
+        if (conversationId) {
+          row.toolId = buildAntigravityAgentToolId(callToolId, conversationId);
+          row.id = buildAntigravityToolRowId(sessionId, row.toolId);
+        }
+        const input = readObjectRecord(row.toolInput);
+        const report = conversationId ? reports.get(conversationId.toLowerCase()) : undefined;
+        const status: SubagentInfo['status'] = report !== undefined
+          ? 'completed'
+          : conversationId && antigravityBackgroundWork.has(conversationId) ? 'running' : 'stopped';
+        const subagent: SubagentInfo = {
+          id: conversationId ?? String(row.toolId),
+          name: readOptionalString(input?.subagent_type),
+          type: readOptionalString(input?.subagent_type),
+          description: readOptionalString(input?.description),
+          status,
+        };
+        if (report !== undefined) {
+          row.toolResult = { content: report, isError: false };
+        }
+        if (conversationId) {
+          const activity = await this.readAgentActivity(conversationId);
+          if (activity.length > 0) {
+            row.subagentTools = activity.map(truncateSubagentActivity);
+            subagent.activityCount = activity.length;
+          }
+        }
+        row.subagent = subagent;
+      }
+    }
+  }
+
+  /** The agent's own transcript as a subagent timeline: its text and tool calls. */
+  private async readAgentActivity(conversationId: string): Promise<SubagentActivity[]> {
+    const { messages } = await this.fetchHistory(conversationId, {});
+    const activity: SubagentActivity[] = [];
+    for (const message of messages) {
+      if (message.kind === 'tool_use') {
+        activity.push({
+          kind: 'tool',
+          timestamp: message.timestamp,
+          toolId: message.toolId,
+          toolName: message.toolName,
+          toolInput: message.toolInput,
+          toolResult: message.toolResult ?? null,
+        });
+      } else if (message.kind === 'text' && message.role === 'assistant') {
+        activity.push({ kind: 'text', timestamp: message.timestamp, content: message.content });
+      }
+    }
+    return activity;
   }
 
   /**

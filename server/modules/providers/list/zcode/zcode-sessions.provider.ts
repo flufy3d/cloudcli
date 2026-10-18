@@ -27,6 +27,7 @@ import {
   readOptionalString,
   removePathIfExists,
   sliceTailPage,
+  SUBAGENT_TOOL_NAME,
 } from '@/shared/utils.js';
 import { getGlobalImageAssetsDir } from '@/shared/image-attachments.js';
 import { resolveAttachmentAssetFile } from '@/modules/assets/index.js';
@@ -36,7 +37,6 @@ import { getZCodeAgentSidecarDir, getZCodeDatabasePath, getZCodeStorageDir } fro
 import {
   buildZCodeTextRowKey,
   isZCodeCancelledEngineError,
-  normalizeZCodeToolName,
   readZCodeTokenUsedCount,
   ZCodeLiveEventNormalizer,
   ZCODE_CANCELLED_NOTICE,
@@ -353,7 +353,7 @@ function aggregateZCodeSessionTokenUsage(
 
 /**
  * What the engine's per-agent sidecar (`metadata.json`) says about one
- * spawned agent, reduced to the fields a Task card reads.
+ * spawned agent, reduced to the fields an Agent card reads.
  */
 type ZCodeAgentSidecar = {
   agentId: string;
@@ -738,7 +738,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
 
       // Handle tool parts (callID/tool/state per Phase 0.3 part schema)
       if (partType === 'tool' || partType === 'function_call') {
-        const toolName = normalizeZCodeToolName(readOptionalString(partData.tool) ?? readOptionalString(partData.name) ?? 'Tool');
+        const toolName = readOptionalString(partData.tool) ?? readOptionalString(partData.name) ?? 'Tool';
         const state = readObjectRecord(partData.state);
 
         const toolMessage = createNormalizedMessage({
@@ -782,7 +782,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
   }
 
   /**
-   * Publishes each spawned agent's outcome on the Task row that launched it.
+   * Publishes each spawned agent's outcome on the Agent row that launched it.
    *
    * The launch row alone cannot say how the agent ended: a background
    * launch's result is only the acknowledgement ("Async agent launched
@@ -796,7 +796,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
     messages: NormalizedMessage[],
     providerSessionId: string,
   ): Promise<void> {
-    const launches = messages.filter((message) => message.kind === 'tool_use' && message.toolName === 'Task' && message.toolId);
+    const launches = messages.filter((message) => message.kind === 'tool_use' && message.toolName === SUBAGENT_TOOL_NAME && message.toolId);
     if (launches.length === 0) {
       return;
     }

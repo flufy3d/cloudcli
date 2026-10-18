@@ -6,6 +6,7 @@
 import type { NormalizedMessage } from '@/modules/chat/hooks/useSessionStore';
 import type { ChatMessage , LiveTaskStatus } from '@/shared/types';
 import { formatUsageLimitText } from '@/modules/chat/utils/chatFormatting';
+import { isSubagentToolName } from '@shared/protocol/subagent';
 
 function formatToolResultContent(content: unknown): string {
   // JSON.stringify(undefined) returns undefined (not a string), so guard the
@@ -256,7 +257,7 @@ function convertRow(
 
       case 'tool_use': {
         const tr = msg.toolResult || (msg.toolId ? toolResultMap.get(msg.toolId) : null);
-        const isSubagentContainer = msg.toolName === 'Task';
+        const isSubagentContainer = isSubagentToolName(msg.toolName);
 
         const toolResult = tr
           ? {

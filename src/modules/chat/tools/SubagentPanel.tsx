@@ -65,9 +65,9 @@ const STATUS_STYLES: Record<SubagentInfo['status'], string> = {
 };
 
 /**
- * Rendered by chat's MessageComponent for any tool call that spawned a
- * subagent — Claude's `Agent`/`Task` and Codex's `spawn_agent` both normalize
- * to the same shape, so both render through this one panel.
+ * Rendered by chat's MessageComponent for any tool call named `Agent` — the
+ * one name every engine's adapter gives a spawned subagent (see
+ * `shared/protocol/subagent.ts`), so all engines render through this one panel.
  *
  * The timeline is mounted only while the panel is open. The shared Collapsible
  * keeps its children mounted when closed, which for an agent that ran a

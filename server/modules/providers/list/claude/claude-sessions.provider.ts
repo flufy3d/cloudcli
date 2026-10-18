@@ -29,6 +29,7 @@ import {
   parseProviderJson,
   compactProviderPayload,
   AppError,
+  canonicalClaudeSubagentToolName,
   createNormalizedMessage,
   generateMessageId,
   isPlaceholderProviderModel,
@@ -147,7 +148,7 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
               const tool: SubagentActivity = {
                 kind: 'tool',
                 toolId: String(part.id ?? ''),
-                toolName: String(part.name ?? 'Tool'),
+                toolName: canonicalClaudeSubagentToolName(String(part.name ?? 'Tool')),
                 toolInput: part.input,
                 timestamp,
               };
@@ -1693,7 +1694,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
               timestamp: ts,
               provider: PROVIDER,
               kind: 'tool_use',
-              toolName: part.name,
+              toolName: typeof part.name === 'string' ? canonicalClaudeSubagentToolName(part.name) : part.name,
               toolInput: part.input,
               toolId: part.id,
             }));

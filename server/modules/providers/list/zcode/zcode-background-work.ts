@@ -1,15 +1,6 @@
 import { BackgroundWorkRegistry } from '../../shared/background-work/background-work-registry.js';
 
 /**
- * The `taskType` ZCode's spawned agents report as, matching what Claude's SDK
- * names its local agents so the client labels both the same way.
- *
- * Consumers: the ZCode live-event normalizer (task_status events) and the
- * ZCode runtime (background-work entries).
- */
-export const ZCODE_AGENT_TASK_TYPE = 'local_agent';
-
-/**
  * ZCode agents still running, keyed by app session id and agent id.
  *
  * Fed by the runtime from the engine's `subagent_spawned`/`subagent_stopped`

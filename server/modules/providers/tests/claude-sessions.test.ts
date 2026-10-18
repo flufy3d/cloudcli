@@ -79,7 +79,7 @@ const AGENT_TOOL_USE_ID = 'toolu_agent_1';
  * subagent: the parent session, and the agent's own transcript plus sidecar
  * metadata under `<session>/subagents/`.
  */
-async function writeClaudeSubagentSession(projectDirectory: string): Promise<string> {
+async function writeClaudeSubagentSession(projectDirectory: string, spawnToolName = 'Agent'): Promise<string> {
   const parentPath = path.join(projectDirectory, `${SESSION_ID}.jsonl`);
   const subagentDirectory = path.join(projectDirectory, SESSION_ID, 'subagents');
   await mkdir(subagentDirectory, { recursive: true });
@@ -95,7 +95,7 @@ async function writeClaudeSubagentSession(projectDirectory: string): Promise<str
         content: [{
           type: 'tool_use',
           id: AGENT_TOOL_USE_ID,
-          name: 'Agent',
+          name: spawnToolName,
           input: { subagent_type: 'Explore', description: 'Survey the repo', prompt: 'Look around' },
         }],
       },
@@ -260,6 +260,48 @@ test('Claude history attaches a subagent transcript stored under the session dir
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test('Claude history presents a legacy Task spawn as an Agent card', { concurrency: false }, async () => {
+  // Transcripts written by older CLIs name the spawn call `Task`. The client
+  // draws a subagent card for `Agent` only, so the reader translates the name
+  // while keeping the agent's status and sub-timeline attached to the row.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-legacy-task-'));
+
+  try {
+    const parentPath = await writeClaudeSubagentSession(tempRoot, 'Task');
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Legacy session', now, now, parentPath);
+
+      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+        providerSessionId: SESSION_ID,
+      });
+      const spawnRows = history.messages.filter((message) => message.kind === 'tool_use' && message.toolId === AGENT_TOOL_USE_ID);
+
+      assert.equal(spawnRows.length, 1);
+      assert.equal(spawnRows[0].toolName, 'Agent');
+      assert.equal(spawnRows[0].subagent?.status, 'completed');
+      assert.equal(history.messages.some((message) => message.toolName === 'Task'), false);
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('a live legacy Task call and a live Agent call both reach the page as Agent, and task-list tools keep their names', () => {
+  const provider = new ClaudeSessionsProvider();
+  const rowFor = (name: string) => provider.normalizeMessage({
+    uuid: `row-${name}`,
+    type: 'assistant',
+    timestamp: new Date().toISOString(),
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: `toolu_${name}`, name, input: {} }] },
+  }, 'session-1')[0];
+
+  assert.equal(rowFor('Task').toolName, 'Agent');
+  assert.equal(rowFor('Agent').toolName, 'Agent');
+  assert.equal(rowFor('TaskCreate').toolName, 'TaskCreate');
 });
 
 test('Claude history folds an agent task notification into the call that spawned it', { concurrency: false }, async () => {

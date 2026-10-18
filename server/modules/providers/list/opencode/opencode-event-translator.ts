@@ -25,6 +25,7 @@
  * @module opencode-event-translator
  */
 
+import { LOCAL_AGENT_TASK_TYPE, createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
 import type { NormalizedMessage } from '@/shared/types.js';
 import {
   compactProviderPayload,
@@ -35,6 +36,12 @@ import {
 } from '@/shared/utils.js';
 
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
+import {
+  isOpenCodeSubagentTool,
+  readSubagentChildSessionId,
+  toAgentCardInput,
+  toClientToolName,
+} from './opencode-subagent.js';
 
 const PROVIDER = 'opencode' as const;
 
@@ -83,8 +90,13 @@ const toTimestamp = (event: OpenCodeEventEnvelope): string => {
   return new Date(created).toISOString();
 };
 
-/** Joins the `content` blocks of a tool result (`[{type:'text', text}]`) into one string. */
-const formatToolOutput = (content: unknown): string => {
+/**
+ * Joins the `content` blocks of a tool result (`[{type:'text', text}]`) into one string.
+ *
+ * Consumers: this translator (live results) and the OpenCode history reader
+ * (persisted v2 tool states carry the same blocks under `content`).
+ */
+export const formatToolOutput = (content: unknown): string => {
   if (typeof content === 'string') {
     return content;
   }
@@ -123,6 +135,8 @@ export class OpenCodeSessionEventTranslator {
   private readonly toolCalls = new Map<string, OpenCodeToolCall>();
   /** Reasoning blocks that already streamed deltas; `reasoning.ended` must not repeat them. */
   private readonly streamedReasoningBlocks = new Set<string>();
+  /** Spawn calls announced but not yet resolved; each owns a card that must be settled. */
+  private readonly openSubagentCalls = new Set<string>();
 
   constructor(
     /** The app session id stamped on every frame (the writer owns provider↔app mapping). */
@@ -131,6 +145,19 @@ export class OpenCodeSessionEventTranslator {
 
   getToolCall(callId: string): OpenCodeToolCall | null {
     return this.toolCalls.get(callId) ?? null;
+  }
+
+  /**
+   * Settles the card of every spawn call the run never resolved, as `stopped`.
+   *
+   * The runtime calls this once the run has ended for any reason (success,
+   * failure, interruption, a lost service), because a call whose result never
+   * arrived has nothing else to end its card: nobody is left to report on it.
+   */
+  settleOpenSubagents(): NormalizedMessage[] {
+    const frames = [...this.openSubagentCalls].map((callId) => this.subagentStatusFrame(callId, callId, 'stopped', new Date().toISOString()));
+    this.openSubagentCalls.clear();
+    return frames;
   }
 
   translate(event: OpenCodeEventEnvelope): OpenCodeTranslatedEvent {
@@ -255,7 +282,11 @@ export class OpenCodeSessionEventTranslator {
         if (!callId) {
           return { frames: [] };
         }
-        return { frames: [this.toolResultFrame(callId, formatToolOutput(data.content), false, timestamp)] };
+        const frames = [this.toolResultFrame(callId, formatToolOutput(data.content), false, timestamp)];
+        if (this.openSubagentCalls.delete(callId)) {
+          frames.push(this.subagentStatusFrame(callId, readSubagentChildSessionId(data.metadata) ?? callId, 'completed', timestamp));
+        }
+        return { frames };
       }
 
       case 'session.tool.failed': {
@@ -263,7 +294,11 @@ export class OpenCodeSessionEventTranslator {
         if (!callId) {
           return { frames: [] };
         }
-        return { frames: [this.toolResultFrame(callId, readErrorMessage(data.error), true, timestamp)] };
+        const frames = [this.toolResultFrame(callId, readErrorMessage(data.error), true, timestamp)];
+        if (this.openSubagentCalls.delete(callId)) {
+          frames.push(this.subagentStatusFrame(callId, callId, 'failed', timestamp));
+        }
+        return { frames };
       }
 
       case 'session.step.ended':
@@ -304,17 +339,33 @@ export class OpenCodeSessionEventTranslator {
     });
   }
 
-  private toolUseFrame(callId: string, toolName: string, toolInput: unknown, timestamp: string): NormalizedMessage {
+  private toolUseFrame(callId: string, engineToolName: string, engineInput: unknown, timestamp: string): NormalizedMessage {
+    const isSubagent = isOpenCodeSubagentTool(engineToolName);
+    if (isSubagent) {
+      this.openSubagentCalls.add(callId);
+    }
     return createNormalizedMessage({
       id: callId,
       sessionId: this.sessionId,
       timestamp,
       provider: PROVIDER,
       kind: 'tool_use',
-      toolName,
-      toolInput,
+      toolName: toClientToolName(engineToolName),
+      toolInput: isSubagent ? toAgentCardInput(engineInput) : engineInput,
       toolId: callId,
     });
+  }
+
+  private subagentStatusFrame(
+    callId: string,
+    taskId: string,
+    status: 'completed' | 'failed' | 'stopped',
+    timestamp: string,
+  ): NormalizedMessage {
+    return createTaskStatusMessage(
+      { provider: PROVIDER, sessionId: this.sessionId, taskId, toolUseId: callId, taskType: LOCAL_AGENT_TASK_TYPE },
+      { id: `${callId}_status`, timestamp, event: 'notification', status },
+    );
   }
 
   private toolResultFrame(callId: string, content: string, isError: boolean, timestamp: string): NormalizedMessage {

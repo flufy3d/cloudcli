@@ -50,17 +50,31 @@ flowchart LR
   G -->|没有| I[释放输入流]
 ```
 
-## 子 agent 卡片：Codex 与 ZCode 的共用机制
+## 子 agent 卡片：六家引擎的共同约定
 
-前端只为工具名为 `Task` 的调用渲染子 agent 面板（运行中/完成/失败状态、用量、agent 自己的时间线），卡片上的实时状态只认 `task_status` 事件，并按 `toolUseId` 折回派出 agent 的那次调用。Codex 和 ZCode 的引擎各有自己的派 agent 形态，适配器在边界把它们翻成这两样东西，前端零引擎分支。
+一条 `tool_use` 只有工具名等于 `Agent` 时才是子 agent 卡片，前端只认这一个名字（常量 `SUBAGENT_TOOL_NAME`，定义在 `shared/protocol/subagent.ts`，前后端 import 同一份）。`Task` 只指任务清单类工具（`TaskCreate`、`TaskUpdate`、`manage_task`）。各家引擎派 agent 的原生形态不同，适配器在边界把它翻成两样东西，前端零引擎分支：
 
-两家共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent，运行时切面的 `listBackgroundWork()` 直接返回它，供运行中会话轮询给输入框的后台工作条和侧栏使用。引擎进程活得比一轮对话久，agent 在 `complete` 之后还在跑：开着的页面靠转发的 `task_status` 事件更新卡片，轮询靠这张表知道会话还有后台工作。
+1. 一条工具名为 `Agent` 的 `tool_use` 行。历史读取和实时流用同一个构造函数生成，所以刷新后重建出的就是直播画过的那张卡。
+2. 状态：历史行上挂 `subagent`（`SubagentInfo`），实时流用 `task_status` 事件按 `toolUseId` 折回这张卡。
 
-**ZCode**：引擎的派 agent 工具叫 `Agent`，`normalizeZCodeToolName` 在实时流和历史读取两处统一改名为 `Task`。引擎把 `subagent_spawned` / `subagent_stopped` 发在**父会话**上（载荷带 `agentId`、`parentToolCallId`、描述、是否后台、结束状态和 `totalTokens` / `totalToolUseCount` / `totalDurationMs`），`normalizeZCodeSubagentLifecycleEvent` 翻成 `task_status`：spawned → `started`，stopped → `notification` 并带状态与用量；不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认这两种事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记；下一轮开始先撤掉它，由新一轮的监听器接管。历史重载读引擎的 agent 旁车 `cli/agents/<父会话>/<agentId>/metadata.json`（`getZCodeAgentSidecarDir`）：按 `parentToolUseId` 对上 Task 行，写入 `subagent`（类型、描述、状态、从子会话首条助手行取的模型）。旁车的 `completed` / `failed` 是定论；`running` 只在登记簿里仍有该 agent 时才算运行中，否则读作 `stopped`（进程没了，没人能再汇报）。
+每张卡必须有结算的那一刻。引擎给得出结束信号就用它；给不出，适配器在能确定"不会再有消息"的时刻（轮次结束、进程退出、会话丢失）把它结算成 `stopped`，前端显示为 "no result"。
 
-**Codex**：真实引擎从不把派 agent 发成协作工具调用条目（所有记录在案的 `CollabAgentToolCall` 都是 `wait`），唯一的宣告是 `SubAgentActivity` 记录，而且同一个 agent 开始与结束的条目 id 不同、靠 `agent_thread_id` 配对。`buildCodexSubagentTaskRow` 从 `started` 记录合成 `Task` 行，历史读取与实时流共用，刷新后重建的就是直播画过的那张卡。实时流在 `started` 时发卡、发 `task_status started`、按线程 id 登记；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。`interacted` 是 agent 之间的往来，不画。
+| 引擎 | 原生形态 | 适配层做什么 | 结算点 |
+| --- | --- | --- | --- |
+| Claude | `Agent` 工具；老记录里叫 `Task` | 历史与实时共用 `canonicalClaudeSubagentToolName`，把老名字 `Task` 翻成 `Agent`；`claude-background-work.ts` 认两个名字；历史按调用结果里的 `agentId` 挂 `subagent` 和子时间线 | 同步 agent 用调用结果；后台 agent 用 SDK 的任务通知；进程没了读作 `stopped` |
+| ZCode | `Agent` 工具，名字原样透传 | 引擎在父会话上发 `subagent_spawned` / `subagent_stopped`，翻成 `task_status`；历史读 agent 旁车 `cli/agents/<父会话>/<agentId>/metadata.json` | `subagent_stopped`（`completed` / `failed` / `stopped`）；旁车里仍写 `running` 的，只有登记簿里还有该 agent 才算运行中，否则读作 `stopped` |
+| Codex | 只有 `SubAgentActivity` 记录，没有任何派 agent 的工具调用条目 | `buildCodexSubagentAgentRow` 从 `started` 记录合成 `Agent` 行；同一 agent 的开始与结束条目 id 不同，靠 `agent_thread_id` 配对 | `completed` / `interrupted` 活动 |
+| OpenCode | `subagent` 工具，输入 `{agent, description, prompt, sessionID?}`，结果 metadata 带子会话 id | 实时翻译器和历史读取共用 `opencode-subagent.ts`：名字翻成 `Agent`，`agent` 翻成 `subagent_type`；历史有子会话 id 时读子会话的 `session_message` 作子时间线 | 工具自身的状态（`completed` / `error`）；运行结束时翻译器对没等到结果的调用补 `stopped`；历史里停在 `pending` / `running` 的调用，只有所属会话还没进入 idle 才算运行中，否则读作 `stopped` |
+| Antigravity | `invoke_subagent`，一次调用派 N 个 agent | 一次调用拆成 N 条 `Agent` 行，`toolId` 为 `<调用 id>:<conversation_id>`，每个 agent 一张卡；实时取 `step_type: "subagent"` 的 DONE 步骤，历史取规划条目里的角色与提示词、再从下一步的回执文本取 `conversationId`；子时间线读 agent 自己的 transcript | agy 在所有 agent 汇报完之后才给出 `result`，结果到达时一起结算为 `completed`；进程退出或中止时一律 `stopped`；历史里 agent 给父会话发的汇报即完成凭证，没有汇报且进程里已无登记的读作 `stopped` |
+| Cursor | 本机没有 Cursor 转录，不能确认有派 agent 的工具 | 未接入；若转录里出现派 agent 的工具，按上面的方式翻成 `Agent` 行 | — |
 
-Claude 的派 agent 工具在上游已从 `Task` 改名为 `Agent`，当前仍走普通工具卡加 `parentToolUseId` 嵌套，不经过这块面板；OpenCode 的 `agent` part 同样以 `Agent` 名上报。两者都不能靠放宽前端的 `Task` 判定接入——OpenCode 的 agent 行没有结束信号，会在面板里永远转圈。
+`agent` part 在 OpenCode 里是用户在提示框里 @ 某个 agent 的标记（提示文本已含这段 @ 文字），不是派发，所以不画成卡片。
+
+Codex、ZCode、Antigravity 共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent。Codex 与 ZCode 的运行时切面 `listBackgroundWork()` 直接返回它，供运行中会话轮询给输入框的后台工作条和侧栏使用；Antigravity 的 `backgroundTasks.list` 从它推出输入框卡片。`shared/background-work/task-status.ts` 的 `createTaskStatusMessage` 是 `task_status` 事件的唯一构造函数。
+
+**Codex** 的实时流在 `started` 时发卡、发 `task_status started`、按线程 id 登记；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。`interacted` 是 agent 之间的往来，不画。
+
+**ZCode** 一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认这两种事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记；下一轮开始先撤掉它，由新一轮的监听器接管。载荷里不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。
 
 ## IProvider 七切面
 
@@ -97,7 +111,7 @@ Claude 的派 agent 工具在上游已从 `Task` 改名为 `Agent`，当前仍�
 - `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
 - `sessions/session-worktree-placement.ts`：会话目录的工作树认亲改判，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类。
-- `background-work/background-work-registry.ts`：`BackgroundWorkRegistry`——按应用会话登记引擎里仍在跑的后台工作（当前是 codex / zcode 的子 agent），运行时切面的 `listBackgroundWork()` 从它作答，见上文「子 agent 卡片」。
+- `background-work/background-work-registry.ts`：`BackgroundWorkRegistry`——按应用会话登记引擎里仍在跑的后台工作（当前是 codex / zcode / antigravity 的子 agent），运行时切面的 `listBackgroundWork()` 从它作答，见上文「子 agent 卡片」。
 Codex 的模型目录由 `codex-models.provider.ts` 通过 `codex-app-server.client.ts` 的连接读取。例如 CLI 的 `model/list` 只返回当前可见模型时，选择器只显示这些模型，不会补回写死的旧型号。查询使用对话运行时同一份内置 `@openai/codex`，不使用终端 PATH 上的另一份 CLI。适配器读取所有分页，过滤隐藏模型，按模型 ID 去重，并使用引擎返回的名称、说明、推理强度和默认模型；没有默认标记时使用首个可见模型。自定义模型由 `provider-models.service.ts` 合并。同 ID 的自定义记录与引擎目录只显示一项，保留用户名称和可编辑记录，并继承引擎的推理强度。引擎收录已有自定义 ID 后，用户仍可修改名称；创建或修改为其他已存在 ID 仍会被拒绝。删除已被引擎收录的自定义记录只移除用户名称，型号继续显示，已有会话的型号与强度保持不变；删除仅存在于自定义记录中的型号才切换到默认型号并清空强度。
 
 成功目录缓存五分钟，并发查询共用一次加载。缓存过期后，下次查询触发刷新；失败会记录错误，保留最近成功目录，十秒后允许重试。首次加载失败、空目录、格式异常或分页游标循环会报错，前端沿用模型加载失败的重试入口，不补入静态模型列表。每次查询结束都关闭 app-server 子进程。缓存只在当前服务进程内保存；页面已经加载的目录不会由服务端主动推送更新。能力表里的默认型号只供目录加载前显示，没有用户选择记录时采用动态默认；已保存且仍在目录里的选择继续保留。前端按引擎分别重试目录加载失败，其他引擎成功不会掩盖 Codex 的错误。已有会话保存的型号独立于可见目录，不因目录隐藏而自动替换。
@@ -282,7 +296,7 @@ zcode 曾为每个持久化 step 产出一条 `complete`——真实会话里占
 
 **子代理的线程 id 也是适配器的责任。** Codex 用 `agent_thread_id` 指向子代理自己的同级 rollout，
 该 id 来自 `SubAgentActivity` 项；spawn 本身也只以这个项出现在 item 流里，
-所以 `Task` 行就以它的 item id 命名，`completed` / `interrupted` 再用同一个 id 收尾。
+所以 `Agent` 行就以它的 item id 命名，`completed` / `interrupted` 再用同一个 id 收尾。
 子代理自己的 rollout 用与主线程完全相同的读法（item 流 + 同一个行渲染器）铺进折叠面板。
 
 **跨路行身份是适配器的责任，不是前端的猜测活。** 一条持久化的行存在两份——
@@ -340,7 +354,7 @@ id 必须字节相同。** 这条有两道闸门守着：
 
 - **一次性 CLI 的异步任务会被静默掐死**：`agy` 的一次性 print 模式（`agy -p "<prompt>"`）在 root agent 转入 idle 后只等几秒就关停整个 CLI，日志为 `root agent idle; waiting up to 5s for N background task(s)` → `terminating N background task(s) on exit`。子代理和被放到后台执行的 `run_command` 都在这里死掉，而 CLI 仍然吐出 `status: SUCCESS`，于是前端收到 complete、任务看着「做完了」，真正的结果永远不会回来。antigravity runtime 因此把这一轮的 prompt 作为一行 NDJSON（`{"event":"user","message":{"content":"…"}}`）写进 stdin 并用 `--input-format stream-json` 启动：stdin 保持打开 → CLI 不自行关停 → 异步任务跑完，结果照常从 stream 回流；收到 `result` 事件后再关闭 stdin 让进程退出。**prompt 一旦退回 argv，这个保护就没了。**
 
-  stream-json 模式下，`agy` 自己等子代理和后台 `run_command` 全部结束才发出 `result`：后台命令的 `tool` step 一直保持 `ACTIVE` 直到命令退出，子代理回报只是一条不带正文的 `system_message` step。所以 `result` 就是整轮的终点，runtime 收到它后清空子代理卡片、关 stdin、发 `complete`。子代理卡片取自 `invoke_subagent` 的 DONE step（`step_type: "subagent"`，`subagent_info.subagents[].conversation_id`），通过 `backgroundTasks.list(sessionId)` 切面供输入框展示。
+  stream-json 模式下，`agy` 自己等子代理和后台 `run_command` 全部结束才发出 `result`：后台命令的 `tool` step 一直保持 `ACTIVE` 直到命令退出，子代理回报只是一条不带正文的 `system_message` step。所以 `result` 就是整轮的终点，runtime 收到它后把仍登记的子代理结算为 `completed`、清空输入框卡片、关 stdin、发 `complete`。子代理取自 `invoke_subagent` 的 DONE step（`step_type: "subagent"`，`subagent_info.subagents[].conversation_id`），每个 agent 一张 `Agent` 卡，输入框卡片通过 `backgroundTasks.list(sessionId)` 切面从登记簿推出。
 
   **绝不能给 agy 传 `--print-timeout`**：它限制的是整轮时长，到点时 agy 会在子代理仍在运行时提前吐出 `status: SUCCESS` 的 `result`，runtime 一关 stdin，agy 就把子代理连同工作一起掐掉，前端还显示完成。agy 的默认值 0 表示等这一轮跑完。防卡死由服务端负责：stdin 由我们持有，`result` 一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住，所以 runtime 自带一个**以 stdout 活动续期的看门狗**（`idleTimeout` / `CLOUDCLI_ANTIGRAVITY_IDLE_TIMEOUT`，默认 30 分钟），到期 SIGTERM 并按失败收尾。主 agent 等子代理期间主流完全静默，所以一个连续 30 分钟没有任何输出的子代理也会被看门狗结束。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 或发 `complete` 都会让前端以为这轮结束、甚至掐死异步工作，所以只有真正的 result 才收尾。
 

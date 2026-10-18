@@ -88,6 +88,30 @@ export function resolveOpenCodeMessageLayout(
   return null;
 }
 
+/**
+ * When the session last went idle (epoch ms), `null` while a run is in
+ * flight, or `undefined` when the database has no idle column (layouts that
+ * predate v2) or no such session.
+ *
+ * Consumer: the OpenCode history reader, to tell a spawn call left `running`
+ * by a run that is still going from one whose run is gone.
+ */
+export function readOpenCodeSessionIdleAt(
+  db: OpenCodeReadableDatabase,
+  sessionId: string,
+): number | null | undefined {
+  const table = resolveOpenCodeSessionTableName(db);
+  if (!table) {
+    return undefined;
+  }
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+  if (!columns.some((column) => column.name === 'time_idle')) {
+    return undefined;
+  }
+  const row = db.prepare(`SELECT time_idle AS idleAt FROM ${table} WHERE id = ?`).get(sessionId) as { idleAt: number | null } | undefined;
+  return row ? row.idleAt : undefined;
+}
+
 export type OpenCodeSessionTokenTotals = {
   inputTokens: number;
   outputTokens: number;

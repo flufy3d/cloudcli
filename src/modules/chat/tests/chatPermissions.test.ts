@@ -22,3 +22,9 @@ test('buildClaudeToolPermissionEntry accepts an already parsed tool input', () =
 test('buildClaudeToolPermissionEntry rejects JSON with no string command', () => {
   assert.equal(buildClaudeToolPermissionEntry('Bash', JSON.stringify({ command: false })), 'Bash');
 });
+
+test('buildClaudeToolPermissionEntry keeps the engine tool name for a subagent spawn', () => {
+  // The always-allow rule is written under the name the CLI asked about, so a
+  // client-side rename would write a rule that never matches.
+  assert.equal(buildClaudeToolPermissionEntry('Agent', JSON.stringify({ prompt: 'go' })), 'Agent');
+});

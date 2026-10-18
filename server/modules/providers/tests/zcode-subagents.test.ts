@@ -86,7 +86,7 @@ test('a subagent event without the launching call is dropped rather than sent un
   assert.deepEqual(provider.normalizeMessage(liveEvent('subagent_spawned', orphan), 'sess_1'), []);
 });
 
-test("the engine's Agent tool is normalized to Task on every live shape", () => {
+test("the engine's Agent tool keeps its name on every live shape", () => {
   const provider = new ZCodeSessionsProvider();
 
   const [snapshot] = provider.normalizeMessage(
@@ -94,13 +94,13 @@ test("the engine's Agent tool is normalized to Task on every live shape", () => 
     'sess_1',
   );
   assert.equal(snapshot.kind, 'tool_use');
-  assert.equal(snapshot.toolName, 'Task');
+  assert.equal(snapshot.toolName, 'Agent');
 
   const [announced] = provider.normalizeMessage(
     { type: 'tool.updated', payload: { kind: 'scheduled', toolCallId: 'call_2', toolName: 'Agent', input: { description: 'Audit' } } },
     'sess_1',
   );
-  assert.equal(announced.toolName, 'Task');
+  assert.equal(announced.toolName, 'Agent');
 
   provider.normalizeMessage(
     { type: 'model_streaming', payload: { kind: 'tool_input_start', toolCallId: 'call_3', toolName: 'Agent' } },
@@ -110,7 +110,7 @@ test("the engine's Agent tool is normalized to Task on every live shape", () => 
     { type: 'model_streaming', payload: { kind: 'tool_input_end', toolCallId: 'call_3', input: { description: 'Scan' } } },
     'sess_1',
   );
-  assert.equal(streamed.toolName, 'Task');
+  assert.equal(streamed.toolName, 'Agent');
 
   // Every other tool keeps its engine name.
   const [bash] = provider.normalizeMessage(
@@ -121,7 +121,7 @@ test("the engine's Agent tool is normalized to Task on every live shape", () => 
 });
 
 // ---------------------------------------------------------------------------
-// History: the Task row reads its outcome off the engine's agent sidecar
+// History: the Agent row reads its outcome off the engine's agent sidecar
 // ---------------------------------------------------------------------------
 
 type AgentMetadata = Record<string, unknown>;
@@ -188,7 +188,7 @@ const writeAgentMetadata = async (storageDir: string, parentSessionId: string, a
 
 const backgroundLaunchOutput = 'Async agent launched successfully.\nagentId: agent_a (internal ID - do not mention to user.)';
 
-test('history renames the Agent row to Task and reads the finished agent off its sidecar', async () => {
+test('history keeps the Agent row and reads the finished agent off its sidecar', async () => {
   await withZCodeStorage(async (storageDir) => {
     await createParentWithAgent(storageDir, 'sess_parent', { output: backgroundLaunchOutput, childModelId: 'GLM-5.3-Flash' });
     await writeAgentMetadata(storageDir, 'sess_parent', 'agent_a', {
@@ -204,7 +204,7 @@ test('history renames the Agent row to Task and reads the finished agent off its
     const task = messages.find((message) => message.kind === 'tool_use');
 
     assert.ok(task, 'the launch row is kept');
-    assert.equal(task.toolName, 'Task');
+    assert.equal(task.toolName, 'Agent');
     assert.equal(task.toolId, 'call_agent');
     assert.deepEqual(task.subagent, {
       id: 'agent_a',
@@ -266,14 +266,14 @@ test('the default liveness check consults the runtime background-work registry',
   });
 });
 
-test('a Task row without a sidecar keeps rendering from its own input and result', async () => {
+test('an Agent row without a sidecar keeps rendering from its own input and result', async () => {
   await withZCodeStorage(async (storageDir) => {
     await createParentWithAgent(storageDir, 'sess_parent', { output: 'The review found no blockers.' });
 
     const provider = new ZCodeSessionsProvider();
     const { messages } = await provider.fetchHistory('sess_parent');
     const task = messages.find((message) => message.kind === 'tool_use');
-    assert.equal(task?.toolName, 'Task');
+    assert.equal(task?.toolName, 'Agent');
     assert.equal(task?.subagent, undefined);
     assert.equal(task?.toolResult?.content, 'The review found no blockers.');
   });

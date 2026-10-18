@@ -349,7 +349,7 @@ test('Codex history renders one file row per patched file, from the applied diff
   }
 });
 
-test('Codex history attaches a spawned agent\'s own transcript to the Task row', { concurrency: false }, async () => {
+test('Codex history attaches a spawned agent\'s own transcript to the Agent row', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-history-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
@@ -362,7 +362,7 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
     await writeFile(transcriptPath, `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
       // A spawn reaches the item stream only as this lifecycle event, so the
-      // Task row is built from it and keeps its id.
+      // Agent row is built from it and keeps its id.
       JSON.stringify({
         type: 'event_msg',
         payload: {
@@ -419,9 +419,9 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
       await new CodexSessionSynchronizer().synchronize();
 
       const history = await new CodexSessionsProvider().fetchHistory('app-parent-2');
-      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Task');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
 
-      assert.ok(task, 'a spawned agent must produce a Task row');
+      assert.ok(task, 'a spawned agent must produce a Agent row');
       assert.equal(task.subagent?.id, agentThreadId);
       assert.equal(task.subagent?.name, 'Hegel');
       assert.equal(task.subagent?.status, 'completed');
@@ -432,7 +432,7 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
       assert.equal(task.subagentTools?.[0].kind, 'tool');
       assert.equal(task.subagentTools?.[0].toolName, 'Bash');
       assert.equal(task.subagentTools?.[0].toolResult?.content, 'README.md\n');
-      assert.equal(task.id, 'spawn-1', 'the Task row is named after the lifecycle item');
+      assert.equal(task.id, 'spawn-1', 'the Agent row is named after the lifecycle item');
     });
   } finally {
     restoreHomeDir();
@@ -478,11 +478,11 @@ test('Codex history closes a still-running subagent when its turn was aborted', 
       await new CodexSessionSynchronizer().synchronize();
 
       const history = await new CodexSessionsProvider().fetchHistory('app-parent-3');
-      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Task');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
 
-      assert.ok(task, 'the spawned agent must produce a Task row');
-      assert.equal(task.subagent?.status, 'completed', 'an aborted turn must not leave the Task card running forever');
-      assert.ok(task.toolResult, 'the Task card needs a result row to settle its spinner');
+      assert.ok(task, 'the spawned agent must produce a Agent row');
+      assert.equal(task.subagent?.status, 'completed', 'an aborted turn must not leave the Agent card running forever');
+      assert.ok(task.toolResult, 'the Agent card needs a result row to settle its spinner');
       assert.equal(task.toolResult?.isError, true, 'an agent the abort cut off did not finish its work');
     });
   } finally {
@@ -564,7 +564,7 @@ test('a plan followed by a memory citation is still recognized as a plan', async
   }
 });
 
-test('an interrupted subagent closes its Task row instead of running forever', async () => {
+test('an interrupted subagent closes its Agent row instead of running forever', async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-interrupted-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
@@ -575,7 +575,7 @@ test('an interrupted subagent closes its Task row instead of running forever', a
     await mkdir(sessionsDir, { recursive: true });
     // Event shapes mirror a real rollout: the `started` activity carries the
     // agent path, and the agent later dies without ever sending a
-    // FINAL_ANSWER that would close its Task card.
+    // FINAL_ANSWER that would close its Agent card.
     await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
       JSON.stringify({
@@ -612,9 +612,9 @@ test('an interrupted subagent closes its Task row instead of running forever', a
       await new CodexSessionSynchronizer().synchronize();
 
       const history = await new CodexSessionsProvider().fetchHistory('app-subagent-interrupted-1');
-      const task = history.messages.find((message) => message.toolName === 'Task');
+      const task = history.messages.find((message) => message.toolName === 'Agent');
 
-      assert.ok(task, 'the spawn must render as a Task row');
+      assert.ok(task, 'the spawn must render as a Agent row');
       assert.ok(task.toolResult, 'an interrupted subagent must not leave its card running');
       assert.match(String(task.toolResult?.content), /interrupted/i);
       assert.equal(task.toolResult?.isError, false);

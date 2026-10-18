@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { mkdirSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -880,6 +881,152 @@ test('v2 history rows carry the same ids the live translator produces for the sa
     // the history rows keep publishing.
     const toolRow = history.messages.find((row) => row.kind === 'tool_use');
     assert.equal(toolRow?.toolId, 'call_9');
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Subagent cards: OpenCode's `subagent` tool is the client's `Agent` card.
+// ---------------------------------------------------------------------------
+
+type SeededSubagent = {
+  status: 'completed' | 'error' | 'running' | 'pending';
+  /** Whether the parent session still has a run in flight (`time_idle` unset). */
+  busy: boolean;
+  withChild?: boolean;
+};
+
+/** Seeds a v2 database whose parent session called the `subagent` tool once. */
+const seedSubagentSession = (homeDir: string, options: SeededSubagent): void => {
+  const dataDir = path.join(homeDir, '.local', 'share', 'opencode');
+  mkdirSync(dataDir, { recursive: true });
+  const db = new Database(path.join(dataDir, 'opencode.db'));
+  try {
+    db.exec(`
+      CREATE TABLE session_v2 (
+        id text PRIMARY KEY, project_id text NOT NULL, parent_id text, slug text NOT NULL,
+        directory text NOT NULL, title text, version text NOT NULL,
+        time_created integer NOT NULL, time_updated integer NOT NULL, time_idle integer
+      );
+      CREATE TABLE session_message (
+        id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL,
+        time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
+      );
+    `);
+    db.prepare(`INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_idle)
+      VALUES ('ses_parent', 'proj', NULL, 'p', '/tmp/proj', 'Parent', '2.0.31', 1000, 2000, ?)`)
+      .run(options.busy ? null : 5000);
+    db.prepare(`INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_idle)
+      VALUES ('ses_child', 'proj', 'ses_parent', 'c', '/tmp/proj', 'Child', '2.0.31', 1100, 1900, 1900)`).run();
+
+    const state: Record<string, unknown> = {
+      status: options.status,
+      input: { agent: 'general', description: 'Review the diff', prompt: 'Read the diff and report.' },
+    };
+    if (options.status === 'completed') {
+      state.content = [{ type: 'text', text: '<subagent sessionID="ses_child" state="completed">Found two problems.</subagent>' }];
+      state.metadata = { sessionID: 'ses_child', status: 'completed', truncated: false };
+    } else if (options.status === 'error') {
+      state.error = 'child crashed';
+    } else if (options.withChild) {
+      state.metadata = { sessionID: 'ses_child' };
+    }
+    const parentContent = [{ type: 'tool', id: 'call_sub', name: 'subagent', state }];
+    db.prepare("INSERT INTO session_message VALUES ('msg_p', 'ses_parent', 'assistant', 1, 1500, 1600, ?)")
+      .run(JSON.stringify({ content: parentContent }));
+
+    const childContent = [
+      { type: 'text', text: 'Reading the diff.' },
+      { type: 'tool', id: 'call_read', name: 'read', state: { status: 'completed', input: { path: '/tmp/a.ts' }, content: [{ type: 'text', text: 'file body' }] } },
+    ];
+    db.prepare("INSERT INTO session_message VALUES ('msg_c', 'ses_child', 'assistant', 1, 1200, 1800, ?)")
+      .run(JSON.stringify({ content: childContent }));
+  } finally {
+    db.close();
+  }
+};
+
+const readSubagentRow = async (homeDir: string, options: SeededSubagent) => {
+  seedSubagentSession(homeDir, options);
+  const history = await new OpenCodeSessionsProvider().fetchHistory('ses_parent');
+  return history.messages.find((message) => message.kind === 'tool_use' && message.toolId === 'call_sub');
+};
+
+const withSubagentHome = async (run: (homeDir: string) => Promise<void>): Promise<void> => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-subagent-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+  try {
+    await run(tempRoot);
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+};
+
+test('a finished subagent call is an Agent card carrying its result and its child session timeline', { concurrency: false }, async () => {
+  await withSubagentHome(async (homeDir) => {
+    const row = await readSubagentRow(homeDir, { status: 'completed', busy: false });
+
+    assert.ok(row, 'the subagent call must be in the history');
+    assert.equal(row.toolName, 'Agent');
+    assert.deepEqual(row.toolInput, {
+      subagent_type: 'general',
+      description: 'Review the diff',
+      prompt: 'Read the diff and report.',
+    });
+    assert.equal(row.toolResult?.content, '<subagent sessionID="ses_child" state="completed">Found two problems.</subagent>');
+    assert.deepEqual(row.subagent, {
+      id: 'ses_child', name: 'general', type: 'general', description: 'Review the diff', status: 'completed', activityCount: 2,
+    });
+    assert.equal(row.subagentTools?.length, 2);
+    assert.equal(row.subagentTools?.[0].kind, 'text');
+    assert.equal(row.subagentTools?.[1].toolName, 'read');
+    assert.equal(row.subagentTools?.[1].toolResult?.content, 'file body');
+  });
+});
+
+test('a subagent call that errored is a failed Agent card', { concurrency: false }, async () => {
+  await withSubagentHome(async (homeDir) => {
+    const row = await readSubagentRow(homeDir, { status: 'error', busy: false });
+    assert.equal(row?.toolName, 'Agent');
+    assert.equal(row?.subagent?.status, 'failed');
+    assert.equal(row?.toolResult?.isError, true);
+  });
+});
+
+test('a subagent call left running reads as running only while its session still has a run in flight', { concurrency: false }, async () => {
+  await withSubagentHome(async (homeDir) => {
+    const live = await readSubagentRow(homeDir, { status: 'running', busy: true, withChild: true });
+    assert.equal(live?.subagent?.status, 'running');
+  });
+  await withSubagentHome(async (homeDir) => {
+    const orphan = await readSubagentRow(homeDir, { status: 'running', busy: false, withChild: true });
+    assert.equal(orphan?.subagent?.status, 'stopped', 'the run that owned the call is gone, so it can never finish');
+  });
+  await withSubagentHome(async (homeDir) => {
+    const pending = await readSubagentRow(homeDir, { status: 'pending', busy: false });
+    assert.equal(pending?.subagent?.status, 'stopped');
+  });
+});
+
+test('an agent part is an @-mention of an agent, not a spawned one, and draws no Agent card', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-agent-part-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+  try {
+    await createOpenCodeDatabase(tempRoot, workspacePath);
+    const db = new Database(path.join(tempRoot, '.local', 'share', 'opencode', 'opencode.db'));
+    try {
+      db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('part-agent', 'message-user', 'open-session-1', 1_700_000_000_500, 1_700_000_000_500, JSON.stringify({ type: 'agent', name: 'general', source: { value: '@general', start: 0, end: 8 } }));
+    } finally {
+      db.close();
+    }
+
+    const history = await new OpenCodeSessionsProvider().fetchHistory('open-session-1');
+    assert.equal(history.messages.some((message) => message.toolName === 'Agent'), false);
   } finally {
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });

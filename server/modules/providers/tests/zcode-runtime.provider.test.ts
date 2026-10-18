@@ -1085,7 +1085,7 @@ test('runtime delivers native tool outputs before turn completion without fetchi
   assert.equal(messages.at(-1)?.kind, 'complete');
 });
 
-test('a background agent shows as a running Task card, is listed as background work, and settles after the turn', async () => {
+test('a background agent shows as a running Agent card, is listed as background work, and settles after the turn', async () => {
   fsSync.writeFileSync(modeFilePath, 'subagent-bg\n');
   const runtime = new ZCodeRuntimeProvider();
   const { messages, writer } = createWriter();
@@ -1096,10 +1096,10 @@ test('a background agent shows as a running Task card, is listed as background w
   assert.deepEqual(result, { sessionId: 'sess_stub_1', success: true });
 
   // The launch renders through the shared subagent card: the engine's
-  // `Agent` call reaches the client as `Task`, and the spawn event marks it
-  // running on that very call.
+  // `Agent` call reaches the client under that name, and the spawn event marks
+  // it running on that very call.
   const launch = messages.find((message) => message.kind === 'tool_use');
-  assert.equal(launch?.toolName, 'Task');
+  assert.equal(launch?.toolName, 'Agent');
   assert.equal(launch?.toolId, 'call_agent_bg');
   const started = messages.find((message) => message.kind === 'task_status' && message.event === 'started');
   assert.equal(started?.taskId, 'agent_bg_1');

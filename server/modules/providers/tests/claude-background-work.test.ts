@@ -54,6 +54,12 @@ test('a foreground Bash does not', () => {
   assert.equal(startsBackgroundWork(turn({ name: 'Bash', input: { run_in_background: false } })), false);
 });
 
+test('a backgrounded legacy Task spawn holds the process open like an Agent', () => {
+  assert.equal(startsBackgroundWork(turn({ name: 'Task', input: { run_in_background: true } })), true);
+  assert.equal(startsBackgroundWork(turn({ name: 'Task', input: { run_in_background: false } })), false);
+  assert.equal(startsBackgroundWork(turn({ name: 'TaskCreate' })), false, 'a to-do item launches nothing');
+});
+
 test('a backgrounded Agent holds the process open', () => {
   // The gap this suite exists for: a background agent used to be scored as
   // nothing outstanding, so the CLI wound down and killed it mid-run.

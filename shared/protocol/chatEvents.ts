@@ -504,8 +504,8 @@ export type NormalizedMessage = {
   agents?: WorkflowAgentProgress[];
   /**
    * Timeline of everything a subagent did, attached to the `tool_use` that
-   * spawned it. Present for Claude `Agent`/`Task` calls and Codex
-   * `spawn_agent` calls; absent for every other tool.
+   * spawned it. Present for `Agent` calls (every engine's subagent spawn);
+   * absent for every other tool.
    */
   subagentTools?: SubagentActivity[];
   /** Identity and lifecycle of the subagent this `tool_use` spawned. */

@@ -1,3 +1,4 @@
+import { LOCAL_AGENT_TASK_TYPE } from '@/modules/providers/shared/background-work/task-status.js';
 import type { AnyRecord, NormalizedMessage, TaskUsage } from '@/shared/types.js';
 import {
   compactProviderPayload,
@@ -8,34 +9,7 @@ import {
   readOptionalString,
 } from '@/shared/utils.js';
 
-import { ZCODE_AGENT_TASK_TYPE } from './zcode-background-work.js';
-
 const PROVIDER = 'zcode';
-
-/**
- * The engine's spawn tool, and the name the client knows that tool by.
- *
- * ZCode calls its agent-spawning tool `Agent`; the client renders the shared
- * subagent card (running state, outcome, the agent's own timeline) for calls
- * named `Task`, Claude's name for the same tool, and Codex already normalizes
- * its spawn to that name at this same boundary. Renaming here lights the card
- * up without the client learning a third name.
- */
-const ZCODE_SPAWN_TOOL_NAME = 'Agent';
-const CLIENT_SPAWN_TOOL_NAME = 'Task';
-
-/**
- * The client-facing name of one ZCode tool: the spawn tool is renamed to
- * `Task` (see {@link ZCODE_SPAWN_TOOL_NAME}); every other tool keeps its
- * engine name.
- *
- * Consumers: this normalizer (live calls) and `zcode-sessions.provider.ts`
- * (persisted calls). Both must agree or a reload would re-render the card as
- * a plain tool row.
- */
-export function normalizeZCodeToolName(toolName: string): string {
-  return toolName === ZCODE_SPAWN_TOOL_NAME ? CLIENT_SPAWN_TOOL_NAME : toolName;
-}
 
 /**
  * The quiet transcript line a cancelled model request degrades to (live and
@@ -256,7 +230,7 @@ const readReportedTotal = (value: unknown): number => {
 /**
  * Translates the engine's subagent lifecycle events — emitted on the PARENT
  * session when an `Agent` call's child session is ready and when it stops —
- * into the `task_status` events the client folds onto the launching Task
+ * into the `task_status` events the client folds onto the launching `Agent`
  * card. Both events name the launching call (`parentToolCallId`); one that
  * does not is dropped, because an unattached status has no card to land on.
  *
@@ -285,7 +259,7 @@ export function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): 
       kind: 'task_status',
       taskId,
       toolUseId,
-      taskType: ZCODE_AGENT_TASK_TYPE,
+      taskType: LOCAL_AGENT_TASK_TYPE,
       ...fields,
     });
 
@@ -455,7 +429,7 @@ export class ZCodeLiveEventNormalizer {
     if (!readObjectRecord(payload.input)) {
       return [];
     }
-    const toolName = normalizeZCodeToolName(readOptionalString(payload.toolName) ?? 'Tool');
+    const toolName = readOptionalString(payload.toolName) ?? 'Tool';
     const toolId = readOptionalString(payload.toolCallId) ?? baseId;
     this.registerToolInputStream(sessionId ?? '', toolId, toolName);
     return [createNormalizedMessage({
@@ -549,7 +523,7 @@ export class ZCodeLiveEventNormalizer {
 
     if (kind === 'tool_call') {
       const toolCallId = readOptionalString(payload.toolCallId) ?? baseId;
-      const toolName = normalizeZCodeToolName(readOptionalString(payload.toolName) ?? 'Tool');
+      const toolName = readOptionalString(payload.toolName) ?? 'Tool';
       this.registerToolInputStream(stateKey, toolCallId, toolName);
       return [createNormalizedMessage({
         id: baseId,
@@ -706,7 +680,7 @@ export class ZCodeLiveEventNormalizer {
       stream = this.registerToolInputStream(
         stateKey,
         toolCallId,
-        normalizeZCodeToolName(readOptionalString(payload.toolName) ?? 'Tool'),
+        readOptionalString(payload.toolName) ?? 'Tool',
       );
     }
 
@@ -718,7 +692,7 @@ export class ZCodeLiveEventNormalizer {
       stream.buffer = '';
       const named = readOptionalString(payload.toolName);
       if (named) {
-        stream.toolName = normalizeZCodeToolName(named);
+        stream.toolName = named;
       }
       return [];
     }

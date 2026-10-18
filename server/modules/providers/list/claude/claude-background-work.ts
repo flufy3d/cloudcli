@@ -1,4 +1,5 @@
 import type { ActiveBackgroundTask, BackgroundTaskSummary } from '@/shared/types.js';
+import { SUBAGENT_TOOL_NAME, canonicalClaudeSubagentToolName } from '@/shared/utils.js';
 
 // TaskCreate writes a to-do item; it does not launch an execution task.
 const DEFERRED_WORK_TOOLS = new Set(['Monitor', 'ScheduleWakeup', 'CronCreate', 'Workflow']);
@@ -64,7 +65,7 @@ export function extractBackgroundTasks(raw: unknown): ActiveBackgroundTask[] {
     if (block.type !== 'tool_use' || typeof name !== 'string'
       || (name === 'ScheduleWakeup' && input?.stop === true)
       || !(DEFERRED_WORK_TOOLS.has(name)
-        || (name === 'Agent' && input?.run_in_background !== false)
+        || (canonicalClaudeSubagentToolName(name) === SUBAGENT_TOOL_NAME && input?.run_in_background !== false)
         || (name === 'Bash' && input?.run_in_background === true))) {
       return [];
     }
