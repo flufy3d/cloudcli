@@ -1,0 +1,87 @@
+# 子 agent 卡片统一
+
+> 状态：设计已定，待实施
+> 分支：`feat/subagent-cards`（工作树 `.worktrees/subagent-cards`）
+> 目标：六家引擎派出的子 agent 都画成同一种卡片（运行中 / 完成 / 失败 / 无结果 + 子时间线），历史重载和实时直播画出同一张卡，并且每张卡都有结算的那一刻，不会永远转圈。
+
+## 为什么要改
+
+前端只在工具名等于 `Task` 时渲染子 agent 面板（`src/modules/chat/hooks/useChatMessages.ts` 的 `isSubagentContainer`），实时状态靠 `task_status` 事件按 `toolUseId` 折回卡片。这个判定已经和各引擎的实际情况脱节，下面四条都在本机真实数据上核实过：
+
+- **Claude**：本机 Claude 记录里派 agent 的调用共 234 次，全部叫 `Agent`，叫 `Task` 的 0 次，因为上游早已改名。`claude-sessions.provider.ts` 会按调用结果里的 `agentId` 把状态和子时间线（`subagentTools`）挂到这一行上，但前端认不出 `Agent`，于是 Claude 的子 agent 全部退化成默认工具卡，后端备好的数据被丢掉了。
+- **OpenCode**：真正派 agent 的是一个叫 `subagent` 的工具（`session_message` 的 assistant 内容里，`type: "tool", name: "subagent"`），它带 `state.status`（`completed` 等）和子会话 id `state.metadata.sessionID`。`opencode-sessions.provider.ts` 把 `type: "agent"` 的 part 画成 `Agent` 工具卡，但这个 part 不是派 agent，属于标错。
+- **Codex**：每轮结束时，`queryCodex` 的 `finally` 调 `connection.close()`，这一步会 `child.kill()` 掉 app-server 进程。所以 agent 活不过派它的那一轮，它的完成事件永远到不了。本机 rollout 里 196 个 agent 有 19 个只有 `started` 记录、没有结束记录，这些 agent 在刷新后的历史里一直显示运行中。
+- **Antigravity**：`invoke_subagent` 一次调用可以派出多个 agent。前端给它单独配了一套 `invoke_subagent` 卡片配置（`toolConfigs.ts`），运行时也自己维护一张 `activeSessionBackgroundTasks` 表，这是同一件事的第三份实现。
+
+另外，`Task` 这个词同时指子 agent 和任务清单类工具（`manage_task`、`TaskCreate`、`TaskUpdate`，见 `ToolGroupContainer.tsx`）。用一个两义的名字当类型判据，正是 Claude 这次出问题的原因。
+
+## 核心约定：子 agent 在协议里只叫 `Agent`
+
+一条 `tool_use` 只有在工具名等于 `Agent` 时，才是子 agent 卡片。前端只认这一个名字，不按引擎分支。从此 `Task` 只指任务清单类工具。
+
+各引擎的适配层负责把自家派 agent 的形态翻译成两样东西：
+
+1. 一条工具名为 `Agent` 的 `tool_use` 行，历史读取和实时流用同一个构造函数生成，保证刷新后重建的就是直播画出的那张卡。
+2. 状态信息：历史行上挂 `subagent`（`SubagentInfo`），实时用 `task_status` 事件按 `toolUseId` 折回。每张卡都必须有一个结算点。如果引擎给不出结束信号，适配层就必须在能确定"不会再有消息"的时刻（轮次结束、进程退出、会话丢失）把它结算成 `stopped`，前端显示为「no result」。
+
+`Agent` 这个名字定义成常量，前后端各一份（前后端不共享运行时代码）。前端那份要有测试钉住它和后端那份的值一致，比如共用一个 fixture，或者写一个对照断言。
+
+权限请求不改名。Claude 的「总是允许」会按原工具名写进设置（`buildClaudeToolPermissionEntry`），改名会让规则对不上。
+
+## 各引擎怎么接
+
+| 引擎 | 原生形态 | 适配层做什么 | 结束信号 |
+| --- | --- | --- | --- |
+| Claude | `Agent` 工具；老记录里叫 `Task` | 老名字 `Task` 一律翻译成 `Agent`。历史（`claude-sessions.provider.ts` 约 150、1696 行）和实时共用同一个翻译点。`claude-background-work.ts` 识别后台 agent 时要能认出两个原名 | 同步 agent 用调用结果；后台 agent 用 SDK 的任务通知；进程没了就 `stopped`（现有逻辑） |
+| ZCode | `Agent` 工具 | 撤掉本分支先前加的 `Agent`→`Task` 改名（`normalizeZCodeToolName`、`zcode-sessions.provider.ts` 按 `'Task'` 过滤的地方），改为按常量识别 | `subagent_stopped`（引擎包已核实，会发 `completed` / `failed` / `stopped`）；引擎崩溃时由适配层补发 `stopped` |
+| Codex | 只有 `SubAgentActivity` 记录 | `buildCodexSubagentTaskRow` 合成 `Agent` 行，函数名也一并改掉 | `completed` / `interrupted` 活动；轮次结束时还登记着的一律 `stopped` |
+| OpenCode | `subagent` 工具 | 翻译成 `Agent`。状态取工具的 `state.status`；有 `metadata.sessionID` 时读子会话作为子时间线（参照 Claude/Codex 的 `subagentTools` 形状）。`type: "agent"` 的 part 不再画成 `Agent`，按它的真实含义处理；如果查不出含义，就不画 | 工具自身的状态 |
+| Antigravity | `invoke_subagent`，一次调用派 N 个 | 在适配层把一次调用拆成 N 条 `Agent` 行，`toolId` 用 `<调用 id>:<conversation_id>`，每个 agent 一张卡。`activeSessionBackgroundTasks` 并入共用的 `BackgroundWorkRegistry`。前端删掉 `invoke_subagent` 专用配置 | 引擎在所有 agent 都汇报完之后才给出轮次结果，结果到达时一起结算；进程退出时一律 `stopped` |
+| Cursor | 存储里有子 agent 目录，派 agent 的工具不明 | 用户不用 Cursor，只做最小核查：如果转录里有派 agent 的工具，就照上面的方式接进来；没有就只在架构文档里写一句 | — |
+
+Antigravity 拆成多张卡是选定方案，原因是 `SubagentPanel` 一次只画一个 `SubagentInfo`，而 Antigravity 的每个 agent 都有自己的 `conversation_id`（也就是自己的子会话）。将来要改成"一张卡列出多个 agent"，只需要改 Antigravity 的适配层。
+
+## 前端随之要改的地方
+
+- `useChatMessages.ts`：判定 `isSubagentContainer` 改成用常量 `Agent`。
+- `toolConfigs.ts`：`Task` 那段子 agent 配置改挂到 `Agent` 上；`invoke_subagent` 的配置删掉。`Task` 只保留给任务清单类工具，如果没有任何引擎再发 `Task`，就把对应配置删掉。
+- `toolTaxonomy.ts`：`agent` 分类里的 `Task`、`invoke_subagent` 换成 `Agent`。
+- 历史遗留的 `Task`（`claude-runtime.provider.js` 的 `planModeTools`，`PermissionsContent.tsx` 的预设列表）：先核实 Claude 当前版本是否还接受 `Task` 这个名字，再改成 `Agent`，或者两个都保留。核实结果要写进提交信息。
+
+## 本分支已有实现的修复
+
+这些是本轮评审发现、并且已经核实属实的问题。
+
+1. **Codex 子 agent 随进程死掉。** 在 `queryCodex` 的 `finally` 里，对本会话还登记着的 agent 逐个发 `task_status`（`status: 'stopped'`），然后注销。历史读取时（`codex-sessions.provider.ts` 约 697 行），没有结束记录的 agent 只有在登记簿里还有它时才算 `running`，否则算 `stopped`，和 ZCode 的旁车规则一致。为此要把 Codex 的登记簿实例单独放进一个模块（参照 `zcode-background-work.ts`），让 sessions provider 也能读到。代码注释和文档里"Codex 引擎活得比一轮久"的说法要删掉。
+2. **ZCode 引擎崩溃时卡片永远转圈。** 运行中监听器和窄监听器（`subagentWatchers`）收到 `SESSION_LOST_METHOD` 时，现在只清登记簿。改成抽一个共用函数：先对每个还登记着的 agent 发 `stopped`，再清空。两处都调它。
+3. **ZCode 交接窗口。** `zcode-runtime.provider.ts` 在新一轮开始后，要先经过 `subscribeToSessionEvents`、`configureSessionMode`、`resolveSendModelParams` 三次异步等待，才撤掉旧的窄监听器。这段时间里，迟到的 stop 会用旧轮次的 writer 发出，导致序号回退或撞号。改成在三次等待之前就撤掉窄监听器、挂上本轮监听器。
+4. **被取代的旧轮次多转发。** 旧轮次的监听器要等轮询（约 100ms 一拍）才知道自己被取代了。这段时间里所有事件都会多发一份。改成：`runLifecycle.isNewestRunForEngineSession(handle)` 为假时，监听器只处理会话丢失，其余事件一律不转发。
+5. **重复代码收口。** 两份 `task_status` 构造函数（`createCodexTaskStatus` 和 ZCode normalizer 里的 `build`）合成一个共用工厂，放在 `shared/background-work/` 下。给 `Array<{ sessionId; tasks: BackgroundTaskSummary[] }>` 起一个类型名，替换 4 处裸写。窄监听器改走 `context.normalizeMessage`，和运行中监听器同一个出口。
+6. **失败结算的用量。** 引擎的失败 stop 不带 `totalTokens`、`totalToolUseCount`（引擎包已核实）。没上报的字段留空，不要填 0。`TaskUsage` 的字段如果是必填，就把它改成可选。
+7. **旁车目录读取的错误。** `readZCodeAgentSidecars` 遇到 `ENOENT` 以外的错误时，要用 `console.error` 记一行日志再返回空表。
+
+## 核实过、不修的
+
+- Codex 的 `started` 记录缺线程 id 导致配不上结束：本机 1942 条记录中有 0 条缺线程 id。而且修复 1 之后，没配上的 agent 会在轮次结束时被结算。
+- ZCode 停止后登记项永远不清：引擎的 `finalizeBackgroundStopped` 会对被杀的后台 agent 发 `status: "stopped"`。
+- 旁车写文件和发事件之间的毫秒级窗口、刷新后用量行丢失：前端子 agent 面板不渲染用量，这个窗口只会让卡片在刷新后短暂显示 `stopped`。
+
+## 测试要求
+
+先写测试，再改实现。每条都用公开入口断言（跑一轮对话、读历史、查 `listBackgroundWork`），不要翻内部状态。
+
+- 每家引擎各一组：历史和实时都产出工具名为 `Agent` 的行，并且能被结算（完成 / 失败 / `stopped` 三态中至少覆盖正常完成和异常结算）。
+- Claude：老记录的 `Task` 翻译成 `Agent`；后台 agent 识别对两个原名都成立；权限请求保留原名。
+- Codex：用一个真实时序的测试替换现有"两个假 server"的绕法，即一轮结束、进程被关闭，断言页面收到 `stopped`，登记簿为空。
+- ZCode：引擎崩溃时页面收到 `stopped`；交接窗口内迟到的 stop 只被转发一次；被取代的轮次不转发。
+- OpenCode：`subagent` 工具变成 `Agent` 卡；`agent` part 不再画成 `Agent`。
+- Antigravity：一次调用派 2 个 agent，得到 2 张 `Agent` 卡，结果到达时两张都结算。
+- 前端（vitest）：`Agent` 走子 agent 面板；`Task`、`TaskCreate` 不走。
+
+## 验收标准
+
+- `pnpm run typecheck`、`pnpm run lint`、`pnpm test`、`pnpm run test:client` 全部通过，不新增 lint 警告。
+- `grep` 全仓：除了"老名字翻译"那一处，以及 Claude 权限 / 计划模式的兼容名单（必须附注释说明原因），不再有任何把 `Task` 当子 agent 判据的代码。
+- 拿本机真实数据各跑一次历史读取探针：Claude、Codex、ZCode、OpenCode 各取一个含子 agent 的会话，确认产出 `Agent` 行，状态没有永久 `running`。
+- `docs/core/providers.md` 子 agent 一节重写成六家对照（写机制，不抄字段表）；`docs/core/chat.md` 写明前端只认 `Agent`。文档和代码在同一个提交里。
+- 设计稿状态行改为「已实施（日期）」。
