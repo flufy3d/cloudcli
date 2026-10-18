@@ -97,12 +97,39 @@ describe('nested agents and orphaned rows', () => {
     ]);
   });
 
-  it('holds a row out of the main thread while its parent card has not arrived', () => {
-    const converted = normalizedToChatMessages([childText()]);
-    expect(converted).toHaveLength(0);
-    const later = normalizedToChatMessages([agentCall(), childText()]);
+  it('holds a live row out of the main thread while its session runs and its parent card has not arrived', () => {
+    const liveRow = { ...childText(), seq: 7 };
+    expect(normalizedToChatMessages([liveRow], { holdOrphanedLiveRows: true })).toHaveLength(0);
+    const later = normalizedToChatMessages([agentCall(), liveRow], { holdOrphanedLiveRows: true });
     expect(later).toHaveLength(1);
     expect(later[0].subagentActivity).toHaveLength(1);
+  });
+
+  it('shows an orphaned row once its session has settled, and always shows a history row', () => {
+    const liveRow = { ...childText(), seq: 7 };
+    expect(normalizedToChatMessages([liveRow], { holdOrphanedLiveRows: false })).toHaveLength(1);
+    // A history row has no live sequence: its card is on an unloaded page or was never written.
+    expect(normalizedToChatMessages([childText()], { holdOrphanedLiveRows: true })).toHaveLength(1);
+  });
+
+  it('folds into the outermost agent even when a non-agent call sits above it', () => {
+    const worker = row({ kind: 'tool_use', toolName: 'Bash', toolId: 'call_worker', toolInput: {} });
+    const outer = agentCall({ parentToolUseId: 'call_worker' });
+    const converted = normalizedToChatMessages([worker, outer, childText()]);
+    expect(converted.map((message) => message.toolName ?? message.content)).toEqual(['Bash', 'Agent']);
+    expect(converted[1].subagentActivity?.map((entry) => entry.content)).toEqual(['Reading the file.']);
+  });
+
+  it('breaks a parent cycle and still draws the card and its rows', () => {
+    const selfParent = agentCall({ parentToolUseId: 'call_agent' });
+    const converted = normalizedToChatMessages([selfParent, childText()]);
+    expect(converted).toHaveLength(1);
+    expect(converted[0].toolName).toBe('Agent');
+    expect(converted[0].subagentActivity).toHaveLength(1);
+
+    const a = row({ kind: 'tool_use', toolName: 'Agent', toolId: 'call_a', toolInput: {}, parentToolUseId: 'call_b' });
+    const b = row({ kind: 'tool_use', toolName: 'Agent', toolId: 'call_b', toolInput: {}, parentToolUseId: 'call_a' });
+    expect(normalizedToChatMessages([a, b]).map((message) => message.toolId)).toEqual(['call_a', 'call_b']);
   });
 
   it('still shows a row whose parent is a known call that is not an agent card', () => {

@@ -68,25 +68,31 @@ const CHILD_ROW_KINDS: ReadonlySet<string> = new Set(['tool_use', 'tool_result',
 const NO_CHILD_ROWS: NormalizedMessage[] = [];
 
 /**
- * The top-level subagent card a row's `parentToolUseId` leads to: the id of the
- * outermost `Agent` call on its parent chain. `null` when the chain ends at a
- * call this transcript does not hold (its card has not arrived), `undefined`
- * when the parent is a known call that is not an agent (Bash, a workflow).
+ * The top-level subagent card a row's `parentToolUseId` leads to: the
+ * outermost `Agent` call on its parent chain, whatever non-agent calls sit above
+ * it. `null` when the chain reaches no agent call and ends at a call this
+ * transcript does not hold (the card has not arrived); `undefined` when it
+ * reaches a known call that is not an agent (Bash, a workflow). A cycle is cut
+ * where it closes, so its members stay cards.
  */
 function resolveParentCard(
   parentId: string,
   toolCallById: Map<string, NormalizedMessage>,
 ): string | null | undefined {
-  let current = parentId;
+  let current: string | undefined = parentId;
+  let outermost: string | undefined;
+  let reachedKnownCall = false;
   const visited = new Set<string>();
-  for (;;) {
-    const call = toolCallById.get(current);
-    if (!call) return null;
-    if (!isSubagentToolName(call.toolName)) return undefined;
-    if (!call.parentToolUseId || visited.has(current)) return current;
+  while (current !== undefined && !visited.has(current)) {
     visited.add(current);
+    const call = toolCallById.get(current);
+    if (!call) break;
+    reachedKnownCall = true;
+    if (isSubagentToolName(call.toolName)) outermost = current;
     current = call.parentToolUseId;
   }
+  if (outermost !== undefined) return outermost;
+  return reachedKnownCall ? undefined : null;
 }
 
 function sameRows(a: NormalizedMessage[], b: NormalizedMessage[]): boolean {
@@ -199,7 +205,18 @@ function foldTaskStatus(
  * transcript artifacts such as local slash commands and compact summaries are
  * intentionally preserved and annotated so they render like normal chat.
  */
-export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMessage[] {
+export function normalizedToChatMessages(
+  messages: NormalizedMessage[],
+  options: {
+    /**
+     * Keep a live row out of the main thread while its parent card has not
+     * arrived. Pass it only while the session is still running: a settled
+     * session's orphan will never get a card, and a history row's card may sit
+     * on a page that is not loaded, so those render where they are.
+     */
+    holdOrphanedLiveRows?: boolean;
+  } = {},
+): ChatMessage[] {
   const converted: ChatMessage[] = [];
 
   // First pass: collect tool results for attachment, and fold the live word
@@ -229,9 +246,17 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
     // `undefined`: a call that is not an agent; its rows stay in the main thread.
     if (card === undefined) continue;
     foldedRows.add(msg);
-    // `null`: the parent card has not arrived (or is on an unloaded page); the
-    // row is held out of the main thread until it does.
-    if (card === null) continue;
+    // `null`: the parent card has not arrived. A live row of a running session
+    // waits for it out of the main thread; any other row renders in place.
+    if (card === null) {
+      if (!(options.holdOrphanedLiveRows && typeof msg.seq === 'number')) foldedRows.delete(msg);
+      continue;
+    }
+    // A card caught in a parent cycle is its own card: it renders itself.
+    if (msg.kind === 'tool_use' && msg.toolId === card) {
+      foldedRows.delete(msg);
+      continue;
+    }
     const rows = childRowsByAgentCall.get(card);
     if (rows) rows.push(msg); else childRowsByAgentCall.set(card, [msg]);
   }
