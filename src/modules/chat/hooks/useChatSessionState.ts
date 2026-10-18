@@ -13,12 +13,12 @@ import { createCachedDiffCalculator } from '@/modules/chat/utils/messageTransfor
 
 import { normalizedToChatMessages } from '@/modules/chat/hooks/useChatMessages';
 import { useTranscriptViewport } from '@/modules/chat/hooks/useTranscriptViewport';
-import { groupConsecutiveTools } from '@/modules/chat/utils/toolGrouping';
+import { groupConsecutiveTools, isToolGroupItem } from '@/modules/chat/utils/toolGrouping';
 import { toTokenBudget } from '@/modules/chat/utils/contextUsage';
 import { findSearchTargetIndex } from '@/modules/chat/utils/searchTargetLocator';
 
-/** How long a search hit stays flashed after the jump lands. */
-const SEARCH_HIGHLIGHT_DURATION_MS = 4000;
+/** How long a jumped-to row stays flashed after the jump lands. */
+const ROW_HIGHLIGHT_DURATION_MS = 4000;
 
 type UseChatSessionStateArgs = {
   isActive: boolean;
@@ -636,12 +636,74 @@ export function useChatSessionState({
       scrollToRow(targetIndex);
       setHighlightedItemIndex(targetIndex);
       searchScrollActiveRef.current = false;
-      window.setTimeout(() => setHighlightedItemIndex(null), SEARCH_HIGHLIGHT_DURATION_MS);
+      window.setTimeout(() => setHighlightedItemIndex(null), ROW_HIGHLIGHT_DURATION_MS);
     };
 
     scrollToTarget();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatMessages.length, isActive, isLoadingSessionMessages, searchTarget]);
+
+  /**
+   * Reveals the transcript row one tool call owns — the jump the composer's
+   * background-tasks strip makes to a running subagent's card.
+   *
+   * The card may sit in history this pane has not loaded, so the full
+   * transcript is hydrated first (the search jump's own path). The row is then
+   * addressed by index, the only coordinate the virtualizer has: off-screen
+   * rows are not in the DOM, so there is nothing to `getElementById`.
+   */
+  const revealToolRow = useCallback(async (toolUseId: string) => {
+    const sessionId = selectedSession?.id;
+    if (!isActive || !toolUseId || !sessionId) return;
+
+    if (!allMessagesLoadedRef.current && selectedProject) {
+      try {
+        const slot = await sessionStore.fetchFromServer(sessionId, {
+          limit: null,
+          offset: 0,
+          canRequest: () => (
+            isActiveRef.current
+            && activeSessionIdRef.current === sessionId
+          ),
+        });
+        if (slot) {
+          syncPaginationFromSlot(slot);
+          setAllMessagesLoaded(true);
+          allMessagesLoadedRef.current = true;
+        } else if (!isActiveRef.current || activeSessionIdRef.current !== sessionId) {
+          return;
+        }
+      } catch {
+        // Fall through and look among the rows already loaded: a transient
+        // read failure should not make the click a no-op when the card is there.
+      }
+    }
+
+    if (!isActiveRef.current || activeSessionIdRef.current !== sessionId) return;
+
+    const messages = normalizedToChatMessages(sessionStore.getMessages(sessionId));
+    const items = groupConsecutiveTools(messages, showThinking);
+    const targetIndex = items.findIndex(
+      (item) => !isToolGroupItem(item) && item.isToolUse === true && item.toolId === toolUseId,
+    );
+    if (targetIndex < 0) {
+      // Nothing to reveal: a nested task's call lives in another agent's
+      // transcript, and a call no row records simply has no card here.
+      return;
+    }
+
+    scrollToRow(targetIndex);
+    setHighlightedItemIndex(targetIndex);
+    window.setTimeout(() => setHighlightedItemIndex(null), ROW_HIGHLIGHT_DURATION_MS);
+  }, [
+    isActive,
+    selectedProject,
+    selectedSession?.id,
+    sessionStore,
+    showThinking,
+    scrollToRow,
+    syncPaginationFromSlot,
+  ]);
 
   const refreshTokenUsage = useCallback(async (sessionIdToFetch?: string) => {
     const sid = sessionIdToFetch || activeSessionIdRef.current;
@@ -770,6 +832,7 @@ export function useChatSessionState({
     transcriptItems,
     highlightedItemIndex,
     loadAllMessages,
+    revealToolRow,
     allMessagesLoaded,
     isLoadingAllMessages,
     createDiff,

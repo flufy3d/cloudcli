@@ -168,6 +168,13 @@ test('stopping the last outstanding task releases the held process', async () =>
     assert.deepEqual(listClaudeSDKBackgroundWork().map((entry) => [entry.sessionId, entry.tasks.map((task) => task.taskId)]), [[SESSION_ID, ['wf1']]]);
     assert.equal(script.released(), false, 'stdin stays open while the workflow runs');
 
+    // The strip's row carries the spawning call as its identity, which is what
+    // the transcript anchors the card by and what a per-task stop matches.
+    const announced = sent.filter((message) => message.kind === 'status' && message.text === 'background_tasks');
+    const announcedTask = announced.at(-1)?.backgroundTasks?.[0];
+    assert.equal(announcedTask?.id, 'toolu_wf');
+    assert.equal(announcedTask?.toolName, 'Workflow');
+
     // The user stops it. The CLI answers with a `stopped` notification and
     // pushes no follow-up turn, so nothing else would ever end the hold.
     assert.equal(await stopClaudeSDKTask(SESSION_ID, 'wf1'), true);

@@ -104,9 +104,16 @@ test('a running child session is background work for the composer until it settl
     }],
   }]);
   assert.equal(registry.backgroundTasksFor('app-parent')[0]?.toolName, 'subagent');
+  assert.equal(
+    registry.backgroundTasksFor('app-parent')[0]?.id,
+    'call_subagent',
+    'the strip addresses the spawn call: that is the transcript anchor and the id a per-task stop matches',
+  );
   const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
   assert.equal(announced.length, 1, 'the composer learns about the background work live');
   assert.equal(announced[0]?.backgroundTasks?.length, 1);
+  assert.equal(announced[0]?.backgroundTasks?.[0]?.id, 'call_subagent');
+  assert.equal(announced[0]?.backgroundTasks?.[0]?.taskId, 'ses_child');
   assert.equal(announced[0]?.backgroundWorkPending, true);
 
   let cleared = false;

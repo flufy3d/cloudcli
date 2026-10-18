@@ -206,7 +206,12 @@ export class OpenCodeRunRegistry {
   /** The active children of one app session, in the wire shape the composer ack uses. */
   backgroundTasksFor(appSessionId: string): ActiveBackgroundTask[] {
     return [...(this.backgroundByApp.get(appSessionId)?.values() ?? [])].map((task) => ({
-      id: task.taskId,
+      // The card's identity is the spawn call, not the child session: the
+      // transcript anchors its card by the call and `chat.stop-task` is keyed
+      // by the tool-use id the client compares against, so one handle on the
+      // strip both reveals the card and stops exactly this task. The child
+      // session id is only the engine's stop handle (`taskId`).
+      id: task.toolUseId || task.taskId,
       taskId: task.taskId,
       toolName: 'subagent',
       description: task.description,

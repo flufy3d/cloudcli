@@ -162,6 +162,8 @@ type ChatComposerProps = {
   backgroundTasks?: ActiveBackgroundTask[];
   /** Stops the task launched by `toolUseId`, or all of them when omitted. */
   onStopBackgroundTasks?: (toolUseId?: string) => void;
+  /** Reveals a running task's card in the transcript. */
+  onRevealBackgroundTask?: (task: ActiveBackgroundTask) => void;
   hasActiveBackgroundTasks?: boolean;
   /** Running background work holds new messages in the queue (see `inputWhileBusy`). */
   backgroundWorkQueuesInput?: boolean;
@@ -249,6 +251,7 @@ function ChatComposer({
   sendByCtrlEnter = false,
   backgroundTasks = [],
   onStopBackgroundTasks,
+  onRevealBackgroundTask,
   hasActiveBackgroundTasks = false,
   backgroundWorkQueuesInput = false,
   queuesInput = false,
@@ -398,7 +401,11 @@ function ChatComposer({
       )}
 
       {hasActiveBackgroundTasks && backgroundTasks.length > 0 && (
-        <BackgroundTaskIndicator tasks={backgroundTasks} onStopTasks={onStopBackgroundTasks} />
+        <BackgroundTaskIndicator
+          tasks={backgroundTasks}
+          onStopTasks={onStopBackgroundTasks}
+          onRevealTask={onRevealBackgroundTask}
+        />
       )}
 
       {queuedDraft && (

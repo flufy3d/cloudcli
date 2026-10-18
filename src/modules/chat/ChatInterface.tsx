@@ -19,7 +19,7 @@ import { useScheduledJobs } from '@/modules/scheduled-jobs';
 import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabilities';
 import ChatMessagesPane from '@/modules/chat/transcript/ChatMessagesPane';
 import ProviderSelectionEmptyState from '@/modules/chat/transcript/ProviderSelectionEmptyState';
-import type { ChatMessage } from '@/shared/types';
+import type { ChatMessage, ActiveBackgroundTask } from '@/shared/types';
 import { useSessionFork } from '@/shared/hooks/useSessionFork';
 import ChatComposer from '@/modules/chat/composer/ChatComposer';
 import CommandResultModal from '@/modules/chat/modals/CommandResultModal';
@@ -114,6 +114,7 @@ function ChatInterface({
     setTokenBudget,
     transcriptItems,
     highlightedItemIndex,
+    revealToolRow,
     createDiff,
     scrollRef,
     virtualizerRef,
@@ -138,6 +139,15 @@ function ChatInterface({
     sessionStore,
     showThinking: Boolean(showThinking),
   });
+
+  // The composer's background-tasks strip jumps to the card its task owns.
+  // `id` is the spawning call (the wire contract for background tasks), so it
+  // addresses both the transcript anchor and the per-task stop request.
+  const handleRevealBackgroundTask = useCallback((task: ActiveBackgroundTask) => {
+    if (task.id) {
+      void revealToolRow(task.id);
+    }
+  }, [revealToolRow]);
 
   // Brand-new conversation: the composer allocated a stable session id via
   // the session gateway before the first send. Record it locally and put it
@@ -616,6 +626,7 @@ function ChatInterface({
           sendByCtrlEnter={sendByCtrlEnter}
           backgroundTasks={backgroundTasks}
           onStopBackgroundTasks={handleStopBackgroundTasks}
+          onRevealBackgroundTask={handleRevealBackgroundTask}
           hasActiveBackgroundTasks={hasActiveBackgroundTasks}
           backgroundWorkQueuesInput={backgroundWorkQueuesInput}
           queuesInput={queuesInput}

@@ -70,4 +70,42 @@ describe('BackgroundTaskIndicator', () => {
     screen.getByTitle('停止此任务').click();
     expect(onStopTasks).toHaveBeenLastCalledWith('task-1');
   });
+
+  it('reveals the task whose label is clicked, and stopping it does not reveal', () => {
+    // The label region is the jump to the transcript card; the stop button
+    // beside it must not trigger that jump.
+    const onRevealTask = vi.fn();
+    const onStopTasks = vi.fn();
+    const task: ActiveBackgroundTask = {
+      id: 'toolu_spawn_1',
+      taskId: 'task-1',
+      toolName: 'Agent',
+      description: 'Audit the repo',
+      startedAt: Date.now(),
+    };
+
+    render(
+      <BackgroundTaskIndicator tasks={[task]} onRevealTask={onRevealTask} onStopTasks={onStopTasks} />,
+    );
+
+    screen.getByTitle('定位到对应卡片').click();
+    expect(onRevealTask).toHaveBeenCalledTimes(1);
+    expect(onRevealTask).toHaveBeenCalledWith(task);
+    expect(onStopTasks).not.toHaveBeenCalled();
+
+    screen.getByTitle('停止此任务').click();
+    expect(onStopTasks).toHaveBeenCalledWith('toolu_spawn_1');
+    expect(onRevealTask).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps rows inert when there is nothing to reveal', () => {
+    const tasks: ActiveBackgroundTask[] = [
+      { id: 'task-1', toolName: 'Bash', command: 'pnpm run build', startedAt: Date.now() },
+    ];
+
+    render(<BackgroundTaskIndicator tasks={tasks} />);
+
+    expect(screen.queryByTitle('定位到对应卡片')).toBeNull();
+    expect(screen.getByText(/pnpm run build/)).toBeTruthy();
+  });
 });

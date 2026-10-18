@@ -7,6 +7,8 @@ type BackgroundTaskIndicatorProps = {
   tasks: ActiveBackgroundTask[];
   /** Stops the task launched by `toolUseId`, or every task when omitted. */
   onStopTasks?: (toolUseId?: string) => void;
+  /** Reveals the task's card in the transcript; omitted rows stay inert. */
+  onRevealTask?: (task: ActiveBackgroundTask) => void;
 };
 
 function formatElapsed(elapsedSeconds: number): string {
@@ -19,7 +21,7 @@ function formatElapsed(elapsedSeconds: number): string {
 }
 
 /** Used by ChatComposer to display running background tasks. */
-export default function BackgroundTaskIndicator({ tasks, onStopTasks }: BackgroundTaskIndicatorProps) {
+export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTask }: BackgroundTaskIndicatorProps) {
   const { t } = useTranslation('chat');
   const [, setTick] = useState(0);
 
@@ -91,20 +93,38 @@ export default function BackgroundTaskIndicator({ tasks, onStopTasks }: Backgrou
           );
           const taskDetail = task.command || task.description || task.id;
 
+          // The label region is its own control so the row can both reveal the
+          // card and keep the stop button beside it (a button inside a button
+          // is not a thing). A task with nothing to reveal stays a plain div.
+          const labelContent = (
+            <>
+              <TerminalIcon className="h-3 w-3 shrink-0 text-sky-500/80" />
+              <span className="shrink-0 font-medium text-sky-600 dark:text-sky-400">
+                {task.toolName}:
+              </span>
+              <span className="truncate font-mono text-muted-foreground" title={taskDetail}>
+                {taskDetail}
+              </span>
+            </>
+          );
+
           return (
             <div
               key={task.id}
               className="flex items-center justify-between gap-2 rounded-md bg-background/50 px-2 py-1 text-[11px]"
             >
-              <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                <TerminalIcon className="h-3 w-3 shrink-0 text-sky-500/80" />
-                <span className="shrink-0 font-medium text-sky-600 dark:text-sky-400">
-                  {task.toolName}:
-                </span>
-                <span className="truncate font-mono text-muted-foreground" title={taskDetail}>
-                  {taskDetail}
-                </span>
-              </div>
+              {onRevealTask ? (
+                <button
+                  type="button"
+                  onClick={() => onRevealTask(task)}
+                  title={t('composer.backgroundTasks.reveal', { defaultValue: '定位到对应卡片' })}
+                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left transition-colors hover:text-foreground"
+                >
+                  {labelContent}
+                </button>
+              ) : (
+                <div className="flex min-w-0 flex-1 items-center gap-1.5">{labelContent}</div>
+              )}
               <span className="shrink-0 tabular-nums text-muted-foreground/70">
                 {formatElapsed(elapsedSeconds)}
               </span>
