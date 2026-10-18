@@ -368,6 +368,15 @@
     "tools_one": "{{count}} 次工具呼叫",
     "tools_other": "{{count}} 次工具呼叫",
     "task": "任務",
-    "result": "結果"
+    "result": "結果",
+    "steps_one": "{{count}} 步",
+    "steps_other": "{{count}} 步",
+    "showMore_one": "再顯示 {{count}} 步",
+    "showMore_other": "再顯示 {{count}} 步",
+    "showEarlier_one": "顯示更早的 {{count}} 步",
+    "showEarlier_other": "顯示更早的 {{count}} 步",
+    "notIncluded_one": "更早的 {{count}} 步未包含",
+    "notIncluded_other": "更早的 {{count}} 步未包含",
+    "askedBy": "來自子 agent：{{description}}"
   }
 }

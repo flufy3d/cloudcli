@@ -9,6 +9,7 @@ import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRende
 import { ToolErrorDisplay } from '@/modules/chat/tools/ToolErrorDisplay';
 import { MarkdownContent } from '@/modules/chat/tools/ContentRenderers/MarkdownContent';
 import { resolveBackgroundTaskStatus } from '@/modules/chat/utils/backgroundTasks';
+import { describeLatestStep } from '@/modules/chat/utils/subagentSteps';
 
 type SubagentPanelProps = {
   /** Raw tool input of the call that spawned the agent, used for the prompt. */
@@ -118,6 +119,8 @@ export const SubagentPanel = memo(({
   const nickname = subagent?.name && subagent.name !== subagent.type ? subagent.name : '';
   const description = subagent?.description ?? String(parsedInput.description ?? '');
   const prompt = String(parsedInput.prompt ?? '');
+  // While the agent runs, the collapsed header says how far it got.
+  const latestStep = status === 'running' ? describeLatestStep(entries) : undefined;
 
   return (
     <div className="my-1 border-l-2 border-l-purple-500 py-0.5 pl-3 dark:border-l-purple-400">
@@ -171,6 +174,12 @@ export const SubagentPanel = memo(({
         </span>
       </button>
 
+      {latestStep && (
+        <div className="truncate pl-[18px] text-[11px] text-muted-foreground/70" data-testid="subagent-progress">
+          {t('subagent.steps', { count: entries.length, defaultValue_one: '{{count}} step', defaultValue_other: '{{count}} steps' })} · {latestStep}
+        </div>
+      )}
+
       {showTimeline && (
         <div className="mt-1.5 space-y-2 pl-[18px]">
           {subagent?.model && (
@@ -187,6 +196,7 @@ export const SubagentPanel = memo(({
           <SubagentTimeline
             activity={entries}
             activityCount={subagent?.activityCount}
+            showNewest={status === 'running'}
             onFileOpen={onFileOpen}
             createDiff={createDiff}
             selectedProject={selectedProject}

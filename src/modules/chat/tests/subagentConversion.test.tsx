@@ -81,6 +81,39 @@ it('refreshes the card when a folded child call\'s result arrives later', () => 
   expect(second[0].subagentActivity?.[0].toolResult).toEqual({ content: 'file body', isError: false });
 });
 
+describe('nested agents and orphaned rows', () => {
+  const nestedAgent = () => row({
+    kind: 'tool_use', toolName: 'Agent', toolId: 'call_inner', toolInput: { subagent_type: 'Plan', description: 'Inner' }, parentToolUseId: 'call_agent',
+  });
+  const deepText = () => row({ kind: 'text', role: 'assistant', content: 'From the inner agent.', parentToolUseId: 'call_inner' });
+
+  it('folds an inner agent and everything under it into the outer card', () => {
+    const converted = normalizedToChatMessages([agentCall(), childText(), nestedAgent(), deepText()]);
+    expect(converted).toHaveLength(1);
+    expect(converted[0].subagentActivity?.map((entry) => [entry.kind, entry.toolName ?? entry.content])).toEqual([
+      ['text', 'Reading the file.'],
+      ['tool', 'Agent'],
+      ['text', 'From the inner agent.'],
+    ]);
+  });
+
+  it('holds a row out of the main thread while its parent card has not arrived', () => {
+    const converted = normalizedToChatMessages([childText()]);
+    expect(converted).toHaveLength(0);
+    const later = normalizedToChatMessages([agentCall(), childText()]);
+    expect(later).toHaveLength(1);
+    expect(later[0].subagentActivity).toHaveLength(1);
+  });
+
+  it('still shows a row whose parent is a known call that is not an agent card', () => {
+    const converted = normalizedToChatMessages([
+      row({ kind: 'tool_use', toolName: 'Bash', toolId: 'call_agent', toolInput: {} }),
+      childText(),
+    ]);
+    expect(converted.filter((message) => message.content === 'Reading the file.')).toHaveLength(1);
+  });
+});
+
 describe('the subagent panel with a timeline', () => {
   it('shows the agent\'s steps once opened', () => {
     const [card] = normalizedToChatMessages([agentCall(), childText(), childTool(), childResult()]);

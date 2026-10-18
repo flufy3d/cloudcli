@@ -445,6 +445,15 @@
     "tools_one": "{{count}} tool",
     "tools_other": "{{count}} tools",
     "task": "Task",
-    "result": "Result"
+    "result": "Result",
+    "steps_one": "{{count}} step",
+    "steps_other": "{{count}} steps",
+    "showMore_one": "Show {{count}} more step",
+    "showMore_other": "Show {{count}} more steps",
+    "showEarlier_one": "Show {{count}} earlier step",
+    "showEarlier_other": "Show {{count}} earlier steps",
+    "notIncluded_one": "{{count}} earlier step is not included",
+    "notIncluded_other": "{{count}} earlier steps are not included",
+    "askedBy": "From subagent: {{description}}"
   }
 }

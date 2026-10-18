@@ -311,10 +311,14 @@ export type SessionActivity = {
 /** Every busy session, keyed by session id. Read it to tell whether a session is busy; check `background` to tell how. */
 export type SessionActivityMap = ReadonlyMap<string, SessionActivity>;
 
-/** Marks a response or background phase as active; a new send starts a response phase immediately. */
+/**
+ * Marks a response or background phase as active; a new send starts a response phase immediately.
+ * `awaitingApproval` is for an approval card that arrives on its own: it leaves an existing entry
+ * untouched and, when the session is idle, records background work rather than a response in flight.
+ */
 export type MarkSessionProcessing = (
   sessionId?: string | null,
-  activity?: { statusText?: string | null; canInterrupt?: boolean; background?: boolean },
+  activity?: { statusText?: string | null; canInterrupt?: boolean; background?: boolean; awaitingApproval?: boolean },
 ) => void;
 
 /** Clears the response phase by default, or only the background phase with `backgroundOnly`. `ifStartedBefore` guards stale response acknowledgements. */

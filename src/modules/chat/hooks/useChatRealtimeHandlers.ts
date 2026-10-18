@@ -14,6 +14,11 @@ const isActionablePermissionRequest = (request: { toolName?: unknown } | null | 
   return request?.toolName !== 'ExitPlanMode' && request?.toolName !== 'exit_plan_mode';
 };
 
+const hasSubagentOrigin = (request: PendingPermissionRequest): boolean => {
+  const subagent = (request.context as { subagent?: unknown } | null | undefined)?.subagent;
+  return Boolean(subagent && typeof subagent === 'object');
+};
+
 const hasActionablePermissionRequests = (requests: Array<{ toolName?: unknown }> | null | undefined): boolean => {
   return Array.isArray(requests) && requests.some((request) => isActionablePermissionRequest(request));
 };
@@ -191,8 +196,15 @@ export function useChatRealtimeHandlers({
             }
           }
           if (sessionId === activeViewSessionIdRef.current) {
-            pendingPermissionRequestsRef.current = [];
-            setPendingPermissionRequests([]);
+            // The turn's own cards end with it. A card from a subagent that
+            // is still running is the server's to retract (`permission_cancelled`
+            // when the agent stops), so a clean finish keeps it; a failed or
+            // aborted run takes every card with it.
+            const surviving = success && !aborted
+              ? pendingPermissionRequestsRef.current.filter((request) => hasSubagentOrigin(request))
+              : [];
+            pendingPermissionRequestsRef.current = surviving;
+            setPendingPermissionRequests(surviving);
           }
 
           if (aborted || !success) {
@@ -281,7 +293,10 @@ export function useChatRealtimeHandlers({
             }
           }
           if (directive.sessionId) {
-            onSessionProcessing?.(directive.sessionId);
+            // A card can arrive with no reply in flight (a background agent
+            // asking after the turn ended); it must not turn the session
+            // into a foreground reply.
+            onSessionProcessing?.(directive.sessionId, { awaitingApproval: true });
           }
           return;
         }

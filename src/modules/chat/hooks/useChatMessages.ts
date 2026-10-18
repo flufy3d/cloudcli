@@ -67,6 +67,28 @@ const CHILD_ROW_KINDS: ReadonlySet<string> = new Set(['tool_use', 'tool_result',
 
 const NO_CHILD_ROWS: NormalizedMessage[] = [];
 
+/**
+ * The top-level subagent card a row's `parentToolUseId` leads to: the id of the
+ * outermost `Agent` call on its parent chain. `null` when the chain ends at a
+ * call this transcript does not hold (its card has not arrived), `undefined`
+ * when the parent is a known call that is not an agent (Bash, a workflow).
+ */
+function resolveParentCard(
+  parentId: string,
+  toolCallById: Map<string, NormalizedMessage>,
+): string | null | undefined {
+  let current = parentId;
+  const visited = new Set<string>();
+  for (;;) {
+    const call = toolCallById.get(current);
+    if (!call) return null;
+    if (!isSubagentToolName(call.toolName)) return undefined;
+    if (!call.parentToolUseId || visited.has(current)) return current;
+    visited.add(current);
+    current = call.parentToolUseId;
+  }
+}
+
 function sameRows(a: NormalizedMessage[], b: NormalizedMessage[]): boolean {
   return a.length === b.length && a.every((row, index) => Object.is(row, b[index]));
 }
@@ -188,21 +210,30 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
   const liveTasksByToolUseId = new Map<string, LiveTaskStatus>();
   const toolUseIdByTaskId = new Map<string, string>();
   const lastTaskSourceByToolUseId = new Map<string, NormalizedMessage>();
-  // Subagent calls in this transcript, and the live rows their agents produced.
-  // A row naming one of these calls as its parent belongs to that agent's
-  // card, not to the main thread.
-  const agentCallIds = new Set<string>();
+  // Subagent cards in this transcript, and the live rows their agents produced.
+  // A row naming a card as its parent belongs to that card's timeline, not to
+  // the main thread. Cards can nest (an agent spawning an agent): the inner
+  // call is a step inside the outer card, and everything under it folds into
+  // that same outer card, the only one the user sees.
+  const toolCallById = new Map<string, NormalizedMessage>();
   for (const msg of messages) {
-    if (msg.kind === 'tool_use' && msg.toolId && isSubagentToolName(msg.toolName)) {
-      agentCallIds.add(msg.toolId);
+    if (msg.kind === 'tool_use' && msg.toolId) {
+      toolCallById.set(msg.toolId, msg);
     }
   }
   const childRowsByAgentCall = new Map<string, NormalizedMessage[]>();
+  const foldedRows = new Set<NormalizedMessage>();
   for (const msg of messages) {
-    if (msg.parentToolUseId && agentCallIds.has(msg.parentToolUseId) && CHILD_ROW_KINDS.has(msg.kind)) {
-      const rows = childRowsByAgentCall.get(msg.parentToolUseId);
-      if (rows) rows.push(msg); else childRowsByAgentCall.set(msg.parentToolUseId, [msg]);
-    }
+    if (!msg.parentToolUseId || !CHILD_ROW_KINDS.has(msg.kind)) continue;
+    const card = resolveParentCard(msg.parentToolUseId, toolCallById);
+    // `undefined`: a call that is not an agent; its rows stay in the main thread.
+    if (card === undefined) continue;
+    foldedRows.add(msg);
+    // `null`: the parent card has not arrived (or is on an unloaded page); the
+    // row is held out of the main thread until it does.
+    if (card === null) continue;
+    const rows = childRowsByAgentCall.get(card);
+    if (rows) rows.push(msg); else childRowsByAgentCall.set(card, [msg]);
   }
   for (const msg of messages) {
     if (msg.kind === 'tool_result' && msg.toolId) {
@@ -220,7 +251,7 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
   }
 
   for (const msg of messages) {
-    if (msg.parentToolUseId && agentCallIds.has(msg.parentToolUseId) && CHILD_ROW_KINDS.has(msg.kind)) {
+    if (foldedRows.has(msg)) {
       continue;
     }
     const foldedChildRows = msg.kind === 'tool_use' && msg.toolId

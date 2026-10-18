@@ -70,6 +70,14 @@ export function useSessionProtection() {
 
     setProcessingSessions((prev) => {
       const existing = prev.get(sessionId);
+      if (activity?.awaitingApproval) {
+        if (existing) {
+          return prev;
+        }
+        const updated = new Map(prev);
+        updated.set(sessionId, { statusText: null, canInterrupt: false, startedAt: Date.now(), background: true });
+        return updated;
+      }
       // A new turn on a session that was only doing background work starts
       // its own clock: the stale idle-ack guard compares against it, and the
       // tasks' start is not when this response began.

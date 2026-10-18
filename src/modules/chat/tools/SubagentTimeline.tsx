@@ -1,4 +1,5 @@
 import { memo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Brain, MessageSquareText } from 'lucide-react';
 
 import type { DiffLine, Project, SubagentActivity } from '@/shared/types';
@@ -13,6 +14,11 @@ type SubagentTimelineProps = {
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   createDiff: (oldStr: string, newStr: string) => DiffLine[];
   selectedProject?: Project | null;
+  /**
+   * Show the newest entries and fold the earlier ones behind a step, instead of
+   * the first ones: what a running agent is doing now is what the reader wants.
+   */
+  showNewest?: boolean;
 };
 
 /**
@@ -52,7 +58,8 @@ SubagentNote.displayName = 'SubagentNote';
  * Only mount it while its panel is open: a run of a hundred tools is a
  * hundred tool renderers.
  */
-export const SubagentTimeline = memo(({ activity, activityCount, onFileOpen, createDiff, selectedProject }: SubagentTimelineProps) => {
+export const SubagentTimeline = memo(({ activity, activityCount, onFileOpen, createDiff, selectedProject, showNewest = false }: SubagentTimelineProps) => {
+  const { t } = useTranslation('chat');
   const isExporting = useIsExportingTranscript();
   // Raised by the "show more" step so a long run can be inspected in full
   // without paying for it up front.
@@ -62,11 +69,23 @@ export const SubagentTimeline = memo(({ activity, activityCount, onFileOpen, cre
   // The backend truncates very long timelines for transport; say so rather
   // than implying the agent stopped where the list does.
   const untransmittedCount = Math.max(0, (activityCount ?? activity.length) - activity.length);
-  const visibleEntries = activity.slice(0, effectiveRenderLimit);
+  const visibleEntries = showNewest ? activity.slice(-effectiveRenderLimit) : activity.slice(0, effectiveRenderLimit);
   const hiddenCount = activity.length - visibleEntries.length;
+  // Position of the first drawn entry, so keys stay stable as the tail grows.
+  const firstDrawnIndex = showNewest ? activity.length - visibleEntries.length : 0;
 
   return (
     <>
+      {showNewest && hiddenCount > 0 && (
+        <button
+          type="button"
+          onClick={() => setRenderLimit((previous) => previous + INITIALLY_RENDERED_ACTIVITIES * 4)}
+          className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        >
+          {t('subagent.showEarlier', { count: hiddenCount, defaultValue_one: 'Show {{count}} earlier step', defaultValue_other: 'Show {{count}} earlier steps' })}
+        </button>
+      )}
+
       {visibleEntries.length > 0 && (
         <div className="border-l border-border/60 pl-2">
           {visibleEntries.map((entry, index) => (
@@ -75,7 +94,7 @@ export const SubagentTimeline = memo(({ activity, activityCount, onFileOpen, cre
               // subagent's shell command or diff looks exactly like one the
               // top-level agent ran.
               <ToolRenderer
-                key={entry.toolId ?? `activity-${index}`}
+                key={entry.toolId ?? `activity-${firstDrawnIndex + index}`}
                 toolName={entry.toolName || 'UnknownTool'}
                 toolInput={entry.toolInput}
                 toolResult={entry.toolResult}
@@ -86,25 +105,25 @@ export const SubagentTimeline = memo(({ activity, activityCount, onFileOpen, cre
                 selectedProject={selectedProject}
               />
             ) : (
-              <SubagentNote key={`activity-${index}`} activity={entry} />
+              <SubagentNote key={`activity-${firstDrawnIndex + index}`} activity={entry} />
             )
           ))}
         </div>
       )}
 
-      {hiddenCount > 0 && (
+      {!showNewest && hiddenCount > 0 && (
         <button
           type="button"
           onClick={() => setRenderLimit((previous) => previous + INITIALLY_RENDERED_ACTIVITIES * 4)}
           className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
         >
-          Show {hiddenCount} more {hiddenCount === 1 ? 'step' : 'steps'}
+          {t('subagent.showMore', { count: hiddenCount, defaultValue_one: 'Show {{count}} more step', defaultValue_other: 'Show {{count}} more steps' })}
         </button>
       )}
 
       {untransmittedCount > 0 && hiddenCount === 0 && (
         <div className="text-[11px] text-muted-foreground/60">
-          {untransmittedCount} earlier {untransmittedCount === 1 ? 'step is' : 'steps are'} not included
+          {t('subagent.notIncluded', { count: untransmittedCount, defaultValue_one: '{{count}} earlier step is not included', defaultValue_other: '{{count}} earlier steps are not included' })}
         </div>
       )}
     </>
