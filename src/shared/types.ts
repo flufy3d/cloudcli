@@ -199,6 +199,11 @@ export type ProjectSession = {
   messageCount?: number;
   provider?: LLMProvider;
   __provider?: LLMProvider;
+  // Git worktree the session actually runs in, when an engine rebound it out
+  // of the owning project's main checkout; the workspace header labels the
+  // session with the branch. Null/absent for main-checkout sessions.
+  worktreePath?: string | null;
+  worktreeBranch?: string | null;
   // Tags the session with the owning project's DB `projectId` so UI handlers
   // (session switching, sidebar focus, etc.) can match against selectedProject.
   __projectId?: string;

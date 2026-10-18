@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- normally. Informational only: a fork is a fully independent provider
     -- session, and deleting the source does not affect it.
     forked_from_session_id TEXT,
+    -- Git worktree the session actually runs in, when an engine rebound it
+    -- out of the owning project's main checkout (OpenCode's worktree feature).
+    -- The session stays keyed under the main project; these columns feed the
+    -- workspace header's branch label. NULL for main-checkout sessions.
+    worktree_path TEXT,
+    worktree_branch TEXT,
     isArchived BOOLEAN DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,

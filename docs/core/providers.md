@@ -81,8 +81,9 @@ flowchart LR
 都在 `server/modules/providers/shared/`：
 
 - `engine-path/cli-engine-path.ts`：引擎二进制定位工厂——env 覆盖 → PATH → 平台安装路径，带 TTL 正/负缓存。配套 `installation/cli-installation-probe.ts` 探测原语。zcode / antigravity 有各自薄封装（`list/zcode/zcode-engine-path.ts` 等）。
-- `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
+- `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定、工作树认亲。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
 - `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
+- `sessions/session-worktree-placement.ts`：会话目录的工作树认亲改判，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类。
 Codex 的模型目录由 `codex-models.provider.ts` 通过 `codex-app-server.client.ts` 的连接读取。例如 CLI 的 `model/list` 只返回当前可见模型时，选择器只显示这些模型，不会补回写死的旧型号。查询使用对话运行时同一份内置 `@openai/codex`，不使用终端 PATH 上的另一份 CLI。适配器读取所有分页，过滤隐藏模型，按模型 ID 去重，并使用引擎返回的名称、说明、推理强度和默认模型；没有默认标记时使用首个可见模型。自定义模型由 `provider-models.service.ts` 合并。同 ID 的自定义记录与引擎目录只显示一项，保留用户名称和可编辑记录，并继承引擎的推理强度。引擎收录已有自定义 ID 后，用户仍可修改名称；创建或修改为其他已存在 ID 仍会被拒绝。删除已被引擎收录的自定义记录只移除用户名称，型号继续显示，已有会话的型号与强度保持不变；删除仅存在于自定义记录中的型号才切换到默认型号并清空强度。
 
@@ -121,6 +122,14 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 "已登记过"这一半对第 2 条同样不能省：外置盘或网络卷没挂载时目录暂时不存在，但项目行已在，会话照常更新。准入失败只阻止**新建**项目，永不删除既有数据；已经入库的临时目录项目行由项目列表的同一判断过滤隐藏（`projects-with-sessions-fetch.service.ts`），数据保留在库中。
 
 引擎解析不出工作区时同步器返回 `null` 跳过该行，不拿服务端自己的 cwd 顶替——那只会把会话记到服务恰好启动的目录名下。
+
+## 会话工作树认亲：改绑进工作树的会话挂回主仓项目
+
+项目以目录路径为键，git 仓库归属对它不可见。引擎会把进行中的会话改绑到自己建的工作树（opencode v2 的工作树功能：引擎中途把会话记录里的目录改写为工作树路径；zcode 走同一通道，引擎侧尚无此功能），纯目录键控的索引随之把会话记成一个以工作树目录命名的新项目——对用户表现为会话"跳槽"成了独立项目。
+
+`shared/sessions/session-worktree-placement.ts` 的 `applySessionWorktreePlacement` 在六个同步器入库前统一改判（与 `admitsWorkspacePath` 同一套约定，新引擎接入同样必接）：目录是某个**已注册且在役**项目主仓的关联工作树时，会话挂回主仓项目，工作树路径与分支记入 `sessions.worktree_path`/`worktree_branch`，工作区头部副标题以「项目 · 分支」标注。两条例外保持现状：工作树目录已有正式命名的项目行（工作树面板「打开为项目」写入「仓 · 分支」格式）时会话留在该独立项目；主仓未注册或已归档时不动。git 归属查询在 worktrees 模块（`resolveWorktreeHome`，`git worktree list --porcelain`，按目录 30 秒正负缓存；软链路径与 git 还原路径不一致时不认亲，安全降级为现状）。解析器经 `server/index.ts` 组装根注入 placement——placement 静态引 worktrees barrel 会经 projects→providers 的既有依赖闭合模块初始化环。
+
+会话搬离后空掉的项目行由落库层收尾：`sessions.db.ts` 的孤儿归档只处理「自定义名等于目录名（即自动注册的默认名）且零活跃会话」的行，正式命名的项目永不自动归档，归档可逆。
 
 ## 引擎自有数据根
 

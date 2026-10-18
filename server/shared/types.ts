@@ -898,6 +898,50 @@ export type WorktreeProjectView = {
   sessionMeta: { hasMore: false; total: 0 };
 };
 
+//--------------------------- SESSION WORKTREE PLACEMENT ------------
+/**
+ * The main checkout a linked git worktree belongs to, resolved from the
+ * worktree directory itself.
+ *
+ * Produced by the Worktrees module's `resolveWorktreeHome` and consumed by the
+ * session worktree placement policy, which reunifies engine sessions that an
+ * engine (currently OpenCode) rebound from a project's main checkout into one
+ * of its worktrees.
+ */
+export type WorktreeHome = {
+  /** Absolute path of the repository's main worktree. */
+  rootPath: string;
+  /** Branch checked out in the linked worktree; null when detached. */
+  branch: string | null;
+};
+
+/**
+ * Async lookup from a session directory to the main checkout of the git
+ * worktree it belongs to.
+ *
+ * Implementations must resolve to null (never throw) when the directory is not
+ * a linked worktree — plain checkouts, missing directories, and non-repository
+ * paths are all ordinary answers here, because every indexed session passes
+ * through the lookup once per cache TTL.
+ */
+export type WorktreeHomeResolver = (directory: string) => Promise<WorktreeHome | null>;
+
+/**
+ * The worktree a session actually runs in, recorded alongside its owning
+ * (main-checkout) project.
+ *
+ * Written by the session synchronizers after placement resolution and surfaced
+ * to the frontend so the workspace header can label a reunified session with
+ * its branch. Both fields are null for sessions running in their project's
+ * main checkout.
+ */
+export type SessionWorktreeInfo = {
+  path: string;
+  branch: string | null;
+};
+
+// ---------------------------
+
 /**
  * Input accepted when removing a linked Git worktree.
  *

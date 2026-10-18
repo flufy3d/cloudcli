@@ -25,6 +25,7 @@ import type { LLMProvider, ProviderSessionWatchTarget } from '@/shared/types.js'
 import { normalizeProviderTimestamp, normalizeSessionName, readOptionalString } from '@/shared/utils.js';
 
 import { admitsWorkspacePath } from './workspace-admission.js';
+import { applySessionWorktreePlacement } from './session-worktree-placement.js';
 
 /**
  * Minimal row contract every adapter's SQL must satisfy; adapters declare
@@ -83,7 +84,7 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
    * adapter's SQL) and upserts each one.
    */
   async synchronize(since?: Date): Promise<number> {
-    const result = this.queryUpdatedSessions(since?.getTime() ?? null, null);
+    const result = await this.queryUpdatedSessions(since?.getTime() ?? null, null);
     return result.processedCount;
   }
 
@@ -97,7 +98,7 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
     }
 
     const sinceMillis = this.highWaterMark > 0 ? this.highWaterMark : null;
-    const result = this.queryUpdatedSessions(sinceMillis, this.incrementalSyncLimit);
+    const result = await this.queryUpdatedSessions(sinceMillis, this.incrementalSyncLimit);
     return result.firstSessionId;
   }
 
@@ -142,11 +143,14 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
   /**
    * Shared scan step: opens a short read-only connection, selects and filters
    * rows, upserts each, and advances the high-water mark. Never throws.
+   *
+   * Async because the worktree placement lookup may spawn a git process per
+   * unseen session directory (cached, so steady-state scans stay git-free).
    */
-  protected queryUpdatedSessions(
+  protected async queryUpdatedSessions(
     sinceMillis: number | null,
     limit: number | null,
-  ): { processedCount: number; firstSessionId: string | null } {
+  ): Promise<{ processedCount: number; firstSessionId: string | null }> {
     const dbPath = this.getDatabasePath();
     if (!fsSync.existsSync(dbPath)) {
       return { processedCount: 0, firstSessionId: null };
@@ -165,7 +169,7 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
           continue;
         }
 
-        const sessionId = this.upsertSession(db, row);
+        const sessionId = await this.upsertSession(db, row);
         if (sessionId) {
           processedCount += 1;
           firstSessionId ??= sessionId;
@@ -190,9 +194,10 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
 
   /**
    * Upserts one provider row: binds pending app sessions, preserves custom
-   * names, and writes the normalized session row.
+   * names, resolves the worktree placement, and writes the normalized session
+   * row.
    */
-  private upsertSession(db: Database.Database, row: Row): string | null {
+  private async upsertSession(db: Database.Database, row: Row): Promise<string | null> {
     const sessionId = this.getSessionId(row);
     if (!sessionId) {
       return null;
@@ -212,15 +217,17 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
     const derivedName = this.deriveSessionName(db, row);
     const nextName = this.resolveSessionName(sessionId, derivedName);
     const { createdAtMs, updatedAtMs } = this.getRowTimestampsMs(row);
+    const placement = await applySessionWorktreePlacement(projectPath);
 
     return sessionsDb.createSession(
       sessionId,
       this.provider,
-      projectPath,
+      placement.projectPath,
       normalizeSessionName(nextName ?? undefined, this.fallbackTitle),
       normalizeProviderTimestamp(createdAtMs),
       normalizeProviderTimestamp(updatedAtMs),
       this.resolveJsonlPath(row),
+      placement.worktree,
     );
   }
 

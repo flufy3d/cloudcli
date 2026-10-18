@@ -15,6 +15,7 @@ import type { IProviderSessionSynchronizer } from '@/shared/interfaces.js';
 import type { ProviderSessionWatchTarget } from '@/shared/types.js';
 
 import { admitsWorkspacePath } from '../../shared/sessions/workspace-admission.js';
+import { applySessionWorktreePlacement } from '../../shared/sessions/session-worktree-placement.js';
 
 type ParsedSession = {
   sessionId: string;
@@ -69,14 +70,16 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
       }
 
       const timestamps = await readFileTimestamps(filePath);
+      const placement = await applySessionWorktreePlacement(parsed.projectPath);
       sessionsDb.createSession(
         parsed.sessionId,
         this.provider,
-        parsed.projectPath,
+        placement.projectPath,
         parsed.sessionName,
         timestamps.createdAt,
         timestamps.updatedAt,
-        filePath
+        filePath,
+        placement.worktree
       );
       processed += 1;
     }
@@ -99,14 +102,16 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
     }
 
     const timestamps = await readFileTimestamps(filePath);
+    const placement = await applySessionWorktreePlacement(parsed.projectPath);
     return sessionsDb.createSession(
       parsed.sessionId,
       this.provider,
-      parsed.projectPath,
+      placement.projectPath,
       parsed.sessionName,
       timestamps.createdAt,
       timestamps.updatedAt,
-      filePath
+      filePath,
+      placement.worktree
     );
   }
 

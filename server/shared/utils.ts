@@ -494,6 +494,25 @@ export function normalizeProjectPath(inputPath: string): string {
 }
 
 /**
+ * A project display name is "default" when it equals the directory basename —
+ * exactly what `ensureProjectPath`/`createProjectPath` store when they
+ * auto-register a project for a session path. Anything else means a user (or
+ * the open-worktree-as-project flow) deliberately named the project.
+ *
+ * Two consumers must agree on this predicate: the session worktree placement
+ * policy keeps sessions under deliberately-named worktree projects, and the
+ * sessions write layer archives only default-named shells after a session
+ * moves away. Changing one side without the other breaks that pairing.
+ */
+export function isDefaultProjectDisplayName(
+  customName: string | null | undefined,
+  projectPath: string,
+): boolean {
+  const trimmedName = customName?.trim() ?? '';
+  return trimmedName !== '' && trimmedName === path.basename(projectPath);
+}
+
+/**
  * Validates that a user-supplied workspace path is safe to use.
  *
  * Call this before any filesystem mutation that creates or registers projects.

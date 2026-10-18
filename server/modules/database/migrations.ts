@@ -460,6 +460,22 @@ const addSessionEffortColumn = (db: Database): void => {
   addColumnToTableIfNotExists(db, 'sessions', columnNames, 'effort', 'TEXT');
 };
 
+/**
+ * Adds the worktree columns that record where a session actually runs when an
+ * engine rebound it into a git worktree of its owning project.
+ *
+ * Existing rows stay NULL — correct by default, since only sessions whose
+ * synchronizer resolves a worktree placement ever write these columns, and
+ * each synchronizer scan refreshes them from engine state.
+ */
+const addSessionWorktreeColumns = (db: Database): void => {
+  const sessionsTableInfo = getTableInfo(db, 'sessions');
+  const columnNames = sessionsTableInfo.map((column) => column.name);
+
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'worktree_path', 'TEXT');
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'worktree_branch', 'TEXT');
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -558,6 +574,7 @@ export const runMigrations = (db: Database) => {
     addSessionModelColumn(db);
     addSessionEffortColumn(db);
     addForkedFromSessionIdColumn(db);
+    addSessionWorktreeColumns(db);
     ensureProjectsForSessionPaths(db);
     db.exec(SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL);
 

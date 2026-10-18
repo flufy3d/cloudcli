@@ -1,6 +1,7 @@
 import { getConnection } from '@/modules/database/connection.js';
 import { projectsDb } from '@/modules/database/repositories/projects.db.js';
-import { normalizeProjectPath } from '@/shared/utils.js';
+import type { SessionWorktreeInfo } from '@/shared/types.js';
+import { isDefaultProjectDisplayName, normalizeProjectPath } from '@/shared/utils.js';
 
 type SessionRow = {
   session_id: string;
@@ -11,10 +12,14 @@ type SessionRow = {
   custom_name: string | null;
   /** Model this session runs with; NULL until the app records one for it. */
   model: string | null;
-  /** Reasoning effort this session runs with; NULL until the app records one. */
+  /** Reasoning effort this session runs with; NULL until the app records one for it. */
   effort: string | null;
   /** The app session this one was branched from; NULL unless it is a fork. */
   forked_from_session_id: string | null;
+  /** Git worktree the session runs in; NULL for main-checkout sessions. */
+  worktree_path: string | null;
+  /** Branch checked out in that worktree; NULL when detached or main-checkout. */
+  worktree_branch: string | null;
   isArchived: number;
   created_at: string;
   updated_at: string;
@@ -26,7 +31,34 @@ type RecentSessionsPage = {
 };
 
 const SESSION_ROW_COLUMNS =
-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, forked_from_session_id, isArchived, created_at, updated_at';
+  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, forked_from_session_id, worktree_path, worktree_branch, isArchived, created_at, updated_at';
+
+/**
+ * Archives the project row a session just moved away from, but only when it
+ * has the shape of an auto-registered shell: default name (directory
+ * basename), zero remaining active sessions. This is the leftover of the old
+ * directory-keyed indexing — a session whose engine rebound it into a
+ * worktree used to strand an empty phantom project in the sidebar.
+ *
+ * Deliberately-named projects and projects that still hold sessions are kept.
+ * Archiving (not deleting) keeps any preserved history recoverable.
+ */
+function archiveOrphanedDefaultNamedProject(projectPath: string): void {
+  const projectRow = projectsDb.getProjectPath(projectPath);
+  if (!projectRow || projectRow.isArchived) {
+    return;
+  }
+
+  if (!isDefaultProjectDisplayName(projectRow.custom_project_name, projectRow.project_path)) {
+    return;
+  }
+
+  if (sessionsDb.countSessionsByProjectPath(projectPath) > 0) {
+    return;
+  }
+
+  projectsDb.updateProjectIsArchived(projectPath, true);
+}
 
 const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
@@ -87,7 +119,8 @@ export const sessionsDb = {
     customName?: string,
     createdAt?: string,
     updatedAt?: string,
-    jsonlPath?: string | null
+    jsonlPath?: string | null,
+    worktree?: SessionWorktreeInfo | null
   ): string {
     const db = getConnection();
     const createdAtValue = normalizeTimestamp(createdAt);
@@ -100,11 +133,11 @@ export const sessionsDb = {
 
     const existing = db
       .prepare(
-        `SELECT session_id FROM sessions
+        `SELECT session_id, project_path FROM sessions
          WHERE provider_session_id = ? AND provider = ?
          LIMIT 1`
       )
-      .get(providerSessionId, provider) as { session_id: string } | undefined;
+      .get(providerSessionId, provider) as { session_id: string; project_path: string | null } | undefined;
 
     if (existing) {
       // CASE 意图: 只有时间前进（或旧行无时间戳）的事件才解除归档，防止迟到的
@@ -116,6 +149,8 @@ export const sessionsDb = {
            updated_at = COALESCE(?, CURRENT_TIMESTAMP),
            project_path = ?,
            jsonl_path = ?,
+           worktree_path = ?,
+           worktree_branch = ?,
            isArchived = CASE WHEN ? IS NULL OR updated_at IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
            custom_name = CASE
              WHEN session_id <> provider_session_id AND custom_name IS NOT NULL THEN custom_name
@@ -127,11 +162,21 @@ export const sessionsDb = {
         updatedAtValue,
         normalizedProjectPath,
         jsonlPath ?? null,
+        worktree?.path ?? null,
+        worktree?.branch ?? null,
         updatedAtValue,
         updatedAtValue,
         customName ?? null,
         existing.session_id
       );
+
+      // A session that moved between projects strands its old project row;
+      // when that row is an auto-registered default-named shell it is now
+      // empty and only litters the sidebar.
+      const previousProjectPath = existing.project_path;
+      if (previousProjectPath && previousProjectPath !== normalizedProjectPath) {
+        archiveOrphanedDefaultNamedProject(previousProjectPath);
+      }
 
       return existing.session_id;
     }
@@ -141,16 +186,18 @@ export const sessionsDb = {
     // covers legacy rows that predate the provider_session_id mapping.
     // CASE 意图: 只有时间前进（或旧行无时间戳）的事件才解除归档，防止迟到的
     // watcher 旧事件误恢复刚归档的会话。`sessions.updated_at IS NULL` 兜底存量
-    // 无时间戳的旧行——否则与 NULL 比较恒为假，这类行永远无法解档。
+    // 的旧行——否则与 NULL 比较恒为假，这类行永远无法解档。
     db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, isArchived, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, worktree_path, worktree_branch, isArchived, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
        ON CONFLICT(session_id) DO UPDATE SET
          provider = excluded.provider,
          provider_session_id = excluded.provider_session_id,
          updated_at = excluded.updated_at,
          project_path = excluded.project_path,
          jsonl_path = excluded.jsonl_path,
+         worktree_path = excluded.worktree_path,
+         worktree_branch = excluded.worktree_branch,
          isArchived = CASE WHEN ? IS NULL OR sessions.updated_at IS NULL OR julianday(excluded.updated_at) > julianday(sessions.updated_at) THEN 0 ELSE sessions.isArchived END,
          custom_name = CASE
            WHEN sessions.session_id <> sessions.provider_session_id AND sessions.custom_name IS NOT NULL
@@ -164,6 +211,8 @@ export const sessionsDb = {
       customName ?? null,
       normalizedProjectPath,
       jsonlPath ?? null,
+      worktree?.path ?? null,
+      worktree?.branch ?? null,
       createdAtValue,
       updatedAtValue,
       updatedAtValue

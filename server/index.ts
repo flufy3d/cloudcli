@@ -16,6 +16,7 @@ import {
     initializeSessionsWatcher,
     providerRuntimeService,
     sessionsAutoArchiveService,
+    setSessionWorktreeHomeResolver,
     shutdownZCodeRuntime,
 } from '@/modules/providers/index.js';
 import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/index.js';
@@ -55,7 +56,7 @@ import { assetsRoutes } from './modules/assets/index.js';
 import { fileTreeRoutes } from './modules/file-tree/index.js';
 import { diagnosticsRoutes } from './modules/diagnostics/index.js';
 import { createLocalProxyRouter, localProxyAbsolutePathFallback } from './modules/local-proxy/index.js';
-import { worktreesRoutes } from './modules/worktrees/index.js';
+import { worktreesRoutes, resolveWorktreeHome } from './modules/worktrees/index.js';
 import {
     browserUseMcpRoutes,
     browserUseRoutes,
@@ -67,6 +68,12 @@ import {
     startTaskContinuationRuntime,
     taskContinuationsRouter,
 } from './modules/task-continuations/index.js';
+
+// The session synchronizers ask the worktree placement policy where a session
+// really belongs when an engine rebound it into a git worktree; the git lookup
+// itself lives in the Worktrees module and is injected here because a static
+// import from the placement module would close a module-initialization cycle.
+setSessionWorktreeHomeResolver(resolveWorktreeHome);
 
 const __dirname = getModuleDirectory(import.meta.url);
 // The server source runs from /server, while the compiled output runs from /dist-server/server.

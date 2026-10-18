@@ -43,6 +43,11 @@ export { getClaudeExternalReadOnlyRoots } from './list/claude/claude-data-root.j
 // AGENTS.md) referenced from chat.
 export { getZcodeExternalReadOnlyRoots } from './list/zcode/index.js';
 
+// setSessionWorktreeHomeResolver: used by the server entrypoint to wire the
+// Worktrees module's git resolver into the session worktree placement policy
+// (injected rather than statically imported to keep the module graph acyclic).
+export { setSessionWorktreeHomeResolver } from './shared/sessions/session-worktree-placement.js';
+
 export type {
   AntigravityQuotaData,
   AntigravityQuotaGroup,

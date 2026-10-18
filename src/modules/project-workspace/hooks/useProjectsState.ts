@@ -115,6 +115,27 @@ const removeSessionFromProject = (project: Project, sessionIdToDelete: string): 
   return updatedProject;
 };
 
+// Drops every row matching one of the session's ids (app id or provider id).
+// Used when a `session_upserted` delta moves a session to a different project
+// (worktree reunification re-keys it server-side): the upsert writes the row
+// into the new project, and the stale copy under the old project must leave
+// instead of lingering until the next full refresh.
+const removeSessionAliasesFromProject = (project: Project, aliasIds: Set<string>): Project => {
+  const sessions = project.sessions ?? [];
+  const nextSessions = sessions.filter((session) => !aliasIds.has(String(session.id)));
+  if (nextSessions.length === sessions.length) {
+    return project;
+  }
+  const updatedProject: Project = { ...project, sessions: nextSessions };
+  const totalSessions = Math.max(0, Number(project.sessionMeta?.total ?? 0) - 1);
+  updatedProject.sessionMeta = {
+    ...project.sessionMeta,
+    total: totalSessions,
+    hasMore: countLoadedProjectSessions(updatedProject) < totalSessions,
+  };
+  return updatedProject;
+};
+
 // Writes a confirmed rename onto the matching sidebar row. Returns the same
 // project when it holds no such row, or the row already carries that title, so
 // the sidebar list does not re-render for projects the rename did not touch.
@@ -771,11 +792,51 @@ export function useProjectsState({
 
       setProjects((previousProjects) => {
         const targetProjectId = upsert.project?.projectId;
-        const existingProject = previousProjects.find((project) =>
-          targetProjectId ? project.projectId === targetProjectId : getProjectSessions(project).some((session) => session.id === upsert.sessionId),
-        );
+        if (!targetProjectId) {
+          // No owning project on the delta: update the row in place wherever it
+          // currently lives, without any cross-project bookkeeping.
+          const existingProject = previousProjects.find((project) =>
+            getProjectSessions(project).some((session) => session.id === upsert.sessionId),
+          );
+          if (!existingProject) {
+            return previousProjects;
+          }
 
-        if (!existingProject) {
+          const updatedProject = upsertSessionIntoProject(existingProject, upsert);
+          if (updatedProject === existingProject) {
+            return previousProjects;
+          }
+
+          return previousProjects.map((project) =>
+            project.projectId === existingProject.projectId ? updatedProject : project,
+          );
+        }
+
+        // A session can move between projects server-side (worktree
+        // reunification re-keys it under the main checkout's project), so the
+        // upsert writes the row into the target project and strips stale
+        // copies from every other project holding one of its ids.
+        const aliasIds = getSessionAliasIds(upsert);
+        let changed = false;
+        let targetProjectSeen = false;
+        const nextProjects = previousProjects.map((project) => {
+          if (project.projectId === targetProjectId) {
+            targetProjectSeen = true;
+            const updatedProject = upsertSessionIntoProject(project, upsert);
+            if (updatedProject !== project) {
+              changed = true;
+            }
+            return updatedProject;
+          }
+
+          const strippedProject = removeSessionAliasesFromProject(project, aliasIds);
+          if (strippedProject !== project) {
+            changed = true;
+          }
+          return strippedProject;
+        });
+
+        if (!targetProjectSeen) {
           // First session of a project this client has never seen: create the
           // project entry from the event payload.
           if (!upsert.project) {
@@ -792,17 +853,10 @@ export function useProjectsState({
             sessionMeta: { hasMore: false, total: 0 },
           } as Project;
 
-          return [...previousProjects, upsertSessionIntoProject(newProject, upsert)];
+          return [...nextProjects, upsertSessionIntoProject(newProject, upsert)];
         }
 
-        const updatedProject = upsertSessionIntoProject(existingProject, upsert);
-        if (updatedProject === existingProject) {
-          return previousProjects;
-        }
-
-        return previousProjects.map((project) =>
-          project.projectId === existingProject.projectId ? updatedProject : project,
-        );
+        return changed ? nextProjects : previousProjects;
       });
 
       // Session-list changes belong to the sidebar's `projects` collection.

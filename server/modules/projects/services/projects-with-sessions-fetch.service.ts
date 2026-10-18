@@ -13,6 +13,10 @@ type SessionSummary = {
   summary: string;
   messageCount: number;
   lastActivity: string;
+  /** Git worktree the session runs in; null for main-checkout sessions. */
+  worktreePath: string | null;
+  /** Branch checked out in that worktree; null when detached or main-checkout. */
+  worktreeBranch: string | null;
 };
 
 type SessionRepositoryRow = {
@@ -21,6 +25,8 @@ type SessionRepositoryRow = {
   custom_name?: string | null;
   updated_at?: string | null;
   created_at?: string | null;
+  worktree_path?: string | null;
+  worktree_branch?: string | null;
 };
 
 type ProjectRepositoryRow = {
@@ -135,6 +141,8 @@ function mapSessionRowToSummary(row: SessionRepositoryRow): SessionSummary {
     summary: row.custom_name || '',
     messageCount: 0,
     lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
+    worktreePath: row.worktree_path ?? null,
+    worktreeBranch: row.worktree_branch ?? null,
   };
 }
 

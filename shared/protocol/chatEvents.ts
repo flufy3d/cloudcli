@@ -338,6 +338,10 @@ export type SessionUpsertedEvent = {
     summary: string;
     messageCount: number;
     lastActivity: string;
+    /** Git worktree the session runs in; null for main-checkout sessions. */
+    worktreePath?: string | null;
+    /** Branch checked out in that worktree; null when detached or main-checkout. */
+    worktreeBranch?: string | null;
   };
   project: SessionUpsertedProject | null;
   timestamp: string;
