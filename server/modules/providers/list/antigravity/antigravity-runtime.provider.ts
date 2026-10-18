@@ -43,7 +43,7 @@ import {
 
 import { getAntigravityDataRoot } from './antigravity-data-root.js';
 import { tryResolveEnginePath } from './antigravity-engine-path.js';
-import { antigravityBackgroundWork, extractAntigravitySubagents } from './antigravity-subagent.js';
+import { antigravityBackgroundWork, extractAntigravitySubagents, judgeAntigravityAgent } from './antigravity-subagent.js';
 import {
   findCatalogOptionForModelString,
   resolveAntigravityModelArgs,
@@ -129,6 +129,11 @@ const abortedProcessKeys = new Set<string>();
  * while the run's tasks are registered under the key it started with.
  */
 const backgroundKeyAliases = new Map<string, string>();
+
+/** Number of live key aliases; the tests use it to prove a finished run leaves none behind. */
+export function getAntigravityBackgroundKeyAliasCount(): number {
+  return backgroundKeyAliases.size;
+}
 
 /**
  * The agents a session is waiting on, in the shape the composer's strip lists.
@@ -254,10 +259,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
 
       const processKey = sessionId || capturedSessionId || `agy_${Date.now()}_${keylessRunCounter += 1}`;
       const sessionKey = sessionId || capturedSessionId || processKey;
-      if (sessionId) {
-        backgroundKeyAliases.set(sessionId, sessionKey);
-      }
-
       const broadcastBackgroundTasks = () => {
         writer.send(createNormalizedMessage({
           id: generateMessageId(PROVIDER),
@@ -271,12 +272,13 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
 
       /**
        * Settles every agent the session still waits on: one `task_status`
-       * per agent so its card stops running, then the registry empties. The
-       * turn's result settles them `completed` (agy only reports a turn once
-       * its agents are back); a process that ends without a result settles
-       * them `stopped`, because nothing is left to report on them.
+       * per agent so its card stops running, then the registry empties. At the
+       * turn's result each agent settles by how its own transcript ended (the
+       * same judgement history uses, so a refresh shows the same card); a
+       * process that ends without a result settles them `stopped`, because
+       * nothing is left to report on them.
        */
-      const settleOutstandingAgents = (status: 'completed' | 'stopped') => {
+      const settleOutstandingAgents = (judge: 'transcript' | 'stopped') => {
         const outstanding = antigravityBackgroundWork.list().find((entry) => entry.sessionId === sessionKey)?.tasks ?? [];
         for (const task of outstanding) {
           writer.send(createTaskStatusMessage(
@@ -287,7 +289,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
               toolUseId: task.toolUseId,
               taskType: LOCAL_AGENT_TASK_TYPE,
             },
-            { event: 'notification', status },
+            { event: 'notification', status: judge === 'stopped' ? 'stopped' : judgeAntigravityAgent(task.taskId) },
           ));
         }
         antigravityBackgroundWork.clearSession(sessionKey);
@@ -316,8 +318,8 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       /** Forgets the run's registered agents and the aliases that reached them. */
       const releaseBackgroundKeys = () => {
         antigravityBackgroundWork.clearSession(sessionKey);
-        for (const id of [sessionId, capturedSessionId]) {
-          if (id && backgroundKeyAliases.get(id) === sessionKey) backgroundKeyAliases.delete(id);
+        if (capturedSessionId && backgroundKeyAliases.get(capturedSessionId) === sessionKey) {
+          backgroundKeyAliases.delete(capturedSessionId);
         }
       };
 
@@ -517,7 +519,12 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             const convId = readOptionalString(rawRecord.conversation_id);
             if (convId && !capturedSessionId) {
               capturedSessionId = convId;
-              backgroundKeyAliases.set(capturedSessionId, sessionKey);
+              // A run keyed by its own process (no app session id) is also
+              // reached by the conversation id the engine names; a run keyed
+              // by the app session id needs no alias.
+              if (capturedSessionId !== sessionKey) {
+                backgroundKeyAliases.set(capturedSessionId, sessionKey);
+              }
               writer.setSessionId?.(capturedSessionId);
 
               if (!providerSessionId && !sessionCreatedSent) {
@@ -665,7 +672,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             // cards go before the client sees the turn complete. An
             // interrupted-stream result is not the end of the turn (below).
             const turnContinues = isError && isStreamInterruptedNotice(errorMessage);
-            if (!turnContinues && settleOutstandingAgents(isError ? 'stopped' : 'completed')) {
+            if (!turnContinues && settleOutstandingAgents(isError ? 'stopped' : 'transcript')) {
               broadcastBackgroundTasks();
             }
 
@@ -850,6 +857,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         // instead of reporting a failure or a completion.
         const wasAborted = abortedProcessKeys.delete(processKey);
         if (wasAborted) {
+          releaseBackgroundKeys();
           notifyRunStopped({
             userId: writer.userId != null ? String(writer.userId) : null,
             provider: PROVIDER,

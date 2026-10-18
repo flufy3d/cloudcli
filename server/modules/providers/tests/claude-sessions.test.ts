@@ -302,6 +302,12 @@ test('a live legacy Task call and a live Agent call both reach the page as Agent
   assert.equal(rowFor('Task').toolName, 'Agent');
   assert.equal(rowFor('Agent').toolName, 'Agent');
   assert.equal(rowFor('TaskCreate').toolName, 'TaskCreate');
+
+  // The flat live shape (toolName on the event itself) is translated too.
+  const [flat] = provider.normalizeMessage({
+    uuid: 'row-flat', type: 'tool_use', toolName: 'Task', toolInput: {}, toolCallId: 'toolu_flat', timestamp: new Date().toISOString(),
+  }, 'session-1');
+  assert.equal(flat.toolName, 'Agent');
 });
 
 test('Claude history folds an agent task notification into the call that spawned it', { concurrency: false }, async () => {

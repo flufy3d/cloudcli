@@ -732,6 +732,17 @@ export function createCompleteMessage(opts: {
  */
 const MAX_SUBAGENT_ACTIVITY_CONTENT = 4000;
 
+/**
+ * Most activities of one subagent sent with its card. A long-running agent can
+ * record hundreds of tool calls, and the transcript only shows them behind a
+ * collapsed header, so shipping the whole timeline on every load costs far more
+ * than it shows. The card reports the full count (`SubagentInfo.activityCount`)
+ * so the UI can say how many were left out.
+ *
+ * Consumers: the Claude, Codex and ZCode history readers.
+ */
+export const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
+
 function truncateForPreview(value: string | undefined): string | undefined {
   if (typeof value !== 'string' || value.length <= MAX_SUBAGENT_ACTIVITY_CONTENT) {
     return value;

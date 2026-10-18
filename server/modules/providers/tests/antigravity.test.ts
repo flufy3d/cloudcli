@@ -33,6 +33,7 @@ import { AntigravityMcpProvider } from '../list/antigravity/antigravity-mcp.prov
 import { AntigravitySessionSynchronizer } from '../list/antigravity/antigravity-session-synchronizer.provider.js';
 import { AntigravitySkillsProvider } from '../list/antigravity/antigravity-skills.provider.js';
 import { readCanonicalAntigravityTranscript } from '../list/antigravity/antigravity-transcript.provider.js';
+import { antigravityBackgroundWork } from '../list/antigravity/antigravity-subagent.js';
 import { AntigravitySessionsProvider } from '../list/antigravity/antigravity-sessions.provider.js';
 import { providerRegistry } from '../provider.registry.js';
 import { providerCapabilitiesService } from '../services/provider-capabilities.service.js';
@@ -1536,7 +1537,16 @@ const SUB_ONE = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
 const SUB_TWO = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb';
 
 /** Writes a parent transcript whose step 3 invokes two subagents, plus the first one's own transcript. */
-async function writeSubagentFixture(tempRoot: string, sessionId: string, options: { reported: boolean }): Promise<void> {
+type SubagentFixtureOptions = {
+  /** Whether the first agent's report reached the parent's transcript. */
+  reported: boolean;
+  /** Whether the step holding the creation receipt was written yet. Default true. */
+  receipt?: boolean;
+  /** How the second agent's own transcript ends. Default: it has none. */
+  secondEnding?: 'normal' | 'error' | 'unfinished';
+};
+
+async function writeSubagentFixture(tempRoot: string, sessionId: string, options: SubagentFixtureOptions): Promise<void> {
   const logsDir = (id: string) => path.join(tempRoot, 'brain', id, '.system_generated', 'logs');
   await fs.mkdir(logsDir(sessionId), { recursive: true });
   await fs.mkdir(logsDir(SUB_ONE), { recursive: true });
@@ -1566,7 +1576,7 @@ async function writeSubagentFixture(tempRoot: string, sessionId: string, options
         { Role: 'Test Runner', TypeName: 'research', Prompt: 'Run the tests', Model: 'inherit' },
       ] } }],
     },
-    { step_index: 3, source: 'MODEL', type: 'GENERIC', status: 'DONE', created_at: '2026-09-03T00:26:58Z', content: created },
+    ...(options.receipt === false ? [] : [{ step_index: 3, source: 'MODEL', type: 'GENERIC', status: 'DONE', created_at: '2026-09-03T00:26:58Z', content: created }]),
     ...(options.reported
       ? [{ step_index: 4, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-09-03T00:27:54Z', content: report }]
       : []),
@@ -1579,6 +1589,17 @@ async function writeSubagentFixture(tempRoot: string, sessionId: string, options
     { step_index: 2, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', created_at: '2026-09-03T00:27:11Z', content: 'Created At: 2026-09-03T08:27:11+08:00\nCompleted At: 2026-09-03T08:27:11+08:00\nFile Path: `/tmp/a.ts`\n1: body' },
   ];
   await fs.writeFile(path.join(logsDir(SUB_ONE), 'transcript.jsonl'), childRows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+  if (options.secondEnding) {
+    await fs.mkdir(logsDir(SUB_TWO), { recursive: true });
+    const head = { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-09-03T00:27:00Z', content: '<USER_REQUEST>\nRun the tests\n</USER_REQUEST>' };
+    const tail = {
+      normal: { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-09-03T00:27:30Z', content: 'All tests pass.' },
+      error: { step_index: 1, source: 'SYSTEM', type: 'ERROR_MESSAGE', status: 'DONE', created_at: '2026-09-03T00:27:30Z', error: 'API error: connection reset' },
+      unfinished: { step_index: 1, source: 'MODEL', type: 'GENERIC', status: 'RUNNING', created_at: '2026-09-03T00:27:30Z', content: 'Tool is running as a background task' },
+    }[options.secondEnding];
+    await fs.writeFile(path.join(logsDir(SUB_TWO), 'transcript.jsonl'), [head, tail].map((row) => JSON.stringify(row)).join('\n') + '\n');
+  }
 }
 
 test('history turns one invoke_subagent call into one Agent card per created subagent', async () => {
@@ -1596,7 +1617,7 @@ test('history turns one invoke_subagent call into one Agent card per created sub
       ['Agent', `tool_3:${SUB_ONE}`],
       ['Agent', `tool_3:${SUB_TWO}`],
     ]);
-    assert.deepEqual(cards[0].toolInput, { subagent_type: 'Code Reviewer', description: 'Code Reviewer', prompt: 'Review the diff' });
+    assert.deepEqual(cards[0].toolInput, { subagent_type: 'Code Reviewer', description: 'Review the diff', prompt: 'Review the diff' });
 
     // The agent that reported back is done and carries its report and its own work.
     assert.equal(cards[0].subagent?.id, SUB_ONE);
@@ -1639,6 +1660,79 @@ test('the live subagent step and the persisted call name each card the same way'
 
     assert.deepEqual(live.map((msg) => [msg.id, msg.toolId, msg.toolName, msg.toolInput]),
       persisted.map((msg) => [msg.id, msg.toolId, msg.toolName, msg.toolInput]));
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('an agent with no report is judged by how its own transcript ends', async () => {
+  const statusesFor = async (secondEnding: SubagentFixtureOptions['secondEnding']) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-judge-'));
+    await writeSubagentFixture(tempRoot, 'hist-judge', { reported: false, secondEnding });
+    const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+    try {
+      const { messages } = await new AntigravitySessionsProvider().fetchHistory('hist-judge', {});
+      return messages.filter((msg) => msg.kind === 'tool_use').map((msg) => msg.subagent?.status);
+    } finally {
+      restoreDataDir();
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  };
+
+  // The first agent's transcript stops on a tool result with no reply after
+  // it, so without a report it counts as unfinished.
+  assert.deepEqual(await statusesFor('normal'), ['stopped', 'completed']);
+  assert.deepEqual(await statusesFor('error'), ['stopped', 'failed']);
+  assert.deepEqual(await statusesFor('unfinished'), ['stopped', 'stopped']);
+  assert.deepEqual(await statusesFor(undefined), ['stopped', 'stopped'], 'no transcript at all: nobody can say it finished');
+});
+
+test('before the receipt step is written, history adopts the ids and status the live run tracks', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-midsession-'));
+  await writeSubagentFixture(tempRoot, 'hist-mid', { reported: false, receipt: false });
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  antigravityBackgroundWork.start('hist-mid', { taskId: SUB_ONE, toolUseId: `tool_3:${SUB_ONE}`, taskType: 'local_agent', description: 'Code Reviewer' });
+  antigravityBackgroundWork.start('hist-mid', { taskId: SUB_TWO, toolUseId: `tool_3:${SUB_TWO}`, taskType: 'local_agent', description: 'Test Runner' });
+  try {
+    const { messages } = await new AntigravitySessionsProvider().fetchHistory('hist-mid', {});
+    const cards = messages.filter((msg) => msg.kind === 'tool_use');
+    assert.deepEqual(cards.map((card) => card.toolId), [`tool_3:${SUB_ONE}`, `tool_3:${SUB_TWO}`]);
+    assert.deepEqual(cards.map((card) => card.subagent?.status), ['running', 'running']);
+  } finally {
+    antigravityBackgroundWork.clearSession('hist-mid');
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('two spawn calls without step indexes get distinct ids, and only a receipt pairs with a spawn', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-unindexed-'));
+  const sessionId = 'hist-unindexed';
+  const logs = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(logs, { recursive: true });
+  const spawn = (role: string) => ({
+    source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-09-03T00:26:54Z',
+    tool_calls: [{ name: 'invoke_subagent', args: { Subagents: [{ Role: role, Prompt: `${role} task` }] } }],
+  });
+  const rows = [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-09-03T00:26:50Z', content: '<USER_REQUEST>\ngo\n</USER_REQUEST>' },
+    spawn('First'),
+    spawn('Second'),
+    // A tool call whose result sits at the step a receipt would; the result is
+    // not a receipt, so it belongs to the tool.
+    { step_index: 5, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-09-03T00:27:00Z', tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/a' } }] },
+    { step_index: 6, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', created_at: '2026-09-03T00:27:01Z', content: 'Created At: x\nCompleted At: y\nFile Path: `/tmp/a`\n1: body' },
+  ];
+  await fs.writeFile(path.join(logs, 'transcript.jsonl'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const { messages } = await new AntigravitySessionsProvider().fetchHistory(sessionId, {});
+    const agentIds = messages.filter((msg) => msg.toolName === 'Agent').map((msg) => msg.toolId);
+    assert.equal(new Set(agentIds).size, 2);
+    const view = messages.find((msg) => msg.toolName === 'view_file');
+    assert.match(view?.toolResult?.content ?? '', /body/);
   } finally {
     restoreDataDir();
     await fs.rm(tempRoot, { recursive: true, force: true });

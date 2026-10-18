@@ -38,6 +38,7 @@ import {
   readUsageNumber,
   removePathIfExists,
   sliceTailPage,
+  MAX_TRANSMITTED_SUBAGENT_ACTIVITIES,
   truncateSubagentActivity,
 } from '@/shared/utils.js';
 
@@ -50,14 +51,6 @@ const PROVIDER = 'codex';
  * already covers a run that crosses midnight.
  */
 const SUBAGENT_LOOKUP_PARENT_LEVELS = 2;
-
-/**
- * Upper bound on how much of a subagent's timeline is sent to the client. A
- * long-running agent can record hundreds of tool calls, and the transcript only
- * ever shows them behind a collapsed header, so shipping the whole history on
- * every load costs far more than it shows.
- */
-const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
 
 type CodexHistoryResult = {
   messages: AnyRecord[];
@@ -168,6 +161,8 @@ type CodexSubagentRecord = {
   agentPath?: string;
   agentThreadId?: string;
   isComplete: boolean;
+  /** Closed by an interruption or abort rather than by a final answer: it ended with no result. */
+  wasStopped?: boolean;
 };
 
 function parseCodexSubagentMessage(payload: AnyRecord): {
@@ -496,11 +491,13 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     timestamp: string,
     output: string,
     isError: boolean,
+    stopped = false,
   ): void => {
     if (record.isComplete) {
       return;
     }
     record.isComplete = true;
+    record.wasStopped = stopped;
     messages.push({
       uuid: `${record.toolCallId}_result`,
       type: 'tool_result',
@@ -572,7 +569,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       // is settled here or its Agent card renders as running forever. The
       // result is an error row: the agent did not finish its work.
       for (const record of subagentsByCallId.values()) {
-        closeSubagent(record, timestamp, 'Subagent ended when the turn was interrupted.', true);
+        closeSubagent(record, timestamp, 'Subagent ended when the turn was interrupted.', true, true);
       }
       messages.push({
         // No item is written for an abort, so the row is named after the
@@ -626,7 +623,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       indexSubagent(existing);
 
       if (item.activity === 'interrupted') {
-        closeSubagent(existing, timestamp, 'Subagent was interrupted before returning a final answer.', false);
+        closeSubagent(existing, timestamp, 'Subagent was interrupted before returning a final answer.', false, true);
       }
       continue;
     }
@@ -699,7 +696,7 @@ async function attachCodexSubagentTranscripts(
       // tracks it (its turn is in flight); otherwise the app-server that ran it
       // is gone and it can never report, so the card must not spin forever.
       status: record.isComplete
-        ? 'completed'
+        ? (record.wasStopped ? 'stopped' : 'completed')
         : codexBackgroundWork.has(record.agentThreadId ?? record.toolCallId) ? 'running' : 'stopped',
     };
 

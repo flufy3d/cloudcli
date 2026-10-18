@@ -73,7 +73,7 @@ export function extractBackgroundTasks(raw: unknown): ActiveBackgroundTask[] {
       : input?.description ?? input?.prompt ?? input?.command;
     return [{
       id: typeof block.id === 'string' ? block.id : '',
-      toolName: name,
+      toolName: canonicalClaudeSubagentToolName(name),
       command: typeof command === 'string' ? command : undefined,
       startedAt: Date.now(),
     }];

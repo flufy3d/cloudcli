@@ -172,11 +172,36 @@ test('an interrupted-stream result keeps the subagent cards of the resumed turn'
   });
 });
 
+/** Gives each conversation a transcript of its own, ending as `ending` says, under a temp data dir. */
+async function withChildTranscripts<T>(endings: Record<string, 'normal' | 'error'>, run: () => Promise<T>): Promise<T> {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-children-'));
+  for (const [id, ending] of Object.entries(endings)) {
+    const logs = path.join(root, 'brain', id, '.system_generated', 'logs');
+    await fs.mkdir(logs, { recursive: true });
+    const last = ending === 'normal'
+      ? { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Done.' }
+      : { step_index: 1, source: 'SYSTEM', type: 'ERROR_MESSAGE', status: 'DONE', error: 'API error' };
+    await fs.writeFile(path.join(logs, 'transcript.jsonl'), [{ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'go' }, last].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  }
+  const previous = process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+  process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = root;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+    else process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = previous;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 const agentCards = (sent: any[]) => sent.filter((msg) => msg.kind === 'tool_use' && msg.toolName === 'Agent');
 const taskStatuses = (sent: any[]) => sent.filter((msg) => msg.kind === 'task_status');
 
-test('one invoke_subagent call that creates two agents draws two Agent cards and settles both when the turn result arrives', async () => {
-  await withStub([
+test('at the turn result each agent settles by how its own transcript ended: finished is completed, errored is failed', async () => {
+  await withChildTranscripts({ 'sub-1': 'normal', 'sub-2': 'error' }, () => withStub([
     { event: 'init', conversation_id: 'conv-two', init: { cwd: '/tmp' } },
     step({ ...subagentStep('DONE', ['sub-1', 'sub-2']), conversation_id: 'conv-two' }),
     step({ conversation_id: 'conv-two', step_index: 3, state: 'DONE', step_type: 'agent_response', text_delta: 'Waiting\n' }),
@@ -198,11 +223,11 @@ test('one invoke_subagent call that creates two agents draws two Agent cards and
     const settled = taskStatuses(sent).filter((msg) => msg.event === 'notification');
     assert.deepEqual(settled.map((msg) => [msg.toolUseId, msg.status]), [
       ['tool_2:sub-1', 'completed'],
-      ['tool_2:sub-2', 'completed'],
+      ['tool_2:sub-2', 'failed'],
     ]);
     const completeAt = sent.findIndex((msg) => msg.kind === 'complete');
     assert.ok(sent.indexOf(settled[1]) < completeAt, 'both cards settle before the turn completes');
-  });
+  }));
 });
 
 test('agents still outstanding when the engine process dies are settled as stopped', async () => {
@@ -233,5 +258,20 @@ test('an abort settles the outstanding agents as stopped', async () => {
 
     const settled = taskStatuses(sent).filter((msg) => msg.event === 'notification');
     assert.deepEqual(settled.map((msg) => msg.status), ['stopped']);
+  }, false);
+});
+
+test('an aborted run leaves no session-key aliases behind', async () => {
+  const { getAntigravityBackgroundKeyAliasCount } = await import('@/modules/providers/list/antigravity/antigravity-runtime.provider.js');
+  const before = getAntigravityBackgroundKeyAliasCount();
+  await withStub([
+    { event: 'init', conversation_id: 'conv-alias', init: { cwd: '/tmp' } },
+    step({ ...subagentStep('DONE', ['sub-alias']), conversation_id: 'conv-alias' }),
+  ], async () => {
+    const { runtime, done, waitForCard } = await createRun('conv-alias');
+    await waitForCard();
+    await runtime.abort('conv-alias');
+    await done;
+    assert.equal(getAntigravityBackgroundKeyAliasCount(), before);
   }, false);
 });

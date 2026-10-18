@@ -12,6 +12,7 @@ import type {
   NormalizedMessage,
   ProviderSessionUsageInput,
   ProviderTokenUsageResult,
+  SubagentActivity,
   SubagentInfo,
 } from '@/shared/types.js';
 import {
@@ -28,6 +29,8 @@ import {
   removePathIfExists,
   sliceTailPage,
   SUBAGENT_TOOL_NAME,
+  MAX_TRANSMITTED_SUBAGENT_ACTIVITIES,
+  truncateSubagentActivity,
 } from '@/shared/utils.js';
 import { getGlobalImageAssetsDir } from '@/shared/image-attachments.js';
 import { resolveAttachmentAssetFile } from '@/modules/assets/index.js';
@@ -510,27 +513,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
     }
 
     try {
-      const rows = db.prepare(`
-        SELECT
-          m.id AS message_id,
-          m.time_created AS message_time_created,
-          m.sequence AS message_sequence,
-          m.data AS message_data,
-          p.id AS part_id,
-          p.time_created AS part_time_created,
-          p.data AS part_data
-        FROM message m
-        LEFT JOIN part p
-          ON p.session_id = m.session_id
-         AND p.message_id = m.id
-        WHERE m.session_id = ?
-        ORDER BY
-          COALESCE(m.time_created, 0),
-          m.sequence,
-          m.id,
-          COALESCE(p.time_created, 0),
-          p.id
-      `).iterate(providerSessionId) as Iterable<ZCodeHistoryRow>;
+      const rows = this.selectHistoryRows(db, providerSessionId);
 
       const normalized = this.normalizeHistoryRows(rows, sessionId);
       await this.attachSubagents(db, normalized, providerSessionId);
@@ -557,6 +540,58 @@ export class ZCodeSessionsProvider implements IProviderSessions {
     } finally {
       db.close();
     }
+  }
+
+  /** One session's message and part rows, in transcript order. */
+  private selectHistoryRows(db: Database.Database, providerSessionId: string): Iterable<ZCodeHistoryRow> {
+    return db.prepare(`
+      SELECT
+        m.id AS message_id,
+        m.time_created AS message_time_created,
+        m.sequence AS message_sequence,
+        m.data AS message_data,
+        p.id AS part_id,
+        p.time_created AS part_time_created,
+        p.data AS part_data
+      FROM message m
+      LEFT JOIN part p
+        ON p.session_id = m.session_id
+       AND p.message_id = m.id
+      WHERE m.session_id = ?
+      ORDER BY
+        COALESCE(m.time_created, 0),
+        m.sequence,
+        m.id,
+        COALESCE(p.time_created, 0),
+        p.id
+    `).iterate(providerSessionId) as Iterable<ZCodeHistoryRow>;
+  }
+
+  /**
+   * The agent's own work as a subagent timeline: the text, reasoning and tool
+   * calls of its child session, read with the same normalizer as the parent's
+   * history. A child session the database does not hold yields an empty list.
+   */
+  private readChildSessionActivity(db: Database.Database, childSessionId: string): SubagentActivity[] {
+    const messages = this.normalizeHistoryRows(this.selectHistoryRows(db, childSessionId), childSessionId);
+    const activity: SubagentActivity[] = [];
+    for (const message of messages) {
+      if (message.kind === 'tool_use') {
+        activity.push({
+          kind: 'tool',
+          timestamp: message.timestamp,
+          toolId: message.toolId,
+          toolName: message.toolName,
+          toolInput: message.toolInput,
+          toolResult: message.toolResult ?? null,
+        });
+      } else if (message.kind === 'text' && message.role !== 'user') {
+        activity.push({ kind: 'text', timestamp: message.timestamp, content: message.content });
+      } else if (message.kind === 'thinking') {
+        activity.push({ kind: 'thinking', timestamp: message.timestamp, content: message.content });
+      }
+    }
+    return activity;
   }
 
   /**
@@ -827,6 +862,15 @@ export class ZCodeSessionsProvider implements IProviderSessions {
         status: this.resolveSidecarStatus(sidecar),
         model: sidecar.childSessionId ? readZCodeChildSessionModel(db, sidecar.childSessionId) : undefined,
       };
+      if (sidecar.childSessionId) {
+        const activity = this.readChildSessionActivity(db, sidecar.childSessionId);
+        if (activity.length > 0) {
+          launch.subagentTools = activity
+            .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
+            .map(truncateSubagentActivity);
+          subagent.activityCount = activity.length;
+        }
+      }
       launch.subagent = subagent;
     }
   }

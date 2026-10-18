@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   createBackgroundWorkTracker,
+  extractBackgroundTasks,
   startsBackgroundWork,
 } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 
@@ -58,6 +59,15 @@ test('a backgrounded legacy Task spawn holds the process open like an Agent', ()
   assert.equal(startsBackgroundWork(turn({ name: 'Task', input: { run_in_background: true } })), true);
   assert.equal(startsBackgroundWork(turn({ name: 'Task', input: { run_in_background: false } })), false);
   assert.equal(startsBackgroundWork(turn({ name: 'TaskCreate' })), false, 'a to-do item launches nothing');
+});
+
+test('a legacy Task launch is listed on the strip under the Agent name', () => {
+  const [task] = extractBackgroundTasks({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 'toolu_legacy', name: 'Task', input: { run_in_background: true, description: 'Survey' } }] },
+  });
+  assert.equal(task.toolName, 'Agent');
+  assert.equal(task.id, 'toolu_legacy');
 });
 
 test('a backgrounded Agent holds the process open', () => {

@@ -172,6 +172,12 @@ const createParentWithAgent = async (
     if (options.childModelId) {
       insertMessage.run('msg_child_user', 'sess_subagent_agent_a', 2200, 2200, JSON.stringify({ role: 'user', text: 'Review the diff' }), 0);
       insertMessage.run('msg_child_asst', 'sess_subagent_agent_a', 2300, 2300, JSON.stringify({ role: 'assistant', modelId: options.childModelId }), 1);
+      // What the agent did: a sentence, then one tool call with its result.
+      insertPart.run('part_child_text', 'msg_child_asst', 'sess_subagent_agent_a', 2310, 2310, JSON.stringify({ type: 'text', text: 'Reading the diff.' }), 0);
+      insertPart.run('part_child_tool', 'msg_child_asst', 'sess_subagent_agent_a', 2320, 2320, JSON.stringify({
+        type: 'tool', callID: 'call_child_read', tool: 'Read',
+        state: { status: 'completed', input: { path: '/tmp/a.ts' }, output: 'file body' },
+      }), 1);
     }
   } finally {
     db.close();
@@ -222,7 +228,29 @@ test('history keeps the Agent row and reads the finished agent off its sidecar',
       description: 'Review the fix',
       status: 'completed',
       model: 'GLM-5.3-Flash',
+      activityCount: 2,
     });
+
+    // The agent's own work, from its child session, in the shape Claude and
+    // Codex cards use.
+    assert.equal(task.subagentTools?.length, 2);
+    assert.equal(task.subagentTools?.[0].kind, 'text');
+    assert.equal(task.subagentTools?.[0].content, 'Reading the diff.');
+    assert.equal(task.subagentTools?.[1].kind, 'tool');
+    assert.equal(task.subagentTools?.[1].toolName, 'Read');
+    assert.equal(task.subagentTools?.[1].toolResult?.content, 'file body');
+  });
+});
+
+test('an agent whose child session is not in the database keeps its card without a timeline', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: backgroundLaunchOutput });
+    await writeAgentMetadata(storageDir, 'sess_parent', 'agent_a', { status: 'completed' });
+
+    const { messages } = await new ZCodeSessionsProvider().fetchHistory('sess_parent');
+    const task = messages.find((message) => message.kind === 'tool_use');
+    assert.equal(task?.subagent?.status, 'completed');
+    assert.equal(task?.subagentTools, undefined);
   });
 });
 

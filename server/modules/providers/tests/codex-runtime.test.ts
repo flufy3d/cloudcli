@@ -985,6 +985,48 @@ test('an aborted run settles its running agents as stopped', async (t) => {
   assert.deepEqual(codexRuntime.listBackgroundWork(), []);
 });
 
+test('a failed turn settles its running agents as stopped before the failed complete', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'failed', error: { message: 'boom' } } });
+  });
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-failed', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'stopped');
+  const complete = messages.find((message) => message.kind === 'complete');
+  assert.ok(stopped && complete);
+  assert.equal(complete.exitCode, 1);
+  assert.ok(messages.indexOf(stopped) < messages.indexOf(complete));
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('a run that throws after an agent started settles it as stopped before the failed complete', async (t) => {
+  t.mock.method(codexAppServerTransport, 'open', async (handlers: CodexAppServerHandlers) => ({
+    async call(method: string) {
+      if (method === 'thread/start' || method === 'thread/resume') return { thread: { id: THREAD_ID } };
+      if (method === 'turn/start') {
+        handlers.onNotification?.('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity } as any);
+        throw new Error('turn/start rejected');
+      }
+      return {};
+    },
+    close() {},
+  }));
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-threw', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'stopped');
+  const complete = messages.find((message) => message.kind === 'complete');
+  assert.ok(stopped && complete);
+  assert.ok(messages.indexOf(stopped) < messages.indexOf(complete));
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
 test('an interrupted agent settles its card as stopped', async (t) => {
   installFakeAppServer(t, (server) => {
     const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);

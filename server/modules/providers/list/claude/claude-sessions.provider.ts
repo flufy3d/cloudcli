@@ -40,6 +40,7 @@ import {
   sanitizeLeafDirectoryName,
   sliceTailPage,
   stripAnsiSequences,
+  MAX_TRANSMITTED_SUBAGENT_ACTIVITIES,
   truncateSubagentActivity,
 } from '@/shared/utils.js';
 import { sessionsDb } from '@/modules/database/index.js';
@@ -62,16 +63,6 @@ const formatDuration = (milliseconds: number): string => {
   const seconds = Math.round(milliseconds / 1_000);
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 };
-
-/**
- * Upper bound on how much of a subagent's timeline is sent to the client. A
- * long-running agent can record hundreds of tool calls, and the transcript only
- * ever shows them behind a collapsed header, so shipping the whole history on
- * every load costs far more than it shows. The newest steps are the ones
- * kept: a running agent's timeline is polled for what it is doing now, and
- * the card says how many earlier ones were left out.
- */
-const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
 
 type ClaudeToolResult = {
   content: unknown;
@@ -1639,7 +1630,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
         timestamp: ts,
         provider: PROVIDER,
         kind: 'tool_use',
-        toolName: raw.toolName,
+        toolName: canonicalClaudeSubagentToolName(String(raw.toolName)),
         toolInput: raw.toolInput,
         toolId: raw.toolCallId || baseId,
       }));

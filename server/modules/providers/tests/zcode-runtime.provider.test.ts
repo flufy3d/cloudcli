@@ -1237,6 +1237,50 @@ test('a superseded run forwards nothing from the stream once a newer run owns th
   await protocolClient.sendRequest('session/stop', { sessionId: 'sess_stub_1' });
 });
 
+test('a setup failure in a new run releases its listener and hands the session back to the watcher', async (t) => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const first = createWriter();
+  await runtime.run('review it', { sessionId: 'app-sess-setup-fail', cwd: stubDir }, first.writer, context);
+  assert.equal(runtime.listBackgroundWork().length, 1, 'the agent outlives the first turn');
+
+  // Count the listeners attached to the engine session from here on.
+  const attached = new Set<unknown>();
+  const originalAdd = protocolClient.addSessionListener.bind(protocolClient);
+  const originalRemove = protocolClient.removeSessionListener.bind(protocolClient);
+  t.mock.method(protocolClient, 'addSessionListener', (sessionId: string, listener: unknown) => {
+    attached.add(listener);
+    return originalAdd(sessionId, listener as never);
+  });
+  t.mock.method(protocolClient, 'removeSessionListener', (sessionId: string, listener: unknown) => {
+    attached.delete(listener);
+    return originalRemove(sessionId, listener as never);
+  });
+
+  // The next run dies during setup (model catalog lookup), before any prompt.
+  const failing: ProviderRuntimeContext = {
+    ...context,
+    getProviderModels: async () => { throw new Error('catalog unavailable'); },
+  };
+  const second = createWriter();
+  await assert.rejects(
+    runtime.run('and again', { sessionId: 'app-sess-setup-fail', cwd: stubDir }, second.writer, failing),
+    /catalog unavailable/,
+  );
+
+  // The agent is still outstanding, so the watcher is back on the session and
+  // delivers its stop once, to the writer of the run that handed it over.
+  const deadline = Date.now() + 3000;
+  while (runtime.listBackgroundWork().length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(runtime.listBackgroundWork(), [], 'the stopped agent is retired');
+  assert.equal(second.messages.filter((m) => m.kind === 'task_status' && m.status === 'completed').length, 1);
+
+  // Once the watcher has stood down, nothing of the failed run still listens.
+  assert.equal(attached.size, 0, 'the failed run leaked its session listener');
+});
+
 // Last: both crash modes kill the shared stub subprocess.
 test('an engine crash settles the agents the watcher was waiting on as stopped, so no card spins', async () => {
   fsSync.writeFileSync(modeFilePath, 'subagent-bg-crash\n');

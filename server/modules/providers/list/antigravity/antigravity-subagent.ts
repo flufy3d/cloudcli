@@ -15,10 +15,21 @@
  * @module antigravity-subagent
  */
 
-import type { AnyRecord, NormalizedMessage } from '@/shared/types.js';
-import { SUBAGENT_TOOL_NAME, createNormalizedMessage, readObjectRecord, readOptionalString } from '@/shared/utils.js';
+import fs from 'node:fs';
+
+import type { AnyRecord, NormalizedMessage, SubagentInfo } from '@/shared/types.js';
+import {
+  SUBAGENT_TOOL_NAME,
+  createNormalizedMessage,
+  parseProviderJson,
+  readObjectRecord,
+  readOptionalString,
+  sanitizeLeafDirectoryName,
+} from '@/shared/utils.js';
 
 import { BackgroundWorkRegistry } from '../../shared/background-work/background-work-registry.js';
+
+import { getAntigravityTranscriptCandidates } from './antigravity-data-root.js';
 
 const PROVIDER = 'antigravity';
 
@@ -36,6 +47,8 @@ export const ANTIGRAVITY_SPAWN_TOOL = 'invoke_subagent';
  */
 export const antigravityBackgroundWork = new BackgroundWorkRegistry();
 
+let unindexedToolCounter = 0;
+
 /**
  * The id both transports must give one tool call.
  *
@@ -50,7 +63,10 @@ export const antigravityBackgroundWork = new BackgroundWorkRegistry();
  */
 export function buildAntigravityToolId(stepIndex: number | undefined, positionInEntry: number | null): string {
   if (stepIndex === undefined) {
-    return `tool_unindexed_${Date.now()}`;
+    // A counter, not the clock: two calls read in the same millisecond must
+    // not share an id.
+    unindexedToolCounter += 1;
+    return `tool_unindexed_${unindexedToolCounter}_${Date.now()}`;
   }
   return positionInEntry === null
     ? `tool_${stepIndex}`
@@ -83,10 +99,20 @@ export type AntigravityAgentSpec = {
   prompt?: string;
 };
 
-/** The card input for one agent: its role is both the card's type and its one-line description. */
+const MAX_CARD_DESCRIPTION_LENGTH = 100;
+
+/**
+ * The card input for one agent: its role is the card's type, and the first line
+ * of its prompt is the one-line description (the role again would print "Role /
+ * Role" in the header). An agent with no prompt falls back to its role.
+ */
 export function toAgentCardInput(spec: AntigravityAgentSpec): AnyRecord {
   const role = spec.role ?? 'Subagent';
-  return { subagent_type: role, description: role, prompt: spec.prompt ?? '' };
+  const firstLine = (spec.prompt ?? '').split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? '';
+  const description = firstLine.length > MAX_CARD_DESCRIPTION_LENGTH
+    ? `${firstLine.slice(0, MAX_CARD_DESCRIPTION_LENGTH - 1)}…`
+    : firstLine;
+  return { subagent_type: role, description: description || role, prompt: spec.prompt ?? '' };
 }
 
 /** One `Agent` row for an agent a call created. */
@@ -167,6 +193,23 @@ export function readInvokedAgentSpecs(args: unknown): AntigravityAgentSpec[] {
   });
 }
 
+/** The text a finished `invoke_subagent` call's receipt starts its agent list with. */
+export const SPAWN_RECEIPT_MARKER = 'Created the following subagents';
+
+/**
+ * The conversation ids the live run tracks for one call, in creation order,
+ * for a history read taken before the call's receipt was written. `sessionKeys`
+ * are the ids the runtime may have registered the session under.
+ */
+export function readTrackedAgentIds(callToolId: string, sessionKeys: string[]): string[] {
+  const prefix = `${callToolId}:`;
+  return antigravityBackgroundWork.list()
+    .filter((entry) => sessionKeys.includes(entry.sessionId))
+    .flatMap((entry) => entry.tasks)
+    .filter((task) => task.toolUseId.startsWith(prefix))
+    .map((task) => task.taskId);
+}
+
 const CONVERSATION_ID_PATTERN = /"conversationId"\s*:\s*"([^"]+)"/g;
 
 /**
@@ -192,4 +235,99 @@ export function readAgentReports(contents: Iterable<string>): Map<string, string
     }
   }
   return reports;
+}
+
+/** Rows of a transcript that are bookkeeping, never the agent's own last word. */
+const NON_OUTCOME_ROW_TYPES = new Set(['CHECKPOINT', 'SYSTEM_MESSAGE', 'EPHEMERAL_MESSAGE', 'CONVERSATION_HISTORY']);
+
+/** How much of a transcript's tail is read to judge how it ended. */
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+
+/**
+ * How an agent ended, from the last meaningful row of its own transcript:
+ * an engine error is `failed`; a planner reply that asks for no further tool
+ * is `completed`; anything else (a tool still running or just returned, no
+ * transcript at all) leaves the agent unfinished, which reads `stopped`.
+ */
+export function judgeAgentTranscriptRows(rows: AnyRecord[]): SubagentInfo['status'] {
+  const ordered = rows
+    .map((row, position) => ({ row, position }))
+    .sort((a, b) => {
+      const left = typeof a.row.step_index === 'number' ? a.row.step_index : Number.MAX_SAFE_INTEGER;
+      const right = typeof b.row.step_index === 'number' ? b.row.step_index : Number.MAX_SAFE_INTEGER;
+      return left - right || a.position - b.position;
+    })
+    .map((entry) => entry.row);
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const row = ordered[index];
+    const type = readOptionalString(row.type);
+    if (type && NON_OUTCOME_ROW_TYPES.has(type)) {
+      continue;
+    }
+    if (type === 'ERROR_MESSAGE') {
+      return 'failed';
+    }
+    const asksForTool = Array.isArray(row.tool_calls) && row.tool_calls.length > 0;
+    return type === 'PLANNER_RESPONSE' && readOptionalString(row.status) === 'DONE' && !asksForTool
+      ? 'completed'
+      : 'stopped';
+  }
+  return 'stopped';
+}
+
+/**
+ * The one judgement of how an agent ended, shared by the live settle at the
+ * turn result and the history reader, so a card reads the same either way.
+ * Reads the tail of the agent's own transcript in the brain directory by its
+ * conversation id (synchronously: the live settle runs inside the stdout
+ * handler and must finish before the turn's `complete`).
+ *
+ * `report` is the answer the agent sent its parent, when the parent's
+ * transcript holds one; it is proof of completion on its own.
+ */
+export function judgeAntigravityAgent(conversationId: string, report?: string): SubagentInfo['status'] {
+  if (report !== undefined) {
+    return 'completed';
+  }
+  let safeId: string;
+  try {
+    safeId = sanitizeLeafDirectoryName(conversationId, 'antigravity session id');
+  } catch {
+    return 'stopped';
+  }
+  const transcriptPath = getAntigravityTranscriptCandidates(safeId).find((candidate) => fs.existsSync(candidate));
+  if (!transcriptPath) {
+    return 'stopped';
+  }
+  let text: string;
+  try {
+    const size = fs.statSync(transcriptPath).size;
+    const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES);
+    const descriptor = fs.openSync(transcriptPath, 'r');
+    try {
+      const buffer = Buffer.alloc(size - start);
+      fs.readSync(descriptor, buffer, 0, buffer.length, start);
+      text = buffer.toString('utf8');
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    if (start > 0) {
+      // The cut can land mid-line; the first fragment is not a row.
+      text = text.slice(text.indexOf('\n') + 1);
+    }
+  } catch (error) {
+    console.error(`[AntigravitySubagent] Could not read the transcript of agent ${conversationId}:`, error);
+    return 'stopped';
+  }
+  const rows: AnyRecord[] = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const row = readObjectRecord(parseProviderJson(line));
+      if (row) rows.push(row);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+    }
+  }
+  return judgeAgentTranscriptRows(rows);
 }

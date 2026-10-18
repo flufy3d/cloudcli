@@ -59,9 +59,12 @@ import {
   buildAntigravityToolRowId,
   createAntigravityAgentRow,
   extractAntigravitySubagents,
+  judgeAntigravityAgent,
   parseCreatedSubagentIds,
+  readTrackedAgentIds,
   readAgentReports,
   readInvokedAgentSpecs,
+  SPAWN_RECEIPT_MARKER,
 } from './antigravity-subagent.js';
 import { readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
 
@@ -546,7 +549,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
             const spawnCall = nativeStepIndex === undefined
               ? undefined
               : spawnCalls.get(buildAntigravityToolId(nativeStepIndex, null));
-            if (spawnCall) {
+            if (spawnCall && !spawnCall.receipt && rawContent.includes(SPAWN_RECEIPT_MARKER)) {
               spawnCall.receipt = rawContent;
               continue;
             }
@@ -586,7 +589,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         }
       }
 
-      await this.settleSpawnCalls(sessionId, spawnCalls, canonicalRows.map((row) => readOptionalString(row.entry.content) ?? ''));
+      await this.settleSpawnCalls(sessionId, providerSessionId, spawnCalls, canonicalRows.map((row) => readOptionalString(row.entry.content) ?? ''));
 
       const total = normalizedMessages.length;
       const { page, hasMore } = sliceTailPage(normalizedMessages, limit, offset);
@@ -630,6 +633,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
    */
   private async settleSpawnCalls(
     sessionId: string,
+    providerSessionId: string,
     spawnCalls: Map<string, { rows: NormalizedMessage[]; receipt?: string }>,
     rawContents: string[],
   ): Promise<void> {
@@ -638,7 +642,13 @@ export class AntigravitySessionsProvider implements IProviderSessions {
     }
     const reports = readAgentReports(rawContents);
     for (const [callToolId, call] of spawnCalls) {
-      const conversationIds = parseCreatedSubagentIds(call.receipt ?? '');
+      // No receipt yet means the run that created these agents is still in
+      // flight: the live stream already named the cards by conversation id, so
+      // adopt those ids (and their running status) or a refresh would draw a
+      // second, differently named set.
+      const conversationIds = call.receipt === undefined
+        ? readTrackedAgentIds(callToolId, [sessionId, providerSessionId])
+        : parseCreatedSubagentIds(call.receipt);
       for (const [position, row] of call.rows.entries()) {
         const conversationId = conversationIds[position];
         if (conversationId) {
@@ -647,9 +657,16 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         }
         const input = readObjectRecord(row.toolInput);
         const report = conversationId ? reports.get(conversationId.toLowerCase()) : undefined;
-        const status: SubagentInfo['status'] = report !== undefined
-          ? 'completed'
-          : conversationId && antigravityBackgroundWork.has(conversationId) ? 'running' : 'stopped';
+        // One judgement for live and history: a report or the agent's own
+        // transcript says how it ended; an agent this server's `agy` still
+        // tracks is running until the turn result settles it.
+        const status: SubagentInfo['status'] = !conversationId
+          ? 'stopped'
+          : report !== undefined
+            ? 'completed'
+            : antigravityBackgroundWork.has(conversationId)
+              ? 'running'
+              : judgeAntigravityAgent(conversationId);
         const subagent: SubagentInfo = {
           id: conversationId ?? String(row.toolId),
           name: readOptionalString(input?.subagent_type),

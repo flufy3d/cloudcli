@@ -482,7 +482,7 @@ test('Codex history closes a still-running subagent when its turn was aborted', 
       const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
 
       assert.ok(task, 'the spawned agent must produce a Agent row');
-      assert.equal(task.subagent?.status, 'completed', 'an aborted turn must not leave the Agent card running forever');
+      assert.equal(task.subagent?.status, 'stopped', 'an aborted turn ends the agent without a result, as the live stream settles it');
       assert.ok(task.toolResult, 'the Agent card needs a result row to settle its spinner');
       assert.equal(task.toolResult?.isError, true, 'an agent the abort cut off did not finish its work');
     });
@@ -682,6 +682,7 @@ test('an interrupted subagent closes its Agent row instead of running forever', 
       assert.ok(task.toolResult, 'an interrupted subagent must not leave its card running');
       assert.match(String(task.toolResult?.content), /interrupted/i);
       assert.equal(task.toolResult?.isError, false);
+      assert.equal(task.subagent?.status, 'stopped', 'live settles an interrupted agent as stopped; history must agree');
     });
   } finally {
     restoreHomeDir();
