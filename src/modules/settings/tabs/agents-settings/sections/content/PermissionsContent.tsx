@@ -38,6 +38,9 @@ const COMMON_CURSOR_COMMANDS = [
   'Shell(node)',
 ];
 
+/** A saved legacy `Task` rule is the `Agent` rule: the CLI resolves one to the other. */
+const LEGACY_TOOL_ALIASES: Record<string, string> = { Agent: 'Task' };
+
 const addUnique = (items: string[], value: string): string[] => {
   const normalizedValue = value.trim();
   if (!normalizedValue || items.includes(normalizedValue)) {
@@ -72,6 +75,9 @@ function ClaudePermissions({
   const { t } = useTranslation('settings');
   const [newAllowedTool, setNewAllowedTool] = useState('');
   const [newDisallowedTool, setNewDisallowedTool] = useState('');
+
+  const isPresetAdded = (tool: string): boolean =>
+    allowedTools.includes(tool) || (LEGACY_TOOL_ALIASES[tool] !== undefined && allowedTools.includes(LEGACY_TOOL_ALIASES[tool]));
 
   const handleAddAllowedTool = (tool: string) => {
     const updated = addUnique(allowedTools, tool);
@@ -209,7 +215,7 @@ function ClaudePermissions({
                 variant="outline"
                 size="sm"
                 onClick={() => handleAddAllowedTool(tool)}
-                disabled={allowedTools.includes(tool)}
+                disabled={isPresetAdded(tool)}
                 className="h-8 text-xs"
               >
                 {tool}

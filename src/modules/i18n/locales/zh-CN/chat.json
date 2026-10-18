@@ -348,5 +348,18 @@
   "memory": {
     "used_one": "引用了 {{count}} 条记忆",
     "used_other": "引用了 {{count}} 条记忆"
+  },
+  "subagent": {
+    "status": {
+      "running": "运行中",
+      "done": "完成",
+      "failed": "失败",
+      "noResult": "无结果"
+    },
+    "noResultHint": "这个 agent 结束时没有交回结果，停止前可能已经改动了部分文件。",
+    "tools_one": "{{count}} 次工具调用",
+    "tools_other": "{{count}} 次工具调用",
+    "task": "任务",
+    "result": "结果"
   }
 }

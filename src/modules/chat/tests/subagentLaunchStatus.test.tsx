@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import React from 'react';
+import { fireEvent, render as mount, screen } from '@testing-library/react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { SubagentPanel } from '@/modules/chat/tools/SubagentPanel';
@@ -78,7 +79,7 @@ describe('a background agent card at the moment it launches', () => {
     );
 
     expect(markup).toContain('no result');
-    expect(markup).toContain('title="The run ended before this agent reported back"');
+    expect(markup).toContain('title="The agent ended without handing back a result. It may have made partial changes before it stopped."');
     expect(markup).not.toContain('running');
     expect(markup).not.toContain('done');
     expect(markup).not.toContain('lucide-circle-check');
@@ -98,5 +99,35 @@ describe('a background agent card at the moment it launches', () => {
     expect(render(launch, undefined, { status: 'completed', summary: 'Agent "Survey the repo" finished' })).toContain('done');
     expect(render(launch, undefined, { status: 'failed' })).toContain('failed');
     expect(render(launch, undefined, { status: 'stopped' })).toContain('no result');
+  });
+});
+
+describe('a launch the engine refused', () => {
+  const refused: ToolResult = {
+    content: 'Agent type \'nope\' not found. Available agents: Explore, Plan',
+    isError: true,
+    // Real refusals carry a plain string here, so no `subagent` is attached.
+    toolUseResult: 'Error: Agent type not found' as unknown as Record<string, unknown>,
+  };
+
+  it('shows failed, not done', () => {
+    const markup = render(refused);
+    expect(markup).toContain('failed');
+    expect(markup).not.toContain('done');
+  });
+
+  it('shows the refusal text as an error inside the opened panel', () => {
+    mount(React.createElement(SubagentPanel, {
+      toolInput: JSON.stringify({ subagent_type: 'nope', description: 'Survey' }),
+      toolResult: refused,
+      createDiff,
+    }));
+    fireEvent.click(screen.getByRole('button'));
+    expect(screen.getByText(/Available agents/)).toBeTruthy();
+    expect(document.querySelector('.border-red-500\\/30')).not.toBeNull();
+  });
+
+  it('lets a live or backend verdict still win over the error flag', () => {
+    expect(render(refused, { id: 'a1', status: 'stopped' })).toContain('no result');
   });
 });

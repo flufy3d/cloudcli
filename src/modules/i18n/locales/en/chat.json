@@ -433,5 +433,18 @@
   "memory": {
     "used_one": "Used {{count}} memory",
     "used_other": "Used {{count}} memories"
+  },
+  "subagent": {
+    "status": {
+      "running": "running",
+      "done": "done",
+      "failed": "failed",
+      "noResult": "no result"
+    },
+    "noResultHint": "The agent ended without handing back a result. It may have made partial changes before it stopped.",
+    "tools_one": "{{count}} tool",
+    "tools_other": "{{count}} tools",
+    "task": "Task",
+    "result": "Result"
   }
 }

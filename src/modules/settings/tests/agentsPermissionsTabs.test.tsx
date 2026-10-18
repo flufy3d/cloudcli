@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { test } from 'vitest';
 
 import '@/modules/i18n';
@@ -40,7 +40,7 @@ const authStatus = (installed: boolean): ProviderAuthStatus => ({
   loading: false,
 });
 
-const renderPermissionsTab = (provider: AgentProvider) => {
+const renderPermissionsTab = (provider: AgentProvider, allowedTools: string[] = []) => {
   const providerAuthStatus = Object.fromEntries(
     PROVIDERS.map((candidate) => [candidate, authStatus(candidate === provider)]),
   ) as Record<AgentProvider, ProviderAuthStatus>;
@@ -51,7 +51,7 @@ const renderPermissionsTab = (provider: AgentProvider) => {
     <AgentsSettingsTab
       providerAuthStatus={providerAuthStatus}
       onProviderLogin={() => {}}
-      claudePermissions={{ permissionMode: 'default', allowedTools: [], disallowedTools: [] }}
+      claudePermissions={{ permissionMode: 'default', allowedTools, disallowedTools: [] }}
       onClaudePermissionsChange={() => {}}
       cursorPermissions={{ skipPermissions: false, allowedCommands: [], disallowedCommands: [] }}
       onCursorPermissionsChange={() => {}}
@@ -89,4 +89,18 @@ test('每个提供商的权限标签都有内容', () => {
     );
     unmount();
   }
+});
+
+test('a saved legacy Task rule counts as the Agent preset already being added', () => {
+  // The CLI resolves a `Task` rule to `Agent`, so offering to add `Agent`
+  // again would leave two rules for one tool.
+  const withLegacy = renderPermissionsTab('claude', ['Task']);
+  const presetWithLegacy = within(withLegacy.pane).getByRole('button', { name: 'Agent' }) as HTMLButtonElement;
+  assert.equal(presetWithLegacy.disabled, true);
+  withLegacy.unmount();
+
+  const without = renderPermissionsTab('claude', []);
+  const preset = within(without.pane).getByRole('button', { name: 'Agent' }) as HTMLButtonElement;
+  assert.equal(preset.disabled, false);
+  without.unmount();
 });

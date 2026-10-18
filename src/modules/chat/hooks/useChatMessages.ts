@@ -111,8 +111,10 @@ function foldTaskStatus(
   // must not wipe the last one that named them.
   const agents = msg.agents?.length ? msg.agents : previous?.agents;
   liveTasksByToolUseId.set(toolUseId, {
-    // A settled status is final. Short of one, `started` and `progress` mean
-    // the task is running, while an `updated` patch that does not change the
+    // A settled status holds against `progress` and `updated`, but a later
+    // `started` revives the task: ZCode re-announces a resumed agent with
+    // `resumed: true`, and that card must run again. Short of a settled
+    // status, `started` and `progress` mean the task is running, while an `updated` patch that does not change the
     // status (an end time, say) leaves it where it was.
     status: settled ?? (msg.event === 'started' || msg.event === 'progress' ? 'running' : previous?.status ?? 'running'),
     taskId: msg.taskId ?? previous?.taskId,

@@ -1,10 +1,12 @@
 import { memo, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Bot, ChevronRight, CircleAlert, CircleCheck, CircleDashed } from 'lucide-react';
 
 import type { DiffLine, LiveTaskStatus, Project, SubagentActivity, SubagentInfo, ToolResult } from '@/shared/types';
 import { cn } from '@/shared/utils';
 import { SubagentTimeline } from '@/modules/chat/tools/SubagentTimeline';
 import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRenderContext';
+import { ToolErrorDisplay } from '@/modules/chat/tools/ToolErrorDisplay';
 import { MarkdownContent } from '@/modules/chat/tools/ContentRenderers/MarkdownContent';
 import { resolveBackgroundTaskStatus } from '@/modules/chat/utils/backgroundTasks';
 
@@ -85,6 +87,7 @@ export const SubagentPanel = memo(({
 }: SubagentPanelProps) => {
   // Collapsed by default: an agent is a summary of work, and its detail is
   // only wanted on demand.
+  const { t } = useTranslation('chat');
   const isExporting = useIsExportingTranscript();
   const [isOpen, setIsOpen] = useState(false);
   const showTimeline = isOpen || isExporting;
@@ -103,8 +106,11 @@ export const SubagentPanel = memo(({
   const isAsyncAgentLaunch = Boolean(
     (toolResult?.toolUseResult as { isAsync?: boolean } | undefined)?.isAsync,
   );
+  // A launch the engine refused (unknown agent type, say) comes back as an
+  // error result and starts nothing, so no backend or live word ever arrives:
+  // the error flag is the whole verdict.
   const status = resolveBackgroundTaskStatus(subagent?.status, taskStatus?.status)
-    ?? (toolResult && !isAsyncAgentLaunch ? 'completed' : 'running');
+    ?? (toolResult?.isError ? 'failed' : toolResult && !isAsyncAgentLaunch ? 'completed' : 'running');
   const toolCount = entries.filter((entry) => entry.kind === 'tool').length;
   // Claude names its agent presets (Explore, Plan); Codex has none, so the
   // neutral label carries and the assigned nickname shows alongside it.
@@ -137,24 +143,29 @@ export const SubagentPanel = memo(({
           {status === 'running' ? (
             <>
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-purple-500 dark:bg-purple-400" />
-              running
+              {t('subagent.status.running', 'running')}
             </>
           ) : status === 'failed' ? (
             <>
               <CircleAlert className="h-3 w-3" />
-              failed
+              {t('subagent.status.failed', 'failed')}
             </>
           ) : status === 'stopped' ? (
             // Neither a spinner nor a check mark: the agent never reported and
             // the process it ran in is gone, so there is no outcome to draw.
-            <span title="The run ended before this agent reported back" className="flex items-center gap-1">
+            <span
+              title={t('subagent.noResultHint', 'The agent ended without handing back a result. It may have made partial changes before it stopped.')}
+              className="flex items-center gap-1"
+            >
               <CircleDashed className="h-3 w-3" />
-              no result
+              {t('subagent.status.noResult', 'no result')}
             </span>
           ) : (
             <>
               <CircleCheck className="h-3 w-3" />
-              {toolCount > 0 ? `${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}` : 'done'}
+              {toolCount > 0
+                ? t('subagent.tools', { count: toolCount, defaultValue_one: '{{count}} tool', defaultValue_other: '{{count}} tools' })
+                : t('subagent.status.done', 'done')}
             </>
           )}
         </span>
@@ -168,7 +179,7 @@ export const SubagentPanel = memo(({
 
           {prompt && (
             <div className="rounded border border-border/40 bg-muted/40 p-2 text-xs text-muted-foreground">
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground/60">Task</div>
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground/60">{t('subagent.task', 'Task')}</div>
               <div className="line-clamp-6 whitespace-pre-wrap break-words">{prompt}</div>
             </div>
           )}
@@ -181,9 +192,11 @@ export const SubagentPanel = memo(({
             selectedProject={selectedProject}
           />
 
-          {resultText && (
+          {toolResult?.isError && status === 'failed' && resultText ? (
+            <ToolErrorDisplay label={t('messageTypes.error', 'Error')} content={resultText} />
+          ) : resultText && (
             <div className="rounded border border-border/40 bg-muted/30 p-2">
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground/60">Result</div>
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground/60">{t('subagent.result', 'Result')}</div>
               <MarkdownContent content={resultText} className="prose prose-sm max-w-none dark:prose-invert" />
             </div>
           )}
