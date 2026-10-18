@@ -66,7 +66,7 @@ flowchart TD
 
 ### 子 agent 卡片只认 `Agent`
 
-前端把工具名等于 `Agent` 的 `tool_use` 行渲染成子 agent 面板（`useChatMessages` 的 `isSubagentContainer`，常量来自 `shared/protocol/subagent.ts`），不按引擎分支，也不看 `Task`：`Task` 只指任务清单类工具。面板的状态先看历史行上的 `subagent`：它给出 `running` 以外的状态就是定论；否则看 `task_status` 事件（实时，按 `toolUseId` 折回这张卡）；两者都没有时才看工具结果：结果带错误标记（引擎拒绝了这次派发，例如 agent 类型不存在）读作 `failed`，其余有结果读作完成，没有结果读作运行中。状态文案和 `stopped` 的提示语走 `chat` 命名空间的 `subagent.*` 键。各引擎怎样把自家的派 agent 形态翻成 `Agent` 行、怎样保证结算，见 [providers.md](./providers.md)「子 agent 卡片」。
+前端把工具名等于 `Agent` 的 `tool_use` 行渲染成子 agent 面板（`useChatMessages` 的 `isSubagentContainer`，常量来自 `shared/protocol/subagent.ts`），不按引擎分支，也不看 `Task`：`Task` 只指任务清单类工具。面板的状态先看历史行上的 `subagent`：它给出 `running` 以外的状态就是定论；否则看 `task_status` 事件（实时，按 `toolUseId` 折回这张卡）；两者都没有时才看工具结果：结果带错误标记（引擎拒绝了这次派发，例如 agent 类型不存在）读作 `failed`，其余有结果读作完成，没有结果读作运行中。状态文案和 `stopped` 的提示语走 `chat` 命名空间的 `subagent.*` 键。面板的 `subagent`、`subagentActivity` 由转换函数从后端行的 `subagent`、`subagentTools` 原样带上；直播送来的、`parentToolUseId` 指向某张 `Agent` 卡的行（工具调用、定稿文本、思考，含对应工具结果）不进主线程，而是折成这张卡的时间线，历史行自带 `subagentTools` 时以历史为准。转换缓存按被折进的子行（含它们的结果）是否变化失效。各引擎怎样把自家的派 agent 形态翻成 `Agent` 行、怎样保证结算，见 [providers.md](./providers.md)「子 agent 卡片」。
 
 ## 断线恢复
 

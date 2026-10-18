@@ -4,7 +4,7 @@
  */
 
 import type { NormalizedMessage } from '@/modules/chat/hooks/useSessionStore';
-import type { ChatMessage , LiveTaskStatus } from '@/shared/types';
+import type { ChatMessage, LiveTaskStatus, SubagentActivity } from '@/shared/types';
 import { formatUsageLimitText } from '@/modules/chat/utils/chatFormatting';
 import { isSubagentToolName } from '@shared/protocol/subagent';
 
@@ -62,6 +62,42 @@ function parseTaskNotification(content: string): ParsedTaskNotification | null {
   };
 }
 
+/** Kinds of live row that can belong to a subagent's card. */
+const CHILD_ROW_KINDS: ReadonlySet<string> = new Set(['tool_use', 'tool_result', 'text', 'thinking', 'stream_delta', 'stream_end']);
+
+const NO_CHILD_ROWS: NormalizedMessage[] = [];
+
+function sameRows(a: NormalizedMessage[], b: NormalizedMessage[]): boolean {
+  return a.length === b.length && a.every((row, index) => Object.is(row, b[index]));
+}
+
+/**
+ * The timeline of a running agent, from the rows its stream delivered: the
+ * same shape the history reader gives a finished one, so a card reads the same
+ * live and after a refresh.
+ */
+function buildLiveActivity(rows: NormalizedMessage[], toolResultMap: Map<string, NormalizedMessage>): SubagentActivity[] {
+  const activity: SubagentActivity[] = [];
+  for (const row of rows) {
+    if (row.kind === 'tool_use') {
+      const result = row.toolResult ?? (row.toolId ? toolResultMap.get(row.toolId) : undefined);
+      activity.push({
+        kind: 'tool',
+        timestamp: row.timestamp,
+        toolId: row.toolId,
+        toolName: row.toolName,
+        toolInput: row.toolInput,
+        toolResult: result ? { content: formatToolResultContent(result.content), isError: Boolean(result.isError) } : null,
+      });
+    } else if (row.kind === 'text' && row.role !== 'user' && row.content?.trim()) {
+      activity.push({ kind: 'text', timestamp: row.timestamp, content: row.content });
+    } else if (row.kind === 'thinking' && row.content?.trim()) {
+      activity.push({ kind: 'thinking', timestamp: row.timestamp, content: row.content });
+    }
+  }
+  return activity;
+}
+
 /**
  * Per-row conversion cache. Conversion output for one NormalizedMessage is a
  * pure function of the row itself plus, for tool_use rows, the attached
@@ -73,6 +109,10 @@ function parseTaskNotification(content: string): ParsedTaskNotification | null {
 type ConversionCacheEntry = {
   /** Identity of whatever tool-result source fed this row's conversion. */
   attachedToolResult: unknown;
+  /** The live child rows folded into a subagent card, compared element by element. */
+  foldedChildRows: NormalizedMessage[];
+  /** The result each folded child tool call had when this entry was built. */
+  foldedResults?: Map<NormalizedMessage, NormalizedMessage | undefined>;
   /** Newest live task-status row folded into this row's projection, when any. */
   taskStatusSource: NormalizedMessage | null;
   outputs: ChatMessage[];
@@ -148,6 +188,22 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
   const liveTasksByToolUseId = new Map<string, LiveTaskStatus>();
   const toolUseIdByTaskId = new Map<string, string>();
   const lastTaskSourceByToolUseId = new Map<string, NormalizedMessage>();
+  // Subagent calls in this transcript, and the live rows their agents produced.
+  // A row naming one of these calls as its parent belongs to that agent's
+  // card, not to the main thread.
+  const agentCallIds = new Set<string>();
+  for (const msg of messages) {
+    if (msg.kind === 'tool_use' && msg.toolId && isSubagentToolName(msg.toolName)) {
+      agentCallIds.add(msg.toolId);
+    }
+  }
+  const childRowsByAgentCall = new Map<string, NormalizedMessage[]>();
+  for (const msg of messages) {
+    if (msg.parentToolUseId && agentCallIds.has(msg.parentToolUseId) && CHILD_ROW_KINDS.has(msg.kind)) {
+      const rows = childRowsByAgentCall.get(msg.parentToolUseId);
+      if (rows) rows.push(msg); else childRowsByAgentCall.set(msg.parentToolUseId, [msg]);
+    }
+  }
   for (const msg of messages) {
     if (msg.kind === 'tool_result' && msg.toolId) {
       toolResultMap.set(msg.toolId, msg);
@@ -164,6 +220,12 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
   }
 
   for (const msg of messages) {
+    if (msg.parentToolUseId && agentCallIds.has(msg.parentToolUseId) && CHILD_ROW_KINDS.has(msg.kind)) {
+      continue;
+    }
+    const foldedChildRows = msg.kind === 'tool_use' && msg.toolId
+      ? childRowsByAgentCall.get(msg.toolId) ?? NO_CHILD_ROWS
+      : NO_CHILD_ROWS;
     const attachedToolResult: unknown = msg.kind === 'tool_use'
       ? (msg.toolResult || (msg.toolId ? toolResultMap.get(msg.toolId) ?? null : null))
       : null;
@@ -172,13 +234,20 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
       : null;
 
     const cached = conversionCache.get(msg);
-    if (cached && Object.is(cached.attachedToolResult, attachedToolResult) && Object.is(cached.taskStatusSource, taskStatusSource)) {
+    if (
+      cached
+      && Object.is(cached.attachedToolResult, attachedToolResult)
+      && Object.is(cached.taskStatusSource, taskStatusSource)
+      && sameRows(cached.foldedChildRows, foldedChildRows)
+      && foldedChildRows.every((child) => Object.is(cached.foldedResults?.get(child), child.toolId ? toolResultMap.get(child.toolId) : undefined))
+    ) {
       converted.push(...cached.outputs);
       continue;
     }
 
-    const outputs = convertRow(msg, toolResultMap, liveTasksByToolUseId);
-    conversionCache.set(msg, { attachedToolResult, taskStatusSource, outputs });
+    const outputs = convertRow(msg, toolResultMap, liveTasksByToolUseId, foldedChildRows);
+    const foldedResults = new Map(foldedChildRows.map((child) => [child, child.toolId ? toolResultMap.get(child.toolId) : undefined]));
+    conversionCache.set(msg, { attachedToolResult, taskStatusSource, foldedChildRows, foldedResults, outputs });
     converted.push(...outputs);
   }
 
@@ -189,6 +258,7 @@ function convertRow(
   msg: NormalizedMessage,
   toolResultMap: Map<string, NormalizedMessage>,
   liveTasksByToolUseId: Map<string, LiveTaskStatus>,
+  foldedChildRows: NormalizedMessage[],
 ): ChatMessage[] {
   const outputs: ChatMessage[] = [];
 
@@ -279,6 +349,12 @@ function convertRow(
           toolId: msg.toolId,
           toolResult,
           isSubagentContainer,
+          // The agent's outcome and work: the history reader's record when the
+          // row carries one, else the child rows the live stream delivered.
+          subagent: msg.subagent,
+          subagentActivity: msg.subagentTools?.length
+            ? msg.subagentTools
+            : foldedChildRows.length > 0 ? buildLiveActivity(foldedChildRows, toolResultMap) : undefined,
           // The latest live word on this call's background work, folded from
           // the session's task_status events. Undefined once the transcript's
           // own settled record (subagent / workflow) takes over.
