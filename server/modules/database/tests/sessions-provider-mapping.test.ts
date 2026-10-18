@@ -66,7 +66,21 @@ test('app sessions get the provider id assigned without creating a duplicate row
     const row = sessionsDb.getSessionById('app-id-1');
     assert.equal(row?.provider_session_id, 'provider-xyz');
     assert.equal(row?.jsonl_path, '/fake/path/provider-xyz.jsonl');
-    assert.equal(row?.custom_name, 'Initial CloudCLI message');
+    // The row is unlocked, so the synced (engine-derived) name replaces the
+    // initial app name; only a user rename (name_locked) would keep it.
+    assert.equal(row?.custom_name, 'Synced Name');
+
+    sessionsDb.updateSessionCustomName('app-id-1', 'User rename', { lockName: true });
+    sessionsDb.createSession(
+      'provider-xyz',
+      'claude',
+      '/workspace/demo',
+      'Newer Synced Name',
+      undefined,
+      undefined,
+      '/fake/path/provider-xyz.jsonl',
+    );
+    assert.equal(sessionsDb.getSessionById('app-id-1')?.custom_name, 'User rename');
   });
 });
 

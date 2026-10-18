@@ -131,6 +131,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- id mid-run, or equals \`session_id\` for sessions discovered on disk.
     provider_session_id TEXT,
     custom_name TEXT,
+    -- 1 when the user renamed the session in the app: engine-generated titles
+    -- must never overwrite it. 0 (the default) means the name is app-derived
+    -- or engine-synced, so synchronizers keep following the engine's title.
+    name_locked INTEGER DEFAULT 0,
     project_path TEXT,
     jsonl_path TEXT,
     -- Model and reasoning effort this session runs with. Written when the user

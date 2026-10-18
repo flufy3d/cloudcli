@@ -475,6 +475,9 @@ export const sessionsService = {
       provider,
       projectPath: source.project_path ?? '',
       customName: sessionName,
+      // A typed fork title is user intent; the auto-derived "(fork)" name
+      // stays followable so the engine can replace it with its own.
+      nameLocked: Boolean(options.title?.trim()),
       providerSessionId: forked.providerSessionId,
       jsonlPath: forked.jsonlPath,
       forkedFromSessionId: sessionId,
@@ -868,6 +871,8 @@ export const sessionsService = {
 
   /**
    * Renames one session by id without requiring the caller to pass provider.
+   *
+   * A user rename locks the name: engine-generated titles never overwrite it.
    */
   renameSessionById(sessionId: string, summary: string): { sessionId: string; summary: string } {
     const session =
@@ -879,7 +884,7 @@ export const sessionsService = {
       });
     }
 
-    sessionsDb.updateSessionCustomName(session.session_id, summary);
+    sessionsDb.updateSessionCustomName(session.session_id, summary, { lockName: true });
     return { sessionId: session.session_id, summary };
   },
 

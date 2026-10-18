@@ -186,6 +186,70 @@ test('repository reads normalize SQLite UTC timestamps to ISO strings', async ()
   });
 });
 
+test('createSession lets an engine title replace an unlocked name and spares locked ones', async () => {
+  await withIsolatedDatabase(() => {
+    // App-created rows carry the initial first-sentence name and no lock, so
+    // the next synchronizer write may replace it with the engine's own title.
+    sessionsDb.createAppSession('app-unlocked', 'claude', '/workspace/demo-project', 'first sentence name');
+    sessionsDb.assignProviderSessionId('app-unlocked', 'prov-unlocked');
+    sessionsDb.createSession('prov-unlocked', 'claude', '/workspace/demo-project', 'Engine title');
+
+    assert.equal(sessionsDb.getSessionById('app-unlocked')?.custom_name, 'Engine title');
+    assert.equal(sessionsDb.getSessionById('app-unlocked')?.name_locked, 0);
+
+    // After the user renamed the session the lock is set; engine titles no
+    // longer win, in either upsert branch.
+    sessionsDb.updateSessionCustomName('app-unlocked', 'My own name', { lockName: true });
+
+    sessionsDb.createSession('prov-unlocked', 'claude', '/workspace/demo-project', 'Newer engine title');
+    assert.equal(sessionsDb.getSessionById('app-unlocked')?.custom_name, 'My own name');
+
+    // ON CONFLICT branch: the app row has no provider id yet, so indexing
+    // under its own id lands there.
+    sessionsDb.createAppSession('app-locked', 'claude', '/workspace/demo-project', 'first sentence name');
+    sessionsDb.updateSessionCustomName('app-locked', 'Renamed early', { lockName: true });
+    sessionsDb.createSession('app-locked', 'claude', '/workspace/demo-project', 'Engine title');
+
+    assert.equal(sessionsDb.getSessionById('app-locked')?.custom_name, 'Renamed early');
+  });
+});
+
+test('updateSessionCustomName only locks when asked', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createSession('session-codex-upgrade', 'codex', '/workspace/demo-project', 'Untitled Codex Session');
+
+    // The synchronizer's fallback-name upgrade must not mark the row as
+    // user-renamed — the engine title has to stay followable.
+    sessionsDb.updateSessionCustomName('session-codex-upgrade', 'Engine title');
+    assert.equal(sessionsDb.getSessionById('session-codex-upgrade')?.name_locked, 0);
+
+    sessionsDb.updateSessionCustomName('session-codex-upgrade', 'Renamed', { lockName: true });
+    assert.equal(sessionsDb.getSessionById('session-codex-upgrade')?.name_locked, 1);
+  });
+});
+
+test('createForkedSession locks the name only when the user typed one', async () => {
+  await withIsolatedDatabase(() => {
+    const baseInput = {
+      sessionId: 'unused',
+      provider: 'claude',
+      projectPath: '/workspace/demo-project',
+      customName: 'Fork name',
+      providerSessionId: 'prov-fork',
+      jsonlPath: '/transcripts/fork.jsonl',
+      forkedFromSessionId: 'source-session',
+      model: null,
+      effort: null,
+    } as const;
+
+    sessionsDb.createForkedSession({ ...baseInput, sessionId: 'fork-user-title', nameLocked: true });
+    sessionsDb.createForkedSession({ ...baseInput, sessionId: 'fork-auto-title', nameLocked: false });
+
+    assert.equal(sessionsDb.getSessionById('fork-user-title')?.name_locked, 1);
+    assert.equal(sessionsDb.getSessionById('fork-auto-title')?.name_locked, 0);
+  });
+});
+
 test('recent sessions are globally ordered, paginated, and limited to visible conversations', async () => {
   await withIsolatedDatabase(() => {
     const fixtures: Array<Parameters<typeof sessionsDb.createSession>> = [

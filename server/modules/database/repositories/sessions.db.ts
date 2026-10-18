@@ -10,6 +10,8 @@ type SessionRow = {
   project_path: string | null;
   jsonl_path: string | null;
   custom_name: string | null;
+  /** 1 when the user renamed the session; engine titles never overwrite it. */
+  name_locked: number;
   /** Model this session runs with; NULL until the app records one for it. */
   model: string | null;
   /** Reasoning effort this session runs with; NULL until the app records one for it. */
@@ -31,7 +33,7 @@ type RecentSessionsPage = {
 };
 
 const SESSION_ROW_COLUMNS =
-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, forked_from_session_id, worktree_path, worktree_branch, isArchived, created_at, updated_at';
+  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, name_locked, model, effort, forked_from_session_id, worktree_path, worktree_branch, isArchived, created_at, updated_at';
 
 /**
  * Archives the project row a session just moved away from, but only when it
@@ -108,9 +110,10 @@ export const sessionsDb = {
    * The given id is the provider-native session id. Rows are keyed by
    * `provider_session_id` so a session that was first created by the app
    * (with an app-allocated `session_id`) is updated in place once its
-   * transcript shows up on disk, instead of producing a duplicate row. An
-   * app-created row keeps its existing name; synchronizer names only update
-   * rows that were themselves created by indexing provider storage.
+   * transcript shows up on disk, instead of producing a duplicate row. The
+   * synchronizer's name wins on every rescan unless the row is locked —
+   * `name_locked = 1` marks a user rename, which no synchronizer may
+   * overwrite.
    */
   createSession(
     providerSessionId: string,
@@ -151,11 +154,11 @@ export const sessionsDb = {
            jsonl_path = ?,
            worktree_path = ?,
            worktree_branch = ?,
-           isArchived = CASE WHEN ? IS NULL OR updated_at IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
-           custom_name = CASE
-             WHEN session_id <> provider_session_id AND custom_name IS NOT NULL THEN custom_name
-             ELSE COALESCE(?, custom_name)
-           END
+          isArchived = CASE WHEN ? IS NULL OR updated_at IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
+          custom_name = CASE
+            WHEN name_locked = 1 THEN custom_name
+            ELSE COALESCE(?, custom_name)
+          END
          WHERE session_id = ?`
       ).run(
         provider,
@@ -200,7 +203,7 @@ export const sessionsDb = {
          worktree_branch = excluded.worktree_branch,
          isArchived = CASE WHEN ? IS NULL OR sessions.updated_at IS NULL OR julianday(excluded.updated_at) > julianday(sessions.updated_at) THEN 0 ELSE sessions.isArchived END,
          custom_name = CASE
-           WHEN sessions.session_id <> sessions.provider_session_id AND sessions.custom_name IS NOT NULL
+           WHEN sessions.name_locked = 1
              THEN sessions.custom_name
            ELSE COALESCE(excluded.custom_name, sessions.custom_name)
          END`
@@ -262,6 +265,8 @@ export const sessionsDb = {
     provider: string;
     projectPath: string;
     customName: string | null;
+    /** True when the fork name was typed by the user; locks it against engine titles. */
+    nameLocked: boolean;
     providerSessionId: string;
     jsonlPath: string;
     forkedFromSessionId: string;
@@ -280,13 +285,14 @@ export const sessionsDb = {
       db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
         .run(input.providerSessionId, input.sessionId);
       db.prepare(
-        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, forked_from_session_id, isArchived, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, name_locked, project_path, jsonl_path, model, effort, forked_from_session_id, isArchived, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
       ).run(
         input.sessionId,
         input.provider,
         input.providerSessionId,
         input.customName,
+        input.nameLocked ? 1 : 0,
         normalizedProjectPath,
         input.jsonlPath,
         input.model,
@@ -506,13 +512,24 @@ export const sessionsDb = {
     ).run(effort, sessionId);
   },
 
-  updateSessionCustomName(sessionId: string, customName: string): void {
+  /**
+   * Renames one session. Callers acting for the user (the rename API, the
+   * fork dialog's typed title) pass `lockName` so no synchronizer may
+   * overwrite the name afterwards; synchronizer-side name upgrades leave the
+   * lock untouched.
+   */
+  updateSessionCustomName(
+    sessionId: string,
+    customName: string,
+    options: { lockName?: boolean } = {}
+  ): void {
     const db = getConnection();
     db.prepare(
       `UPDATE sessions
-       SET custom_name = ?
+       SET custom_name = ?,
+           name_locked = CASE WHEN ? = 1 THEN 1 ELSE name_locked END
        WHERE session_id = ?`
-    ).run(customName, sessionId);
+    ).run(customName, options.lockName ? 1 : 0, sessionId);
   },
 
   getSessionById(sessionId: string): SessionRow | null {

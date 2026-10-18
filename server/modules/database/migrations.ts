@@ -476,6 +476,18 @@ const addSessionWorktreeColumns = (db: Database): void => {
   addColumnToTableIfNotExists(db, 'sessions', columnNames, 'worktree_branch', 'TEXT');
 };
 
+/**
+ * Adds the `name_locked` flag that marks sessions the user renamed in the app.
+ *
+ * Existing rows default to 0 (follow the engine) on purpose: names synced from
+ * engine storage before this column existed were engine-derived, and pre-existing
+ * first-sentence names should still be able to grow into engine titles.
+ */
+const addSessionNameLockedColumn = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'name_locked', 'INTEGER DEFAULT 0');
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -575,6 +587,7 @@ export const runMigrations = (db: Database) => {
     addSessionEffortColumn(db);
     addForkedFromSessionIdColumn(db);
     addSessionWorktreeColumns(db);
+    addSessionNameLockedColumn(db);
     ensureProjectsForSessionPaths(db);
     db.exec(SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL);
 
