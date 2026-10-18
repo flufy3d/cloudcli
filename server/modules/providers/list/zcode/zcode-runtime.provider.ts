@@ -514,6 +514,10 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * Detaches a run's listener from the engine session and, when agents it
    * launched are still running, leaves the lifecycle watcher behind so their
    * stops still reach the page and retire them from the background list.
+   *
+   * A superseded run leaves nothing behind: the newer run's listener owns
+   * the stream, and a watcher armed beside it would forward every lifecycle
+   * event twice.
    */
   private releaseSessionListener(
     handle: RunHandle,
@@ -521,7 +525,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     writer: ProviderRuntimeWriter,
   ): void {
     protocolClient.removeSessionListener(handle.sessionId, eventListener);
-    if (zcodeBackgroundWork.hasSession(handle.abortKey)) {
+    if (zcodeBackgroundWork.hasSession(handle.abortKey) && runLifecycle.isNewestRunForEngineSession(handle)) {
       this.armSubagentWatcher(handle.sessionId, handle.abortKey, writer);
     }
   }

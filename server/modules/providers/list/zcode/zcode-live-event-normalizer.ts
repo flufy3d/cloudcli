@@ -236,12 +236,19 @@ export function readZCodeSessionEvent(rawMessage: unknown, fallbackSessionId: st
   };
 }
 
-/** Whether an event type is one of the two subagent lifecycle events this module translates. */
+/**
+ * Whether an event type is one of the two subagent lifecycle events this
+ * module translates.
+ *
+ * Consumers: `normalize` (dispatch) and the runtime's subagent lifecycle
+ * watcher, which must forward exactly these and ignore the rest of the stream.
+ */
 export function isZCodeSubagentLifecycleEvent(type: string): boolean {
   return type === 'subagent_spawned' || type === 'subagent_stopped';
 }
 
-const readNonNegativeNumber = (value: unknown): number => {
+/** An engine-reported total as a usage figure: missing, invalid or negative reads as 0. */
+const readReportedTotal = (value: unknown): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 };
@@ -292,9 +299,9 @@ export function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): 
   const reported = readOptionalString(payload.status);
   const status = reported === 'completed' || reported === 'failed' ? reported : 'stopped';
   const usage: TaskUsage = {
-    totalTokens: readNonNegativeNumber(payload.totalTokens),
-    toolUses: readNonNegativeNumber(payload.totalToolUseCount),
-    durationMs: readNonNegativeNumber(payload.totalDurationMs),
+    totalTokens: readReportedTotal(payload.totalTokens),
+    toolUses: readReportedTotal(payload.totalToolUseCount),
+    durationMs: readReportedTotal(payload.totalDurationMs),
   };
   return build({
     event: 'notification',

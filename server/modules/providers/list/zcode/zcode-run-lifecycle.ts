@@ -265,6 +265,18 @@ export class ZCodeRunLifecycle {
     return this.runs.get(handle.abortKey) === handle;
   }
 
+  /**
+   * Whether no newer run has claimed this handle's engine session. A
+   * superseded run must not leave anything behind on the session — the
+   * newer run's listener owns the stream — so its wind-down checks this
+   * before arming the subagent watcher. True once the handle is disposed,
+   * since a disposed run was never replaced.
+   */
+  isNewestRunForEngineSession(handle: RunHandle): boolean {
+    const current = this.runsByEngineSession.get(handle.sessionId);
+    return current === undefined || current === handle;
+  }
+
   /** A readonly view of the run's terminal bookkeeping for reporting. */
   completionOf(handle: RunHandle): { failed: boolean; failedMessage?: string; tokenUsage?: number } {
     return {

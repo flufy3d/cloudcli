@@ -54,7 +54,7 @@ flowchart LR
 
 前端只为工具名为 `Task` 的调用渲染子 agent 面板（运行中/完成/失败状态、用量、agent 自己的时间线），卡片上的实时状态只认 `task_status` 事件，并按 `toolUseId` 折回派出 agent 的那次调用。Codex 和 ZCode 的引擎各有自己的派 agent 形态，适配器在边界把它们翻成这两样东西，前端零引擎分支。
 
-两家共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent，运行时切面的 `listBackgroundWork()` 直接返回它，供运行中会话轮询给输入框的后台工作条和侧栏使用。引擎进程活得比一轮对话久，agent 在 `complete` 之后还在跑，这张表就是页面知道"还没完"的唯一来源。
+两家共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent，运行时切面的 `listBackgroundWork()` 直接返回它，供运行中会话轮询给输入框的后台工作条和侧栏使用。引擎进程活得比一轮对话久，agent 在 `complete` 之后还在跑：开着的页面靠转发的 `task_status` 事件更新卡片，轮询靠这张表知道会话还有后台工作。
 
 **ZCode**：引擎的派 agent 工具叫 `Agent`，`normalizeZCodeToolName` 在实时流和历史读取两处统一改名为 `Task`。引擎把 `subagent_spawned` / `subagent_stopped` 发在**父会话**上（载荷带 `agentId`、`parentToolCallId`、描述、是否后台、结束状态和 `totalTokens` / `totalToolUseCount` / `totalDurationMs`），`normalizeZCodeSubagentLifecycleEvent` 翻成 `task_status`：spawned → `started`，stopped → `notification` 并带状态与用量；不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认这两种事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记；下一轮开始先撤掉它，由新一轮的监听器接管。历史重载读引擎的 agent 旁车 `cli/agents/<父会话>/<agentId>/metadata.json`（`getZCodeAgentSidecarDir`）：按 `parentToolUseId` 对上 Task 行，写入 `subagent`（类型、描述、状态、从子会话首条助手行取的模型）。旁车的 `completed` / `failed` 是定论；`running` 只在登记簿里仍有该 agent 时才算运行中，否则读作 `stopped`（进程没了，没人能再汇报）。
 

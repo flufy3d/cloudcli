@@ -235,11 +235,14 @@ rl.on('line', (line) => {
       send({ method: 'session/event', params: { sessionId, type: 'turn.failed', payload: { error: { message: 'provider auth failed', attribution: { statusCode: 401, reason: 'auth_failed' } } } } });
       return;
     }
-    if (readMode() === 'subagent-bg') {
+    if (readMode() === 'subagent-bg' || readMode() === 'subagent-bg-crash') {
       // A background agent: the engine announces the Agent call, reports the
       // spawn on the parent session once the child is ready, returns the
       // launch acknowledgement as the tool result and ends the turn. The
-      // agent keeps working and reports its stop well after the turn settled.
+      // agent keeps working and reports its stop well after the turn settled
+      // — or, in the crash variant, the engine dies with the agent still
+      // running and never reports.
+      const crash = readMode() === 'subagent-bg-crash';
       const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
       const agent = { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg' };
       ev('model_streaming', { kind: 'tool_call', toolCallId: 'call_agent_bg', toolName: 'Agent', input: { description: 'Review the fix', prompt: 'look', run_in_background: true, subagent_type: 'general-purpose' } });
@@ -247,6 +250,9 @@ rl.on('line', (line) => {
       ev('model_streaming', { kind: 'tool_result', toolCallId: 'call_agent_bg', result: { success: true, content: 'Async agent launched successfully.\\nagentId: agent_bg_1' } });
       ev('turn_complete', { usage: { inputTokens: 3, outputTokens: 4 } });
       setTimeout(() => {
+        if (crash) {
+          process.exit(1);
+        }
         ev('subagent_stopped', { ...agent, status: 'completed', totalDurationMs: 1500, totalToolUseCount: 2, totalTokens: 300 });
       }, 400);
       return;
@@ -1120,4 +1126,52 @@ test('a background agent shows as a running Task card, is listed as background w
   const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'completed');
   assert.equal(stopped?.toolUseId, 'call_agent_bg');
   assert.deepEqual(stopped?.usage, { totalTokens: 300, toolUses: 2, durationMs: 1500 });
+});
+
+test('a new run takes the session over from the lifecycle watcher: a late stop is forwarded exactly once', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const first = createWriter();
+  await runtime.run('review it', { sessionId: 'app-sess-handover', cwd: stubDir }, first.writer, context);
+  assert.equal(runtime.listBackgroundWork().length, 1, 'the agent outlives the first turn');
+  const forwardedToFirstAtHandover = first.messages.filter((message) => message.kind === 'task_status').length;
+
+  // The user sends again before the agent reports. The engine's stop lands
+  // either during this run (its listener owns the stream) or after it (the
+  // re-armed watcher does) — never through both, and never through the
+  // writer of the turn that is over.
+  fsSync.writeFileSync(modeFilePath, 'ok\n');
+  const second = createWriter();
+  await runtime.run('and again', { sessionId: 'app-sess-handover', cwd: stubDir }, second.writer, context);
+
+  const deadline = Date.now() + 3000;
+  while (runtime.listBackgroundWork().length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(runtime.listBackgroundWork(), [], 'the stopped agent is retired');
+
+  const settledInSecond = second.messages.filter((message) => message.kind === 'task_status' && message.status === 'completed');
+  assert.equal(settledInSecond.length, 1, 'the stop reaches the live writer once');
+  assert.equal(
+    first.messages.filter((message) => message.kind === 'task_status').length,
+    forwardedToFirstAtHandover,
+    'the superseded turn\'s writer receives nothing after the handover',
+  );
+});
+
+test('an engine crash retires the agents it was running and stands the watcher down', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg-crash\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+  await runtime.run('review it', { sessionId: 'app-sess-bg-crash', cwd: stubDir }, writer, context);
+  assert.equal(runtime.listBackgroundWork().length, 1, 'the agent is tracked once the turn ends');
+
+  // The engine dies with the agent still running. Nothing can report it any
+  // more, so it must leave the background list instead of spinning forever.
+  const deadline = Date.now() + 4000;
+  while (runtime.listBackgroundWork().length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(runtime.listBackgroundWork(), [], 'the dead engine\'s agent is retired');
+  assert.ok(!messages.some((message) => message.kind === 'task_status' && message.status === 'completed'), 'no completion is fabricated');
 });
