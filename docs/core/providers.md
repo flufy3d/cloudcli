@@ -172,9 +172,11 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 
 会话搬离后空掉的项目行由落库层收尾：`sessions.db.ts` 的孤儿归档只处理「自定义名等于目录名（即自动注册的默认名）且零活跃会话」的行，正式命名的项目永不自动归档，归档可逆。
 
-## 会话标题：改名锁
+## 会话标题：跟随引擎命名与改名锁
 
-会话名存在 `sessions.custom_name`，API 与推送一律以 `summary` 下发。用户在应用内改名（侧边栏铅笔、标题双击，经 `renameSessionById`）时该行置 `name_locked=1`：落库层的 upsert 从此不再动这个名，任何同步器都覆盖不了。fork 时用户手填的标题同样上锁，自动拼的「(fork)」名不上。其余行（首句自动名、同步器写的名）保持 `name_locked=0`。
+会话名存在 `sessions.custom_name`，API 与推送一律以 `summary` 下发。各家引擎自己会给会话起智能标题（claude 的 `ai-title`/`custom-title`、codex 索引里的 `thread_name`、zcode / opencode / antigravity 共享库的 `title` 列），同步器每次扫描都能读到它；但读到的不一定落库，裁决统一走 `shared/sessions/session-title-resolution.ts`：上锁的行永远用用户的名；未锁的行跟随引擎生成的标题（即使覆盖掉之前同步来的名）；内容派生名（claude 的 `last-prompt`、opencode 的首条消息兜底、cursor 的首条消息）只在「无名 / 占位名」时补位，绝不追着跑——否则标题会随每轮对话漂移。
+
+用户在应用内改名（侧边栏铅笔、标题双击，经 `renameSessionById`）时该行置 `name_locked=1`：落库层 upsert 从此不再动这个名，任何同步器都覆盖不了。fork 时用户手填的标题同样上锁，自动拼的「(fork)」名不上。两处引擎侧细节：codex 每次给会话改名都向 `session_index.jsonl` 追加一条新记录，读取必须取「每个 id 的最后一条」；zcode 生成标题时更新 `time_title_updated`，行时间戳要并入该列，否则增量游标会漏掉「只改了标题、消息活动没动」的行。cursor 是唯一没有引擎标题的一家，维持首条消息派生命名的现状。
 
 ## 引擎自有数据根
 

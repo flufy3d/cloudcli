@@ -526,8 +526,8 @@ const seedOpenCodeSession = async (
   const db = new Database(path.join(dataDir, 'opencode.db'));
   try {
     db.exec(`
-      CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
-      CREATE TABLE session (
+      CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT);
+      CREATE TABLE IF NOT EXISTS session (
         id TEXT PRIMARY KEY,
         project_id TEXT,
         parent_id TEXT,
@@ -537,21 +537,21 @@ const seedOpenCodeSession = async (
         time_updated INTEGER,
         time_archived INTEGER
       );
-      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
-      CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+      CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+      CREATE TABLE IF NOT EXISTS part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
     `);
 
-    db.prepare('INSERT INTO project (id, worktree) VALUES (?, ?)').run('project-1', workspacePath);
+    db.prepare('INSERT OR IGNORE INTO project (id, worktree) VALUES (?, ?)').run('project-1', workspacePath);
     db.prepare(`
       INSERT INTO session (id, project_id, directory, title, time_created, time_updated, time_archived)
       VALUES (?, ?, ?, ?, ?, ?, NULL)
     `).run(options.sessionId, 'project-1', workspacePath, options.title, 1_700_000_000_000, 1_700_000_001_000);
     db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)')
-      .run('message-user', options.sessionId, 1_700_000_001_000, JSON.stringify({ role: 'user' }));
+      .run(`message-user-${options.sessionId}`, options.sessionId, 1_700_000_001_000, JSON.stringify({ role: 'user' }));
     db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)')
       .run(
-        'part-user',
-        'message-user',
+        `part-user-${options.sessionId}`,
+        `message-user-${options.sessionId}`,
         options.sessionId,
         1_700_000_001_000,
         // OpenCode persists the prompt as a JSON string literal inside the text
@@ -563,7 +563,7 @@ const seedOpenCodeSession = async (
   }
 };
 
-test('OpenCode synchronizer preserves the title assigned when CloudCLI creates a session', { concurrency: false }, async () => {
+test('OpenCode synchronizer follows the stored title unless the app session is user-locked', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-app-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
@@ -576,13 +576,24 @@ test('OpenCode synchronizer preserves the title assigned when CloudCLI creates a
       title: 'OpenCode generated title',
       firstUserText: 'OpenCode first user prompt',
     });
+    await seedOpenCodeSession(tempRoot, workspacePath, {
+      sessionId: 'oc-app-2',
+      title: 'OpenCode generated title',
+      firstUserText: 'OpenCode first user prompt',
+    });
     await withIsolatedDatabase(async () => {
       sessionsDb.createAppSession('app-1', 'opencode', workspacePath, 'Fix the checkout crash');
       sessionsDb.assignProviderSessionId('app-1', 'oc-app-1');
+      sessionsDb.createAppSession('app-2', 'opencode', workspacePath, 'Fix the checkout crash');
+      sessionsDb.assignProviderSessionId('app-2', 'oc-app-2');
+      sessionsDb.updateSessionCustomName('app-2', 'My rename', { lockName: true });
 
       await new OpenCodeSessionSynchronizer().synchronize();
 
-      assert.equal(sessionsDb.getSessionById('app-1')?.custom_name, 'Fix the checkout crash');
+      // The engine's own title replaces the unlocked initial app name…
+      assert.equal(sessionsDb.getSessionById('app-1')?.custom_name, 'OpenCode generated title');
+      // …but never a user rename.
+      assert.equal(sessionsDb.getSessionById('app-2')?.custom_name, 'My rename');
     });
   } finally {
     restoreHomeDir();

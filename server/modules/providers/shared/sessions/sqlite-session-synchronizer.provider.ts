@@ -5,8 +5,8 @@
  * SQLite database (zcode, antigravity, opencode). It owns the scan skeleton
  * the three implementations used to duplicate: watch-file filtering, the
  * high-water-mark incremental cursor, the short read-only connection
- * discipline, the pending-app-session binding protocol, custom-name
- * preservation, and the createSession upsert.
+ * discipline, the pending-app-session binding protocol, session-title
+ * resolution (lock/generated protocol), and the createSession upsert.
  *
  * Adapters contribute only what is genuinely provider-specific: the database
  * path, the row-selection SQL, and the row → session-metadata mapping.
@@ -26,6 +26,7 @@ import { normalizeProviderTimestamp, normalizeSessionName, readOptionalString } 
 
 import { admitsWorkspacePath } from './workspace-admission.js';
 import { applySessionWorktreePlacement } from './session-worktree-placement.js';
+import { resolveSessionTitle, type DerivedSessionTitle } from './session-title-resolution.js';
 
 /**
  * Minimal row contract every adapter's SQL must satisfy; adapters declare
@@ -128,9 +129,12 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
 
   /**
    * Title derived from the provider row. `db` is open for adapters that fall
-   * back to reading session content (opencode's first user text).
+   * back to reading session content (opencode's first user text). Adapters
+   * mark whether the title is engine-generated (the engine's own naming) or
+   * merely content-derived — only generated titles may replace an existing
+   * synced name.
    */
-  protected abstract deriveSessionName(db: Database.Database, row: Row): string | null;
+  protected abstract deriveSessionName(db: Database.Database, row: Row): DerivedSessionTitle;
 
   /**
    * Extracts the provider-native session id from a row. Adapters may override
@@ -193,9 +197,9 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
   }
 
   /**
-   * Upserts one provider row: binds pending app sessions, preserves custom
-   * names, resolves the worktree placement, and writes the normalized session
-   * row.
+   * Upserts one provider row: binds pending app sessions, resolves the title
+   * against the lock/generated protocol, resolves the worktree placement, and
+   * writes the normalized session row.
    */
   private async upsertSession(db: Database.Database, row: Row): Promise<string | null> {
     const sessionId = this.getSessionId(row);
@@ -214,8 +218,15 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
 
     this.bindPendingAppSession(sessionId, projectPath);
 
-    const derivedName = this.deriveSessionName(db, row);
-    const nextName = this.resolveSessionName(sessionId, derivedName);
+    const derivedTitle = this.deriveSessionName(db, row);
+    const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId)
+      ?? sessionsDb.getSessionById(sessionId);
+    const nextName = resolveSessionTitle({
+      nameLocked: existingSession?.name_locked === 1,
+      existingName: existingSession?.custom_name,
+      fallbackTitle: this.fallbackTitle,
+      derived: derivedTitle,
+    });
     const { createdAtMs, updatedAtMs } = this.getRowTimestampsMs(row);
     const placement = await applySessionWorktreePlacement(projectPath);
 
@@ -248,21 +259,6 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
     if (pendingAppSession && !pendingAppSession.provider_session_id) {
       sessionsDb.assignProviderSessionId(pendingAppSession.session_id, sessionId);
     }
-  }
-
-  /**
-   * Preserves an existing custom session name; otherwise uses the derived
-   * name (adapters may fall back to content, e.g. opencode's first user text).
-   */
-  private resolveSessionName(sessionId: string, derivedName: string | null): string | null {
-    const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId)
-      ?? sessionsDb.getSessionById(sessionId);
-    const existingName = existingSession?.custom_name;
-
-    if (existingName && existingName !== this.fallbackTitle) {
-      return existingName;
-    }
-    return derivedName ?? this.fallbackTitle;
   }
 
   /**

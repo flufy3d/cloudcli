@@ -147,8 +147,10 @@ export class AntigravitySessionSynchronizer extends SqliteSessionSynchronizer<An
     return isTopLevelConversation(row) ? super.getSessionId(row) : null;
   }
 
-  protected deriveSessionName(_db: Database.Database, row: AntigravitySummaryRow): string | null {
-    return readOptionalString(row.title) ?? null;
+  protected deriveSessionName(_db: Database.Database, row: AntigravitySummaryRow) {
+    const title = readOptionalString(row.title) ?? null;
+    // Antigravity maintains the summary title itself; it is engine naming.
+    return { name: title, generated: title !== null };
   }
 
   /**

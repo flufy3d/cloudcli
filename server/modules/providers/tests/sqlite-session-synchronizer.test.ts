@@ -14,6 +14,8 @@ import { workspaceFixturePath } from './workspace-fixture.js';
 type FixtureRow = {
   id: string;
   title: string | null;
+  /** 1 when `title` stands for a content-derived name the engine did not generate. */
+  derived?: number;
   updated_ms: number;
 };
 
@@ -36,7 +38,7 @@ class FixtureSynchronizer extends SqliteSessionSynchronizer<FixtureRow> {
     limit: number | null,
   ): FixtureRow[] {
     return db.prepare(`
-      SELECT id, title, updated_ms
+      SELECT id, title, derived, updated_ms
       FROM session
       WHERE (? IS NULL OR updated_ms > ?)
       ORDER BY updated_ms DESC
@@ -54,8 +56,8 @@ class FixtureSynchronizer extends SqliteSessionSynchronizer<FixtureRow> {
     return row.id === 'no-project' ? null : fixtureWorkspacePath(row.id);
   }
 
-  protected deriveSessionName(_db: Database.Database, row: FixtureRow): string | null {
-    return row.title;
+  protected deriveSessionName(_db: Database.Database, row: FixtureRow) {
+    return { name: row.title, generated: row.title !== null && !row.derived };
   }
 }
 
@@ -95,10 +97,10 @@ async function createFixtureDatabase(directory: string, rows: FixtureRow[]): Pro
   const dbPath = path.join(directory, 'fixture.db');
   const db = new Database(dbPath);
   try {
-    db.exec('CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, updated_ms INTEGER)');
-    const insert = db.prepare('INSERT INTO session (id, title, updated_ms) VALUES (?, ?, ?)');
+    db.exec('CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, derived INTEGER DEFAULT 0, updated_ms INTEGER)');
+    const insert = db.prepare('INSERT INTO session (id, title, derived, updated_ms) VALUES (?, ?, ?, ?)');
     for (const row of rows) {
-      insert.run(row.id, row.title, row.updated_ms);
+      insert.run(row.id, row.title, row.derived ?? 0, row.updated_ms);
       await mkdir(fixtureWorkspacePath(row.id), { recursive: true });
     }
   } finally {
@@ -169,6 +171,57 @@ test('scan upserts rows, keeps custom names, and reports the first session id', 
       // after the provider id was bound to it.
       const sessionB = sessionsDb.getSessionByProviderSessionId('sess_b');
       assert.equal(sessionB?.custom_name, 'My custom name');
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a generated engine title replaces an unlocked name and spares a locked one', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'sqlite-synchronizer-'));
+  const dbPath = await createFixtureDatabase(tempDir, [
+    { id: 'sess_follow', title: 'Fresh engine title', updated_ms: 4_000 },
+    { id: 'sess_locked', title: 'Fresh engine title', updated_ms: 5_000 },
+  ]);
+
+  try {
+    await withIsolatedDatabase(async () => {
+      // Both rows already carry a real (non-fallback) name from an earlier
+      // sync; the second one was renamed by the user and is locked.
+      sessionsDb.createSession('sess_follow', 'zcode', fixtureWorkspacePath('sess_follow'), 'Old synced name');
+      sessionsDb.createSession('sess_locked', 'zcode', fixtureWorkspacePath('sess_locked'), 'Old synced name');
+      sessionsDb.updateSessionCustomName('sess_locked', 'My rename', { lockName: true });
+
+      const synchronizer = new FixtureSynchronizer(dbPath);
+      await synchronizer.synchronize();
+
+      assert.equal(sessionsDb.getSessionByProviderSessionId('sess_follow')?.custom_name, 'Fresh engine title');
+      assert.equal(sessionsDb.getSessionByProviderSessionId('sess_locked')?.custom_name, 'My rename');
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a content-derived name never overwrites an existing name but fills empty ones', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'sqlite-synchronizer-'));
+  const dbPath = await createFixtureDatabase(tempDir, [
+    { id: 'sess_derived_real', title: 'Derived from content', derived: 1, updated_ms: 4_000 },
+    { id: 'sess_derived_fallback', title: 'Derived from content', derived: 1, updated_ms: 5_000 },
+  ]);
+
+  try {
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession('sess_derived_real', 'zcode', fixtureWorkspacePath('sess_derived_real'), 'Earlier real name');
+      sessionsDb.createSession('sess_derived_fallback', 'zcode', fixtureWorkspacePath('sess_derived_fallback'), 'Untitled Fixture');
+
+      const synchronizer = new FixtureSynchronizer(dbPath);
+      await synchronizer.synchronize();
+
+      // The derived name may not drift an existing real name…
+      assert.equal(sessionsDb.getSessionByProviderSessionId('sess_derived_real')?.custom_name, 'Earlier real name');
+      // …but it does replace the placeholder.
+      assert.equal(sessionsDb.getSessionByProviderSessionId('sess_derived_fallback')?.custom_name, 'Derived from content');
     });
   } finally {
     await rm(tempDir, { recursive: true, force: true });

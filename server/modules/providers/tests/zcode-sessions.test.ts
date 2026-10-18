@@ -1127,14 +1127,15 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
           directory TEXT,
           title TEXT,
           time_created INTEGER,
-          time_updated INTEGER
+          time_updated INTEGER,
+          time_title_updated INTEGER
         )
       `);
       const insertSession = db.prepare(
-        'INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_title_updated) VALUES (?, ?, ?, ?, ?, ?, ?)',
       );
-      insertSession.run('sess_sync', null, workspaceDir, 'Fixture session', 1000, 2000);
-      insertSession.run('sess_subagent_agent_x', 'sess_sync', workspaceDir, 'Subagent', 9000, 9500);
+      insertSession.run('sess_sync', null, workspaceDir, 'Fixture session', 1000, 2000, null);
+      insertSession.run('sess_subagent_agent_x', 'sess_sync', workspaceDir, 'Subagent', 9000, 9500, null);
     } finally {
       db.close();
     }

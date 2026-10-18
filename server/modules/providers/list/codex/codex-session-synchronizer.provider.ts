@@ -16,6 +16,7 @@ import type { ProviderSessionWatchTarget } from '@/shared/types.js';
 
 import { admitsWorkspacePath } from '../../shared/sessions/workspace-admission.js';
 import { applySessionWorktreePlacement } from '../../shared/sessions/session-worktree-placement.js';
+import { resolveSessionTitle } from '../../shared/sessions/session-title-resolution.js';
 
 type ParsedSession = {
   sessionId: string;
@@ -46,7 +47,9 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
    * Scans ~/.codex/sessions and upserts discovered sessions into DB.
    */
   async synchronize(since?: Date): Promise<number> {
-    const nameMap = await buildLookupMap(path.join(this.codexHome, 'session_index.jsonl'), 'id', 'thread_name');
+    // Codex appends a new record to the index whenever it (re)names a thread,
+    // so the last record per id is the engine's current title.
+    const nameMap = await buildLookupMap(path.join(this.codexHome, 'session_index.jsonl'), 'id', 'thread_name', 'last');
     const files = await findFilesRecursivelyCreatedAfter(
       path.join(this.codexHome, 'sessions'),
       '.jsonl',
@@ -58,15 +61,6 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
       const parsed = await this.processSessionFile(filePath, nameMap);
       if (!parsed) {
         continue;
-      }
-
-      const existingSession = sessionsDb.getSessionByProviderSessionId(parsed.sessionId)
-        ?? sessionsDb.getSessionById(parsed.sessionId);
-      if (existingSession) {
-        // If session name is untitled and we now have a name, update it
-        if (existingSession.custom_name === 'Untitled Codex Session' && parsed.sessionName && parsed.sessionName !== 'Untitled Codex Session') {
-          sessionsDb.updateSessionCustomName(existingSession.session_id, parsed.sessionName);
-        }
       }
 
       const timestamps = await readFileTimestamps(filePath);
@@ -95,7 +89,7 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
       return null;
     }
 
-    const nameMap = await buildLookupMap(path.join(this.codexHome, 'session_index.jsonl'), 'id', 'thread_name');
+    const nameMap = await buildLookupMap(path.join(this.codexHome, 'session_index.jsonl'), 'id', 'thread_name', 'last');
     const parsed = await this.processSessionFile(filePath, nameMap);
     if (!parsed) {
       return null;
@@ -158,26 +152,29 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
       return null;
     }
 
-    // App-created sessions are keyed by an app id, so disk-discovered provider
-    // ids must be resolved through the provider-id mapping first.
-    const existingSession = sessionsDb.getSessionByProviderSessionId(parsed.sessionId)
-      ?? sessionsDb.getSessionById(parsed.sessionId);
-    const existingSessionName = existingSession?.custom_name;
-    if (existingSessionName && existingSessionName !== 'Untitled Codex Session') {
-      return {
-        ...parsed,
-        sessionName: normalizeSessionName(existingSessionName, 'Untitled Codex Session'),
-      };
-    }
-
-    let sessionName = nameMap.get(parsed.sessionId);
+    // `thread_name` in the index is Codex's own (re)name for the thread and is
+    // followed on every rescan; the trailing agent message is only a
+    // content-derived placeholder that fills a nameless row.
+    const threadName = nameMap.get(parsed.sessionId);
+    let sessionName = threadName;
     if (!sessionName) {
       sessionName = await this.extractLastAgentMessageFromEnd(filePath);
     }
 
+    // App-created sessions are keyed by an app id, so disk-discovered provider
+    // ids must be resolved through the provider-id mapping first.
+    const existingSession = sessionsDb.getSessionByProviderSessionId(parsed.sessionId)
+      ?? sessionsDb.getSessionById(parsed.sessionId);
+    const resolvedName = resolveSessionTitle({
+      nameLocked: existingSession?.name_locked === 1,
+      existingName: existingSession?.custom_name,
+      fallbackTitle: 'Untitled Codex Session',
+      derived: { name: sessionName ?? null, generated: Boolean(threadName) },
+    });
+
     return {
       ...parsed,
-      sessionName: normalizeSessionName(sessionName, 'Untitled Codex Session'),
+      sessionName: normalizeSessionName(resolvedName ?? undefined, 'Untitled Codex Session'),
     };
   }
 

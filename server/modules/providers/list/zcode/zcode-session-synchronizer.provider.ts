@@ -12,6 +12,8 @@ type ZCodeSessionRow = {
   title: string | null;
   time_created: number | null;
   time_updated: number | null;
+  /** Set when ZCode's own title generation (re)named the session. */
+  time_title_updated: number | null;
 };
 
 /**
@@ -20,7 +22,8 @@ type ZCodeSessionRow = {
  * Contributes ZCode's row mapping to the shared SQLite synchronizer skeleton:
  * top-level sessions only (`parent_id IS NULL`), sub-agent sessions filtered
  * out, ZCode-generated titles used directly, and the workspace `directory` as
- * project path.
+ * project path. Row recency folds in `time_title_updated` so a late generated
+ * title re-syncs even when message activity has gone quiet.
  */
 export class ZCodeSessionSynchronizer extends SqliteSessionSynchronizer<ZCodeSessionRow> {
   protected readonly fallbackTitle = 'Untitled ZCode Session';
@@ -46,11 +49,12 @@ export class ZCodeSessionSynchronizer extends SqliteSessionSynchronizer<ZCodeSes
         s.directory AS directory,
         s.title AS title,
         s.time_created AS time_created,
-        s.time_updated AS time_updated
+        s.time_updated AS time_updated,
+        s.time_title_updated AS time_title_updated
       FROM session s
       WHERE s.parent_id IS NULL
         AND s.id NOT LIKE 'sess_subagent_agent_%'
-        AND (? IS NULL OR s.time_updated > ?)
+        AND (? IS NULL OR MAX(s.time_updated, COALESCE(s.time_title_updated, s.time_updated)) > ?)
       ORDER BY s.time_updated DESC, s.id DESC
       ${limit === null ? '' : 'LIMIT ?'}
     `).all(...(limit === null
@@ -61,7 +65,10 @@ export class ZCodeSessionSynchronizer extends SqliteSessionSynchronizer<ZCodeSes
   protected getRowTimestampsMs(row: ZCodeSessionRow): { createdAtMs: number; updatedAtMs: number } {
     return {
       createdAtMs: row.time_created ?? 0,
-      updatedAtMs: row.time_updated ?? row.time_created ?? 0,
+      updatedAtMs: Math.max(
+        row.time_updated ?? row.time_created ?? 0,
+        row.time_title_updated ?? 0,
+      ),
     };
   }
 
@@ -69,8 +76,11 @@ export class ZCodeSessionSynchronizer extends SqliteSessionSynchronizer<ZCodeSes
     return readOptionalString(row.directory) ?? null;
   }
 
-  protected deriveSessionName(_db: Database.Database, row: ZCodeSessionRow): string | null {
-    return readOptionalString(row.title) ?? null;
+  protected deriveSessionName(_db: Database.Database, row: ZCodeSessionRow) {
+    const title = readOptionalString(row.title) ?? null;
+    // ZCode's `title` is the engine's own naming (first_input at first, then
+    // its generated title); whatever it currently says is what we follow.
+    return { name: title, generated: title !== null };
   }
 
   /**

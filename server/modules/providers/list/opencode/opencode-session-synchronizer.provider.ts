@@ -115,8 +115,14 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
     return readOptionalString(row.directory) ?? readOptionalString(row.worktree) ?? null;
   }
 
-  protected deriveSessionName(db: Database.Database, row: OpenCodeSessionRow): string | null {
-    return readOptionalString(row.title) ?? this.readFirstUserText(db, row.id) ?? null;
+  protected deriveSessionName(db: Database.Database, row: OpenCodeSessionRow) {
+    const title = readOptionalString(row.title) ?? null;
+    if (title !== null) {
+      return { name: title, generated: true };
+    }
+    // No engine title yet: the first user text is only a placeholder, not a
+    // name the engine generated, so it never replaces an existing synced name.
+    return { name: this.readFirstUserText(db, row.id) ?? null, generated: false };
   }
 
   /**

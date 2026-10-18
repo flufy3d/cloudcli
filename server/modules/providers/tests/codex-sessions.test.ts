@@ -155,6 +155,99 @@ test('Codex synchronizer leaves indexed sessions untitled when no name is availa
   }
 });
 
+test('Codex synchronizer follows the engine rename recorded last in session_index.jsonl', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-rename-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeCodexTranscript(tempRoot, 'codex-rename-1', workspacePath);
+    // Codex appends one record when the thread is created and another when its
+    // AI title lands seconds later; the last record is the current name.
+    const codexHome = path.join(tempRoot, '.codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      path.join(codexHome, 'session_index.jsonl'),
+      [
+        JSON.stringify({ id: 'codex-rename-1', thread_name: 'hello', updated_at: '2026-07-07T10:00:00Z' }),
+        JSON.stringify({ id: 'codex-rename-1', thread_name: '真正的智能标题', updated_at: '2026-07-07T10:00:04Z' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      const synchronizer = new CodexSessionSynchronizer();
+      await synchronizer.synchronize();
+
+      assert.equal(sessionsDb.getSessionById('codex-rename-1')?.custom_name, '真正的智能标题');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex synchronizer replaces an earlier synced name with the engine thread name', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-follow-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeCodexTranscript(tempRoot, 'codex-follow-1', workspacePath);
+    const codexHome = path.join(tempRoot, '.codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      path.join(codexHome, 'session_index.jsonl'),
+      JSON.stringify({ id: 'codex-follow-1', thread_name: 'Codex generated name', updated_at: '2026-07-07T10:00:00Z' }) + '\n',
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      // A name an earlier pass derived (fallback upgrade path) must not stick
+      // once the engine has generated its own.
+      sessionsDb.createSession('codex-follow-1', 'codex', workspacePath, 'Earlier synced name');
+
+      const synchronizer = new CodexSessionSynchronizer();
+      await synchronizer.synchronize();
+
+      assert.equal(sessionsDb.getSessionById('codex-follow-1')?.custom_name, 'Codex generated name');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex synchronizer keeps a user-locked name over the engine thread name', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-locked-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeCodexTranscript(tempRoot, 'codex-locked-1', workspacePath);
+    const codexHome = path.join(tempRoot, '.codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      path.join(codexHome, 'session_index.jsonl'),
+      JSON.stringify({ id: 'codex-locked-1', thread_name: 'Codex generated name', updated_at: '2026-07-07T10:00:00Z' }) + '\n',
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession('codex-locked-1', 'codex', workspacePath, 'My rename');
+      sessionsDb.updateSessionCustomName('codex-locked-1', 'My rename', { lockName: true });
+
+      const synchronizer = new CodexSessionSynchronizer();
+      await synchronizer.synchronize();
+
+      assert.equal(sessionsDb.getSessionById('codex-locked-1')?.custom_name, 'My rename');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('Codex history reads 0.153-era prompts from item_completed UserMessage rows', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-user-153-'));
   const workspacePath = await createWorkspaceFixture();
