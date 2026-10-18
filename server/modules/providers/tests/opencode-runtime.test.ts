@@ -60,7 +60,12 @@ type FakeService = {
   url: string;
   requests: RecordedRequest[];
   snapshot: Record<string, unknown>;
+  /** What the service's form/permission list routes report as still pending. */
+  forms: unknown[];
+  permissions: unknown[];
   emit: (event: Record<string, unknown>) => void;
+  /** Ends the live event feed the way a dropped subscription does. */
+  dropFeeds: () => void;
   waitForRequest: (predicate: (request: RecordedRequest) => boolean) => Promise<RecordedRequest>;
   close: () => void;
 };
@@ -73,9 +78,17 @@ const startFakeService = async (): Promise<FakeService> => {
     url: '',
     requests,
     snapshot: { id: 'ses_new', outcome: 'succeeded', time: { idle: Date.now() + 60_000 }, tokens: { input: 10, output: 5, reasoning: 1, cache: { read: 2, write: 0 } } },
+    forms: [],
+    permissions: [],
     emit: (event) => {
       for (const feed of feeds) {
         feed.write(`data: ${JSON.stringify(event)}\n\n`);
+      }
+    },
+    dropFeeds: () => {
+      for (const feed of [...feeds]) {
+        feeds.delete(feed);
+        feed.destroy();
       }
     },
     waitForRequest: (predicate) => new Promise((resolve) => {
@@ -123,6 +136,10 @@ const startFakeService = async (): Promise<FakeService> => {
         reply(200, { data: { id: 'msg_1' } });
       } else if (request.method === 'POST' && url.endsWith('/interrupt')) {
         reply(200, { interrupted: true });
+      } else if (request.method === 'GET' && url.endsWith('/form')) {
+        reply(200, { data: service.forms });
+      } else if (request.method === 'GET' && url.endsWith('/permission')) {
+        reply(200, { data: service.permissions });
       } else if (request.method === 'GET' && url.startsWith('/api/session/')) {
         reply(200, { data: service.snapshot });
       } else {
@@ -539,6 +556,94 @@ test('an execution the engine starts on its own is adopted and rides the run pip
         ? { appSessionId: 'app-adopted', writer: adopted.writer }
         : null;
     },
+  });
+});
+
+test('the permission facet re-reads the service for asks the event feed never delivered', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('hello', { sessionId: 'app-1', projectPath: '/tmp/project' }, writer, makeContext(null));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    assert.ok(runtime.permissions?.reconcilePending, 'the facade exposes the reconcile hook');
+    // The gap: both asks exist only in the service's pending set, because the
+    // events that announced them were emitted while the feed was down.
+    service.forms = [{
+      id: 'frm_gap',
+      sessionID: 'ses_new',
+      title: 'Questions',
+      metadata: { kind: 'question', tool: { messageID: 'msg_a', id: 'call_gap' } },
+      fields: [{
+        key: 'q0',
+        title: 'Curtain',
+        description: 'Which side?',
+        type: 'string',
+        options: [{ value: 'right', label: 'Right' }],
+      }],
+    }];
+    service.permissions = [{
+      id: 'per_gap',
+      sessionID: 'ses_new',
+      action: 'shell',
+      resources: ['echo gap'],
+      source: { type: 'tool', messageID: 'msg_a', id: 'call_gap' },
+    }];
+
+    runtime.permissions?.reconcilePending?.('app-1');
+
+    await waitFor(() => frames.some((frame) => frame.kind === 'permission_request' && frame.toolName === 'AskUserQuestion'));
+    await waitFor(() => frames.some((frame) => frame.kind === 'permission_request' && frame.toolName === 'shell'));
+    assert.deepEqual(
+      service.requests
+        .filter((request) => request.path === '/api/session/ses_new/form' || request.path === '/api/session/ses_new/permission')
+        .map((request) => request.path)
+        .sort(),
+      ['/api/session/ses_new/form', '/api/session/ses_new/permission'],
+    );
+    assert.equal(runtime.permissions?.listPending('app-1').length, 2);
+
+    // Answering a reconciled card routes the panel's answer back onto the
+    // service's field keys, exactly like a card that arrived as an event.
+    runtime.permissions?.resolve('frm_gap', { allow: true, updatedInput: { answers: { 'Which side?': 'Right' } } });
+    const reply = await service.waitForRequest((request) => request.path.endsWith('/form/frm_gap/reply'));
+    assert.deepEqual(reply.body, { answer: { q0: 'Right' } });
+
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+  });
+});
+
+test('an event-stream reconnect re-reads the asks raised inside the gap', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('hello', { sessionId: 'app-1', projectPath: '/tmp/project' }, writer, makeContext(null));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    service.forms = [{
+      id: 'frm_after_gap',
+      sessionID: 'ses_new',
+      title: 'Questions',
+      metadata: { kind: 'question', tool: { messageID: 'msg_a', id: 'call_gap' } },
+      fields: [{
+        key: 'q0',
+        title: 'Curtain',
+        description: 'Which side?',
+        type: 'string',
+        options: [{ value: 'right', label: 'Right' }],
+      }],
+    }];
+    // The run is still working: the session row has no idle timestamp, which is
+    // what the reconnect's run reconcile reads before leaving it open.
+    service.snapshot = { ...service.snapshot, time: { idle: null } };
+    // Dropping the feed is what a slow-consumer overflow or a restart looks
+    // like from here: the connection ends and the gap's events are gone.
+    service.dropFeeds();
+
+    await waitFor(() => service.requests.some((request) => request.path === '/api/session/ses_new/form'), 5_000);
+    await waitFor(() => frames.some((frame) => frame.kind === 'permission_request' && frame.toolName === 'AskUserQuestion'));
+
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
   });
 });
 

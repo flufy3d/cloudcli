@@ -18,6 +18,11 @@
  * after a reload, retracts cards the moment they are answered (here or in
  * another opencode client), and expires forgotten ones.
  *
+ * The engine's event feed is volatile — a dropped connection loses the events
+ * that happened while it was down — so the bridge can also re-read what the
+ * service still holds (`adoptPending`) and place the cards those lost events
+ * never announced: a question the model is waiting on stays answerable.
+ *
  * @module opencode-interaction-bridge
  */
 
@@ -72,6 +77,12 @@ type FormField = {
   description?: string;
   type?: string;
   options?: Array<{ value?: string; label?: string; description?: string }>;
+};
+
+type ResolvedAttachedSession = {
+  session: OpenCodeInteractionSession;
+  /** Session the service expects the answer on: the child for a subagent ask. */
+  replySessionId: string;
 };
 
 type PendingInteraction = {
@@ -272,9 +283,7 @@ export class OpenCodeInteractionBridge {
    * service expects the answer (the child for a subagent request); the session
    * itself carries the parent's writer and app id.
    */
-  private resolveAttachedSession(
-    providerSessionId: string,
-  ): { session: OpenCodeInteractionSession; replySessionId: string } | null {
+  private resolveAttachedSession(providerSessionId: string): ResolvedAttachedSession | null {
     const direct = this.sessions.get(providerSessionId);
     if (direct) {
       return { session: direct, replySessionId: providerSessionId };
@@ -284,10 +293,44 @@ export class OpenCodeInteractionBridge {
     return parentSession ? { session: parentSession, replySessionId: providerSessionId } : null;
   }
 
+  /**
+   * Announces the interactions the service still holds for a session but this
+   * bridge has no card for — the recovery path for `permission.asked` and
+   * `form.created` events lost while the service's event feed was down.
+   *
+   * The service keeps its pending set in process memory and the list routes
+   * read it back, so an ask lost in a gap is still answerable; nothing else
+   * ever re-reads those sets, and a model waiting on a question would wait
+   * forever. Ids already pending are left alone, so reconciling after every
+   * event-stream reconnect and every subscribe is idempotent.
+   *
+   * Consumer: opencode runtime (event-stream reconnect, session subscribe).
+   */
+  adoptPending(
+    providerSessionId: string,
+    input: { forms?: unknown[]; permissions?: unknown[] },
+  ): number {
+    const resolved = this.resolveAttachedSession(providerSessionId);
+    if (!resolved) {
+      return 0;
+    }
+    let announced = 0;
+    for (const permission of input.permissions ?? []) {
+      if (this.announcePermission(resolved, readObjectRecord(permission))) {
+        announced += 1;
+      }
+    }
+    for (const form of input.forms ?? []) {
+      if (this.announceForm(resolved, readObjectRecord(form), { warnOnUnsupportedKind: false })) {
+        announced += 1;
+      }
+    }
+    return announced;
+  }
+
   private onPermissionAsked(data: Record<string, unknown>): void {
-    const requestId = readOptionalString(data.id);
     const providerSessionId = readOptionalString(data.sessionID);
-    if (!requestId || !providerSessionId || this.pending.has(requestId)) {
+    if (!providerSessionId) {
       return;
     }
     // A permission asked inside a subagent is answered against the child
@@ -297,7 +340,30 @@ export class OpenCodeInteractionBridge {
     if (!resolved) {
       return;
     }
-    const { session, replySessionId } = resolved;
+    this.announcePermission(resolved, data);
+  }
+
+  private onFormCreated(form: Record<string, unknown>): void {
+    const providerSessionId = readOptionalString(form.sessionID);
+    if (!providerSessionId) {
+      return;
+    }
+    const resolved = this.resolveAttachedSession(providerSessionId);
+    if (!resolved) {
+      return;
+    }
+    this.announceForm(resolved, form, { warnOnUnsupportedKind: true });
+  }
+
+  /** Places one permission card; false when it is malformed or already pending. */
+  private announcePermission(
+    { session, replySessionId }: ResolvedAttachedSession,
+    data: Record<string, unknown> | null,
+  ): boolean {
+    const requestId = data ? readOptionalString(data.id) : undefined;
+    if (!data || !requestId || this.pending.has(requestId)) {
+      return false;
+    }
     const action = readOptionalString(data.action) ?? 'tool';
     const resources = Array.isArray(data.resources) ? data.resources.filter((item): item is string => typeof item === 'string') : [];
     const source = readObjectRecord(data.source);
@@ -321,26 +387,33 @@ export class OpenCodeInteractionBridge {
       formFields: [],
       writer: session.writer,
     });
+    return true;
   }
 
-  private onFormCreated(form: Record<string, unknown>): void {
-    const requestId = readOptionalString(form.id);
-    const providerSessionId = readOptionalString(form.sessionID);
-    if (!requestId || !providerSessionId || this.pending.has(requestId)) {
-      return;
+  /**
+   * Places one question card; false when it is malformed, already pending, or
+   * a kind the panel cannot render. Only the event path warns about that last
+   * case — a reconcile re-reads the same list on every subscribe, and the
+   * warning exists to notice a new service-side form kind once.
+   */
+  private announceForm(
+    { session, replySessionId }: ResolvedAttachedSession,
+    form: Record<string, unknown> | null,
+    options: { warnOnUnsupportedKind: boolean },
+  ): boolean {
+    const requestId = form ? readOptionalString(form.id) : undefined;
+    if (!form || !requestId || this.pending.has(requestId)) {
+      return false;
     }
-    const resolved = this.resolveAttachedSession(providerSessionId);
-    if (!resolved) {
-      return;
-    }
-    const { session, replySessionId } = resolved;
     const metadata = readObjectRecord(form.metadata);
     const kind = readOptionalString(metadata?.kind);
     if (kind !== 'question') {
       // Only the question tool's form has the panel shape; anything else the
       // service adds later must not be rendered as an answerable survey.
-      console.warn(`[OpenCode] ignoring form of unsupported kind "${kind ?? 'unknown'}"`);
-      return;
+      if (options.warnOnUnsupportedKind) {
+        console.warn(`[OpenCode] ignoring form of unsupported kind "${kind ?? 'unknown'}"`);
+      }
+      return false;
     }
     const tool = readObjectRecord(metadata?.tool);
     const fields = readFormFields(form.fields);
@@ -357,6 +430,7 @@ export class OpenCodeInteractionBridge {
       formFields: fields,
       writer: session.writer,
     });
+    return true;
   }
 
   private announce(session: OpenCodeInteractionSession, entry: PendingInteraction): void {

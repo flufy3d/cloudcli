@@ -92,6 +92,13 @@ export type ProviderRuntimeGateway = {
   isBackgroundWorkPending(sessionId: string): boolean;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
+  /**
+   * Asks the provider to re-read the interactions it still holds for a running
+   * session and announce the ones no card covers — the recovery path for an
+   * ask whose event was lost while the provider's event feed was down.
+   * Fire-and-forget; providers without a re-readable pending set omit it.
+   */
+  reconcilePendingInteractions?(sessionId: string): void;
   getBackgroundTasksForSession?(sessionId: string): ActiveBackgroundTask[];
 };
 
@@ -808,6 +815,16 @@ function handleChatSubscribe(
     // (opencode resuming the session on its own) attaches this socket through
     // `adoptExternalRun`, so the tab watching now sees it live.
     chatRunRegistry.noteSessionSubscriber(sessionId, ws);
+
+    // A running session may be waiting on an ask whose event never reached the
+    // gateway (the provider's event feed is volatile: a drop loses what
+    // happened during the gap, and the model then waits on a card nobody can
+    // see). Opening the conversation re-reads the provider's pending set, so
+    // the panel comes back; idempotent, and a runtime without a re-readable
+    // pending set simply does not implement the hook.
+    if (isProcessing) {
+      dependencies.runtime.reconcilePendingInteractions?.(sessionId);
+    }
 
     // Pending approvals are tracked under the app session id inside the
     // Claude runtime, so they can be looked up directly.

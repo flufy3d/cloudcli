@@ -395,9 +395,24 @@ export type ProviderPermissionDecision = {
   rememberEntry?: unknown;
 };
 
+/**
+ * Interactive-approval facet of a provider runtime: the cards the chat shows
+ * and the decisions that answer them.
+ *
+ * Consumers: the chat websocket through the provider runtime service, which
+ * fans every call out across the registered providers.
+ */
 export type ProviderRuntimePermissionGateway = {
   resolve(requestId: string, decision: ProviderPermissionDecision): void;
   listPending(sessionId: string): unknown[];
+  /**
+   * Re-reads the interactions the engine still holds for a session and
+   * announces the ones no card covers yet — the recovery path for an ask whose
+   * event was lost while the engine's event feed was down. Fire-and-forget and
+   * idempotent; runtimes whose pending set cannot be re-read leave it
+   * undefined, and callers must treat that as "nothing to reconcile".
+   */
+  reconcilePending?(sessionId: string): void;
 };
 
 /**

@@ -9,7 +9,8 @@
  *      `metadata.kind === 'question'` and `fields[].key` (`q0`, …) as the
  *      answer keys;
  *   2. list  — `GET /api/session/:id/form` returns pending forms (and is what
- *      a stalled form could be reconciled from);
+ *      a stalled form could be reconciled from); the same-shaped
+ *      `GET /api/session/:id/permission` lists pending approvals.
  *   3. reply — `POST /api/session/:id/form/:formId/reply {answer: {q0: …}}`
  *      makes the tool succeed (`form.replied` → `session.tool.success`) and
  *      the execution run to its usual terminal;
@@ -165,6 +166,17 @@ async function main() {
     listed.body?.data?.some((entry) => entry.id === form.id),
     'GET /api/session/:id/form lists the pending form',
     `status=${listed.status}`,
+  );
+
+  // 2b. The permission list route answers in the same envelope (this scenario
+  // asks for no approval, so it must be an empty list, not a 404/500). The
+  // interaction bridge reads it beside the form list when an event-feed gap
+  // loses an ask, so its shape is part of the reconcile contract.
+  const approvals = await api(a, 'GET', `/api/session/${sessionId}/permission`);
+  check(
+    approvals.status === 200 && Array.isArray(approvals.body?.data),
+    'GET /api/session/:id/permission lists pending approvals',
+    `status=${approvals.status} data=${Array.isArray(approvals.body?.data) ? approvals.body.data.length : 'n/a'}`,
   );
 
   // 3. Reply closure: answer by field key → tool succeeds → execution ends.

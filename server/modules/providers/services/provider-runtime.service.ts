@@ -167,6 +167,12 @@ export function createProviderRuntimeService(
       );
     },
 
+    reconcilePendingInteractions(sessionId: string): void {
+      for (const provider of dependencies.listProviders()) {
+        provider.runtime.permissions?.reconcilePending?.(sessionId);
+      }
+    },
+
     getBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
       return dependencies.listProviders().flatMap(
         (provider) => provider.runtime.backgroundTasks?.list(sessionId) ?? [],

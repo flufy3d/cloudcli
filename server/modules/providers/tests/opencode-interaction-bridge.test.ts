@@ -177,6 +177,72 @@ test('form.created becomes an AskUserQuestion card with the panel question shape
   assert.deepEqual(frame.context, { reason: 'Questions', kind: 'question' });
 });
 
+/**
+ * The question fixture's form object: the same payload `form.created` carries
+ * and the service's `GET /api/session/:id/form` lists back.
+ */
+const formFixture = (): Record<string, unknown> => (
+  (formCreated().data as { form: Record<string, unknown> }).form
+);
+
+test('adoptPending re-announces asks the event feed never delivered, and answers route back', async () => {
+  const { bridge, calls, frames } = makeHarness();
+  const form = formFixture();
+
+  // Nothing was announced through the event path: this is what a gap in the
+  // service's event feed looks like — the ask exists only in the service.
+  const announced = bridge.adoptPending(PROVIDER_SESSION, {
+    forms: [form],
+    permissions: [permissionAsked({ id: 'per_reconciled' }).data],
+  });
+
+  assert.equal(announced, 2);
+  assert.deepEqual(frames.map((frame) => [frame.kind, frame.requestId, frame.toolName]), [
+    ['permission_request', 'per_reconciled', 'shell'],
+    ['permission_request', form.id, 'AskUserQuestion'],
+  ]);
+  assert.deepEqual(bridge.listPending(APP_SESSION).map((entry) => entry.requestId), ['per_reconciled', form.id]);
+
+  // Idempotent: the same service lists again after the next subscribe or
+  // reconnect announce nothing new.
+  assert.equal(bridge.adoptPending(PROVIDER_SESSION, {
+    forms: [form],
+    permissions: [permissionAsked({ id: 'per_reconciled' }).data],
+  }), 0);
+  assert.equal(frames.length, 2);
+
+  // A reconciled form still answers by field key, because its field list was
+  // rebuilt from the same payload `form.created` carries.
+  frames.length = 0;
+  const formId = String(form.id);
+  bridge.resolve(formId, {
+    allow: true,
+    updatedInput: { answers: { 'Which color?': 'Blue', 'Which areas?': 'server/, docs' } },
+  });
+  await flush();
+  assert.deepEqual(calls, [{
+    method: 'replyForm',
+    args: [PROVIDER_SESSION, formId, { q0: 'Blue', q1: ['server/', 'docs'] }],
+  }]);
+});
+
+test('adoptPending ignores sessions without a run and payloads the panel cannot render', () => {
+  const { bridge, frames } = makeHarness();
+  const form = formFixture();
+
+  assert.equal(bridge.adoptPending('ses_unknown', { forms: [form] }), 0, 'no attached run, no card');
+  assert.equal(bridge.adoptPending(PROVIDER_SESSION, {
+    forms: [
+      { ...form, id: 'frm_mcp', metadata: { kind: 'mcp' } },
+      { ...form, id: undefined },
+      'not a form',
+    ],
+    permissions: [{ sessionID: PROVIDER_SESSION }, null],
+  }), 0);
+  assert.equal(frames.length, 0);
+  assert.equal(bridge.listPending(APP_SESSION).length, 0);
+});
+
 test('maps the panel answers (keyed by question text) back onto the form field keys', async () => {
   const { bridge, calls, frames } = makeHarness();
   bridge.handleEvent(formCreated());

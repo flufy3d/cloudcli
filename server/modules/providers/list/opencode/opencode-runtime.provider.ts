@@ -28,6 +28,11 @@
  * execution arrives for a session with no run of ours, the installed adopter
  * opens a gateway run and the execution rides the normal pipeline from there.
  *
+ * Because the engine's event feed is volatile (a dropped connection loses its
+ * events for good), the `permissions` facet can also re-read the service's
+ * pending set (`reconcilePending`): asks raised while the feed was down are
+ * re-announced, so a model waiting on a question can still be answered.
+ *
  * @module opencode-runtime.provider
  */
 
@@ -186,6 +191,64 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   const settings = new OpenCodeSessionSettingsApplier();
   /** Live occupancy publisher for the run in flight; recreated per run. */
   let budgetTracker: OpenCodeTokenBudgetTracker | null = null;
+  /** App sessions whose pending set is being re-read right now. */
+  const reconcilingPending = new Set<string>();
+
+  /**
+   * Re-reads what the service still holds for a session's live runs and places
+   * the cards the event feed never delivered.
+   *
+   * The feed is volatile by contract: a connection that drops loses the events
+   * that happened while it was down, and a `form.created` or `permission.asked`
+   * lost that way is invisible everywhere else — no later frame carries it, and
+   * the model waits on an answer no card can collect. The service keeps those
+   * pending sets in memory and its list routes read them back, so this is the
+   * only way to recover one. Idempotent through the bridge's pending ids, so it
+   * is safe to run after every reconnect and every session subscribe.
+   *
+   * Consumers: this runtime's permission facet (chat.subscribe) and its own
+   * event-stream reconnect handler.
+   */
+  const reconcilePendingInteractions = async (appSessionId: string): Promise<void> => {
+    const run = runs.get(appSessionId);
+    const activeClient = client;
+    if (!run || !activeClient || reconcilingPending.has(appSessionId)) {
+      return;
+    }
+    reconcilingPending.add(appSessionId);
+    try {
+      // The run's own session plus the children still running: a question
+      // asked inside a subagent is answered against the child session id but
+      // surfaces as the parent's card. A task without an engine handle names
+      // no session to ask.
+      const sessionIds = [
+        run.providerSessionId,
+        ...runs.backgroundTasksFor(appSessionId)
+          .map((task) => task.taskId)
+          .filter((taskId): taskId is string => typeof taskId === 'string' && taskId.length > 0),
+      ];
+      for (const providerSessionId of sessionIds) {
+        let forms: unknown[];
+        let permissions: unknown[];
+        try {
+          [forms, permissions] = await Promise.all([
+            activeClient.listForms(providerSessionId),
+            activeClient.listPermissionRequests(providerSessionId),
+          ]);
+        } catch (error) {
+          // Best effort: the cards still in the bridge are unaffected, and the
+          // next subscribe or reconnect tries again.
+          console.warn(`[OpenCode] could not re-read pending interactions for ${providerSessionId}:`, error);
+          continue;
+        }
+        if (forms.length > 0 || permissions.length > 0) {
+          bridge.adoptPending(providerSessionId, { forms, permissions });
+        }
+      }
+    } finally {
+      reconcilingPending.delete(appSessionId);
+    }
+  };
 
   eventStream.subscribe((event) => {
     adoptExternalExecution(event);
@@ -195,6 +258,11 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   eventStream.onReconnect(() => {
     void runs.reconcile({ getSession: (sessionId) => client?.getSession(sessionId)
       ?? Promise.reject(new OpenCodeApiError('GET', '/api/session', 503, 'OpenCode service is not running')) });
+    // The gap swallowed more than the run terminals: any ask raised inside it
+    // exists only in the service's pending set now.
+    for (const run of runs.all()) {
+      void reconcilePendingInteractions(run.appSessionId);
+    }
   });
   supervisor.onExit(() => {
     settings.reset();
@@ -636,6 +704,9 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       },
       listPending(sessionId: string): unknown[] {
         return bridge.listPending(sessionId);
+      },
+      reconcilePending(sessionId: string): void {
+        void reconcilePendingInteractions(sessionId);
       },
     },
     backgroundTasks: {

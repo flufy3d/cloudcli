@@ -256,6 +256,35 @@ export class OpenCodeApiClient {
   }
 
   /**
+   * `GET /api/session/:id/form` — the forms the service still holds for the
+   * session, in the same shape `form.created` carries (verified against
+   * v2.0.32: a pending question is listed until it is answered or cancelled).
+   *
+   * Consumer: opencode interaction bridge (reconcile) — a `form.created` event
+   * lost while the event feed was down leaves no trace anywhere else, so the
+   * card can only be rebuilt from this list.
+   */
+  async listForms(sessionId: string): Promise<unknown[]> {
+    const result = await this.request<{ data?: unknown }>(
+      'GET',
+      `/api/session/${encodeURIComponent(sessionId)}/form`,
+    );
+    return Array.isArray(result?.data) ? result.data : [];
+  }
+
+  /**
+   * `GET /api/session/:id/permission` — the permission requests the service
+   * still holds for the session. Same recover-from-a-gap role as `listForms`.
+   */
+  async listPermissionRequests(sessionId: string): Promise<unknown[]> {
+    const result = await this.request<{ data?: unknown }>(
+      'GET',
+      `/api/session/${encodeURIComponent(sessionId)}/permission`,
+    );
+    return Array.isArray(result?.data) ? result.data : [];
+  }
+
+  /**
    * `GET /api/session/:id` — the session row. `outcome` and `time.idle` are
    * set once a run has finished (the runtime uses them to reconcile a run
    * whose terminal event was missed during a stream drop); `tokens` are the
