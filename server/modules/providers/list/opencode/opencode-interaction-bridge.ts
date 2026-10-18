@@ -50,6 +50,8 @@ export type OpenCodeInteractionSession = {
   writer: ProviderRuntimeWriter;
   /** Tool call lookup for labelling permission cards (translator-backed). */
   resolveToolCall: (callId: string) => OpenCodeToolCall | null;
+  /** For a subagent's session: the `Agent` card its requests belong to. Absent on the root session. */
+  resolveOrigin?: () => { toolUseId: string; description?: string } | null;
 };
 
 /** Replay shape for `chat.subscribe`; mirrors zcode's PendingPermissionView. */
@@ -100,6 +102,7 @@ type BridgeDependencies = {
   resolveChild?: (providerSessionId: string) => {
     rootProviderSessionId: string;
     resolveToolCall: (callId: string) => OpenCodeToolCall | null;
+    resolveOrigin: () => { toolUseId: string; description?: string } | null;
   } | null;
   now?: () => number;
   pendingTtlMs?: number;
@@ -184,7 +187,7 @@ export class OpenCodeInteractionBridge {
     const child = this.resolveChild(providerSessionId);
     const root = child ? this.sessions.get(child.rootProviderSessionId) : undefined;
     return child && root
-      ? { ...root, providerSessionId, resolveToolCall: child.resolveToolCall }
+      ? { ...root, providerSessionId, resolveToolCall: child.resolveToolCall, resolveOrigin: child.resolveOrigin }
       : undefined;
   }
 
@@ -310,6 +313,7 @@ export class OpenCodeInteractionBridge {
         resources,
         save: Array.isArray(data.save) ? data.save : undefined,
         reason: resources.length > 0 ? `${action}: ${resources.join(', ')}` : action,
+        ...this.originOf(session),
       },
       receivedAt: new Date(this.now()),
       formFields: [],
@@ -345,11 +349,17 @@ export class OpenCodeInteractionBridge {
       toolName: QUESTION_TOOL_NAME,
       toolId: readOptionalString(tool?.id),
       input: { questions: fields.map(toPanelQuestion) },
-      context: { reason: readOptionalString(form.title) ?? 'Questions', kind: readOptionalString(metadata?.kind) },
+      context: { reason: readOptionalString(form.title) ?? 'Questions', kind: readOptionalString(metadata?.kind), ...this.originOf(session) },
       receivedAt: new Date(this.now()),
       formFields: fields,
       writer: session.writer,
     });
+  }
+
+  /** `{ subagent }` for a request from a subagent's session, else nothing. */
+  private originOf(session: OpenCodeInteractionSession): { subagent?: { toolUseId: string; description?: string } } {
+    const origin = session.resolveOrigin?.();
+    return origin ? { subagent: origin } : {};
   }
 
   private announce(session: OpenCodeInteractionSession, entry: PendingInteraction): void {

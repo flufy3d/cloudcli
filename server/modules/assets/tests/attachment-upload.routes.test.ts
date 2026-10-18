@@ -326,8 +326,17 @@ for (const [kind, field, limit, mimeType] of [
       request.destroy(new Error('client disconnected after file size limit'));
       await closed;
       assert.equal(storedSize, limit, 'server reached its production file size limit');
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal((await upload(url, { 'X-Upload-Request-Id': 'after-size-limit-12345' })).status, 200);
+      // The server releases the aborted upload's slot when it notices the
+      // disconnect, which takes however long the event loop needs; the next
+      // upload is turned away with 503 until then. Wait for the slot to free
+      // (a slot that never frees fails here at the deadline) instead of
+      // guessing how long that takes.
+      let followUp = await upload(url, { 'X-Upload-Request-Id': 'after-size-limit-12345' });
+      for (const deadline = Date.now() + 5_000; followUp.status === 503 && Date.now() < deadline;) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        followUp = await upload(url, { 'X-Upload-Request-Id': 'after-size-limit-12345' });
+      }
+      assert.equal(followUp.status, 200);
       assert.equal((await fs.readdir(directory)).length, 1, 'only the subsequent successful upload remains');
     }, { maxEntries: 1, now: () => { markStarted(); return Date.now(); } });
   });

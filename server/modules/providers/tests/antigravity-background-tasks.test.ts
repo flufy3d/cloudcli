@@ -275,3 +275,47 @@ test('an aborted run leaves no session-key aliases behind', async () => {
     assert.equal(getAntigravityBackgroundKeyAliasCount(), before);
   }, false);
 });
+
+test('while an agent works, its own steps stream into its card and stop when it settles', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-live-'));
+  const logs = path.join(root, 'brain', 'sub-live', '.system_generated', 'logs');
+  await fs.mkdir(logs, { recursive: true });
+  const rows = [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\ngo\n</USER_REQUEST>' },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/a.ts' } }] },
+    { step_index: 2, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', content: 'Created At: x\nCompleted At: y\nFile Path: `/tmp/a.ts`\n1: body' },
+    { step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Read it.' },
+  ];
+  await fs.writeFile(path.join(logs, 'transcript.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const previous = process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+  process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = root;
+  try {
+    await withStub([
+      { event: 'init', conversation_id: 'conv-live', init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', ['sub-live']), conversation_id: 'conv-live' }),
+      2500,
+      { event: 'result', result: { conversation_id: 'conv-live', status: 'SUCCESS', usage: { total_tokens: 1 } } },
+    ], async () => {
+      const { sent, done, waitForCard } = await createRun('conv-live');
+      await waitForCard();
+      const deadline = Date.now() + 2000;
+      while (!sent.some((msg) => msg.parentToolUseId === 'tool_2:sub-live' && msg.kind === 'text') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const steps = sent.filter((msg) => msg.parentToolUseId === 'tool_2:sub-live');
+      assert.deepEqual(steps.map((msg) => [msg.kind, msg.toolName ?? msg.content]), [['tool_use', 'view_file'], ['text', 'Read it.']]);
+      assert.match(steps[0].toolResult?.content ?? '', /body/);
+      await done;
+      const countAtEnd = sent.length;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(sent.length, countAtEnd, 'nothing is sent for the agent once it settled');
+    });
+  } finally {
+    if (previous === undefined) delete process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+    else process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = previous;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

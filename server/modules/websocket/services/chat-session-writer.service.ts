@@ -4,6 +4,7 @@ import type {
   NormalizedMessage,
   RealtimeClientConnection,
 } from '@/shared/types.js';
+import { notifyPermissionRequired } from '@/modules/notifications/index.js';
 import { enforceNormalizedMessageContract } from '@/shared/normalized-message-contract.js';
 import {
   createCompleteMessage,
@@ -29,6 +30,17 @@ type ChatSessionWriterOptions = {
    * `complete` after an abort already completed the run).
    */
   decorateOutboundEvent: (message: NormalizedMessage) => NormalizedMessage | null;
+  /**
+   * Raises the push notification for an approval card. Defaults to the
+   * notification service; tests inject their own.
+   */
+  notifyPermissionRequest?: (info: {
+    userId: string | number | null;
+    provider: LLMProvider;
+    sessionId: string | null;
+    toolName?: string;
+    requestId: string;
+  }) => void;
 };
 
 /**
@@ -132,6 +144,18 @@ export class ChatSessionWriter {
     const outbound = this.options.decorateOutboundEvent(message);
     if (outbound) {
       this.forward(outbound);
+      // Every engine's approval and question cards pass through here, so this
+      // is the one place that tells the user something waits for them, whether
+      // or not a page is open.
+      if (outbound.kind === 'permission_request' && outbound.requestId) {
+        (this.options.notifyPermissionRequest ?? notifyPermissionRequired)({
+          userId: this.userId,
+          provider: this.options.provider,
+          sessionId: outbound.sessionId ?? null,
+          toolName: outbound.toolName,
+          requestId: outbound.requestId,
+        });
+      }
     }
   }
 

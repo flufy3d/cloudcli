@@ -28,7 +28,7 @@
  */
 
 import type { ProviderPermissionDecision, ProviderRuntimeWriter } from '@/shared/types.js';
-import { createNormalizedMessage, generateMessageId, readJsonRecord, readOptionalString } from '@/shared/utils.js';
+import { createNormalizedMessage, generateMessageId, readJsonRecord, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
 import type { ProtocolServerRequest } from './zcode-codec.js';
 import { readDecryptedZCodeIndividualPlanApiKey, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
@@ -277,6 +277,7 @@ export class ZCodeRunLifecycle {
   /**
    * Where an engine session's approval and question cards go: the run on it,
    * else the watcher keeping its background agents (see `adoptIdleTarget`).
+   * Also where a followed subagent's live steps are sent.
    */
   private requestTargetFor(engineSessionId: string): { writer: ProviderRuntimeWriter; appSessionId: string | null } | undefined {
     return this.runsByEngineSession.get(engineSessionId) ?? this.idleTargets.get(engineSessionId);
@@ -498,6 +499,7 @@ export class ZCodeRunLifecycle {
       reason: readOptionalString(params.reason),
       options: params.options,
       suggestedPermissionUpdates: params.suggestedPermissionUpdates,
+      ...readSubagentOrigin(params),
     };
 
     // Register before sending the frame: if the send throws, the parked
@@ -619,7 +621,7 @@ export class ZCodeRunLifecycle {
       toolName,
       toolId,
       input: params.input,
-      context: { reason: readOptionalString(params.prompt) },
+      context: { reason: readOptionalString(params.prompt), ...readSubagentOrigin(params) },
       sessionId,
       appSessionId: target.appSessionId ?? undefined,
       receivedAt: new Date(),
@@ -636,7 +638,7 @@ export class ZCodeRunLifecycle {
       toolName,
       toolId,
       input: params.input,
-      context: { reason: readOptionalString(params.prompt) },
+      context: { reason: readOptionalString(params.prompt), ...readSubagentOrigin(params) },
       canInterrupt: true,
     }));
 
@@ -690,6 +692,27 @@ export class ZCodeRunLifecycle {
       } catch {
         // A resolver that throws on settle must not block its siblings.
       }
+    }
+  }
+
+  /**
+   * Takes down the pending cards of a subagent that has stopped (or, with no
+   * `agentToolUseId`, of every agent on the session, for an engine that died):
+   * nobody is waiting for the answer any more. The parked engine request is
+   * denied, and the card is retracted through the writer that showed it, so
+   * this must run before that writer stops being the session's target.
+   */
+  retractSubagentPermissions(engineSessionId: string, agentToolUseId?: string): void {
+    for (const [requestId, details] of [...this.pendingPermissionDetails]) {
+      if (details.sessionId !== engineSessionId) {
+        continue;
+      }
+      const origin = (details.context as { subagent?: { toolUseId?: string } } | undefined)?.subagent;
+      if (!origin || (agentToolUseId !== undefined && origin.toolUseId !== agentToolUseId)) {
+        continue;
+      }
+      this.answerPendingPermission(requestId, { result: { decision: 'deny', reason: 'The agent that asked has stopped.' } });
+      this.retractPendingPermission(requestId, details);
     }
   }
 
@@ -750,6 +773,22 @@ export class ZCodeRunLifecycle {
       }
     }
   }
+}
+
+/**
+ * `{ subagent }` for a request the engine filed on behalf of a subagent. The
+ * engine rewrites such a request to the parent session and tags it with
+ * `origin.kind: "subagent"`, whose `parentToolCallId` is the `Agent` call and
+ * `description` the agent's task line; anything else carries no subagent.
+ */
+function readSubagentOrigin(params: Record<string, unknown>): { subagent?: { toolUseId: string; description?: string } } {
+  const origin = readObjectRecord(params.origin);
+  const toolUseId = readOptionalString(origin?.parentToolCallId);
+  if (readOptionalString(origin?.kind) !== 'subagent' || !toolUseId) {
+    return {};
+  }
+  const description = readOptionalString(origin?.description);
+  return { subagent: { toolUseId, ...(description ? { description } : {}) } };
 }
 
 /**

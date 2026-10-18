@@ -71,18 +71,25 @@ type OpenCodeChildSession = {
   /** The session that spawned this one (the root session, or another child). */
   parentSessionId: string;
   /**
-   * The root-level `Agent` call whose card shows this session's steps. A
-   * grandchild shares its ancestor's card, since the card the user sees is
-   * the one the root run drew. Unknown until the spawning call reports it.
+   * The call in the parent session that spawned this one, as the latest
+   * `session.tool.progress` named it (a resumed child is spawned again by a
+   * later call, and the newest call owns the card). The card the user sees is
+   * the one of the topmost child of the root run, so a grandchild finds its
+   * card by walking up (`cardCallIdOf`). Unknown until the call reports it.
    */
-  cardCallId?: string;
+  spawnCallId?: string;
   translator: OpenCodeSessionEventTranslator;
   /** Frames translated before the card was known, flushed once it is. */
   held: NormalizedMessage[];
+  /** Set once the held-frame cap was hit, so the loss is logged once per child. */
+  heldOverflowLogged?: boolean;
 };
 
 /** Most frames held for a child whose card is not known yet. */
 const MAX_HELD_CHILD_FRAMES = 500;
+
+/** Longest ancestor chain followed; a real tree is a few levels deep, a cycle is a bug. */
+const MAX_CHILD_DEPTH = 16;
 
 /** Frame kinds a child's stream never contributes: its finished rows carry the content. */
 const CHILD_STREAMING_KINDS = new Set(['stream_delta', 'stream_end']);
@@ -132,11 +139,28 @@ export class OpenCodeRunRegistry {
    * session the engine created for a subagent. Used by the interaction bridge
    * to show a child's approval and question cards under the root session.
    */
-  childOwner(sessionId: string): { rootProviderSessionId: string; resolveToolCall: (callId: string) => OpenCodeToolCall | null } | null {
+  childOwner(sessionId: string): {
+    rootProviderSessionId: string;
+    resolveToolCall: (callId: string) => OpenCodeToolCall | null;
+    /** The `Agent` card the child's requests belong to, when its spawn call is known. */
+    resolveOrigin: () => { toolUseId: string; description?: string } | null;
+  } | null {
     const child = this.children.get(sessionId);
-    return child
-      ? { rootProviderSessionId: child.run.providerSessionId, resolveToolCall: (callId) => child.translator.getToolCall(callId) }
-      : null;
+    if (!child) {
+      return null;
+    }
+    return {
+      rootProviderSessionId: child.run.providerSessionId,
+      resolveToolCall: (callId) => child.translator.getToolCall(callId),
+      resolveOrigin: () => {
+        const toolUseId = this.cardCallIdOf(child);
+        if (!toolUseId) {
+          return null;
+        }
+        const description = readOptionalString(readObjectRecord(child.run.translator.getToolCall(toolUseId)?.input)?.description);
+        return { toolUseId, ...(description ? { description } : {}) };
+      },
+    };
   }
 
   /**
@@ -218,13 +242,29 @@ export class OpenCodeRunRegistry {
         return;
       }
       const child = this.children.get(childId) ?? this.adoptChild(childId, sessionId);
-      if (child && child.cardCallId === undefined) {
-        // A child of the root run is shown on the card of the call that spawned
-        // it; a grandchild already took its ancestor's card when adopted.
-        child.cardCallId = callId;
-        this.flushHeld(child);
+      if (child && child.spawnCallId !== callId) {
+        child.spawnCallId = callId;
+        this.flushHeldBelow(childId);
       }
     }
+  }
+
+  /**
+   * The root-level `Agent` call whose card shows a child's steps: the spawn
+   * call of the topmost child on its ancestor chain. Resolved at dispatch time
+   * rather than copied at adoption, because a grandchild can be adopted before
+   * the call that spawned its ancestor has been reported.
+   */
+  private cardCallIdOf(child: OpenCodeChildSession): string | undefined {
+    let current = child;
+    for (let depth = 0; depth < MAX_CHILD_DEPTH; depth += 1) {
+      const parent = this.children.get(current.parentSessionId);
+      if (!parent) {
+        return current.spawnCallId;
+      }
+      current = parent;
+    }
+    return undefined;
   }
 
   private adoptChild(childId: string, parentId: string): OpenCodeChildSession | null {
@@ -237,7 +277,6 @@ export class OpenCodeRunRegistry {
     const child: OpenCodeChildSession = {
       run,
       parentSessionId: parentId,
-      cardCallId: parentChild?.cardCallId,
       translator: new OpenCodeSessionEventTranslator(run.appSessionId),
       held: [],
     };
@@ -248,28 +287,55 @@ export class OpenCodeRunRegistry {
   private dispatchChild(child: OpenCodeChildSession, event: OpenCodeEventEnvelope): void {
     // A child's own end is not the run's end: only the root session settles it.
     const { frames } = child.translator.translate(event);
+    const cardCallId = this.cardCallIdOf(child);
     for (const frame of frames) {
       if (CHILD_STREAMING_KINDS.has(frame.kind)) {
         continue;
       }
-      if (child.cardCallId === undefined) {
+      if (cardCallId === undefined) {
         if (child.held.length < MAX_HELD_CHILD_FRAMES) {
           child.held.push(frame);
+        } else if (!child.heldOverflowLogged) {
+          child.heldOverflowLogged = true;
+          console.warn(
+            `[OpenCode] dropping steps of a subagent session whose card is still unknown (more than ${MAX_HELD_CHILD_FRAMES} held)`,
+          );
         }
         continue;
       }
-      child.run.writer.send(this.tieToCard(frame, child.cardCallId));
+      child.run.writer.send(this.tieToCard(frame, cardCallId));
     }
   }
 
-  private flushHeld(child: OpenCodeChildSession): void {
-    if (child.cardCallId === undefined) {
-      return;
+  /** Sends what a child (and every session below it) held while its card was unknown. */
+  private flushHeldBelow(rootChildId: string): void {
+    for (const [childId, child] of this.children) {
+      if (child.held.length === 0) {
+        continue;
+      }
+      if (childId !== rootChildId && !this.isBelow(childId, rootChildId)) {
+        continue;
+      }
+      const cardCallId = this.cardCallIdOf(child);
+      if (cardCallId === undefined) {
+        continue;
+      }
+      for (const frame of child.held) {
+        child.run.writer.send(this.tieToCard(frame, cardCallId));
+      }
+      child.held = [];
     }
-    for (const frame of child.held) {
-      child.run.writer.send(this.tieToCard(frame, child.cardCallId));
+  }
+
+  private isBelow(childId: string, ancestorId: string): boolean {
+    let current = this.children.get(childId);
+    for (let depth = 0; current && depth < MAX_CHILD_DEPTH; depth += 1) {
+      if (current.parentSessionId === ancestorId) {
+        return true;
+      }
+      current = this.children.get(current.parentSessionId);
     }
-    child.held = [];
+    return false;
   }
 
   /** Marks a child's row as belonging to the card of `callId`. */

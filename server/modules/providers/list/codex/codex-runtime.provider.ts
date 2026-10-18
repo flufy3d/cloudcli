@@ -593,6 +593,12 @@ async function queryCodex(
       ? { toolName: 'Bash', input: JSON.stringify({ command: readCodexCommandLine(command) }) }
       : approvalSubjects.get(itemId);
     const reason = readNonEmptyString(params.reason);
+    // An approval for a running agent's thread names the agent's card.
+    const askingThread = readNonEmptyString(params.threadId);
+    const owner = askingThread && askingThread !== capturedSessionId ? codexBackgroundWork.find(askingThread) : undefined;
+    const subagent = owner && owner.sessionKey === (sessionId || capturedSessionId)
+      ? { toolUseId: owner.task.toolUseId, description: owner.task.description }
+      : undefined;
 
     return new Promise<ProviderPermissionDecision | null>((resolve) => {
       let settled = false;
@@ -628,6 +634,7 @@ async function queryCodex(
           reason: reason ?? (method === 'item/fileChange/requestApproval'
             ? 'Codex wants to write outside its sandbox.'
             : 'Codex wants to step outside its sandbox.'),
+          ...(subagent ? { subagent } : {}),
         },
         canInterrupt: true,
         sessionId: capturedSessionId || sessionId || null,

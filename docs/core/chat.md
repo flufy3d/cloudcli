@@ -88,6 +88,8 @@ flowchart TD
 - 批准记忆（`rememberEntry`）各引擎语义不同：claude 往 `allowedTools` 追加一条规则，codex 改答 `acceptForSession`（由引擎自己记住本会话）。
 - **谁来复核由引擎配置决定，适配器不覆盖**：codex 的 `approvals_reviewer`（`user` / `auto_review` / `guardian_subagent`）决定请求是否在到达客户端前就被自动裁决；在 `thread/start` 里写死这个值等于悄悄推翻用户自己的设置。
 
+权限卡片的推送通知由网关统一发（`ChatSessionWriter.send` 看到 `permission_request` 就调用通知服务），各引擎适配器不再各自发一份；没有前台回复在跑时到达的卡片（后台 agent 在一轮结束后发出的请求）不会把会话记成“处理中”，只记成后台工作。
+
 ## 后台任务与输入排队
 
 - **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台执行（如后台 `Bash`、Agent 或定时唤醒）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。`TaskCreate` 只创建待办项，不属于后台执行。

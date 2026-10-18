@@ -213,6 +213,11 @@ export function readZCodeSessionEvent(rawMessage: unknown, fallbackSessionId: st
   };
 }
 
+/** The `Agent` call whose agent made a mirrored tool event, or undefined for a main-thread event. */
+function readSubagentParentToolCallId(payload: AnyRecord): string | undefined {
+  return readOptionalString(payload.source) === 'subagent' ? readOptionalString(payload.parentToolCallId) : undefined;
+}
+
 /**
  * Whether an event type is one of the two subagent lifecycle events this
  * module translates.
@@ -445,6 +450,10 @@ export class ZCodeLiveEventNormalizer {
       toolName,
       toolInput: payload.input,
       toolId,
+      // While an agent runs the engine mirrors its tool calls onto the parent
+      // session's stream, marked `source: "subagent"` with the agent's `Agent`
+      // call as `parentToolCallId`; they belong in that card's timeline.
+      parentToolUseId: readSubagentParentToolCallId(payload),
     })];
   }
 

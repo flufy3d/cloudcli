@@ -43,6 +43,8 @@ import {
 
 import { getAntigravityDataRoot } from './antigravity-data-root.js';
 import { tryResolveEnginePath } from './antigravity-engine-path.js';
+import { createAgentTranscriptTail } from './antigravity-agent-tail.js';
+import { AntigravitySessionsProvider } from './antigravity-sessions.provider.js';
 import { antigravityBackgroundWork, extractAntigravitySubagents, judgeAntigravityAgent } from './antigravity-subagent.js';
 import {
   findCatalogOptionForModelString,
@@ -270,6 +272,15 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         }));
       };
 
+      // The agents' own work lives in their transcripts, not in `agy`'s
+      // stream; following those puts their steps into their cards as they
+      // happen, in the same shape history gives them.
+      const historyReader = new AntigravitySessionsProvider();
+      const agentTail = createAgentTranscriptTail({
+        readTimeline: async (conversationId) => (await historyReader.fetchHistory(conversationId, {})).messages,
+        emit: (message) => writer.send(message),
+      });
+
       /**
        * Settles every agent the session still waits on: one `task_status`
        * per agent so its card stops running, then the registry empties. At the
@@ -279,6 +290,9 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
        * nothing is left to report on them.
        */
       const settleOutstandingAgents = (judge: 'transcript' | 'stopped') => {
+        // One last read each, so the final steps arrive; they follow the
+        // settle frames by a moment.
+        void agentTail.stopAll();
         const outstanding = antigravityBackgroundWork.list().find((entry) => entry.sessionId === sessionKey)?.tasks ?? [];
         for (const task of outstanding) {
           writer.send(createTaskStatusMessage(
@@ -554,6 +568,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
                   taskType: LOCAL_AGENT_TASK_TYPE,
                   description: agent.role ?? 'Subagent',
                 });
+                agentTail.follow(agent.conversationId, agent.toolUseId);
                 writer.send(createTaskStatusMessage(
                   {
                     provider: PROVIDER,

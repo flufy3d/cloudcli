@@ -20,6 +20,7 @@ import path from 'path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
 import { createBackgroundWorkTracker } from '@/modules/providers/list/claude/claude-background-work.js';
+import { createSubagentOriginTracker } from '@/modules/providers/list/claude/claude-subagent-origin.js';
 import {
   appendFilesInputTag,
   buildClaudeUserContent,
@@ -911,6 +912,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // auto-approves them and the model acts on a generated answer. Move these
     // tools to a PreToolUse hook (runs before the mode check) if we need them
     // to work in those modes.
+    const subagentOrigins = createSubagentOriginTracker();
     sdkOptions.canUseTool = async (toolName, input, context) => {
       const requiresInteraction = TOOLS_REQUIRING_INTERACTION.has(toolName);
 
@@ -935,17 +937,11 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       }
 
       const requestId = createRequestId();
-      ws.send(createNormalizedMessage({ kind: 'permission_request', requestId, toolName, input, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
-      emitNotification(createNotificationEvent({
-        provider: 'claude',
-        sessionId: sessionId || capturedSessionId || null,
-        kind: 'action_required',
-        code: 'permission.required',
-        meta: { toolName, sessionName: sessionSummary },
-        severity: 'warning',
-        requiresUserAction: true,
-        dedupeKey: `claude:permission:${sessionId || capturedSessionId || 'none'}:${requestId}`
-      }));
+      // The callback serves the main thread and every subagent alike; the
+      // stream told us which card the asking call was made under.
+      const subagent = subagentOrigins.originOf(context?.toolUseID);
+      const requestContext = subagent ? { subagent } : undefined;
+      ws.send(createNormalizedMessage({ kind: 'permission_request', requestId, toolName, input, context: requestContext, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
 
       const decision = await waitForToolApproval(requestId, {
         timeoutMs: requiresInteraction ? 0 : undefined,
@@ -956,6 +952,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
           _sessionId: sessionId || capturedSessionId || null,
           _toolName: toolName,
           _input: input,
+          _context: requestContext,
           _receivedAt: new Date(),
         },
         onCancel: (reason) => {
@@ -1027,6 +1024,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // Process streaming messages
     console.log('Starting async generator loop for session:', capturedSessionId || 'NEW');
     for await (const message of queryInstance) {
+      subagentOrigins.observe(message);
       // Late output from an interrupted run must never mutate the new run's
       // task state or clear its cards on the shared session stream.
       const current = getSession(sessionKey());

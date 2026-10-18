@@ -521,6 +521,10 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     }
     if (message.status === 'completed' || message.status === 'failed' || message.status === 'stopped') {
       zcodeBackgroundWork.end(appSessionKey, message.taskId);
+      // Its unanswered approval cards have nobody left to answer them.
+      if (message.sessionId) {
+        runLifecycle.retractSubagentPermissions(message.sessionId, message.toolUseId);
+      }
     }
   }
 
@@ -552,6 +556,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * run's listener and the lifecycle watcher, whichever hears the engine go.
    */
   private settleAgentsOfLostEngine(appSessionKey: string, engineSessionId: string, writer: ProviderRuntimeWriter): void {
+    runLifecycle.retractSubagentPermissions(engineSessionId);
     for (const task of zcodeBackgroundWork.clearSession(appSessionKey)) {
       writer.send(createTaskStatusMessage(
         { provider: 'zcode', sessionId: engineSessionId, taskId: task.taskId, toolUseId: task.toolUseId, taskType: LOCAL_AGENT_TASK_TYPE },

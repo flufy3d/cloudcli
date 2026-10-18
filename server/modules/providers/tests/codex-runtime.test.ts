@@ -544,6 +544,28 @@ test('an approval waits for the user and carries the command it is about', async
   assert.equal(codexRuntime.permissions.listPending('app-session').length, 0);
 });
 
+test('an approval asked by a running agent says which agent asked', async (t) => {
+  let answer: Promise<unknown> | undefined;
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    // The request comes from the agent's own thread on the shared connection.
+    answer = Promise.resolve(fake.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      threadId: 'thread_child_1', turnId: 'child-turn', itemId: 'child-exec', command: "/bin/zsh -lc 'rm x'",
+    } as any));
+    void answer.then(() => notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } }));
+  });
+  const messages: any[] = [];
+  const run = codexRuntime.run('go', { sessionId: 'app-session-origin', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const prompt = await waitFor(() => messages.find((message) => message.kind === 'permission_request'));
+  assert.deepEqual(prompt.context.subagent, { toolUseId: 'call_spawn_1', description: 'Standards' });
+  codexRuntime.permissions.resolve(prompt.requestId, { allow: true });
+  await run;
+});
+
 test('remembering an approval grants it for the whole session', async (t) => {
   let answer: Promise<unknown> | undefined;
   installFakeAppServer(t, (fake) => {

@@ -266,6 +266,29 @@ function notifyRunStopped({ userId, provider, sessionId = null, stopReason = 'co
 }
 
 /**
+ * Tells the user a tool or question is waiting for their answer. One place
+ * serves every engine: the chat gateway calls it for any approval card a
+ * provider raises, so an engine cannot forget to.
+ *
+ * @param {{ userId?: string | number | null, provider: string, sessionId?: string | null, toolName?: string | null, requestId: string, sessionName?: string | null }} options
+ */
+function notifyPermissionRequired({ userId, provider, sessionId = null, toolName = null, requestId, sessionName = null }) {
+  notifyUserIfEnabled({
+    userId,
+    event: createNotificationEvent({
+      provider,
+      sessionId,
+      kind: 'action_required',
+      code: 'permission.required',
+      meta: { toolName, sessionName },
+      severity: 'warning',
+      requiresUserAction: true,
+      dedupeKey: `${provider}:permission:${sessionId || 'none'}:${requestId}`
+    })
+  });
+}
+
+/**
  * Reports background work that finished after its turn had already completed.
  *
  * Uses the `stop` kind so it rides the existing "run stopped" preference rather
@@ -312,5 +335,6 @@ export {
   notifyUserIfEnabled,
   notifyRunStopped,
   notifyRunFailed,
-  notifyBackgroundWorkCompleted
+  notifyBackgroundWorkCompleted,
+  notifyPermissionRequired
 };

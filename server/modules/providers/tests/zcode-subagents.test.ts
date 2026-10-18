@@ -129,6 +129,40 @@ test("the engine's Agent tool keeps its name on every live shape", () => {
   assert.equal(bash.toolName, 'Bash');
 });
 
+// Captured from the real engine (ZCode 0.16.x): while an agent runs, its tool
+// calls are mirrored onto the PARENT session's stream as `tool.updated` events
+// whose payload names the agent's card as `parentToolCallId`.
+const childScheduled = {
+  toolCallId: 'tool_subagent_agent_a_call_child',
+  assistantMessageId: 'msg_child',
+  toolName: 'Bash',
+  input: { command: 'echo hello-from-agent', description: 'Print hello' },
+  kind: 'scheduled',
+  source: 'subagent',
+  agentId: 'agent_a',
+  agentType: 'general-purpose',
+  childSessionId: 'sess_subagent_agent_a',
+  childToolCallId: 'call_child',
+  parentToolCallId: 'call_agent',
+};
+
+test('a tool call an agent makes is tied to the agent\'s card, not shown in the main thread', () => {
+  const provider = new ZCodeSessionsProvider();
+  const [row] = provider.normalizeMessage({ method: 'session/event', params: { sessionId: 'sess_1', type: 'tool.updated', payload: childScheduled } }, 'sess_1');
+  assert.equal(row.kind, 'tool_use');
+  assert.equal(row.toolName, 'Bash');
+  assert.equal(row.toolId, 'tool_subagent_agent_a_call_child');
+  assert.equal(row.parentToolUseId, 'call_agent');
+});
+
+test('a main-thread tool call is not tied to any card', () => {
+  const provider = new ZCodeSessionsProvider();
+  const { source: _s, agentId: _a, agentType: _t, childSessionId: _c, childToolCallId: _k, parentToolCallId: _p, ...mainThread } = childScheduled;
+  const [row] = provider.normalizeMessage({ method: 'session/event', params: { sessionId: 'sess_1', type: 'tool.updated', payload: mainThread } }, 'sess_1');
+  assert.equal(row.kind, 'tool_use');
+  assert.equal(row.parentToolUseId, undefined);
+});
+
 // ---------------------------------------------------------------------------
 // History: the Agent row reads its outcome off the engine's agent sidecar
 // ---------------------------------------------------------------------------

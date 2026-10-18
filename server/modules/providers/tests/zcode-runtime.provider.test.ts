@@ -267,7 +267,7 @@ rl.on('line', (line) => {
       send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
       return;
     }
-    if (readMode() === 'subagent-bg' || readMode() === 'subagent-bg-crash' || readMode() === 'subagent-bg-permission') {
+    if (readMode() === 'subagent-bg' || readMode() === 'subagent-bg-crash' || readMode() === 'subagent-bg-permission' || readMode() === 'subagent-bg-permission-orphan') {
       // A background agent: the engine announces the Agent call, reports the
       // spawn on the parent session once the child is ready, returns the
       // launch acknowledgement as the tool result and ends the turn. The
@@ -275,7 +275,8 @@ rl.on('line', (line) => {
       // — or, in the crash variant, the engine dies with the agent still
       // running and never reports.
       const crash = readMode() === 'subagent-bg-crash';
-      const asksPermission = readMode() === 'subagent-bg-permission';
+      const asksPermission = readMode() === 'subagent-bg-permission' || readMode() === 'subagent-bg-permission-orphan';
+      const orphansPermission = readMode() === 'subagent-bg-permission-orphan';
       const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
       const agent = { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg' };
       ev('model_streaming', { kind: 'tool_call', toolCallId: 'call_agent_bg', toolName: 'Agent', input: { description: 'Review the fix', prompt: 'look', run_in_background: true, subagent_type: 'general-purpose' } });
@@ -291,10 +292,14 @@ rl.on('line', (line) => {
           // and tags it with the subagent as its origin; the parent turn is
           // over by now.
           send({ id: 'server-perm-bg', method: 'interaction/requestPermission', params: {
-            requestId: 'perm_bg_1', sessionId, toolCallId: 'call_child_bash', toolName: 'Bash',
+            requestId: orphansPermission ? 'perm_bg_orphan' : 'perm_bg_1', sessionId, toolCallId: 'call_child_bash', toolName: 'Bash',
             input: { command: 'touch /tmp/bg' }, reason: 'Tool Bash requires approval', riskLevel: 'medium',
-            origin: { kind: 'subagent', childSessionId: 'sess_subagent_agent_bg_1', parentSessionId: sessionId, parentToolCallId: 'call_agent_bg' },
+            origin: { kind: 'subagent', agentId: 'agent_bg_1', agentType: 'general-purpose', description: 'Review the fix', childSessionId: 'sess_subagent_agent_bg_1', parentSessionId: sessionId, parentToolCallId: 'call_agent_bg' },
           } });
+          if (orphansPermission) {
+            // The agent ends while its request is still unanswered.
+            setTimeout(() => ev('subagent_stopped', { ...agent, status: 'stopped', totalDurationMs: 10 }), 200);
+          }
           return;
         }
         ev('subagent_stopped', { ...agent, status: 'completed', totalDurationMs: 1500, totalToolUseCount: 2, totalTokens: 300 });
@@ -1309,6 +1314,7 @@ test('a background agent asking for approval after its turn ended still reaches 
   const card = messages.find((msg) => msg.kind === 'permission_request');
   assert.ok(card, 'the approval card must reach the page although no turn is running');
   assert.equal(card.requestId, 'perm_bg_1');
+  assert.deepEqual((card.context as { subagent?: unknown }).subagent, { toolUseId: 'call_agent_bg', description: 'Review the fix' });
   assert.deepEqual((zcodeRuntimePermissions.listPending('app-sess-bg-perm') as Array<{ requestId: string }>).map((entry) => entry.requestId), ['perm_bg_1']);
 
   zcodeRuntimePermissions.resolve('perm_bg_1', { allow: true });
@@ -1319,7 +1325,25 @@ test('a background agent asking for approval after its turn ended still reaches 
   const answer = readStubLog().filter((entry) => entry.name === 'perm_answer' && (entry.value as { id?: string }).id === 'server-perm-bg');
   assert.equal(answer.length, 1);
   assert.deepEqual((answer[0].value as { result: unknown }).result, { decision: 'allow' });
-  assert.equal(messages.some((msg) => msg.kind === 'permission_cancelled'), true, 'the card is retracted once answered');
+  assert.equal(messages.filter((msg) => msg.kind === 'permission_cancelled').length, 1, 'retracted once when answered, not again when the agent stops');
+});
+
+test('an approval card is retracted when its agent stops before the user answered', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg-permission-orphan\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+  await runtime.run('review it', { sessionId: 'app-sess-orphan', cwd: stubDir }, writer, context);
+
+  const deadline = Date.now() + 4000;
+  while (!messages.some((msg) => msg.kind === 'permission_cancelled') && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  assert.equal(messages.filter((msg) => msg.kind === 'permission_request').length, 1);
+  assert.equal(messages.filter((msg) => msg.kind === 'permission_cancelled').length, 1, 'the dead agent\'s card is taken down');
+  assert.deepEqual(zcodeRuntimePermissions.listPending('app-sess-orphan'), []);
+  // A late answer to the retracted card changes nothing.
+  zcodeRuntimePermissions.resolve('perm_bg_orphan', { allow: true });
+  assert.equal(messages.filter((msg) => msg.kind === 'permission_cancelled').length, 1);
 });
 
 // Last: both crash modes kill the shared stub subprocess.
