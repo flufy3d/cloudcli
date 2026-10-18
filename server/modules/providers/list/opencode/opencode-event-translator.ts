@@ -29,6 +29,7 @@ import type { NormalizedMessage } from '@/shared/types.js';
 import {
   compactProviderPayload,
   createNormalizedMessage,
+  hasVisibleText,
   readObjectRecord,
   readOptionalString,
 } from '@/shared/utils.js';
@@ -141,7 +142,9 @@ export class OpenCodeSessionEventTranslator {
     switch (event.type) {
       case 'session.text.delta': {
         const delta = readVerbatimString(data.delta);
-        if (!delta) {
+        // A delta carrying only invisible characters would otherwise sit in
+        // the client's streaming buffer and flush as a copy-control-only row.
+        if (!delta || !hasVisibleText(delta)) {
           return { frames: [] };
         }
         return {
@@ -163,10 +166,10 @@ export class OpenCodeSessionEventTranslator {
         // (per-type ordinal within the message — see the v2 history flattener).
         const text = readVerbatimString(data.text);
         const frames: NormalizedMessage[] = [];
-        // Whitespace-only bodies are skipped by the history reader too; a row
-        // for one would survive every refresh as an orphan with no persisted
-        // copy to retire it.
-        if (text?.trim()) {
+        // Whitespace- or invisible-only bodies are skipped by the history
+        // reader too; a row for one would survive every refresh as an orphan
+        // with no persisted copy to retire it.
+        if (text && hasVisibleText(text)) {
           frames.push(createNormalizedMessage({
             id: `${messageId}_text_${ordinal}`,
             sessionId: this.sessionId,
@@ -204,7 +207,7 @@ export class OpenCodeSessionEventTranslator {
           return { frames: [] };
         }
         const text = readVerbatimString(data.text);
-        if (!text?.trim()) {
+        if (!text || !hasVisibleText(text)) {
           return { frames: [] };
         }
         return { frames: [this.thinkingFrame(blockId, text, timestamp)] };

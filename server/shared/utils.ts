@@ -103,6 +103,20 @@ function storeInlineImage(mimeType: string, encoded: string): string {
 }
 
 /**
+ * Blank-check for engine display text. Zero-width format characters
+ * (U+200B-U+200D, U+2060, U+FEFF) render as nothing in the transcript, yet
+ * JavaScript `.trim()` treats them as content, so an engine that emits one as
+ * a whole text part would surface as a transcript row carrying only its copy
+ * control. Consumers: the opencode live translator and history reader, which
+ * must agree on what counts as an empty segment.
+ */
+const INVISIBLE_TEXT_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
+
+export function hasVisibleText(text: string): boolean {
+  return text.replace(INVISIBLE_TEXT_RE, '').trim().length > 0;
+}
+
+/**
  * Providers and the websocket gateway compact display copies before retaining
  * or serializing them. Recognized inline images become content-addressed,
  * authenticated asset references; engine-owned inputs are never mutated.

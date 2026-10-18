@@ -717,6 +717,91 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
   }
 });
 
+test('zero-width-space text and reasoning parts are skipped on history and live reads', { concurrency: false }, async () => {
+  // ses_eb34f87e3ffe (2026-10-18): DeepSeek ended every later segment with a
+  // single U+200B. `.trim()` passes it, so each persisted part surfaced as a
+  // transcript row whose only visible content was its copy control.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-zwsp-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (
+          id, project_id, slug, directory, title, version,
+          tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          time_created, time_updated
+        ) VALUES (
+          'ses_v2_zwsp', 'proj_1', 'v2-zwsp', '/tmp/proj', 'V2 zwsp', '2.0.31',
+          0, 0, 0, 0, 0, 1000, 2000
+        );
+      `);
+      const assistantData = JSON.stringify({
+        time: { created: 1100 },
+        model: { id: 'beam-free', providerID: 'opencode', variant: 'high' },
+        content: [
+          { type: 'text', text: '​' },
+          { type: 'reasoning', text: 'thinking' },
+          { type: 'tool', id: 'call_1', name: 'write', state: { status: 'completed', input: { path: '/tmp/x' }, output: 'ok' } },
+          { type: 'text', text: '​' },
+          { type: 'reasoning', text: '​' },
+        ],
+      });
+      db.prepare(`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES ('msg_u', 'ses_v2_zwsp', 'user', 1, 1000, 1000, ?),
+               ('msg_a', 'ses_v2_zwsp', 'assistant', 2, 1100, 1200, ?)`)
+        .run(JSON.stringify({ time: { created: 1000 }, text: 'Build it' }), assistantData);    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('ses_v2_zwsp');
+
+    // Only the user prompt, the real reasoning block, and the tool call are
+    // user-visible; the three zero-width-space parts drop out entirely.
+    assert.equal(history.messages[0]?.role, 'user');
+    assert.equal(history.messages[0]?.content, 'Build it');
+    assert.deepEqual(history.messages.slice(1).map((message) => message.kind), ['thinking', 'tool_use']);
+
+    // The live `opencode run` normalizer shares the blank-text contract.
+    assert.deepEqual(provider.normalizeMessage({ type: 'text', text: '​' }, 'ses_v2_zwsp'), []);
+    assert.deepEqual(provider.normalizeMessage({ type: 'reasoning', text: '​' }, 'ses_v2_zwsp'), []);
+    const padded = provider.normalizeMessage({ type: 'text', text: '​ok' }, 'ses_v2_zwsp');
+    assert.equal(padded.length, 1);
+    assert.equal(padded[0]?.content, '​ok');
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('v2 history rows carry the same ids the live translator produces for the same message', { concurrency: false }, async () => {
   // The cross-transport identity contract: the SSE stream names a part
   // `${assistantMessageID}_text_${ordinal}` / `${assistantMessageID}_reasoning_${ordinal}`,

@@ -19,6 +19,7 @@ import {
   AppError,
   createNormalizedMessage,
   generateMessageId,
+  hasVisibleText,
   normalizeProjectPath,
   normalizeProviderTimestamp,
   readObjectRecord,
@@ -323,7 +324,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       }
 
       const content = extractText(raw.text ?? raw.delta ?? raw.message ?? part?.text);
-      if (!content.trim()) {
+      if (!hasVisibleText(content)) {
         return [];
       }
 
@@ -339,7 +340,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
 
     if (type === 'reasoning') {
       const content = extractText(raw.text ?? raw.delta ?? raw.message ?? part?.text);
-      if (!content.trim()) {
+      if (!hasVisibleText(content)) {
         return [];
       }
 
@@ -552,7 +553,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
           ? parseFilesInputTag(parsedImages.text)
           : { text: rawContent, attachments: [] };
         if (
-          parsedFiles.text.trim()
+          hasVisibleText(parsedFiles.text)
           || parsedImages.attachments.length > 0
           || parsedFiles.attachments.length > 0
         ) {
@@ -573,7 +574,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
 
       if (partType === 'reasoning') {
         const content = extractText(partData);
-        if (content.trim()) {
+        if (hasVisibleText(content)) {
           yield createNormalizedMessage({
             id: baseId,
             sessionId,

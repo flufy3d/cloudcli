@@ -66,6 +66,28 @@ test('an ended text segment with no body still closes the stream but emits no em
   }
 });
 
+test('zero-width-space bodies count as blank on every text frame', () => {
+  // ses_eb34f87e3ffe (2026-10-18): DeepSeek ended every later segment with a
+  // single U+200B. `.trim()` passes it, so each segment surfaced as a
+  // transcript row whose only visible content was its copy control.
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+
+  const delta = translator.translate(event('session.text.delta', { assistantMessageID: MESSAGE, ordinal: 0, delta: '​' }));
+  assert.deepEqual(delta.frames, []);
+
+  const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: '​' }));
+  assert.equal(ended.frames.length, 1);
+  assert.equal(ended.frames[0].kind, 'stream_end');
+
+  const reasoning = translator.translate(event('session.reasoning.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: '​' }));
+  assert.deepEqual(reasoning.frames, []);
+
+  // Real content that merely carries invisible padding must still stream.
+  const padded = translator.translate(event('session.text.delta', { assistantMessageID: MESSAGE, ordinal: 1, delta: '​ok' }));
+  assert.equal(padded.frames.length, 1);
+  assert.equal(padded.frames[0].content, '​ok');
+});
+
 test('emits reasoning deltas under one stable block id and does not repeat the block on ended', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
 
