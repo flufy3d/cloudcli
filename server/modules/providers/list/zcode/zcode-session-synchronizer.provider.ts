@@ -10,11 +10,23 @@ type ZCodeSessionRow = {
   id: string;
   directory: string | null;
   title: string | null;
+  title_source: string | null;
   time_created: number | null;
   time_updated: number | null;
   /** Set when ZCode's own title generation (re)named the session. */
   time_title_updated: number | null;
 };
+
+/**
+ * The `session.title_source` column tells apart the engine's namings
+ * (`generated`, user renames via `custom`) from the raw first input the engine
+ * seeds the title with (`first_input`). Older engine databases may not have
+ * the column yet; those degrade to content-derived titles.
+ */
+function hasTitleSourceColumn(db: Database.Database): boolean {
+  const columns = db.prepare('PRAGMA table_info(session)').all() as Array<{ name: string }>;
+  return columns.some((column) => column.name === 'title_source');
+}
 
 /**
  * Session synchronizer for ZCode's SQLite-backed session store.
@@ -43,11 +55,15 @@ export class ZCodeSessionSynchronizer extends SqliteSessionSynchronizer<ZCodeSes
     sinceMillis: number | null,
     limit: number | null,
   ): ZCodeSessionRow[] {
+    const titleSourceSelect = hasTitleSourceColumn(db)
+      ? 's.title_source AS title_source'
+      : 'NULL AS title_source';
     return db.prepare(`
       SELECT
         s.id AS id,
         s.directory AS directory,
         s.title AS title,
+        ${titleSourceSelect},
         s.time_created AS time_created,
         s.time_updated AS time_updated,
         s.time_title_updated AS time_title_updated
@@ -78,9 +94,14 @@ export class ZCodeSessionSynchronizer extends SqliteSessionSynchronizer<ZCodeSes
 
   protected deriveSessionName(_db: Database.Database, row: ZCodeSessionRow) {
     const title = readOptionalString(row.title) ?? null;
-    // ZCode's `title` is the engine's own naming (first_input at first, then
-    // its generated title); whatever it currently says is what we follow.
-    return { name: title, generated: title !== null };
+    const source = readOptionalString(row.title_source);
+    // The engine seeds `title` with the raw first input (`first_input`) before
+    // its own title lands; only `generated` (and engine-side `custom` renames)
+    // are namings ZCode made itself, so only those may replace an existing
+    // synced name — otherwise a session's compact title would balloon back to
+    // the raw message until the generated title arrives.
+    const generated = source === 'generated' || source === 'custom';
+    return { name: title, generated: title !== null && generated };
   }
 
   /**

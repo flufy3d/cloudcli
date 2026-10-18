@@ -154,11 +154,11 @@ export const sessionsDb = {
            jsonl_path = ?,
            worktree_path = ?,
            worktree_branch = ?,
-          isArchived = CASE WHEN ? IS NULL OR updated_at IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
-          custom_name = CASE
-            WHEN name_locked = 1 THEN custom_name
-            ELSE COALESCE(?, custom_name)
-          END
+           isArchived = CASE WHEN ? IS NULL OR updated_at IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
+           custom_name = CASE
+             WHEN name_locked = 1 THEN custom_name
+             ELSE COALESCE(?, custom_name)
+           END
          WHERE session_id = ?`
       ).run(
         provider,

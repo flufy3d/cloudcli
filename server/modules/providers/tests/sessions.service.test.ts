@@ -129,6 +129,17 @@ test('app session names cut at Latin exclamation or question marks but not perio
   });
 });
 
+test('app session names skip leading terminators instead of giving up', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const exclaimed = sessionsService.createAppSession('claude', '/tmp/session-name-project', '？？？为什么这里会崩');
+    assert.equal(exclaimed.sessionName, '为什么这里会崩');
+
+    // A message that is only punctuation has nothing to name.
+    const punctuated = sessionsService.createAppSession('claude', '/tmp/session-name-project', '？？？');
+    assert.equal(punctuated.sessionName, 'Untitled Session');
+  });
+});
+
 test('app sessions without message text receive a stable fallback name', { concurrency: false }, async () => {
   await withIsolatedDatabase(() => {
     const result = sessionsService.createAppSession('claude', '/tmp/attachment-only-project', '  \n ');

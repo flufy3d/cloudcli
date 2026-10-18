@@ -163,10 +163,12 @@ function buildCloudCliSessionName(initialMessage: string): string {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) ?? '';
-  // The Latin period is left out on purpose: "1." and "e.g." would otherwise
-  // gut the name. Chinese terminators and Latin !/?/; are safe sentence ends.
-  const [firstSentence] = firstLine.split(/[。？！；?!;]/);
-  return (firstSentence ?? firstLine).trim().slice(0, MAX_CLOUDCLI_SESSION_NAME_CHARS)
+  // Leading terminators describe nothing ("？？？为什么崩" is about the crash),
+  // and would otherwise cut the first sentence to nothing. The Latin period is
+  // left out on purpose: "1." and "e.g." would otherwise gut the name.
+  const stripped = firstLine.replace(/^[。？！；?!;\s]+/, '');
+  const [firstSentence] = (stripped || firstLine).split(/[。？！；?!;]/);
+  return (firstSentence ?? '').trim().slice(0, MAX_CLOUDCLI_SESSION_NAME_CHARS)
     || 'Untitled Session';
 }
 

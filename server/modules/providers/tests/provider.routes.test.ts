@@ -73,10 +73,11 @@ test('session creation route names a CloudCLI session from the initial message',
     };
 
     assert.equal(response.status, 201);
-    assert.equal(payload.data.sessionName, 'abcd efg hij klm');
+    // The name is the first line of the message (no terminator to split on).
+    assert.equal(payload.data.sessionName, 'abcd  efg');
     assert.equal(
       sessionsDb.getSessionById(payload.data.sessionId)?.custom_name,
-      'abcd efg hij klm',
+      'abcd  efg',
     );
   });
 });

@@ -40,5 +40,5 @@ export function resolveSessionTitle(input: {
     return existingName;
   }
 
-  return input.derived.name ?? existingName ?? input.fallbackTitle;
+  return input.derived.name ?? input.fallbackTitle;
 }
