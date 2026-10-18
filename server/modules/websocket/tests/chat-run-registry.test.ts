@@ -22,6 +22,65 @@ class FakeConnection {
   }
 }
 
+test('replay buffers are bounded by bytes and report a gap even from sequence zero', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'byte-budget', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    for (let i = 0; i < 100; i += 1) {
+      run.writer.send({ kind: 'stream_delta', provider: 'codex', content: `${i}:` + 'x'.repeat(200_000) });
+    }
+    const replay = chatRunRegistry.replayEvents('byte-budget', 0);
+    assert.ok(Buffer.byteLength(JSON.stringify(replay.events)) <= 8 * 1024 * 1024);
+    assert.equal(replay.stale, true);
+    assert.equal(replay.lastSeq, 100);
+    assert.equal(chatRunRegistry.replayEvents('byte-budget', 99).stale, false);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('a single oversized event is not retained and cannot hide a replay gap', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'single-budget', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    run.writer.send({ id: 'large-tool', kind: 'tool_use', provider: 'codex', toolInput: Array.from({ length: 300 }, () => 'x'.repeat(8_000)) });
+    assert.equal(run.events.length, 0);
+    run.writer.send({ kind: 'stream_end', provider: 'codex' });
+    assert.equal(chatRunRegistry.replayEvents('single-budget', 0).stale, true);
+    assert.equal(chatRunRegistry.replayEvents('single-budget', 1).stale, false);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('many sessions share one process-wide replay byte budget', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const runs = Array.from({ length: 10 }, (_, index) => chatRunRegistry.startRun({ appSessionId: `global-budget-${index}`, provider: 'codex', providerSessionId: null, connection: null, userId: null }));
+    for (const run of runs) {
+      assert.ok(run);
+      for (let i = 0; i < 25; i += 1) run.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'x'.repeat(200_000) });
+    }
+    const bytes = runs.reduce((sum, run) => sum + (run?.bufferedBytes ?? 0), 0);
+    assert.ok(bytes <= 32 * 1024 * 1024);
+    assert.equal(chatRunRegistry.replayEvents('global-budget-0', 0).stale, true);
+    assert.equal(chatRunRegistry.replayEvents('global-budget-9', 0).stale, false);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('an expired run still reports missing events using its session watermark', (context) => {
+  chatRunRegistry.clearAll();
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'expired-budget', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    run.writer.send({ id: 'large-tool', kind: 'tool_use', provider: 'codex', toolInput: Array.from({ length: 300 }, () => 'x'.repeat(8_000)) });
+    run.writer.sendComplete({ exitCode: 0 });
+    context.mock.timers.tick(5 * 60 * 1000 + 1);
+    assert.equal(chatRunRegistry.getRun('expired-budget'), undefined);
+    assert.equal(chatRunRegistry.replayEvents('expired-budget', 0).stale, true);
+    assert.equal(chatRunRegistry.replayEvents('expired-budget', 2).stale, false);
+  } finally { context.mock.timers.reset(); chatRunRegistry.clearAll(); }
+});
+
 async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const tempDirectory = await mkdtemp(path.join(tmpdir(), 'chat-run-registry-'));

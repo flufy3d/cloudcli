@@ -1,6 +1,6 @@
 # 聊天链路（Chat Pipeline）
 
-> 基准：2.9.0 / 2026-10-17
+> 基准：2.10.0 / 2026-10-18
 > **核心文档**：改动 `server/modules/websocket/**` 或 `src/modules/chat/**` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -66,7 +66,7 @@ flowchart TD
 
 ## 断线恢复
 
-- `seq` 由 run registry 按 session 维护单调水位：跨 run 续数、不随缓冲驱逐失效，服务端单方定义，客户端只透传（取 max 对账）。重连后发 `chat.subscribe`（带 `lastSeq`）→ 活跃 run 从缓冲精确补发；ack 带权威 `lastSeq` 与 `stale` 标志——`stale: true` 表示 `lastSeq` 已落在缓冲窗之前（5000 条上限 / 5 分钟保留），客户端补一次 REST 刷新。完成态 run 不 replay，走 REST。
+- `seq` 由 run registry 按 session 维护单调水位：跨 run 续数、不随缓冲驱逐失效，服务端单方定义，客户端只透传（取 max 对账）。重连后发 `chat.subscribe`（带 `lastSeq`）→ 活跃 run 从缓冲精确补发；ack 带权威 `lastSeq` 与 `stale` 标志——`stale: true` 表示需要的事件已被条数、字节预算或保留期限驱逐，客户端补一次 REST 刷新。完成态 run 不 replay，走 REST。
 - WS 鉴权用 query token 或 Authorization 头（`websocket-auth.service.ts`）；30s 心跳在 `websocket-server.service.ts`。
 - `websocket_reconnected` 帧是前端 `src/shared/context/WebSocketContext.tsx` 本地合成的，用于各订阅方追赶。
 
@@ -200,3 +200,9 @@ flowchart LR
 | 新增工具卡片渲染 | `src/modules/chat/tools/configs/toolConfigs.ts` 注册（配置驱动，**禁止散落条件分支**），复杂内容加 ContentRenderer；见 `src/modules/chat/tools/README.md`。工具别名/展示分类/命令提取统一在 `toolTaxonomy.ts`，别再拷贝名单 |
 | 新增权限相关能力 | 引擎 runtime 的 `permissions` 网关 → 矩阵自动推导 `supportsPermissionRequests` → 前端按矩阵渲染 |
 | 改历史分页 | `src/modules/chat/utils/sessionMessagePagination.ts` + store 的序列化测试（`sessionTimelineSequences.test.ts`）必须跟着改 |
+
+## 重连缓存的容量
+
+例如一个工具返回一张内嵌截图，writer 广播的是图片资源引用，registry 不保留图片正文。registry 同时限制单条事件、单个运行和所有运行的缓存字节数，并保留条数限制。预算常量以 `chat-run-registry.service.ts` 为准；字节数按序列化消息计费，与 Node 实际堆占用不同。
+
+单条超预算事件仍发给当前在线客户端，但不进入重放缓存。缓存不足时先裁掉已完成或较早运行的旧事件。每个运行记录最大的缺失序号，客户端订阅序号早于缺失位置时收到 `stale: true`，包括从零订阅、缓存已空和中间单条事件被跳过的情况。切换运行、运行过期和测试清空均释放对应字节账目。运行过期后，客户端序号落后于会话水位时仍标记缺口，避免断线期间完成的结果被漏掉。全局预算只约束 registry 的缓存，不代表整个服务进程的内存上限。

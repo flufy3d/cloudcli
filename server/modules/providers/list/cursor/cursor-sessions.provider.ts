@@ -6,6 +6,8 @@ import { parseFilesInputTag, parseImagesInputTag } from '@/shared/image-attachme
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import type { AnyRecord, FetchHistoryOptions, FetchHistoryResult, NormalizedMessage } from '@/shared/types.js';
 import {
+  ProviderDisplayAssetError,
+  compactProviderPayload,
   createNormalizedMessage,
   generateMessageId,
   normalizeProjectPath,
@@ -249,54 +251,38 @@ export class CursorSessionsProvider implements IProviderSessions {
     const db = new Database(resolvedStoreDbPath, { readonly: true, fileMustExist: true });
 
     try {
-      const allBlobs = db.prepare<[], CursorDbBlob>('SELECT rowid, id, data FROM blobs').all();
-
-      const blobMap = new Map<string, CursorDbBlob>();
+      // Retain graph identity and compact JSON, never every SQLite blob's bytes.
+      const allBlobs = db.prepare<[], CursorDbBlob>('SELECT rowid, id FROM blobs').all();
+      const blobMap = new Map(allBlobs.map((blob) => [blob.id, blob]));
       const parentRefs = new Map<string, string[]>();
-      const childRefs = new Map<string, string[]>();
+      const binaryMessageRefs = new Map<string, string[]>();
       const jsonBlobs: CursorJsonBlob[] = [];
+      const jsonIds = db.prepare<[], { id: string }>("SELECT id FROM blobs WHERE substr(data, 1, 1) = x'7B'").all()
+        .map(({ id }) => ({ id, bytes: Buffer.from(id, 'hex') })).filter(({ bytes }) => bytes.length > 0);
 
-      for (const blob of allBlobs) {
-        blobMap.set(blob.id, blob);
-
-        if (blob.data && blob.data[0] === 0x7B) {
+      for (const blob of db.prepare<[], CursorDbBlob>('SELECT rowid, id, data FROM blobs').iterate()) {
+        if (!blob.data) continue;
+        if (blob.data[0] === 0x7B) {
           try {
-            const parsed = JSON.parse(blob.data.toString('utf8')) as AnyRecord;
-            jsonBlobs.push({ ...blob, parsed });
-          } catch {
-            // Cursor can include binary or partial blobs; only JSON blobs become messages.
+            const parsed = compactProviderPayload(JSON.parse(blob.data.toString('utf8'))) as AnyRecord;
+            jsonBlobs.push({ id: blob.id, rowid: blob.rowid, parsed });
+          } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
+            if (!(error instanceof SyntaxError)) throw error;
           }
-        }
-      }
-
-      for (const blob of allBlobs) {
-        if (!blob.data || blob.data[0] === 0x7B) {
           continue;
         }
-
         const parents: string[] = [];
         let i = 0;
         while (i < blob.data.length - 33) {
           if (blob.data[i] === 0x0A && blob.data[i + 1] === 0x20) {
-            const parentHash = blob.data.slice(i + 2, i + 34).toString('hex');
-            if (blobMap.has(parentHash)) {
-              parents.push(parentHash);
-            }
+            const parentHash = blob.data.subarray(i + 2, i + 34).toString('hex');
+            if (blobMap.has(parentHash)) parents.push(parentHash);
             i += 34;
-          } else {
-            i++;
-          }
+          } else { i += 1; }
         }
-
-        if (parents.length > 0) {
-          parentRefs.set(blob.id, parents);
-          for (const parentId of parents) {
-            if (!childRefs.has(parentId)) {
-              childRefs.set(parentId, []);
-            }
-            childRefs.get(parentId)?.push(blob.id);
-          }
-        }
+        if (parents.length > 0) parentRefs.set(blob.id, parents);
+        binaryMessageRefs.set(blob.id, jsonIds.filter(({ bytes }) => blob.data!.includes(bytes)).map(({ id }) => id));
       }
 
       const visited = new Set<string>();
@@ -327,17 +313,8 @@ export class CursorSessionsProvider implements IProviderSessions {
       const messageOrder = new Map<string, number>();
       let orderIndex = 0;
       for (const blob of sorted) {
-        if (blob.data && blob.data[0] !== 0x7B) {
-          for (const jsonBlob of jsonBlobs) {
-            try {
-              const idBytes = Buffer.from(jsonBlob.id, 'hex');
-              if (blob.data.includes(idBytes) && !messageOrder.has(jsonBlob.id)) {
-                messageOrder.set(jsonBlob.id, orderIndex++);
-              }
-            } catch {
-              // Ignore malformed blob ids that cannot be decoded as hex.
-            }
-          }
+        for (const id of binaryMessageRefs.get(blob.id) ?? []) {
+          if (!messageOrder.has(id)) messageOrder.set(id, orderIndex++);
         }
       }
 
@@ -374,7 +351,7 @@ export class CursorSessionsProvider implements IProviderSessions {
    * normalized from SQLite blobs in fetchHistory().
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     if (raw?.type === 'assistant' && raw.message?.content?.[0]?.text) {
       return [createNormalizedMessage({
         kind: 'stream_delta',
@@ -426,6 +403,7 @@ export class CursorSessionsProvider implements IProviderSessions {
         limit,
       };
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[CursorProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
@@ -446,7 +424,7 @@ export class CursorSessionsProvider implements IProviderSessions {
 
     for (let i = 0; i < blobs.length; i++) {
       const blob = blobs[i];
-      const content = blob.content;
+      const content = compactProviderPayload(blob.content);
       const ts = new Date(baseTime + (blob.sequence ?? i) * 100).toISOString();
       const baseId = blob.id || generateMessageId('cursor');
 
@@ -624,6 +602,7 @@ export class CursorSessionsProvider implements IProviderSessions {
           }));
         }
       } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
         console.warn('Error normalizing cursor blob:', error);
       }
     }

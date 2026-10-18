@@ -25,6 +25,9 @@ import type {
   ProviderTokenUsageResult,
 } from '@/shared/types.js';
 import {
+  ProviderDisplayAssetError,
+  readJsonlRecords,
+  compactProviderPayload,
   AppError,
   createNormalizedMessage,
   generateMessageId,
@@ -112,72 +115,35 @@ function findTranscriptPath(sessionId: string): string | null {
  * is re-scanned and characters are estimated at ~3 chars/token so long
  * conversations still show a ballpark figure instead of zeros.
  */
-function readAntigravityTokenUsage(fileContent: string): ProviderTokenUsageResult {
+async function readAntigravityTokenUsage(filename: string): Promise<ProviderTokenUsageResult> {
   let inputTokens = 0;
   let outputTokens = 0;
   let totalTokens = 0;
-  const lines = fileContent.trim().split('\n');
-
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    try {
-      const entry = JSON.parse(lines[index]) as AnyRecord;
-      const usage = entry.usage
-        ?? entry.result?.usage
-        ?? (entry.event === 'result' ? entry.result?.usage : null)
-        ?? (entry.payload?.usage)
-        ?? null;
-
-      if (usage) {
-        inputTokens = readUsageNumber(usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens);
-        outputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens);
-        totalTokens = readUsageNumber(usage.total_tokens ?? usage.totalTokens)
-          || (inputTokens + outputTokens);
-        break;
-      }
-
-      if (typeof entry.total_tokens === 'number' || typeof entry.tokens === 'number') {
-        totalTokens = readUsageNumber(entry.total_tokens ?? entry.tokens);
-        inputTokens = readUsageNumber(entry.input_tokens ?? entry.prompt_tokens);
-        outputTokens = readUsageNumber(entry.output_tokens ?? entry.completion_tokens);
-        break;
-      }
-    } catch {
-      // Skip unparseable lines.
+  let estimatedInputChars = 0;
+  let estimatedOutputChars = 0;
+  for await (const entry of readJsonlRecords(filename)) {
+    const contentLength = typeof entry.content === 'string' ? entry.content.length : 0;
+    const thinkingLength = typeof entry.thinking === 'string' ? entry.thinking.length : 0;
+    if (entry.source === 'MODEL' || entry.type === 'PLANNER_RESPONSE') estimatedOutputChars += contentLength + thinkingLength;
+    else estimatedInputChars += contentLength;
+    const usage = entry.usage ?? entry.result?.usage
+      ?? (entry.event === 'result' ? entry.result?.usage : null) ?? entry.payload?.usage ?? null;
+    if (usage) {
+      inputTokens = readUsageNumber(usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens);
+      outputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens);
+      totalTokens = readUsageNumber(usage.total_tokens ?? usage.totalTokens) || inputTokens + outputTokens;
+    } else if (typeof entry.total_tokens === 'number' || typeof entry.tokens === 'number') {
+      totalTokens = readUsageNumber(entry.total_tokens ?? entry.tokens);
+      inputTokens = readUsageNumber(entry.input_tokens ?? entry.prompt_tokens);
+      outputTokens = readUsageNumber(entry.output_tokens ?? entry.completion_tokens);
     }
   }
-
   if (totalTokens === 0 && inputTokens === 0 && outputTokens === 0) {
-    let estimatedInputChars = 0;
-    let estimatedOutputChars = 0;
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const entry = JSON.parse(trimmed) as AnyRecord;
-        const contentLength = typeof entry.content === 'string' ? entry.content.length : 0;
-        const thinkingLength = typeof entry.thinking === 'string' ? entry.thinking.length : 0;
-        if (entry.source === 'MODEL' || entry.type === 'PLANNER_RESPONSE') {
-          estimatedOutputChars += contentLength + thinkingLength;
-        } else {
-          estimatedInputChars += contentLength;
-        }
-      } catch {
-        // Skip unparseable lines
-      }
-    }
-    if (estimatedInputChars > 0 || estimatedOutputChars > 0) {
-      inputTokens = Math.ceil(estimatedInputChars / 3);
-      outputTokens = Math.ceil(estimatedOutputChars / 3);
-      totalTokens = inputTokens + outputTokens;
-    }
+    inputTokens = Math.ceil(estimatedInputChars / 3);
+    outputTokens = Math.ceil(estimatedOutputChars / 3);
+    totalTokens = inputTokens + outputTokens;
   }
-
-  return {
-    used: totalTokens || (inputTokens + outputTokens),
-    inputTokens,
-    outputTokens,
-    breakdown: { input: inputTokens, output: outputTokens },
-  };
+  return { used: totalTokens || inputTokens + outputTokens, inputTokens, outputTokens, breakdown: { input: inputTokens, output: outputTokens } };
 }
 
 function cleanToolArgValue(val: unknown): unknown {
@@ -322,7 +288,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
    * Normalizes live stream-json events or objects into NormalizedMessage array.
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     if (!raw) {
       if (typeof rawMessage === 'string' && rawMessage.trim()) {
         return [createNormalizedMessage({
@@ -621,6 +587,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         tokenUsage,
       };
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       console.warn(`[AntigravitySessions] Failed to load history for ${sessionId}:`, error);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
     }
@@ -663,8 +630,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       }
     }
 
-    const fileContent = await readFile(sessionFilePath, 'utf8');
-    return readAntigravityTokenUsage(fileContent);
+    return readAntigravityTokenUsage(sessionFilePath);
   }
 
   /**

@@ -12,6 +12,7 @@ type TranscriptExportDocumentProps = {
   createDiff: (oldStr: string, newStr: string) => DiffLine[];
   provider: LLMProvider | string;
   selectedProject?: Project | null;
+  assetData?: Readonly<Record<string, string>>;
 };
 
 /**
@@ -33,6 +34,7 @@ export function TranscriptExportDocument({
   createDiff,
   provider,
   selectedProject,
+  assetData,
 }: TranscriptExportDocumentProps) {
   // Everything renders, folded: the exported document is the complete record
   // of the conversation. Process content — thinking blocks, tool groups —
@@ -50,7 +52,7 @@ export function TranscriptExportDocument({
 
   return (
     <I18nextProvider i18n={i18n}>
-      <TranscriptRenderContext.Provider value={{ isExporting: true }}>
+      <TranscriptRenderContext.Provider value={{ isExporting: true, assetData }}>
         <div className="chat-export-transcript">
           {grouped.map((item, index) => {
             if (isToolGroupItem(item)) {

@@ -26,7 +26,12 @@
  */
 
 import type { NormalizedMessage } from '@/shared/types.js';
-import { createNormalizedMessage, readObjectRecord, readOptionalString } from '@/shared/utils.js';
+import {
+  compactProviderPayload,
+  createNormalizedMessage,
+  readObjectRecord,
+  readOptionalString,
+} from '@/shared/utils.js';
 
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 
@@ -128,7 +133,7 @@ export class OpenCodeSessionEventTranslator {
   }
 
   translate(event: OpenCodeEventEnvelope): OpenCodeTranslatedEvent {
-    const data = readObjectRecord(event.data) ?? {};
+    const data = readObjectRecord(compactProviderPayload(event.data)) ?? {};
     const timestamp = toTimestamp(event);
     const messageId = readOptionalString(data.assistantMessageID) ?? 'message';
     const ordinal = toNumber(data.ordinal);

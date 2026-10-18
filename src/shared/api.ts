@@ -4,7 +4,7 @@ import {
   getStoredAuthToken,
   storeAuthToken,
 } from '@/shared/authToken';
-import { IS_PLATFORM } from '@/shared/utils';
+import { collectStoredOutputAssets, IS_PLATFORM } from '@/shared/utils';
 import { readVoiceConfig, voiceConfigHeaders } from '@/shared/voiceConfig';
 
 // Headers are a plain record rather than the full `HeadersInit` union so the
@@ -468,6 +468,24 @@ export const api = {
 
   // Chat attachments, stored globally under ~/.cloudcli/assets
   assets: {
+    /** Explicit HTML/PDF/JSON exports embed authenticated assets for offline use, one request at a time. */
+    embedForExport: async (references: string[]): Promise<Record<string, string>> => {
+      const result: Record<string, string> = {};
+      for (const reference of new Set(references)) {
+        if (!collectStoredOutputAssets(reference).includes(reference)) throw new Error('Invalid export asset reference');
+        const response = await authenticatedFetch(reference);
+        if (!response.ok) throw new Error(`Asset export failed (${response.status})`);
+        const blob = await response.blob();
+        result[reference] = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('Invalid export asset data'));
+          reader.onerror = () => reject(reader.error ?? new Error('Asset export read failed'));
+          reader.onabort = () => reject(new Error('Asset export cancelled'));
+          reader.readAsDataURL(blob);
+        });
+      }
+      return result;
+    },
     uploadFiles: (formData: FormData) =>
       authenticatedFetch('/api/assets/files', {
         method: 'POST',

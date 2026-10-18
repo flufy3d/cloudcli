@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.9.0 / 2026-10-17
+> 基准：2.10.0 / 2026-10-18
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -334,3 +334,22 @@ id 必须字节相同。** 这条有两道闸门守着：
 - **全仓散落的引擎清单**：除上述契约点外，历史上有过 6 处硬编码 6 家列表/能力表的地方（MCP scopes、公开 API 文档 `public/api-docs.html` 的 `PROVIDER_ORDER` 等）。新增引擎后 `grep -rn "antigravity" src server public --include='*.ts' --include='*.tsx' --include='*.html' -l` 扫一遍清单类常量，防止新引擎被隐藏。
 - `sessions`（运行时事件归一化/历史分页）与 `sessionSynchronizer`（落盘索引）是两个关注点，别混在一个类里。
 - 归一化消息 id 必须唯一：一个原生事件拆多个 part 时要加判别后缀；分页契约 `limit: null` = 全量、`limit: 0` = 空页。
+
+## 大结果的展示边界
+
+一次 `read` 工具返回截图时，引擎仍保留原始图片供模型使用。CloudCLI 在保存展示副本前，通过 `server/shared/utils.ts` 的 `compactProviderPayload` 把内嵌图片写入全局资源目录，再用稳定的资源地址替换图片正文。相同图片在实时事件和历史记录中得到同一引用。超过展示阈值的结果文本保留预览，全文通过文件资源提供，阈值以该函数为准。用户提示词保留完整原文，供编辑重发和复制；联表记录在处理 part 时携带父消息的用户角色。
+
+```mermaid
+flowchart LR
+  A[引擎原始结果] --> B[展示副本]
+  B --> C[媒体与大文本写入资源文件]
+  C --> D[带引用的归一化消息]
+  D --> E[实时广播与重连缓存]
+  D --> F[历史页与历史缓存]
+```
+
+各适配器在重新序列化和批量保留记录前执行压缩，`createNormalizedMessage` 与 websocket writer 再检查输出边界。资源写入失败通过 `ProviderDisplayAssetError` 上报；JSONL 的未写完尾行可以跳过，资源错误不能按坏 JSON 忽略。资源文件先写临时文件，完整写入后原子发布。写入失败清理临时文件，已有短文件重新生成。资源文件沿用 assets 模块的鉴权、文件名校验和 SVG 下载策略。
+
+OpenCode 逐条读取数据库并用有限窗口收集请求页，同时扫描计数以维持精确总数。ZCode 逐条读取联表记录；Claude、Codex、Antigravity 逐行读取文件，在分支、工具配对和顺序索引中保留压缩后的展示副本。Cursor 保留 blob 身份和引用关系，原始二进制 blob 逐条检查后释放。后几种格式仍需扫描和索引会话记录，不保证历史读取时间与页大小成正比。token 统计和 Codex 标题提取同样逐行读取，不建立整份文件字符串。
+
+Claude、Codex 的全历史缓存按归一化结果的序列化大小、字符串与行对象开销估算容量，不用源文件大小代替。单个超预算结果只供当前请求使用，不驻留缓存。容量常量以 `session-history-cache.service.ts` 为准；计费是保守估计，不是精确堆测量。

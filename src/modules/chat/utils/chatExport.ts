@@ -1,5 +1,6 @@
 import type { ChatMessage, LLMProvider, Project, DiffLine } from '@/shared/types';
-import { saveOrShareBlob } from '@/shared/utils';
+import { collectStoredOutputAssets, saveOrShareBlob } from '@/shared/utils';
+import { api } from '@/shared/api';
 import { buildTranscriptHtml } from '@/modules/chat/export/buildTranscriptHtml';
 import { buildTranscriptMarkdown } from '@/modules/chat/export/buildTranscriptMarkdown';
 
@@ -74,6 +75,8 @@ export async function buildTranscriptExport(
   exportedAt: Date,
 ): Promise<string> {
   if (format === 'json') {
+    const references = collectStoredOutputAssets(JSON.stringify(input.messages));
+    const assets = await api.assets.embedForExport(references);
     return `${JSON.stringify(
       {
         title: input.sessionTitle,
@@ -81,6 +84,7 @@ export async function buildTranscriptExport(
         exportedAt: exportedAt.toISOString(),
         messageCount: input.messages.length,
         messages: input.messages,
+        ...(references.length > 0 ? { assets } : {}),
       },
       null,
       2,

@@ -24,6 +24,10 @@ import type {
 import { parseFilesInputTag } from '@/shared/image-attachments.js';
 import { prepareTranscriptMessages, truncateNestedOutput } from '@/shared/message-unification.js';
 import {
+  ProviderDisplayAssetError,
+  readJsonlRecords,
+  parseProviderJson,
+  compactProviderPayload,
   AppError,
   createNormalizedMessage,
   generateMessageId,
@@ -127,7 +131,7 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
       }
 
       try {
-        const entry = JSON.parse(line) as AnyRecord;
+        const entry = parseProviderJson(line) as AnyRecord;
         const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
         if (timestamp && !transcript.startedAt) {
           transcript.startedAt = timestamp;
@@ -186,11 +190,13 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
             };
           }
         }
-      } catch {
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
         // Skip malformed lines that can happen during concurrent writes.
       }
     }
   } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`Error parsing agent file ${filePath}:`, message);
   }
@@ -262,26 +268,8 @@ async function findClaudeSubagentTranscript(
 async function readWorkflowJournal(transcriptDir: string): Promise<WorkflowAgentInfo[]> {
   const agentsById = new Map<string, WorkflowAgentInfo>();
 
-  let journal: string;
   try {
-    journal = await fsp.readFile(path.join(transcriptDir, 'journal.jsonl'), 'utf8');
-  } catch {
-    return [];
-  }
-
-  for (const line of journal.split('\n')) {
-    if (!line.trim()) {
-      continue;
-    }
-
-    let entry: AnyRecord;
-    try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
-      // The workflow appends while this reads, so the last line can be partial.
-      continue;
-    }
-
+    for await (const entry of readJsonlRecords(path.join(transcriptDir, 'journal.jsonl'))) {
     const agentId = typeof entry.agentId === 'string' ? entry.agentId : '';
     if (!agentId) {
       continue;
@@ -306,6 +294,10 @@ async function readWorkflowJournal(transcriptDir: string): Promise<WorkflowAgent
     } else if (entry.type === 'failed') {
       agent.status = 'failed';
     }
+  }
+
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
 
   return [...agentsById.values()];
@@ -480,23 +472,9 @@ function replaceLaunchToolResultContent(message: AnyRecord, replacement: string)
  */
 async function readTranscriptRows(jsonlPath: string, providerSessionId: string): Promise<AnyRecord[]> {
   const rows: AnyRecord[] = [];
-  const fileStream = fs.createReadStream(jsonlPath);
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-  for await (const line of rl) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const entry = JSON.parse(line) as AnyRecord;
-      if (entry.sessionId === providerSessionId) {
-        rows.push(entry);
-      }
-    } catch {
-      // A row can be half-written while the CLI is streaming into the file.
-    }
+  for await (const entry of readJsonlRecords(jsonlPath)) {
+    if (entry.sessionId === providerSessionId) rows.push(compactProviderPayload(entry));
   }
-
   return rows;
 }
 
@@ -934,6 +912,7 @@ async function getSessionMessages(
       limit,
     };
   } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
     console.error(`Error reading messages for session ${sessionId}:`, error);
     return limit === null ? [] : { messages: [], total: 0, hasMore: false };
   }
@@ -1069,19 +1048,16 @@ function readTaskUsage(value: unknown): TaskUsage | undefined {
  * from the end and stops at the first readable assistant entry. Cache reads
  * and writes count toward the input total, matching how the CLI bills them.
  */
-function readClaudeTokenUsage(
-  fileContent: string,
+async function readClaudeTokenUsage(
+  filename: string,
   configuredContextWindow: string | undefined,
-): ProviderTokenUsageResult {
+): Promise<ProviderTokenUsageResult> {
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let cacheCreationTokens = 0;
-  const lines = fileContent.trim().split('\n');
 
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    try {
-      const entry = JSON.parse(lines[index]) as AnyRecord;
+  for await (const entry of readJsonlRecords(filename)) {
       const usage = entry.type === 'assistant' ? entry.message?.usage : null;
       if (!usage) {
         continue;
@@ -1098,10 +1074,6 @@ function readClaudeTokenUsage(
       );
       inputTokens = directInputTokens + cacheReadTokens + cacheCreationTokens;
       outputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens);
-      break;
-    } catch {
-      // Skip malformed lines without discarding usage from earlier messages.
-    }
   }
 
   const parsedContextWindow = Number.parseInt(configuredContextWindow ?? '', 10);
@@ -1307,7 +1279,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     const messages = this.normalizeMessageRows(rawMessage, sessionId);
     // A synthesized id is useless as an anchor — it changes on every read — so
     // a row without its own uuid produces messages with no anchor at all.
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     const anchorId = typeof raw?.uuid === 'string' && raw.uuid ? raw.uuid : null;
     if (anchorId) {
       for (const message of messages) {
@@ -1330,7 +1302,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
   }
 
   private normalizeMessageRows(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     if (!raw) {
       return [];
     }
@@ -1479,8 +1451,11 @@ export class ClaudeSessionsProvider implements IProviderSessions {
         // Image attachments sent through the SDK are persisted as base64
         // `image` blocks next to the prompt text. Collect them so the UI can
         // render them on the user bubble.
-        const imageAttachments: Array<{ data: string }> = [];
+        const imageAttachments: Array<{ data?: string; path?: string }> = [];
         for (const part of raw.message.content) {
+          if (part?.type === 'image' && part.source?.type === 'url' && typeof part.source.url === 'string' && part.source.url.startsWith('/api/assets/images/')) {
+            imageAttachments.push({ path: part.source.url });
+          }
           if (part?.type === 'image' && part.source?.type === 'base64' && typeof part.source.data === 'string') {
             const mediaType = typeof part.source.media_type === 'string' ? part.source.media_type : 'image/png';
             imageAttachments.push({ data: `data:${mediaType};base64,${part.source.data}` });
@@ -1882,6 +1857,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       // not raw JSONL records.
       result = await getSessionMessages(sessionId, providerSessionId, null, 0, this.getLiveRunStartTime);
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ClaudeProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
@@ -1995,8 +1971,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       });
     }
 
-    const fileContent = await fsp.readFile(sessionFilePath, 'utf8');
-    return readClaudeTokenUsage(fileContent, process.env.CONTEXT_WINDOW);
+    return readClaudeTokenUsage(sessionFilePath, process.env.CONTEXT_WINDOW);
   }
 
   /**

@@ -13,6 +13,8 @@ import type {
   ProviderTokenUsageResult,
 } from '@/shared/types.js';
 import {
+  ProviderDisplayAssetError,
+  compactProviderPayload,
   AppError,
   createNormalizedMessage,
   generateMessageId,
@@ -45,6 +47,7 @@ function openZCodeDatabase(): Database.Database | null {
   try {
     return new Database(dbPath, { readonly: true, fileMustExist: true });
   } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     console.warn('[ZCodeProvider] Failed to open database:', message);
     return null;
@@ -315,7 +318,7 @@ function aggregateZCodeSessionTokenUsage(
   db: Database.Database,
   sessionId: string,
 ): ProviderTokenUsageResult | undefined {
-  const rows = db.prepare('SELECT data FROM message WHERE session_id = ?').all(sessionId) as { data: string }[];
+  const rows = db.prepare('SELECT data FROM message WHERE session_id = ?').iterate(sessionId) as Iterable<{ data: string }>;
 
   const totals: ZCodeTokenTotals = { input: 0, output: 0, reasoning: 0, cache: 0 };
   let hasAnyUsage = false;
@@ -369,8 +372,8 @@ export class ZCodeSessionsProvider implements IProviderSessions {
   /**
    * Loads ZCode session history from SQLite database.
    *
-   * Uses read-only connection to query message and part tables with proper
-   * pagination (LIMIT/OFFSET). Joins with part table for full message content.
+   * Iterates joined message/part rows through a read-only connection and
+   * compacts media before retaining the normalized transcript.
    * Uses the existing sequence column and message_session_time_created_id_idx index.
    *
    * Filter out sub-agent sessions (sess_subagent_agent_*) per plan requirements.
@@ -415,7 +418,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
           m.id,
           COALESCE(p.time_created, 0),
           p.id
-      `).all(providerSessionId) as ZCodeHistoryRow[];
+      `).iterate(providerSessionId) as Iterable<ZCodeHistoryRow>;
 
       const normalized = this.normalizeHistoryRows(rows, sessionId);
       const tokenUsage = aggregateZCodeSessionTokenUsage(db, providerSessionId);
@@ -434,6 +437,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
         tokenUsage,
       };
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ZCodeProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
@@ -450,7 +454,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
    * per the Phase 0.3 SQLite schema. Applies suffix to fragment IDs for
    * uniqueness per §5.1 of the plan.
    */
-  private normalizeHistoryRows(rows: ZCodeHistoryRow[], sessionId: string): NormalizedMessage[] {
+  private normalizeHistoryRows(rows: Iterable<ZCodeHistoryRow>, sessionId: string): NormalizedMessage[] {
     const normalized: NormalizedMessage[] = [];
     const emittedMessageErrors = new Set<string>();
     const emittedUserTexts = new Set<string>();
@@ -463,7 +467,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
       const timestamp = normalizeProviderTimestamp(row.part_time_created ?? row.message_time_created);
       // Apply suffix to fragment IDs for uniqueness per §5.1
       const baseId = `${row.message_id}_${row.part_id ?? normalized.length}`;
-      const messageInfo = readJsonRecord(row.message_data);
+      const messageInfo = compactProviderPayload(readJsonRecord(row.message_data));
       const messageRole = readOptionalString(messageInfo?.role);
 
       // Model-only injections are skipped entirely, including their parts.
@@ -526,7 +530,8 @@ export class ZCodeSessionsProvider implements IProviderSessions {
         continue;
       }
 
-      const partData = readJsonRecord(row.part_data);
+      const rawPartData = readJsonRecord(row.part_data);
+      const partData = compactProviderPayload(rawPartData && messageRole === 'user' ? { ...rawPartData, role: 'user' } : rawPartData);
       if (!partData) {
         continue;
       }

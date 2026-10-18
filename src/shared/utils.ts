@@ -11,6 +11,12 @@ import type { Project, ProjectSession, QuickSettingsTab, SlashCommand } from '@/
  */
 export const IS_PLATFORM = import.meta.env?.VITE_IS_PLATFORM === 'true';
 
+//----------------- STORED OUTPUT REFERENCES ------------
+/** Chat output previews and export builders recognize only content-addressed display assets. */
+export function collectStoredOutputAssets(content: string): string[] {
+  return [...new Set(content.match(/\/api\/assets\/(?:images\/inline-[a-f0-9]{64}\.(?:png|jpg|gif|webp|svg)|files\/output-[a-f0-9]{64}\.txt)/g) ?? [])];
+}
+
 // ---------------------------
 
 //----------------- TAILWIND CLASS COMPOSITION ------------

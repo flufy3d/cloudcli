@@ -1,5 +1,6 @@
 import type { AnyRecord, NormalizedMessage } from '@/shared/types.js';
 import {
+  compactProviderPayload,
   createNormalizedMessage,
   generateMessageId,
   normalizeProviderTimestamp,
@@ -176,7 +177,7 @@ export class ZCodeLiveEventNormalizer {
   private readonly textRowMessageIds = new Map<string, string>();
 
   normalize(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     if (!raw) {
       return [];
     }
@@ -184,7 +185,7 @@ export class ZCodeLiveEventNormalizer {
     let event: AnyRecord = raw;
     for (let depth = 0; depth < 3 && !readOptionalString(event.type); depth += 1) {
       const next = readObjectRecord(event.event)
-        ?? readObjectRecord(event.data)
+        ?? readObjectRecord(compactProviderPayload(event.data))
         ?? readObjectRecord(event.params);
       if (!next) {
         break;

@@ -3,6 +3,8 @@ import { createElement } from 'react';
 import type { ChatMessage, DiffLine, LLMProvider, Project } from '@/shared/types';
 import { ThemeProvider } from '@/shared/context/ThemeContext';
 import { UiPreferencesProvider } from '@/shared/context/UiPreferencesContext';
+import { api } from '@/shared/api';
+import { collectStoredOutputAssets } from '@/shared/utils';
 import { TranscriptExportDocument } from '@/modules/chat/export/TranscriptExportDocument';
 
 type BuildTranscriptHtmlInput = {
@@ -64,6 +66,8 @@ function escapeHtml(value: string): string {
 export async function buildTranscriptHtml(input: BuildTranscriptHtmlInput): Promise<string> {
   // Loaded on demand so react-dom/server stays out of the app's main chunk.
   const { renderToStaticMarkup } = await import('react-dom/server');
+  const references = collectStoredOutputAssets(JSON.stringify(input.messages));
+  const assetData = await api.assets.embedForExport(references);
 
   const body = renderToStaticMarkup(
     // The transcript mounts the live MessageComponent: its speak control reads
@@ -81,6 +85,7 @@ export async function buildTranscriptHtml(input: BuildTranscriptHtmlInput): Prom
           createDiff: input.createDiff,
           provider: input.provider,
           selectedProject: input.selectedProject,
+          assetData,
         }),
       ),
     ),

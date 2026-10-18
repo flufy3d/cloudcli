@@ -111,17 +111,15 @@ test('concurrent misses share a single load', async () => {
   });
 });
 
-test('the oldest entries are evicted over budget, but the newest survives alone', async () => {
+test('the oldest entries are evicted according to retained payload size', async () => {
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'session-history-cache-evict-'));
   try {
     const firstPath = path.join(tempDirectory, 'first.jsonl');
     const secondPath = path.join(tempDirectory, 'second.jsonl');
-    // Each file is 100 bytes, so a 150-byte budget holds exactly one entry —
-    // and the newest entry stays cached even though it exceeds nothing alone.
     await writeFile(firstPath, 'x'.repeat(100), 'utf8');
     await writeFile(secondPath, 'y'.repeat(100), 'utf8');
 
-    const cache = createSessionHistoryCache(150);
+    const cache = createSessionHistoryCache(900);
     const loadsBySession = new Map<string, number>();
     const loaderFor = (sessionId: string) => async () => {
       loadsBySession.set(sessionId, (loadsBySession.get(sessionId) ?? 0) + 1);
@@ -140,6 +138,29 @@ test('the oldest entries are evicted over budget, but the newest survives alone'
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
   }
+});
+
+test('an oversized history payload is not cached even when its source file is tiny', async () => {
+  await withTranscriptFile(async (transcriptPath) => {
+    const cache = createSessionHistoryCache(1024);
+    let loads = 0;
+    const loadFull = async () => { loads += 1; return historyResult('x'.repeat(4096)); };
+    await cache.getFullHistory({ sessionId: 'large', transcriptPath, loadFull });
+    await cache.getFullHistory({ sessionId: 'large', transcriptPath, loadFull });
+    assert.equal(loads, 2);
+  });
+});
+
+test('a large source file can cache a small normalized payload', async () => {
+  await withTranscriptFile(async (transcriptPath) => {
+    await writeFile(transcriptPath, 'x'.repeat(4096));
+    const cache = createSessionHistoryCache(1024);
+    let loads = 0;
+    const loadFull = async () => { loads += 1; return historyResult('small'); };
+    await cache.getFullHistory({ sessionId: 'small', transcriptPath, loadFull });
+    await cache.getFullHistory({ sessionId: 'small', transcriptPath, loadFull });
+    assert.equal(loads, 1);
+  });
 });
 
 test('invalidating a session re-parses its unchanged transcript on the next read', async () => {

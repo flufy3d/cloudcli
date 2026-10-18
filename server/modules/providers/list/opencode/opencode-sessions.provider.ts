@@ -14,6 +14,8 @@ import type {
   ProviderTokenUsageResult,
 } from '@/shared/types.js';
 import {
+  ProviderDisplayAssetError,
+  compactProviderPayload,
   AppError,
   createNormalizedMessage,
   generateMessageId,
@@ -146,16 +148,16 @@ const readOpenCodeSessionColumnTokenUsage = (
  * message plus one virtual part per block. Compaction, idle, and system rows
  * carry no user-visible transcript content and are skipped.
  */
-const flattenOpenCodeV2HistoryRows = (
+function* flattenOpenCodeV2HistoryRows(
   db: Database.Database,
   sessionId: string,
-): OpenCodeHistoryRow[] => {
+): Generator<OpenCodeHistoryRow> {
   const messageRows = db.prepare(`
     SELECT id, type, time_created, time_updated, data
     FROM session_message
     WHERE session_id = ?
     ORDER BY seq
-  `).all(sessionId) as Array<{
+  `).iterate(sessionId) as Iterable<{
     id: string;
     type: string;
     time_created: number | null;
@@ -163,34 +165,33 @@ const flattenOpenCodeV2HistoryRows = (
     data: string;
   }>;
 
-  const rows: OpenCodeHistoryRow[] = [];
   for (const messageRow of messageRows) {
     if (messageRow.type !== 'user' && messageRow.type !== 'assistant') {
       continue;
     }
 
-    const data = readJsonRecord(messageRow.data) ?? {};
+    const data: AnyRecord = compactProviderPayload({ ...(readJsonRecord(messageRow.data) ?? {}), role: messageRow.type });
     // Part rows repeat the message payload (the v1 join did too) so the
     // normalizer can read the role off every row.
     const messageData = JSON.stringify({ role: messageRow.type, error: data.error ?? null });
-    rows.push({
+    yield {
       message_id: messageRow.id,
       message_time_created: messageRow.time_created,
       message_data: messageData,
       part_id: null,
       part_time_created: null,
       part_data: null,
-    });
+    };
 
     if (messageRow.type === 'user') {
-      rows.push({
+      yield {
         message_id: messageRow.id,
         message_time_created: messageRow.time_created,
         message_data: messageData,
         part_id: `${messageRow.id}_text`,
         part_time_created: messageRow.time_created,
         part_data: JSON.stringify({ type: 'text', text: readOptionalString(data.text) ?? '' }),
-      });
+      };
       continue;
     }
 
@@ -202,10 +203,10 @@ const flattenOpenCodeV2HistoryRows = (
     // record identically — the timeline deduplicates on that id.
     let textOrdinal = 0;
     let reasoningOrdinal = 0;
-    content.forEach((block, index) => {
+    for (const [index, block] of content.entries()) {
       const blockRecord = readObjectRecord(block);
       if (!blockRecord) {
-        return;
+        continue;
       }
 
       const blockType = readOptionalString(blockRecord.type);
@@ -225,22 +226,20 @@ const flattenOpenCodeV2HistoryRows = (
         };
       }
       if (!partData) {
-        return;
+        continue;
       }
 
-      rows.push({
+      yield {
         message_id: messageRow.id,
         message_time_created: messageRow.time_created,
         message_data: messageData,
         part_id: partId,
         part_time_created: messageRow.time_updated ?? messageRow.time_created,
         part_data: JSON.stringify(partData),
-      });
-    });
+      };
+    }
   }
-
-  return rows;
-};
+}
 
 /**
  * OpenCode stores per-message token counts on assistant `message.data` objects
@@ -256,7 +255,7 @@ const aggregateOpenCodeSessionTokenUsage = (
     return sessionColumnUsage;
   }
 
-  const rows = db.prepare('SELECT data FROM message WHERE session_id = ?').all(sessionId) as { data: string }[];
+  const rows = db.prepare('SELECT data FROM message WHERE session_id = ?').iterate(sessionId) as Iterable<{ data: string }>;
 
   let inputTokens = 0;
   let outputTokens = 0;
@@ -301,7 +300,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
    * v1 carried the fields on the event itself; both shapes are read.
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     if (!raw) {
       return [];
     }
@@ -447,11 +446,21 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         ? buildTokenUsage(readOpenCodeSessionTokenTotals(db, providerSessionId) ?? undefined)
         : aggregateOpenCodeSessionTokenUsage(db, providerSessionId);
 
-      const normalized = this.normalizeHistoryRows(rows, sessionId);
       const normalizedOffset = Math.max(0, offset);
       const normalizedLimit = limit === null ? null : Math.max(0, limit);
-      const total = normalized.length;
-      const { page, hasMore } = sliceTailPage(normalized, normalizedLimit, normalizedOffset);
+      const capacity = normalizedLimit === null ? Infinity : normalizedOffset + normalizedLimit;
+      const window: NormalizedMessage[] = [];
+      let total = 0;
+      let head = 0;
+      for (const message of this.normalizeHistoryRows(rows, sessionId)) {
+        total += 1;
+        if (capacity === 0) continue;
+        if (window.length < capacity) window.push(message);
+        else { window[head] = message; head = (head + 1) % capacity; }
+      }
+      const ordered = head === 0 ? window : [...window.slice(head), ...window.slice(0, head)];
+      const { page } = sliceTailPage(ordered, normalizedLimit, normalizedOffset);
+      const hasMore = normalizedLimit !== null && total > normalizedOffset + normalizedLimit;
 
       return {
         messages: page,
@@ -462,6 +471,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         tokenUsage,
       };
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[OpenCodeProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
@@ -471,7 +481,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
   }
 
   /** The v1 message+part layout query, kept for databases predating v2. */
-  private readV1HistoryRows(db: Database.Database, providerSessionId: string): OpenCodeHistoryRow[] {
+  private readV1HistoryRows(db: Database.Database, providerSessionId: string): Iterable<OpenCodeHistoryRow> {
     return db.prepare(`
       SELECT
         m.id AS message_id,
@@ -490,17 +500,17 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         m.id,
         COALESCE(p.time_created, 0),
         p.id
-    `).all(providerSessionId) as OpenCodeHistoryRow[];
+    `).iterate(providerSessionId) as Iterable<OpenCodeHistoryRow>;
   }
 
-  private normalizeHistoryRows(rows: OpenCodeHistoryRow[], sessionId: string): NormalizedMessage[] {
-    const normalized: NormalizedMessage[] = [];
+  private *normalizeHistoryRows(rows: Iterable<OpenCodeHistoryRow>, sessionId: string): Generator<NormalizedMessage> {
+    let rowOrdinal = 0;
     const emittedMessageErrors = new Set<string>();
 
     for (const row of rows) {
       const timestamp = normalizeProviderTimestamp(row.part_time_created ?? row.message_time_created);
-      const baseId = `${row.message_id}_${row.part_id ?? normalized.length}`;
-      const messageInfo = readJsonRecord(row.message_data);
+      const baseId = `${row.message_id}_${row.part_id ?? rowOrdinal++}`;
+      const messageInfo = compactProviderPayload(readJsonRecord(row.message_data));
       const messageRole = readOptionalString(messageInfo?.role);
 
       if (
@@ -510,21 +520,22 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         && !emittedMessageErrors.has(row.message_id)
       ) {
         emittedMessageErrors.add(row.message_id);
-        normalized.push(createNormalizedMessage({
+        yield createNormalizedMessage({
           id: `${baseId}_error`,
           sessionId,
           timestamp,
           provider: PROVIDER,
           kind: 'error',
           content: formatToolContent(messageInfo.error),
-        }));
+        });
       }
 
       if (!row.part_id) {
         continue;
       }
 
-      const partData = readJsonRecord(row.part_data) ?? {};
+      const rawPartData = readJsonRecord(row.part_data);
+      const partData = compactProviderPayload(rawPartData && messageRole === 'user' ? { ...rawPartData, role: 'user' } : rawPartData) ?? {};
       const partType = readOptionalString(partData.type);
       if (!partType) {
         continue;
@@ -545,7 +556,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
           || parsedImages.attachments.length > 0
           || parsedFiles.attachments.length > 0
         ) {
-          normalized.push(createNormalizedMessage({
+          yield createNormalizedMessage({
             id: baseId,
             sessionId,
             timestamp,
@@ -555,7 +566,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
             content: parsedFiles.text,
             images: parsedImages.attachments.length > 0 ? parsedImages.attachments : undefined,
             files: parsedFiles.attachments.length > 0 ? parsedFiles.attachments : undefined,
-          }));
+          });
         }
         continue;
       }
@@ -563,14 +574,14 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       if (partType === 'reasoning') {
         const content = extractText(partData);
         if (content.trim()) {
-          normalized.push(createNormalizedMessage({
+          yield createNormalizedMessage({
             id: baseId,
             sessionId,
             timestamp,
             provider: PROVIDER,
             kind: 'thinking',
             content,
-          }));
+          });
         }
         continue;
       }
@@ -596,23 +607,23 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
           };
         }
 
-        normalized.push(toolMessage);
+        yield toolMessage;
         continue;
       }
 
       if (partType === 'step-finish') {
-        normalized.push(createNormalizedMessage({
+        yield createNormalizedMessage({
           id: baseId,
           sessionId,
           timestamp,
           provider: PROVIDER,
           kind: 'stream_end',
-        }));
+        });
         continue;
       }
 
       if (partType === 'patch' || partType === 'agent') {
-        normalized.push(createNormalizedMessage({
+        yield createNormalizedMessage({
           id: baseId,
           sessionId,
           timestamp,
@@ -621,11 +632,10 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
           toolName: partType === 'patch' ? 'Patch' : 'Agent',
           toolInput: partData,
           toolId: row.part_id,
-        }));
+        });
       }
     }
 
-    return normalized;
   }
 
   /**

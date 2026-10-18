@@ -1,9 +1,10 @@
 import os from 'node:os';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+
 
 import { sessionsDb } from '@/modules/database/index.js';
 import {
+  readJsonlRecords,
   buildLookupMap,
   extractFirstValidJsonlData,
   findFilesRecursivelyCreatedAfter,
@@ -195,39 +196,18 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
   }
 
   private async extractLastAgentMessageFromEnd(filePath: string): Promise<string | undefined> {
+    let latest: string | undefined;
     try {
-      const content = await readFile(filePath, 'utf8');
-      const lines = content.split(/\r?\n/);
-
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        const line = lines[index]?.trim();
-        if (!line) {
-          continue;
-        }
-
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          continue;
-        }
-
-        const data = parsed as Record<string, unknown>;
-        const eventType = typeof data.type === 'string' ? data.type : undefined;
+      for await (const data of readJsonlRecords(filePath)) {
         const payload = data.payload as Record<string, unknown> | undefined;
-        const payloadType = typeof payload?.type === 'string' ? payload.type : undefined;
-        const lastAgentMessage = typeof payload?.last_agent_message === 'string'
-          ? payload.last_agent_message
-          : undefined;
-
-        if (eventType === 'event_msg' && payloadType === 'task_complete' && lastAgentMessage?.trim()) {
-          return lastAgentMessage;
+        if (data.type === 'event_msg' && payload?.type === 'task_complete'
+          && typeof payload.last_agent_message === 'string' && payload.last_agent_message.trim()) {
+          latest = payload.last_agent_message;
         }
       }
-    } catch {
-      // Ignore missing/unreadable files so sync can continue.
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.warn('[Codex] Failed to read session title:', error);
     }
-
-    return undefined;
+    return latest;
   }
 }

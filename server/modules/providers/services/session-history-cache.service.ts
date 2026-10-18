@@ -34,8 +34,9 @@ import type { FetchHistoryResult } from '@/shared/types.js';
 type CacheEntry = {
   transcriptPath: string;
   mtimeMs: number;
-  /** File size in bytes; doubles as the entry's cost against the byte budget. */
+  /** Source file size, used only for stat invalidation. */
   size: number;
+  retainedBytes: number;
   full: FetchHistoryResult;
 };
 
@@ -48,16 +49,16 @@ type GetFullHistoryArgs = {
 };
 
 /**
- * A transcript entry's heap cost is roughly the file it was parsed from, so
- * the budget is expressed in file bytes. The newest entry is always retained
- * even when it alone exceeds the budget — evicting it would just re-parse the
- * same file on the next request.
+ * Budget normalized content, not source file size: a tiny source can expand
+ * into many rows, while a large image-heavy source becomes small references.
+ * UTF-16 strings and per-row objects are conservatively charged in addition
+ * to the serialized shape. An oversized entry is served without retaining it.
  */
-const MAX_CACHED_TRANSCRIPT_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_CACHED_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_CACHE_ENTRIES = 8;
 
 export function createSessionHistoryCache(
-  maxTotalFileBytes = MAX_CACHED_TRANSCRIPT_FILE_BYTES,
+  maxTotalBytes = MAX_CACHED_HISTORY_BYTES,
   maxEntries = MAX_CACHE_ENTRIES,
 ) {
   const entries = new Map<string, CacheEntry>();
@@ -66,13 +67,13 @@ export function createSessionHistoryCache(
   function evictOverBudget(): void {
     let totalBytes = 0;
     for (const entry of entries.values()) {
-      totalBytes += entry.size;
+      totalBytes += entry.retainedBytes;
     }
     for (const key of entries.keys()) {
-      if (entries.size <= 1 || (totalBytes <= maxTotalFileBytes && entries.size <= maxEntries)) {
+      if (totalBytes <= maxTotalBytes && entries.size <= maxEntries) {
         break;
       }
-      totalBytes -= entries.get(key)!.size;
+      totalBytes -= entries.get(key)!.retainedBytes;
       entries.delete(key);
     }
   }
@@ -127,6 +128,7 @@ export function createSessionHistoryCache(
           transcriptPath,
           mtimeMs: stat.mtimeMs,
           size: stat.size,
+          retainedBytes: Buffer.byteLength(JSON.stringify(full)) * 2 + full.messages.length * 128,
           full,
         });
         evictOverBudget();

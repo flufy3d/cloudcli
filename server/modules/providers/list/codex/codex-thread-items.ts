@@ -30,7 +30,10 @@
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 import { toImageAttachments } from '@/shared/image-attachments.js';
 import type { AnyRecord } from '@/shared/types.js';
-import { readObjectRecord } from '@/shared/utils.js';
+import {
+  compactProviderPayload,
+  readObjectRecord,
+} from '@/shared/utils.js';
 
 /**
  * Lifecycle of an item that does work. Both transports report the same four
@@ -328,7 +331,7 @@ function readUserImages(item: AnyRecord): Array<{ path?: string; data?: string }
  * Consumer: the history reader in `codex-sessions.provider.ts`.
  */
 export function readCodexRolloutItem(raw: unknown): CodexThreadItem | null {
-  const item = readObjectRecord(raw);
+  const item = readObjectRecord(compactProviderPayload(raw));
   const id = item ? readNonEmptyString(item.id) : undefined;
   if (!item || !id) {
     return null;
@@ -452,7 +455,7 @@ function readSubagentActivityKind(value: unknown): 'started' | 'completed' | 'in
  * Consumer: the live run loop in `codex-runtime.provider.ts`.
  */
 export function readCodexAppServerItem(raw: unknown): CodexThreadItem | null {
-  const item = readObjectRecord(raw);
+  const item = readObjectRecord(compactProviderPayload(raw));
   const id = item ? readNonEmptyString(item.id) : undefined;
   if (!item || !id) {
     return null;

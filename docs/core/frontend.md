@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.9.0 / 2026-10-07
+> 基准：2.10.0 / 2026-10-18
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -152,3 +152,9 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 | 新增设置分区 | `src/modules/settings/`（各分区独立组件），文案走 i18n 三语言 |
 | 新增面板/标签页 | `src/modules/project-workspace/`（Shell 布局 + 标签页） |
 | 引入新依赖 | 先确认不破坏性能守则（全量 Prism、per-frame setState、CV:auto 都是禁区） |
+
+## 大结果附件
+
+`OutputAssets` 从结果里的受限资源地址提取图片和完整文本入口，重复地址只展示一次。入口默认折叠，展开前不挂载图片组件，因此浏览器不会为整段读图历史一次性拉取所有图片。图片复用 `ChatMessageImages` 和统一查看器；全文复用文件附件下载。图片引用即使落在旧的 `images.data` 字段，也走 assets API 的鉴权读取，不交给裸 `img` 请求。
+
+HTML、PDF 导出通过 assets API 顺序读取引用的资源并内嵌 data URL，附件用原生 `details` 与下载链接显示，不依赖 React 事件。JSON 导出保留消息并附资源映射。读取失败使导出明确失败，不生成缺少附件的文件。完整导出需要在浏览器汇总资源，因此不能用日常聊天读取的内存预算承诺导出峰值。

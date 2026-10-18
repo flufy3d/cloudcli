@@ -45,6 +45,9 @@ type ChatRun = {
   status: ChatRunStatus;
   lastSeq: number;
   events: NormalizedMessage[];
+  eventBytes: number[];
+  bufferedBytes: number;
+  lastDroppedSeq: number;
   writer: ChatSessionWriter;
   startedAt: number;
   completedAt: number | null;
@@ -72,6 +75,25 @@ const COMPLETED_RUN_RETENTION_MS = 5 * 60 * 1000;
  * REST history refresh, which is always the authoritative source.
  */
 const MAX_BUFFERED_EVENTS_PER_RUN = 5000;
+const MAX_BUFFERED_EVENT_BYTES = 1024 * 1024;
+const MAX_BUFFERED_RUN_BYTES = 8 * 1024 * 1024;
+const MAX_BUFFERED_TOTAL_BYTES = 32 * 1024 * 1024;
+let totalBufferedBytes = 0;
+
+function dropOldestEvent(run: ChatRun): void {
+  const removed = run.events.shift();
+  const bytes = run.eventBytes.shift() ?? 0;
+  run.bufferedBytes -= bytes;
+  totalBufferedBytes -= bytes;
+  if (typeof removed?.seq === 'number') run.lastDroppedSeq = Math.max(run.lastDroppedSeq, removed.seq);
+}
+
+function releaseBufferedEvents(run: ChatRun): void {
+  totalBufferedBytes -= run.bufferedBytes;
+  run.events.length = 0;
+  run.eventBytes.length = 0;
+  run.bufferedBytes = 0;
+}
 
 /**
  * Active and recently-completed runs keyed by app session id.
@@ -119,6 +141,7 @@ function evictRunLater(run: ChatRun): void {
       evictRunLater(run);
       return;
     }
+    releaseBufferedEvents(run);
     runs.delete(run.appSessionId);
   }, COMPLETED_RUN_RETENTION_MS);
 
@@ -176,9 +199,26 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
     evictRunLater(run);
   }
 
-  run.events.push(outbound);
-  if (run.events.length > MAX_BUFFERED_EVENTS_PER_RUN) {
-    run.events.splice(0, run.events.length - MAX_BUFFERED_EVENTS_PER_RUN);
+  const bytes = Buffer.byteLength(JSON.stringify(outbound));
+  if (bytes > MAX_BUFFERED_EVENT_BYTES) {
+    // The live audience still receives the event. Reconnects must fetch its
+    // authoritative history instead of silently replaying across this hole.
+    run.lastDroppedSeq = run.lastSeq;
+  } else {
+    run.events.push(outbound);
+    run.eventBytes.push(bytes);
+    run.bufferedBytes += bytes;
+    totalBufferedBytes += bytes;
+    while (run.events.length > MAX_BUFFERED_EVENTS_PER_RUN || run.bufferedBytes > MAX_BUFFERED_RUN_BYTES) {
+      dropOldestEvent(run);
+    }
+    while (totalBufferedBytes > MAX_BUFFERED_TOTAL_BYTES) {
+      // Prefer evicting completed runs; otherwise trim the oldest run first.
+      const candidates = [...runs.values()].filter((entry) => entry.events.length > 0);
+      candidates.sort((a, b) => Number(a.status !== 'completed') - Number(b.status !== 'completed') || a.startedAt - b.startedAt);
+      if (!candidates[0]) break;
+      dropOldestEvent(candidates[0]);
+    }
   }
 
   return outbound;
@@ -261,6 +301,7 @@ export const chatRunRegistry = {
     if (existing && existing.status === 'running') {
       return null;
     }
+    if (existing) releaseBufferedEvents(existing);
 
     const run: ChatRun = {
       appSessionId: input.appSessionId,
@@ -272,6 +313,9 @@ export const chatRunRegistry = {
       // make its replay filter silently drop the new run's events.
       lastSeq: sessionWatermarks.get(input.appSessionId) ?? 0,
       events: [],
+      eventBytes: [],
+      bufferedBytes: 0,
+      lastDroppedSeq: 0,
       writer: null as unknown as ChatSessionWriter,
       startedAt: Date.now(),
       completedAt: null,
@@ -353,14 +397,13 @@ export const chatRunRegistry = {
     const lastSeq = sessionWatermarks.get(appSessionId) ?? 0;
     const run = runs.get(appSessionId);
     if (!run) {
-      return { events: [], lastSeq, stale: false };
+      return { events: [], lastSeq, stale: afterSeq < lastSeq };
     }
 
     const events = run.events.filter((event) => typeof event.seq === 'number' && event.seq > afterSeq);
     const oldestBuffered = run.events.find((event) => typeof event.seq === 'number')?.seq;
-    const stale = afterSeq > 0
-      && typeof oldestBuffered === 'number'
-      && oldestBuffered > afterSeq + 1;
+    const stale = afterSeq < run.lastDroppedSeq
+      || (typeof oldestBuffered === 'number' && oldestBuffered > afterSeq + 1);
 
     return { events, lastSeq, stale };
   },
@@ -408,6 +451,7 @@ export const chatRunRegistry = {
    */
   clearAll(): void {
     runs.clear();
+    totalBufferedBytes = 0;
     sessionWatermarks.clear();
   },
 };

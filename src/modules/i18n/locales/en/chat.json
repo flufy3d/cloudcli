@@ -367,6 +367,8 @@
     "resetCardWeeklyAlso5h": "Resetting the weekly allowance also refills the 5-hour pool, without spending a 5-hour card."
   },
   "misc": {
+    "outputAssets": "Output attachments ({{count}})",
+    "fullOutput": "Full output.txt",
     "copyToClipboard": "Copy to clipboard",
     "copyCommand": "Copy command",
     "runningTask": "Running task",

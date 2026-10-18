@@ -5,7 +5,10 @@ import type {
   RealtimeClientConnection,
 } from '@/shared/types.js';
 import { enforceNormalizedMessageContract } from '@/shared/normalized-message-contract.js';
-import { createCompleteMessage } from '@/shared/utils.js';
+import {
+  createCompleteMessage,
+  compactProviderPayload,
+} from '@/shared/utils.js';
 
 type ChatSessionWriterOptions = {
   connection: RealtimeClientConnection | null;
@@ -89,7 +92,7 @@ export class ChatSessionWriter {
     // runtimes are `.js` files the compiler never type-checks, so this is the
     // last place an undeclared field can be stopped before a renderer starts
     // depending on it.
-    const checked = enforceNormalizedMessageContract(data);
+    const checked = enforceNormalizedMessageContract(compactProviderPayload(data));
     if (!checked.ok) {
       console.error(
         `[ChatSessionWriter] Dropping outbound payload from ${this.options.provider}: ${checked.reason}`,

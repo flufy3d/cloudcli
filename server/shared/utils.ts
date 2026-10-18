@@ -24,6 +24,7 @@ import type { MessageInputForKind, VolatileMessageId } from '../../shared/protoc
 import { VOLATILE_MESSAGE_ID_PREFIX } from '../../shared/protocol/messageKinds.js';
 
 import { parseFrontMatter } from './frontmatter.js';
+import { getGlobalImageAssetsDir } from './image-attachments.js';
 import type {
   AnyRecord,
   ApiSuccessShape,
@@ -41,6 +42,176 @@ import type {
 /** Returns the lowercase SHA-256 hex digest for opaque tokens and content. */
 export function sha256Hex(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+//----------------- PROVIDER DISPLAY PAYLOADS ------------
+const INLINE_IMAGE_EXTENSIONS: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+  'image/webp': 'webp', 'image/svg+xml': 'svg',
+};
+
+/** Provider history readers propagate display-storage failures rather than treating them as malformed JSON. */
+export class ProviderDisplayAssetError extends Error {
+  constructor(cause: unknown) {
+    super(`Provider display asset failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'ProviderDisplayAssetError';
+  }
+}
+
+function storeDisplayAsset(bytes: Buffer | string, filename: string): void {
+  const directory = getGlobalImageAssetsDir();
+  fs.mkdirSync(directory, { recursive: true });
+  const assetPath = path.join(directory, filename);
+  const expectedSize = typeof bytes === 'string' ? Buffer.byteLength(bytes) : bytes.length;
+  try {
+    const existing = fs.lstatSync(assetPath);
+    if (!existing.isFile() || existing.isSymbolicLink()) throw new Error('Invalid stored display asset');
+    if (existing.size === expectedSize) return;
+    // A previous interrupted write may have left a short final file.
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const temporaryPath = `${assetPath}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, bytes, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporaryPath, assetPath);
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new AggregateError([error, cleanupError], 'Display asset write and cleanup failed');
+      }
+    }
+    throw error;
+  }
+}
+
+function storeInlineImage(mimeType: string, encoded: string): string {
+  const extension = INLINE_IMAGE_EXTENSIONS[mimeType.toLowerCase()];
+  if (!extension) throw new Error(`Unsupported inline image type: ${mimeType}`);
+  if (!encoded || encoded.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    throw new Error('Invalid inline image base64');
+  }
+  const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.length === 0 || bytes.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) {
+    throw new Error('Invalid inline image base64');
+  }
+  const filename = `inline-${sha256Hex(bytes)}.${extension}`;
+  // Exclusive creation never follows a pre-existing symlink. Identical
+  // results from live/history reuse the same file without a heap cache.
+  storeDisplayAsset(bytes, filename);
+  return `/api/assets/images/${filename}`;
+}
+
+/**
+ * Providers and the websocket gateway compact display copies before retaining
+ * or serializing them. Recognized inline images become content-addressed,
+ * authenticated asset references; engine-owned inputs are never mutated.
+ * JSON strings are inspected only when they contain an image marker. The
+ * operation is idempotent and intentionally has no in-memory image cache.
+ * Invalid base64 and storage failures propagate to the caller.
+ */
+export function compactProviderPayload<T>(value: T): T {
+  const seen = new WeakMap<object, unknown>();
+  function visit(input: unknown, field = '', previewText = true): unknown {
+    if (typeof input === 'string') {
+      // User text is also the source for edit/resend and copy. Compact image
+      // descriptors in that turn, but never replace the prompt with a preview.
+      if (!previewText && /^(content|text|message)$/.test(field)) return input;
+      if (input.startsWith('data:image/')) {
+        const match = /^data:([^;,]+);base64,([\s\S]*)$/.exec(input);
+        if (!match) throw new Error('Invalid inline image base64 URI');
+        return storeInlineImage(match[1], match[2]);
+      }
+      if ((input.startsWith('{') || input.startsWith('['))
+        && (input.includes('"image"') || input.includes('data:image/'))) {
+        let parsed: unknown;
+        try { parsed = JSON.parse(input); } catch { /* Non-JSON tool logs still need a bounded preview below. */ }
+        if (parsed !== undefined) {
+          const compact = visit(parsed, field, previewText);
+          if (compact !== parsed) return JSON.stringify(compact);
+        }
+      }
+      if (previewText && input.length > 256 * 1024 && /^(content|output|result|text|stdout|stderr)$/.test(field)) {
+        const filename = `output-${sha256Hex(input)}.txt`;
+        storeDisplayAsset(input, filename);
+        return `${input.slice(0, 64 * 1024)}\n\n/api/assets/files/${filename}`;
+      }
+      return input;
+    }
+    if (!input || typeof input !== 'object' || Buffer.isBuffer(input)) return input;
+    if (seen.has(input)) return seen.get(input);
+    // Provider payloads are JSON records; leave runtime instances untouched.
+    if (!Array.isArray(input) && Object.getPrototypeOf(input) !== Object.prototype) return input;
+    const record = input as Record<string, unknown>;
+    const userTurn = record.role === 'user' || readObjectRecord(record.message)?.role === 'user'
+      || ['UserMessage', 'userMessage', 'user_message', 'USER_INPUT'].includes(String(record.type))
+      || record.source === 'USER_EXPLICIT';
+    const toolResult = record.type === 'tool_result' || record.type === 'tool-result' || record.role === 'tool';
+    const childPreviewText = toolResult || (previewText && !userTurn);
+    if (record.type === 'base64' && typeof record.media_type === 'string'
+      && record.media_type.startsWith('image/') && typeof record.data === 'string') {
+      const result = { type: 'url', url: storeInlineImage(record.media_type, record.data) };
+      seen.set(input, result);
+      return result;
+    }
+    if (record.type === 'image' && typeof record.data === 'string'
+      && typeof (record.mimeType ?? record.mime_type) === 'string') {
+      const { data, ...rest } = record;
+      const result = { ...rest, uri: storeInlineImage(String(record.mimeType ?? record.mime_type), data) };
+      seen.set(input, result);
+      return result;
+    }
+    seen.set(input, input);
+    let result: unknown = input;
+    for (const [key, child] of Object.entries(input)) {
+      const compact = visit(child, key, childPreviewText);
+      if (compact !== child) {
+        if (result === input) result = Array.isArray(input) ? [...input] : { ...record };
+        (result as Record<string, unknown>)[key] = compact;
+      }
+    }
+    seen.set(input, result);
+    return result;
+  }
+  try { return visit(value) as T; } catch (error) {
+    if (error instanceof ProviderDisplayAssetError) throw error;
+    throw new ProviderDisplayAssetError(error);
+  }
+}
+
+/**
+ * Provider history readers use this after parsing each record, before storing
+ * it in branch/pairing indexes. This avoids retaining inline media from the
+ * whole transcript while preserving every provider's native row identity.
+ */
+export function parseProviderJson(text: string): AnyRecord {
+  return compactProviderPayload(JSON.parse(text) as AnyRecord);
+}
+
+/**
+ * Provider history, usage and synchronization readers scan JSONL records one
+ * line at a time. Blank, primitive and incomplete JSON records are skipped;
+ * filesystem errors propagate. Closing the iterator closes its file stream.
+ * This reader does not materialize media: callers choose which display rows
+ * need compaction, while usage/indexing paths only inspect their metadata.
+ */
+export async function* readJsonlRecords(filename: string): AsyncGenerator<AnyRecord> {
+  const input = fs.createReadStream(filename);
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      let entry: unknown;
+      try { entry = JSON.parse(line); } catch (error) {
+        if (error instanceof SyntaxError) continue;
+        throw error;
+      }
+      if (entry && typeof entry === 'object' && !Array.isArray(entry)) yield entry as AnyRecord;
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
 }
 
 //----------------- ENVIRONMENT UTILITIES ------------
@@ -468,13 +639,14 @@ export function generateMessageId(prefix = 'msg'): VolatileMessageId {
 export function createNormalizedMessage<K extends MessageKind>(
   fields: MessageInputForKind<K>,
 ): NormalizedMessage {
-  return {
+  const message: NormalizedMessage = {
     ...fields,
     id: fields.id || generateMessageId(fields.kind),
     sessionId: fields.sessionId || '',
     timestamp: fields.timestamp || new Date().toISOString(),
     provider: fields.provider,
   };
+  return compactProviderPayload(message);
 }
 
 /**

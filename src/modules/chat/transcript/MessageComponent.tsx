@@ -7,10 +7,7 @@ import { getProviderDisplayName } from '@/shared/providerDisplay';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/shared/ui/Collapsible';
 import type {
   ChatMessage,
-  ClaudePermissionSuggestion,
   DiffLine,
-  LLMProvider,
-  PermissionGrantResult,
   Project,
   Provider,
 } from '@/shared/types';
@@ -19,9 +16,9 @@ import { parseErrorCardContent } from '@/modules/chat/utils/errorCardContent';
 import { getToolConfig, isCommandTool, SubagentPanel, ToolRenderer, ToolErrorDisplay, WorkflowPanel, shouldHideToolResult } from '@/modules/chat/tools';
 import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRenderContext';
 import { Reasoning, ReasoningTrigger, ReasoningContent } from '@/shared/ui/ReasoningFork';
-
 import ChatMessageImages from '@/modules/chat/transcript/ChatMessageImages';
 import ChatMessageFiles from '@/modules/chat/transcript/ChatMessageFiles';
+import { OutputAssets } from '@/modules/chat/transcript/OutputAssets';
 import { Markdown } from '@/modules/chat/transcript/Markdown';
 import { StreamingMarkdown } from '@/modules/chat/transcript/StreamingMarkdown';
 import { MemoryCitations } from '@/modules/chat/transcript/MemoryCitations';
@@ -29,11 +26,6 @@ import MessageCopyControl from '@/modules/chat/transcript/MessageCopyControl';
 import MessageModelLabel from '@/modules/chat/transcript/MessageModelLabel';
 import MessageSpeakControl from '@/modules/chat/transcript/MessageSpeakControl';
 
-type ForkDiffLine = {
-  type: string;
-  content: string;
-  lineNum: number;
-};
 
 type MessageComponentProps = {
   message: ChatMessage;
@@ -124,6 +116,7 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
             {message.files && message.files.length > 0 && (
               <ChatMessageFiles files={message.files} />
             )}
+            <OutputAssets content={String(message.content || '')} />
             {userCopyContent.trim().length > 0 || (!message.images?.length && !message.files?.length) ? (
               <div className="group max-w-full rounded-2xl rounded-br-md border border-border/60 bg-muted/60 px-3 py-2 text-foreground shadow-sm dark:bg-gray-800/60 sm:px-4">
                 <div dir="auto" className="break-words font-serif text-sm">
@@ -525,6 +518,8 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
               </div>
             )}
 
+            <OutputAssets content={`${formattedMessageContent}\n${String(message.toolResult?.content || '')}`} />
+
             {message.memoryCitations && message.memoryCitations.length > 0 && (
               <MemoryCitations citations={message.memoryCitations} />
             )}
@@ -565,4 +560,3 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
 });
 
 export default MessageComponent;
-

@@ -1,4 +1,8 @@
 {
+  "misc": {
+    "outputAssets": "結果附件（{{count}}）",
+    "fullOutput": "完整輸出.txt"
+  },
   "codeBlock": {
     "copy": "複製",
     "copied": "已複製",

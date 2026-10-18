@@ -27,14 +27,17 @@ import type {
     SubagentInfo,
 } from '@/shared/types.js';
 import {
+  ProviderDisplayAssetError,
+  readJsonlRecords,
+  parseProviderJson,
   AppError,
   createNormalizedMessage,
   generateMessageId,
   readObjectRecord,
-    readUsageNumber,
-    removePathIfExists,
-    sliceTailPage,
-    truncateSubagentActivity,
+  readUsageNumber,
+  removePathIfExists,
+  sliceTailPage,
+  truncateSubagentActivity,
 } from '@/shared/utils.js';
 
 const PROVIDER = 'codex';
@@ -143,7 +146,8 @@ async function readCodexLiveTurnIds(filePath: string): Promise<string[]> {
     let entry: AnyRecord;
     try {
       entry = JSON.parse(line) as AnyRecord;
-    } catch {
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       continue;
     }
     const payload = readObjectRecord(entry.payload);
@@ -283,8 +287,9 @@ async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubag
 
     let entry: AnyRecord;
     try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
+      entry = parseProviderJson(line) as AnyRecord;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       continue;
     }
 
@@ -398,16 +403,13 @@ async function findCodexSessionFile(
  * Codex appends cumulative totals over time, so the scan walks from the end
  * and stops at the first readable token_count entry.
  */
-function readCodexTokenUsage(fileContent: string): ProviderTokenUsageResult {
+async function readCodexTokenUsage(filename: string): Promise<ProviderTokenUsageResult> {
   let inputTokens = 0;
   let outputTokens = 0;
   let totalTokens = 0;
   let contextWindow = 200_000;
-  const lines = fileContent.trim().split('\n');
 
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    try {
-      const entry = JSON.parse(lines[index]) as AnyRecord;
+  for await (const entry of readJsonlRecords(filename)) {
       const tokenInfo = entry.type === 'event_msg' && entry.payload?.type === 'token_count'
         ? entry.payload.info
         : null;
@@ -415,17 +417,16 @@ function readCodexTokenUsage(fileContent: string): ProviderTokenUsageResult {
         continue;
       }
 
+      inputTokens = 0;
+      outputTokens = 0;
+      totalTokens = 0;
       if (tokenInfo.total_token_usage) {
         inputTokens = readUsageNumber(tokenInfo.total_token_usage.input_tokens);
         outputTokens = readUsageNumber(tokenInfo.total_token_usage.output_tokens);
         totalTokens = readUsageNumber(tokenInfo.total_token_usage.total_tokens)
           || inputTokens + outputTokens;
       }
-      contextWindow = readUsageNumber(tokenInfo.model_context_window) || contextWindow;
-      break;
-    } catch {
-      // A provider may be writing the last JSONL line while this read happens.
-    }
+      contextWindow = readUsageNumber(tokenInfo.model_context_window) || 200_000;
   }
 
   return {
@@ -519,8 +520,9 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
 
     let entry: AnyRecord;
     try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
+      entry = parseProviderJson(line) as AnyRecord;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       continue;
     }
 
@@ -1005,6 +1007,7 @@ export class CodexSessionsProvider implements IProviderSessions {
     try {
       result = await getCodexSessionMessages(sessionId);
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[CodexProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
@@ -1072,8 +1075,7 @@ export class CodexSessionsProvider implements IProviderSessions {
       });
     }
 
-    const fileContent = await fsp.readFile(sessionFilePath, 'utf8');
-    return readCodexTokenUsage(fileContent);
+    return readCodexTokenUsage(sessionFilePath);
   }
 
   /**

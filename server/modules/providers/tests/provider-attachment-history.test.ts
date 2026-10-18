@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
@@ -8,6 +12,12 @@ import { CursorSessionsProvider } from '@/modules/providers/list/cursor/cursor-s
 import { appendFilesInputTag, appendImagesInputTag } from '@/shared/image-attachments.js';
 
 const SESSION_ID = 'session-1';
+const originalHome = os.homedir;
+let fixtureHome: string;
+test.beforeEach(async () => { fixtureHome = await mkdtemp(path.join(os.tmpdir(), 'attachment-history-')); os.homedir = () => fixtureHome; });
+test.afterEach(async () => { os.homedir = originalHome; await rm(fixtureHome, { recursive: true, force: true }); });
+const storedImage = (base64: string, extension: string) => `/api/assets/images/inline-${createHash('sha256').update(Buffer.from(base64, 'base64')).digest('hex')}.${extension}`;
+
 
 // ---------------------------------------------------------------- Claude
 
@@ -33,8 +43,8 @@ test('claude history: base64 image blocks surface as user message images', () =>
   assert.equal(messages[0].role, 'user');
   assert.equal(messages[0].content, 'What is in this screenshot?');
   assert.deepEqual(messages[0].images, [
-    { data: 'data:image/png;base64,QUJD' },
-    { data: 'data:image/jpeg;base64,REVG' },
+    { path: storedImage('QUJD', 'png') },
+    { path: storedImage('REVG', 'jpg') },
   ]);
 });
 
@@ -56,7 +66,7 @@ test('claude history: image-only user turns still produce a bubble', () => {
   assert.equal(messages.length, 1);
   assert.equal(messages[0].role, 'user');
   assert.equal(messages[0].content, '');
-  assert.deepEqual(messages[0].images, [{ data: 'data:image/png;base64,QUJD' }]);
+  assert.deepEqual(messages[0].images, [{ path: storedImage('QUJD', 'png') }]);
 });
 
 test('claude history: plain text user turns carry no images field', () => {
@@ -128,7 +138,7 @@ test('codex history: local_image content parts become path attachments', () => {
   );
 });
 
-test('codex history: base64 data URLs pass through as inline data attachments', () => {
+test('codex history: base64 data URLs become stored image attachments', () => {
   const dataUrl = 'data:image/png;base64,QUJD';
   assert.deepEqual(
     codexPromptImages({
@@ -140,7 +150,7 @@ test('codex history: base64 data URLs pass through as inline data attachments', 
         { type: 'text', text: 'look', text_elements: [] },
       ],
     }),
-    [{ path: 'C:/proj/a.png' }, { data: dataUrl }],
+    [{ path: 'C:/proj/a.png' }, { path: storedImage('QUJD', 'png') }],
   );
 });
 
