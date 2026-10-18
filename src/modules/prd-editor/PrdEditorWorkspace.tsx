@@ -1,5 +1,6 @@
 import { useState } from 'react';
 
+import type { MarkdownImageContext } from '@/shared/types';
 import { cn } from '@/shared/utils';
 import { ensurePrdExtension } from '@/modules/prd-editor/utils/fileName';
 import GenerateTasksModal from '@/modules/prd-editor/modals/GenerateTasksModal';
@@ -19,6 +20,8 @@ type PrdEditorWorkspaceProps = {
   onDownload: () => void;
   onClose: () => void;
   loadError: string | null;
+  // Where the preview resolves the PRD's local image references.
+  markdownImageContext?: MarkdownImageContext | null;
 };
 
 /** Rendered by PRDEditor inside the prd-editor module to lay out the PRD header, editing body and footer once the document has loaded. */
@@ -34,6 +37,7 @@ export default function PrdEditorWorkspace({
   onDownload,
   onClose,
   loadError,
+  markdownImageContext = null,
 }: PrdEditorWorkspaceProps) {
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isDarkMode, setIsDarkMode] = useState<boolean>(true);
@@ -100,6 +104,7 @@ export default function PrdEditorWorkspace({
             previewMode={previewMode}
             isDarkMode={isDarkMode}
             wordWrap={wordWrap}
+            markdownImageContext={markdownImageContext}
           />
         </div>
 

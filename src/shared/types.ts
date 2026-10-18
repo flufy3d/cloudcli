@@ -725,7 +725,7 @@ export type CodeEditorDiffInfo = {
   [key: string]: unknown;
 };
 
-/** A file handed to the code editor for viewing or editing, carrying its display name, workspace-relative path, owning DB projectId for read/save requests and any diff to highlight. */
+/** A file handed to the code editor for viewing or editing, carrying its display name, absolute workspace path, owning DB projectId for read/save requests and any diff to highlight. */
 export type CodeEditorFile = {
   name: string;
   path: string;
@@ -742,6 +742,19 @@ export type CodeEditorFile = {
 export type CodeEditorGotoTarget = {
   // 1-based, clamped to the document by the editor surface.
   line: number;
+};
+
+/**
+ * Where the local image references inside a rendered Markdown document resolve
+ * from. Markdown paths are relative to the document that carries them, so
+ * `baseDir` is that document's absolute directory; `projectId` addresses the
+ * files route that serves it, and `isExternal` marks a document that lives
+ * outside the project (read through the external read-only route instead).
+ */
+export type MarkdownImageContext = {
+  projectId?: string;
+  baseDir?: string;
+  isExternal: boolean;
 };
 
 /** The category of browser-renderable media a file maps to, used by the code editor to decide whether to show an inline image, PDF, video or audio preview instead of a text buffer. */

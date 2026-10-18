@@ -1,4 +1,5 @@
 import { clsx, type ClassValue } from 'clsx';
+import { defaultUrlTransform } from 'react-markdown';
 import { twMerge } from 'tailwind-merge';
 
 import type { Project, ProjectSession, QuickSettingsTab, SlashCommand } from '@/shared/types';
@@ -352,3 +353,74 @@ export function createClientRequestId(): string {
   }
   return `submit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+// ---------------------------
+
+//----------------- MARKDOWN URLS ------------
+
+/**
+ * Whether a URL points at a local file (`file://`). Providers such as
+ * Antigravity link workspace-external documents and their images this way.
+ */
+export const isFileUrl = (url?: string): boolean => /^file:\/\//i.test(url ?? '');
+
+/** Whether a URL is a Windows absolute path, in either separator or percent-escaped form. */
+export const isWindowsAbsolutePath = (url?: string): boolean =>
+  /^[a-zA-Z]:([/\\]|%5[cC])/i.test(url ?? '');
+
+/**
+ * The `urlTransform` hook to hand react-markdown: it keeps `file://` URLs and
+ * Windows absolute paths verbatim and delegates every other URL to the
+ * library's default sanitization, whose `file:` handling would strip the scheme
+ * and destroy the path. Use it for any markdown that can reference local files.
+ */
+export const markdownUrlTransform = (url: string): string =>
+  isFileUrl(url) || isWindowsAbsolutePath(url) ? url : defaultUrlTransform(url);
+
+/**
+ * Converts a `file://` URL back into an absolute filesystem path, decoding
+ * percent-escapes so paths with spaces or non-ASCII characters survive. Returns
+ * undefined for anything that is not a local `file://` URL (remote hosts such
+ * as `file://server/share` are not local paths).
+ */
+export const filePathFromFileUrl = (href?: string): string | undefined => {
+  if (!isFileUrl(href)) {
+    return undefined;
+  }
+  try {
+    const url = new URL(href as string);
+    if (url.host && url.host !== 'localhost') {
+      return undefined;
+    }
+    return decodeURIComponent(url.pathname);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Turns a markdown link `href` into the filesystem reference the code editor
+ * should open. react-markdown percent-escapes non-ASCII characters and spaces
+ * before handing an href to a custom renderer, so those are decoded back; web
+ * and other non-file schemes are left alone instead of being decoded.
+ */
+export const fileReferenceFromMarkdownHref = (href?: string): string | undefined => {
+  if (!href) {
+    return undefined;
+  }
+
+  if (isFileUrl(href)) {
+    return filePathFromFileUrl(href) ?? href;
+  }
+
+  if (!isWindowsAbsolutePath(href) && /^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    return href;
+  }
+
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    // A literal or incomplete percent escape may be part of a valid filename.
+    return href;
+  }
+};

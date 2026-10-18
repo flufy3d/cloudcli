@@ -10,17 +10,17 @@ import { useTranslation } from 'react-i18next';
 import { SyntaxHighlighter, isRegisteredLanguage } from '@/modules/chat/composer/codeHighlightLanguages';
 import { MermaidDiagram } from '@/modules/code-editor';
 import { normalizeInlineCodeFences } from '@/modules/chat/utils/chatFormatting';
-import {
-  filePathFromFileUrl,
-  fileReferenceFromMarkdownHref,
-  isFileUrl,
-  markdownUrlTransform,
-} from '@/modules/chat/utils/fileLink';
 import { normalizeLatexDelimiters } from '@/modules/chat/utils/latexDelimiters';
 import { api, readApiJson, readExternalFileContent } from '@/shared/api';
 import { MarkdownWorkspaceContext } from '@/modules/chat/context/MarkdownWorkspaceContext';
 import { shouldProxyLocalHref } from '@/modules/chat/utils/localProxyLink';
-import { copyTextToClipboard } from '@/shared/utils';
+import {
+  copyTextToClipboard,
+  filePathFromFileUrl,
+  fileReferenceFromMarkdownHref,
+  isFileUrl,
+  markdownUrlTransform,
+} from '@/shared/utils';
 import { UnifiedImageViewer } from '@/shared/ui';
 import { usePaletteOps } from '@/modules/command-palette';
 import { useTheme } from '@/shared/context/ThemeContext';
