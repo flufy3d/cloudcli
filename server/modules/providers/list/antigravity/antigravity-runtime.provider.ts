@@ -159,6 +159,9 @@ export function getAntigravityBackgroundTasksForSession(sessionId: string): Acti
  * writes actionable errors (auth failures, bad flags, quota) to stderr only;
  * the tail is what the user sees when the run fails.
  */
+/** How long a run waits for its agents' final transcript reads before settling. */
+const AGENT_TAIL_FINAL_READ_TIMEOUT_MS = 5_000;
+
 const STDERR_TAIL_LIMIT = 4_000;
 
 /**
@@ -282,6 +285,29 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         readTimeline: async (conversationId) => (await historyReader.fetchHistory(conversationId, {})).messages,
         emit: (message) => writer.send(message),
       });
+      /**
+       * Stops following every agent after one last read, bounded so a stuck
+       * transcript read cannot hold the run open forever; a failure is
+       * reported and the run still settles.
+       */
+      const finishAgentTails = async (): Promise<void> => {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            agentTail.stopAll(),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(() => {
+                console.warn('[AntigravityRuntime] Final agent transcript reads did not finish in time; settling without them.');
+                resolve();
+              }, AGENT_TAIL_FINAL_READ_TIMEOUT_MS);
+            }),
+          ]);
+        } catch (error) {
+          console.error('[AntigravityRuntime] Failed to finish agent transcript tails:', error);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
 
       /**
        * Settles every agent the session still waits on: one `task_status`
@@ -700,9 +726,15 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             // none of them lands behind the settle frames or the `complete`.
             // `close` waits for this before it speaks for the run.
             turnEnding = (async () => {
-              await agentTail.stopAll();
-              if (settleOutstandingAgents(isError ? 'stopped' : 'transcript')) {
-                broadcastBackgroundTasks();
+              // A failed or stuck final read must not keep the turn from
+              // ending: `close` waits on this, and the run only settles after.
+              await finishAgentTails();
+              try {
+                if (settleOutstandingAgents(isError ? 'stopped' : 'transcript')) {
+                  broadcastBackgroundTasks();
+                }
+              } catch (error) {
+                console.error('[AntigravityRuntime] Failed to settle agent cards at turn end:', error);
               }
 
               // A finished turn releases the stdin that was holding the CLI
@@ -858,7 +890,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         // Agents that never reported are gone with the process; what they did
         // last is still read from their transcripts first.
         await turnEnding;
-        await agentTail.stopAll();
+        await finishAgentTails();
         if (settleOutstandingAgents('stopped')) {
           broadcastBackgroundTasks();
         }
@@ -923,7 +955,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         console.error('[Antigravity CLI error]:', err);
 
         await turnEnding;
-        await agentTail.stopAll();
+        await finishAgentTails();
         if (settleOutstandingAgents('stopped')) {
           broadcastBackgroundTasks();
         }
