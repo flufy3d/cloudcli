@@ -51,7 +51,7 @@ const resetListResponse = {
     targetType: 'PERSONAL',
     lastFiveHourResetTime: '2026-09-22 23:49:58',
     fiveHourResets: [
-      { recordId: 606262, grantType: 'DIRECT', expireTime: '2026-10-18 18:50:54', available: true },
+      { recordId: 606262, grantType: 'DIRECT', expireTime: '2099-10-18 18:50:54', available: true },
       { recordId: 758489, grantType: 'DIRECT', expireTime: '2026-09-20 18:06:38', available: false },
     ],
     weekResets: [],
@@ -417,7 +417,7 @@ describe('ZCode Credentials & Quota Provider', () => {
           resetType: '5h',
           grantType: 'DIRECT',
           available: true,
-          expireTime: new Date('2026-10-18T18:50:54').toISOString(),
+          expireTime: new Date('2099-10-18T18:50:54').toISOString(),
         },
         {
           id: '758489',
