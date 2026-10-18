@@ -163,6 +163,12 @@ type CodexSubagentRecord = {
   isComplete: boolean;
   /** Closed by an interruption or abort rather than by a final answer: it ended with no result. */
   wasStopped?: boolean;
+  /**
+   * The engine's `completed` activity is on record. Its FINAL_ANSWER can be
+   * missing or unreadable (real rollouts carry encrypted reports), so this
+   * alone settles the card as completed — the word live settles it on.
+   */
+  reportedComplete?: boolean;
 };
 
 function parseCodexSubagentMessage(payload: AnyRecord): {
@@ -569,7 +575,9 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       // is settled here or its Agent card renders as running forever. The
       // result is an error row: the agent did not finish its work.
       for (const record of subagentsByCallId.values()) {
-        closeSubagent(record, timestamp, 'Subagent ended when the turn was interrupted.', true, true);
+        if (!record.reportedComplete) {
+          closeSubagent(record, timestamp, 'Subagent ended when the turn was interrupted.', true, true);
+        }
       }
       messages.push({
         // No item is written for an abort, so the row is named after the
@@ -622,7 +630,9 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       existing.agentThreadId = existing.agentThreadId ?? item.agentThreadId;
       indexSubagent(existing);
 
-      if (item.activity === 'interrupted') {
+      if (item.activity === 'completed') {
+        existing.reportedComplete = true;
+      } else if (item.activity === 'interrupted' && !existing.reportedComplete) {
         closeSubagent(existing, timestamp, 'Subagent was interrupted before returning a final answer.', false, true);
       }
       continue;
@@ -697,7 +707,9 @@ async function attachCodexSubagentTranscripts(
       // is gone and it can never report, so the card must not spin forever.
       status: record.isComplete
         ? (record.wasStopped ? 'stopped' : 'completed')
-        : codexBackgroundWork.has(record.agentThreadId ?? record.toolCallId) ? 'running' : 'stopped',
+        : record.reportedComplete
+          ? 'completed'
+          : codexBackgroundWork.has(record.agentThreadId ?? record.toolCallId) ? 'running' : 'stopped',
     };
 
     if (record.agentThreadId) {

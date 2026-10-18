@@ -690,6 +690,50 @@ test('an interrupted subagent closes its Agent row instead of running forever', 
   }
 });
 
+test('a subagent whose completed activity is on record stays completed through a later turn abort', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-completed-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-subagent-completed-1';
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    // Real rollouts carry agent reports the reader cannot parse as a
+    // FINAL_ANSWER; the `completed` activity is then the only word that the
+    // agent finished, and live settles the card on it.
+    const activity = (id: string, kind: string) => JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        item: { type: 'SubAgentActivity', id, agent_path: '/root/reviewer', agent_thread_id: 'thread-1', kind },
+      },
+    });
+    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${[
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      activity('call_spawn_1', 'started'),
+      activity('done-1', 'completed'),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-1', reason: 'interrupted' } }),
+    ].join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-subagent-completed-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-subagent-completed-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-subagent-completed-1');
+      const agent = history.messages.find((message) => message.toolName === 'Agent');
+
+      assert.ok(agent, 'the spawn must render as an Agent row');
+      assert.equal(agent.subagent?.status, 'completed', 'live settles a completed activity as completed; history must agree');
+      assert.notEqual(agent.toolResult?.isError, true);
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('a persisted assistant plan normalizes to the same plan card as a live one', () => {
   const provider = new CodexSessionsProvider();
   const plan = '# Rework the merge\n\n1. Anchor the order\n2. Delete the guess';
