@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 
 import { test } from 'vitest';
 
-import type { NormalizedMessage } from '@/shared/types';
+import type { NormalizedMessage, ServerEvent } from '@/shared/types';
 import { normalizedToChatMessages } from '@/modules/chat/hooks/useChatMessages';
+import { SessionTimelineStore } from '@/modules/chat/utils/sessionTimelineStore';
 
 /**
  * While a subagent runs, its rows stream in stamped with the spawning call's
@@ -179,4 +180,42 @@ test('streamed subagent text deltas share one timeline entry', () => {
   assert.deepEqual(converted[0].subagentActivity, [
     { kind: 'text', content: 'Hello world', timestamp: '2026-08-26T12:00:00.000Z' },
   ]);
+});
+
+test('a subagent streamed through the timeline store stays inside its container', async () => {
+  // The store buffers deltas before they reach the fold. That buffer used to
+  // drop `parentToolUseId`, so a running subagent's prose rendered as the
+  // session's own messages until a reload moved it into the card — the
+  // vanishing-fragments report this pins shut.
+  const store = new SessionTimelineStore();
+
+  store.applyServerEvent({
+    kind: 'tool_use',
+    id: 'spawn-card',
+    sessionId: 'session-1',
+    provider: 'opencode',
+    timestamp: '2026-08-26T12:00:00.000Z',
+    toolId: 'call_subagent',
+    toolName: 'subagent',
+    toolInput: { description: 'demo' },
+  } as unknown as ServerEvent, { provider: 'opencode' });
+  store.applyServerEvent({
+    kind: 'stream_delta',
+    id: 'child-text',
+    sessionId: 'session-1',
+    provider: 'opencode',
+    timestamp: '2026-08-26T12:00:01.000Z',
+    content: 'Now the hooks — tellPlan, slowFlare, onHit:',
+    providerRowKey: 'opencode-part:msg_child_text_0',
+    parentToolUseId: 'call_subagent',
+  } as unknown as ServerEvent, { provider: 'opencode' });
+  await new Promise((resolve) => setTimeout(resolve, 130));
+
+  const converted = normalizedToChatMessages(store.getMessages('session-1'));
+  assert.equal(converted.length, 1, 'the subagent stream must not become a top-level message');
+  assert.equal(converted[0].isSubagentContainer, true);
+  assert.equal(
+    converted[0].subagentActivity?.[0]?.content,
+    'Now the hooks — tellPlan, slowFlare, onHit:',
+  );
 });

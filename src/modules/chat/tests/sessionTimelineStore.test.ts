@@ -234,6 +234,63 @@ test('a streaming row anchors its timestamp at segment start and finalizes in pl
   assert.equal(nextSegment!.content, 'Next');
 });
 
+test("a subagent's streamed text keeps its parent stamp and never becomes a top-level row", async () => {
+  const store = new SessionTimelineStore();
+
+  emit(store, {
+    kind: 'stream_delta',
+    sessionId: SESSION_ID,
+    content: 'Now the hooks',
+    parentToolUseId: 'call_subagent',
+    providerRowKey: 'opencode-part:msg_1_text_0',
+  });
+  await tickThrottle();
+
+  // The child scope streams under its own row, stamped with the spawn call;
+  // the session's own streaming row is untouched.
+  const rows = store.getSessionSlot(SESSION_ID)!.realtimeMessages;
+  const streaming = rows.find((row) => row.parentToolUseId === 'call_subagent');
+  assert.ok(streaming, 'the child segment must keep its parentToolUseId');
+  assert.equal(streaming!.content, 'Now the hooks');
+  assert.equal(rows.some((row) => row.id === `__streaming_${SESSION_ID}`), false);
+
+  emit(store, { kind: 'stream_end', sessionId: SESSION_ID, parentToolUseId: 'call_subagent' });
+
+  const finalized = store.getSessionSlot(SESSION_ID)!.realtimeMessages.find(
+    (row) => row.content === 'Now the hooks',
+  );
+  assert.ok(finalized);
+  assert.match(finalized!.id, /^__streamed_/);
+  assert.equal(finalized!.parentToolUseId, 'call_subagent');
+});
+
+test('concurrent subagents stream into separate segments without cutting each other off', async () => {
+  const store = new SessionTimelineStore();
+
+  emit(store, {
+    kind: 'stream_delta', sessionId: SESSION_ID, content: 'Child A part one. ',
+    parentToolUseId: 'call_a', providerRowKey: 'part:a_0',
+  });
+  emit(store, {
+    kind: 'stream_delta', sessionId: SESSION_ID, content: 'Child B text.',
+    parentToolUseId: 'call_b', providerRowKey: 'part:b_0',
+  });
+  emit(store, {
+    kind: 'stream_delta', sessionId: SESSION_ID, content: 'Child A part two.',
+    parentToolUseId: 'call_a', providerRowKey: 'part:a_0',
+  });
+  // A content frame from the session's own turn closes only the session's
+  // segment; it must not cut the children's sentences in half.
+  emit(store, {
+    kind: 'text', id: 'parent-text', role: 'assistant', sessionId: SESSION_ID, content: 'parent text',
+  });
+  await tickThrottle();
+
+  const rows = store.getSessionSlot(SESSION_ID)!.realtimeMessages;
+  assert.equal(rows.find((row) => row.parentToolUseId === 'call_a')?.content, 'Child A part one. Child A part two.');
+  assert.equal(rows.find((row) => row.parentToolUseId === 'call_b')?.content, 'Child B text.');
+});
+
 test('a realtime row an engine names twice stays one row', async () => {
   const store = new SessionTimelineStore();
 
