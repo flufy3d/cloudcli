@@ -4,7 +4,7 @@ import test from 'node:test';
 import { ChatSessionWriter } from '@/modules/websocket/services/chat-session-writer.service.js';
 import type { NormalizedMessage } from '@/shared/types.js';
 
-type Notified = { userId: string | number | null; provider: string; sessionId: string | null; toolName?: string; requestId: string };
+type Notified = { userId: string | number | null; provider: string; sessionId: string | null; toolName?: string; requestId: string; sessionName?: string | null };
 
 const makeWriter = (provider: 'claude' | 'zcode' | 'opencode' = 'zcode') => {
   const notified: Notified[] = [];
@@ -17,6 +17,7 @@ const makeWriter = (provider: 'claude' | 'zcode' | 'opencode' = 'zcode') => {
     onProviderSessionId: () => {},
     // Stands in for the run registry, which stamps the app session id.
     decorateOutboundEvent: (message: NormalizedMessage) => ({ ...message, sessionId: 'app-1', seq: 1 }),
+    sessionName: 'Fix the checkout',
     notifyPermissionRequest: (info) => { notified.push(info as Notified); },
   });
   return { writer, notified, sent };
@@ -26,7 +27,7 @@ test('any engine\'s approval card raises one push notification for the app sessi
   for (const provider of ['claude', 'zcode', 'opencode'] as const) {
     const { writer, notified } = makeWriter(provider);
     writer.send({ id: 'm1', kind: 'permission_request', requestId: 'per_1', toolName: 'Bash', input: {}, sessionId: 'native-1', provider, timestamp: '2026-01-01T00:00:00.000Z' });
-    assert.deepEqual(notified, [{ userId: 7, provider, sessionId: 'app-1', toolName: 'Bash', requestId: 'per_1' }]);
+    assert.deepEqual(notified, [{ userId: 7, provider, sessionId: 'app-1', toolName: 'Bash', requestId: 'per_1', sessionName: 'Fix the checkout' }]);
   }
 });
 

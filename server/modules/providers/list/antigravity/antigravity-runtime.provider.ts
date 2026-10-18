@@ -276,6 +276,8 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       // stream; following those puts their steps into their cards as they
       // happen, in the same shape history gives them.
       const historyReader = new AntigravitySessionsProvider();
+      /** The turn-end work a `result` event started; `close` and `error` wait for it. */
+      let turnEnding: Promise<void> | null = null;
       const agentTail = createAgentTranscriptTail({
         readTimeline: async (conversationId) => (await historyReader.fetchHistory(conversationId, {})).messages,
         emit: (message) => writer.send(message),
@@ -290,9 +292,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
        * nothing is left to report on them.
        */
       const settleOutstandingAgents = (judge: 'transcript' | 'stopped') => {
-        // One last read each, so the final steps arrive; they follow the
-        // settle frames by a moment.
-        void agentTail.stopAll();
         const outstanding = antigravityBackgroundWork.list().find((entry) => entry.sessionId === sessionKey)?.tasks ?? [];
         for (const task of outstanding) {
           writer.send(createTaskStatusMessage(
@@ -683,40 +682,46 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
               }));
             }
 
-            // agy reports a turn only after its subagents are back, so their
-            // cards go before the client sees the turn complete. An
-            // interrupted-stream result is not the end of the turn (below).
-            const turnContinues = isError && isStreamInterruptedNotice(errorMessage);
-            if (!turnContinues && settleOutstandingAgents(isError ? 'stopped' : 'transcript')) {
-              broadcastBackgroundTasks();
-            }
-
-            // A finished turn releases the stdin that was holding the CLI
-            // open: agy exits on EOF and `close` settles the run. An
-            // interrupted-stream result is deliberately excluded — agy has
+            // An interrupted-stream result is not the end of the turn: agy has
             // injected its own continuation prompt and is still working, so
             // closing stdin here would EOF the CLI mid-task and resurrect the
             // very "async work silently killed" bug stdin ownership exists to
             // prevent. Its eventual real result closes stdin instead, and the
-            // watchdog bounds the wait if that result never comes.
+            // watchdog bounds the wait if that result never comes. The client
+            // keeps the turn busy too.
+            const turnContinues = isError && isStreamInterruptedNotice(errorMessage);
             if (turnContinues) {
-              // The client keeps the turn busy too: agy is still working on it.
               return;
             }
-            closeStdinTurn();
 
-            if (!completeSent) {
-              completeSent = true;
-              const completeMsg = createCompleteMessage({
-                provider: PROVIDER,
-                sessionId: capturedSessionId || sessionId || null,
-                exitCode: isError && !streamInterruptedResult ? 1 : 0,
-              });
-              if (totalTokens !== undefined) {
-                completeMsg.tokens = totalTokens;
+            // agy reports a turn only after its subagents are back, so their
+            // cards settle before the client sees the turn complete — and only
+            // after each agent's last steps were read from its transcript, so
+            // none of them lands behind the settle frames or the `complete`.
+            // `close` waits for this before it speaks for the run.
+            turnEnding = (async () => {
+              await agentTail.stopAll();
+              if (settleOutstandingAgents(isError ? 'stopped' : 'transcript')) {
+                broadcastBackgroundTasks();
               }
-              writer.send(completeMsg);
-            }
+
+              // A finished turn releases the stdin that was holding the CLI
+              // open: agy exits on EOF and `close` settles the run.
+              closeStdinTurn();
+
+              if (!completeSent) {
+                completeSent = true;
+                const completeMsg = createCompleteMessage({
+                  provider: PROVIDER,
+                  sessionId: capturedSessionId || sessionId || null,
+                  exitCode: isError && !streamInterruptedResult ? 1 : 0,
+                });
+                if (totalTokens !== undefined) {
+                  completeMsg.tokens = totalTokens;
+                }
+                writer.send(completeMsg);
+              }
+            })();
             return;
           }
 
@@ -828,7 +833,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
       });
 
-      agyProcess.on('close', (code: number | null) => {
+      agyProcess.on('close', async (code: number | null) => {
         clearWatchdog();
         activeProcesses.delete(processKey);
 
@@ -850,7 +855,10 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
           }));
         }
 
-        // Agents that never reported are gone with the process.
+        // Agents that never reported are gone with the process; what they did
+        // last is still read from their transcripts first.
+        await turnEnding;
+        await agentTail.stopAll();
         if (settleOutstandingAgents('stopped')) {
           broadcastBackgroundTasks();
         }
@@ -909,11 +917,13 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         }
       });
 
-      agyProcess.on('error', (err: Error) => {
+      agyProcess.on('error', async (err: Error) => {
         clearWatchdog();
         activeProcesses.delete(processKey);
         console.error('[Antigravity CLI error]:', err);
 
+        await turnEnding;
+        await agentTail.stopAll();
         if (settleOutstandingAgents('stopped')) {
           broadcastBackgroundTasks();
         }

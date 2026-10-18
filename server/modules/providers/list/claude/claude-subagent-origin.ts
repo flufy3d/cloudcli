@@ -34,6 +34,8 @@ function describeAgentCall(input: Record<string, unknown> | undefined): string |
 export function createSubagentOriginTracker() {
   const parentOfCall = new Map<string, string>();
   const agentCalls = new Map<string, AgentCall>();
+  const seenCalls = new Set<string>();
+  const waiters = new Map<string, Array<() => void>>();
 
   return {
     /** Feeds one SDK stream message. */
@@ -55,10 +57,37 @@ export function createSubagentOriginTracker() {
         if (parent) {
           parentOfCall.set(call.id, parent);
         }
+        seenCalls.add(call.id);
+        for (const wake of waiters.get(call.id) ?? []) {
+          wake();
+        }
+        waiters.delete(call.id);
         if (typeof call.name === 'string' && canonicalClaudeSubagentToolName(call.name) === SUBAGENT_TOOL_NAME) {
           agentCalls.set(call.id, { description: describeAgentCall(readObject(call.input)) });
         }
       }
+    },
+
+    /**
+     * Resolves once the stream has shown the call, or after `timeoutMs`. The
+     * approval request and the stream travel separately, so a request can
+     * arrive first; asking here before `originOf` keeps its card from losing
+     * the origin.
+     */
+    whenObserved(toolUseId: string | undefined, timeoutMs: number): Promise<void> {
+      if (!toolUseId || seenCalls.has(toolUseId)) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        const timer = setTimeout(done, timeoutMs);
+        function done(): void {
+          clearTimeout(timer);
+          resolve();
+        }
+        const list = waiters.get(toolUseId) ?? [];
+        list.push(done);
+        waiters.set(toolUseId, list);
+      });
     },
 
     /** The card a tool call belongs to, or undefined for a main-thread call. */

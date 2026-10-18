@@ -139,8 +139,18 @@ async function withGateway(
   }
 }
 
-/** The handler is async and the socket listener does not await it. */
-const settle = () => new Promise((resolve) => { setTimeout(resolve, 30); });
+/**
+ * The handler is async and the socket listener does not await it. A test that
+ * expects an effect names it in `until` and waits for that (the handler reads
+ * the transcript from disk, which takes longer under load); one that expects
+ * nothing to happen can only wait a moment.
+ */
+const settle = async (until?: () => boolean) => {
+  for (const deadline = Date.now() + 5_000; until && !until() && Date.now() < deadline;) {
+    await new Promise((resolve) => { setTimeout(resolve, 5); });
+  }
+  await new Promise((resolve) => { setTimeout(resolve, 30); });
+};
 
 test('an edit resumes through the turn before the one being replaced', async () => {
   await withGateway('claude', async ({ socket, runs }) => {
@@ -150,7 +160,7 @@ test('an edit resumes through the turn before the one being replaced', async () 
       anchorId: 'e-u2',
       content: 'a better second prompt',
     }));
-    await settle();
+    await settle(() => runs.length >= 1);
 
     assert.equal(runs.length, 1);
     assert.equal(runs[0].command, 'a better second prompt');
@@ -170,7 +180,7 @@ test('an enabled Codex run receives a user-bound capability that expires when th
       content: 'continue later',
       options: { permissionMode: 'acceptEdits' },
     }));
-    await settle();
+    await settle(() => runs.length >= 1);
 
     assert.equal(runs.length, 1);
     const taskExecutionContext = runs[0].options.taskExecutionContext as { token?: string } | undefined;
@@ -202,7 +212,7 @@ test('editing the first prompt starts the conversation over', async () => {
       anchorId: 'e-u1',
       content: 'a better first prompt',
     }));
-    await settle();
+    await settle(() => runs.length >= 1);
 
     assert.equal(runs.length, 1);
     assert.equal(runs[0].options.resumeAnchorId, undefined);
@@ -290,7 +300,7 @@ test('a refused send never rewinds the conversation', async () => {
         sessionId: SESSION_ID,
         content: 'a turn that is already running',
       }));
-      await settle();
+      await settle(() => runs.length >= 1);
       assert.equal(runs.length, 1);
 
       socket.emit('message', JSON.stringify({
@@ -331,7 +341,7 @@ test('a provider that has to branch to rewind is rewound before the run, not dur
         anchorId: 'turn-b',
         content: 'a better second prompt',
       }));
-      await settle();
+      await settle(() => runs.length >= 1);
     } finally {
       sessionsService.rewindSessionForEdit = realRewind;
     }
@@ -365,7 +375,7 @@ test('chat.send drops client-supplied host task capabilities and tool results', 
         taskContinuationLifecycle: { onEngineTurnStarted: 'forged-callback' },
       },
     }));
-    await settle();
+    await settle(() => runs.length >= 1);
 
     assert.equal(runs.length, 1);
     assert.equal('toolOutput' in runs[0].options, false);

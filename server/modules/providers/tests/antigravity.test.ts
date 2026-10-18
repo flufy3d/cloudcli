@@ -1738,3 +1738,24 @@ test('two spawn calls without step indexes get distinct ids, and only a receipt 
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+test('the live spawn call is not drawn as a tool row beside its Agent cards, so live matches history', () => {
+  const sessions = new AntigravitySessionsProvider();
+  const active = sessions.normalizeMessage({
+    event: 'step_update',
+    step_update: { step_index: 3, state: 'ACTIVE', step_type: 'tool', tool_name: 'invoke_subagent', tool_info: { parameters: { Subagents: [{ Role: 'Reviewer', Prompt: 'Review' }] } } },
+  }, 'live-spawn');
+  const done = sessions.normalizeMessage({
+    event: 'step_update',
+    step_update: { step_index: 3, state: 'DONE', step_type: 'tool', tool_name: 'invoke_subagent', tool_info: { output: 'Created the following subagents: ...' } },
+  }, 'live-spawn');
+  assert.deepEqual(active, []);
+  assert.deepEqual(done, []);
+
+  // Other tools are unaffected.
+  const other = sessions.normalizeMessage({
+    event: 'step_update',
+    step_update: { step_index: 4, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'ls' } } },
+  }, 'live-spawn');
+  assert.equal(other[0]?.toolName, 'run_command');
+});

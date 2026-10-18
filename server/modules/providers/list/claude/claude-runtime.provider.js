@@ -48,6 +48,9 @@ const activeSessions = new Map();
 // entry lives exactly as long as the map entry it shadows: cleared when the
 // session is removed, and reset when a newer run takes the key over.
 const backgroundWork = createBackgroundWorkTracker();
+/** How long an approval request waits for the stream to show its tool call before going without an origin. */
+const SUBAGENT_ORIGIN_WAIT_MS = 1500;
+
 const pendingToolApprovals = new Map();
 // Query instances cancelled via abort-session. The abort handler sends the
 // terminal `complete` (aborted: true) to the client, so the run loop must not
@@ -166,12 +169,31 @@ function waitForToolApproval(requestId, options = {}) {
     const resolver = (decision) => {
       finalize(decision);
     };
+    // Lets the run that raised this request take it down when its process ends.
+    resolver._cancel = (reason) => {
+      onCancel?.(reason);
+      finalize({ cancelled: true });
+    };
     // Attach metadata for getPendingApprovalsForSession lookup
     if (metadata) {
       Object.assign(resolver, metadata);
     }
     pendingToolApprovals.set(requestId, resolver);
   });
+}
+
+/**
+ * Retracts every request a finished run left unanswered. An interactive tool
+ * (a question, a plan) waits without a timeout, and a subagent's request
+ * outlives the turn that spawned it; when the process exits nobody can answer,
+ * and the page would keep the card for ever.
+ */
+function cancelRunApprovals(runToken) {
+  for (const resolver of [...pendingToolApprovals.values()]) {
+    if (resolver._runToken === runToken) {
+      resolver._cancel?.('cancelled');
+    }
+  }
 }
 
 function resolveToolApproval(requestId, decision) {
@@ -753,6 +775,8 @@ async function loadMcpConfig(cwd) {
  */
 async function queryClaudeSDK(command, options = {}, ws, context) {
   const { sessionId, sessionSummary } = options;
+  // Identifies this run's pending approvals, so its end can retract them.
+  const runToken = Symbol('claude-run');
   // Callers pass the stable app session id; the SDK only understands the
   // provider-native id recorded on the session row.
   const providerSessionId = context.resolveProviderSessionId(sessionId);
@@ -939,6 +963,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       const requestId = createRequestId();
       // The callback serves the main thread and every subagent alike; the
       // stream told us which card the asking call was made under.
+      // (Observed live: the stream leads by a millisecond or so, but the two
+      // travel separately, so a request that wins the race waits briefly.)
+      await subagentOrigins.whenObserved(context?.toolUseID, SUBAGENT_ORIGIN_WAIT_MS);
       const subagent = subagentOrigins.originOf(context?.toolUseID);
       const requestContext = subagent ? { subagent } : undefined;
       ws.send(createNormalizedMessage({ kind: 'permission_request', requestId, toolName, input, context: requestContext, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
@@ -953,6 +980,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
           _toolName: toolName,
           _input: input,
           _context: requestContext,
+          _runToken: runToken,
           _receivedAt: new Date(),
         },
         onCancel: (reason) => {
@@ -1305,6 +1333,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       if (lastBroadcastHadTasks || lastBroadcastPending) broadcastBackgroundTasks();
     }
     releasePromptStream();
+    cancelRunApprovals(runToken);
   }
 }
 

@@ -45,6 +45,7 @@ const fingerprint = (message: NormalizedMessage): string => JSON.stringify([
 export function createAgentTranscriptTail(options: TailOptions) {
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
   const followed = new Map<string, Followed>();
+  const rejected = new Set<string>();
 
   async function poll(conversationId: string, entry: Followed): Promise<void> {
     if (entry.reading) {
@@ -90,7 +91,15 @@ export function createAgentTranscriptTail(options: TailOptions) {
   return {
     /** Starts following an agent; its steps go to the card named by `toolUseId`. */
     follow(conversationId: string, toolUseId: string): void {
-      if (followed.has(conversationId)) {
+      if (followed.has(conversationId) || rejected.has(conversationId)) {
+        return;
+      }
+      try {
+        sanitizeLeafDirectoryName(conversationId, 'antigravity session id');
+      } catch (error) {
+        // An id that names no transcript directory never will; say so once.
+        rejected.add(conversationId);
+        console.warn(`[AntigravityAgentTail] Not following agent "${conversationId}": ${error instanceof Error ? error.message : String(error)}`);
         return;
       }
       const entry: Followed = { toolUseId, sent: new Map(), timer: null, watcher: null, reading: null };

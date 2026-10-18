@@ -296,6 +296,8 @@ export const chatRunRegistry = {
      */
     connection: RealtimeClientConnection | null;
     userId: string | number | null;
+    /** What the user calls the session, for notification titles. */
+    sessionName?: string | null;
   }): ChatRun | null {
     const existing = runs.get(input.appSessionId);
     if (existing && existing.status === 'running') {
@@ -325,6 +327,7 @@ export const chatRunRegistry = {
     run.writer = new ChatSessionWriter({
       connection: input.connection,
       userId: input.userId,
+      sessionName: input.sessionName,
       provider: input.provider,
       providerSessionId: input.providerSessionId,
       onProviderSessionId: (providerSessionId) => {

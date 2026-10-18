@@ -40,3 +40,24 @@ test('the legacy Task name is an agent call too, and an agent with no descriptio
   tracker.observe(assistant([{ id: 'toolu_child', name: 'Read' }], 'toolu_task'));
   assert.deepEqual(tracker.originOf('toolu_child'), { toolUseId: 'toolu_task', description: 'Look around' });
 });
+
+test('a request that beats the stream waits for its tool call to be seen, then finds the origin', async () => {
+  const tracker = createSubagentOriginTracker();
+  tracker.observe(assistant([{ id: 'toolu_agent', name: 'Agent', input: { description: 'Review' } }]));
+
+  const waiting = tracker.whenObserved('toolu_child', 1_000);
+  assert.equal(tracker.originOf('toolu_child'), undefined, 'not known yet');
+  tracker.observe(assistant([{ id: 'toolu_child', name: 'Bash' }], 'toolu_agent'));
+  await waiting;
+  assert.deepEqual(tracker.originOf('toolu_child'), { toolUseId: 'toolu_agent', description: 'Review' });
+});
+
+test('waiting for a call already seen, or one that never shows, does not hang', async () => {
+  const tracker = createSubagentOriginTracker();
+  tracker.observe(assistant([{ id: 'toolu_main', name: 'Bash' }]));
+  await tracker.whenObserved('toolu_main', 1_000);
+  const started = Date.now();
+  await tracker.whenObserved('toolu_ghost', 50);
+  assert.ok(Date.now() - started < 500);
+  await tracker.whenObserved(undefined, 50);
+});

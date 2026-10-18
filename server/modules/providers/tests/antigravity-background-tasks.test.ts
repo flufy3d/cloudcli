@@ -319,3 +319,45 @@ test('while an agent works, its own steps stream into its card and stop when it 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test('an agent\'s last steps arrive before its card settles and before the turn completes', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-order-'));
+  const logs = path.join(root, 'brain', 'sub-order', '.system_generated', 'logs');
+  await fs.mkdir(logs, { recursive: true });
+  const file = path.join(logs, 'transcript.jsonl');
+  const head = [{ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'go' }];
+  const write = (rows: unknown[]) => fs.writeFile(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const previous = process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+  process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = root;
+  try {
+    await withStub([
+      { event: 'init', conversation_id: 'conv-order', init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', ['sub-order']), conversation_id: 'conv-order' }),
+      700,
+      { event: 'result', result: { conversation_id: 'conv-order', status: 'SUCCESS', usage: { total_tokens: 1 } } },
+    ], async () => {
+      const { sent, done, waitForCard } = await createRun('conv-order');
+      await waitForCard();
+      // The transcript appears only now, a moment before the turn result: there
+      // was nothing to watch yet and the next poll is seconds away, so only the
+      // final read at settle can find these steps.
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      await write([...head, { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Last words.' }]);
+      await done;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const lastWords = sent.findIndex((msg) => msg.parentToolUseId === 'tool_2:sub-order' && msg.content === 'Last words.');
+      const settled = sent.findIndex((msg) => msg.kind === 'task_status' && msg.event === 'notification');
+      const complete = sent.findIndex((msg) => msg.kind === 'complete');
+      assert.ok(lastWords >= 0, 'the final step reaches the page');
+      assert.ok(lastWords < settled && settled < complete, 'final step, then settle, then complete');
+    });
+  } finally {
+    if (previous === undefined) delete process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+    else process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = previous;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

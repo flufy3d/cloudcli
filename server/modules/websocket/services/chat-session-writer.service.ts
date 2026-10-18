@@ -31,6 +31,11 @@ type ChatSessionWriterOptions = {
    */
   decorateOutboundEvent: (message: NormalizedMessage) => NormalizedMessage | null;
   /**
+   * What the user calls this session, for notification titles. A brand-new
+   * session has no stored name yet, so the run's creator passes what it knows.
+   */
+  sessionName?: string | null;
+  /**
    * Raises the push notification for an approval card. Defaults to the
    * notification service; tests inject their own.
    */
@@ -40,6 +45,7 @@ type ChatSessionWriterOptions = {
     sessionId: string | null;
     toolName?: string;
     requestId: string;
+    sessionName?: string | null;
   }) => void;
 };
 
@@ -154,6 +160,7 @@ export class ChatSessionWriter {
           sessionId: outbound.sessionId ?? null,
           toolName: outbound.toolName,
           requestId: outbound.requestId,
+          sessionName: this.options.sessionName ?? null,
         });
       }
     }

@@ -337,8 +337,13 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         }));
       }
 
+      // The spawn call is drawn by its Agent cards, one per created agent
+      // (above); a raw tool row beside them would be a duplicate that history,
+      // which drops the call, never shows.
+      const isSpawnCall = stepType === 'tool' && readOptionalString(step.tool_name) === ANTIGRAVITY_SPAWN_TOOL;
+
       // Tool use initiation
-      if (stepType === 'tool' && state === 'ACTIVE') {
+      if (stepType === 'tool' && state === 'ACTIVE' && !isSpawnCall) {
         const toolName = readOptionalString(step.tool_name) || 'tool';
         const toolInfo = readObjectRecord(step.tool_info);
         const parameters = normalizeAntigravityToolArgs(toolInfo?.parameters ?? {});
@@ -357,7 +362,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       }
 
       // Tool result completion or error
-      if (stepType === 'tool' && (state === 'DONE' || state === 'ERROR')) {
+      if (stepType === 'tool' && (state === 'DONE' || state === 'ERROR') && !isSpawnCall) {
         const toolInfo = readObjectRecord(step.tool_info);
         const toolId = buildAntigravityToolId(stepIndex, null);
         const output = readOptionalString(toolInfo?.output) ?? '';

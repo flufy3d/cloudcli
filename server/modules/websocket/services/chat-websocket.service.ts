@@ -112,6 +112,12 @@ function readClientRuntimeOptions(value: unknown): AnyRecord {
   );
 }
 
+/** The session title the client put in its send options, if any. */
+function readSessionSummary(options: unknown): string | null {
+  const summary = options && typeof options === 'object' ? (options as AnyRecord).sessionSummary : undefined;
+  return typeof summary === 'string' && summary.trim() ? summary.trim() : null;
+}
+
 /**
  * Extracts the authenticated request user id in the formats currently produced
  * by platform and OSS auth code paths.
@@ -299,6 +305,8 @@ async function dispatchRun(
     providerSessionId: session.provider_session_id,
     connection: ws,
     userId,
+    // The composer sends the title it shows; a stored name is the fallback.
+    sessionName: readSessionSummary(data.options) ?? session.custom_name,
   });
 
   if (!run) {

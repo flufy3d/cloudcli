@@ -86,3 +86,18 @@ test('a failing read is logged and does not stop the following', async (t) => {
   assert.deepEqual(sent.map((message) => message.id), ['a']);
   await tail.stopAll();
 });
+
+test('an agent with an unusable conversation id is reported once and never polled', async (t) => {
+  const warnings: string[] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); });
+  let reads = 0;
+  const tail = createAgentTranscriptTail({ readTimeline: async () => { reads += 1; return []; }, emit: () => {}, intervalMs: 20 });
+
+  tail.follow('../escape', 'card');
+  tail.follow('../escape', 'card');
+  await wait(100);
+
+  assert.equal(reads, 0);
+  assert.equal(warnings.length, 1);
+  await tail.stopAll();
+});

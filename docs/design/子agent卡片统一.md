@@ -130,3 +130,13 @@ Antigravity 拆成多张卡是选定方案，原因是 `SubagentPanel` 一次只
 - 侧栏没有单独的“等待批准”文案：卡片到达会让会话作为后台工作出现在侧栏，输入框上方的批准卡片本身是主要提示（有待批准卡片时活动条本来就隐藏）。
 
 **直播时间线补全。** 真实 ZCode 引擎会把 agent 的工具调用镜像在父会话的流里（`tool.updated`，载荷带 `source: "subagent"` 和 `parentToolCallId`），此前这些行以主线程工具行的样子出现；现在带上 `parentToolUseId`，不需要订阅子会话。Antigravity 的 agent 过程只写在它自己的 transcript，登记期间用 `fs.watch` 加轮询重读，与历史同一个读取器，结算时再读一次。两家都用真实引擎端到端验证过。不转发 Codex 的 `collab_spawn` 形状（真实引擎从不发）。
+
+## 第五轮：小修
+
+- Antigravity 实时流除了 `Agent` 卡片，还会发 `invoke_subagent` 的原始工具行和结果行；历史不画它。实时分支跳过这次调用，实时与历史一致。真实 `agy` 运行已确认帧里不再有 `invoke_subagent`。
+- 折叠规则的三个边角：父链上有非 agent 祖先时仍取最外层 `Agent`；成环时在闭合处截断；找不到父卡的行只有“直播行且会话仍在运行”才被扣住，历史行和已结算会话的行照常显示。
+- Claude 批准卡片的来源：真实运行里流领先请求约 1ms，但两者顺序没有保证，请求先到时最多等 1.5 秒。真实 Claude 运行（默认模式，子 agent 执行 `touch`）确认卡片带 `context.subagent`。一轮的进程结束时撤回这一轮没回答的卡片，不依赖 SDK 在进程退出时中止信号。
+- 推送通知的标题带会话名：网关把客户端发来的会话标题（没有就用库里的名字）交给写入器。
+- Antigravity 的 agent 跟踪：结算前等最后一次读取发完；非法的 `conversationId` 只警告一次。
+
+不做：ZCode 在 20 秒去重窗口过后重新推送（影响小）；Antigravity 增量读取 transcript（性能取舍，影响小）。
