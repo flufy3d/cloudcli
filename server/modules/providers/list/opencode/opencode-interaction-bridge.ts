@@ -27,6 +27,7 @@ import { createNormalizedMessage, generateMessageId, readObjectRecord, readOptio
 import type { OpenCodeApiClient, OpenCodeFormAnswer } from './opencode-api.client.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import type { OpenCodeToolCall } from './opencode-event-translator.js';
+import { OpenCodeSubagentIndex } from './opencode-subagent-index.js';
 
 const PROVIDER = 'opencode' as const;
 const QUESTION_TOOL_NAME = 'AskUserQuestion';
@@ -153,6 +154,8 @@ export class OpenCodeInteractionBridge {
   private readonly pendingTtlMs: number;
   private readonly sessions = new Map<string, OpenCodeInteractionSession>();
   private readonly pending = new Map<string, PendingInteraction>();
+  /** Child session → parent run links, so a card raised inside an agent is the parent's. */
+  private readonly subagents = new OpenCodeSubagentIndex();
 
   constructor(dependencies: BridgeDependencies) {
     this.getClient = dependencies.getClient;
@@ -166,10 +169,14 @@ export class OpenCodeInteractionBridge {
 
   detach(providerSessionId: string): void {
     this.sessions.delete(providerSessionId);
+    this.subagents.forgetParent(providerSessionId);
   }
 
   /** Feeds one service event; non-interaction events and foreign sessions are ignored. */
   handleEvent(event: OpenCodeEventEnvelope): void {
+    // Session lifecycle events teach the bridge which child sessions belong
+    // to an attached run, so cards raised inside a subagent resolve to it.
+    this.subagents.note(event);
     const data = readObjectRecord(event.data);
     if (!data) {
       return;
@@ -227,7 +234,12 @@ export class OpenCodeInteractionBridge {
     this.sweepExpired();
     const views: OpenCodePendingInteractionView[] = [];
     for (const entry of this.pending.values()) {
-      if (entry.appSessionId !== sessionId && entry.providerSessionId !== sessionId) {
+      const parentProviderSessionId = this.subagents.resolve(entry.providerSessionId)?.parentProviderSessionId;
+      if (
+        entry.appSessionId !== sessionId
+        && entry.providerSessionId !== sessionId
+        && parentProviderSessionId !== sessionId
+      ) {
         continue;
       }
       views.push({
@@ -254,16 +266,38 @@ export class OpenCodeInteractionBridge {
     }
   }
 
+  /**
+   * Resolves the attached session an interactive request belongs to, directly
+   * or through the subagent that raised it. `replySessionId` is where the
+   * service expects the answer (the child for a subagent request); the session
+   * itself carries the parent's writer and app id.
+   */
+  private resolveAttachedSession(
+    providerSessionId: string,
+  ): { session: OpenCodeInteractionSession; replySessionId: string } | null {
+    const direct = this.sessions.get(providerSessionId);
+    if (direct) {
+      return { session: direct, replySessionId: providerSessionId };
+    }
+    const parent = this.subagents.resolve(providerSessionId);
+    const parentSession = parent ? this.sessions.get(parent.parentProviderSessionId) : undefined;
+    return parentSession ? { session: parentSession, replySessionId: providerSessionId } : null;
+  }
+
   private onPermissionAsked(data: Record<string, unknown>): void {
     const requestId = readOptionalString(data.id);
     const providerSessionId = readOptionalString(data.sessionID);
     if (!requestId || !providerSessionId || this.pending.has(requestId)) {
       return;
     }
-    const session = this.sessions.get(providerSessionId);
-    if (!session) {
+    // A permission asked inside a subagent is answered against the child
+    // session (the service owns the request there) but belongs to the parent
+    // chat session, whose run the card surfaces through.
+    const resolved = this.resolveAttachedSession(providerSessionId);
+    if (!resolved) {
       return;
     }
+    const { session, replySessionId } = resolved;
     const action = readOptionalString(data.action) ?? 'tool';
     const resources = Array.isArray(data.resources) ? data.resources.filter((item): item is string => typeof item === 'string') : [];
     const source = readObjectRecord(data.source);
@@ -273,7 +307,7 @@ export class OpenCodeInteractionBridge {
       requestId,
       kind: 'permission',
       appSessionId: session.appSessionId,
-      providerSessionId,
+      providerSessionId: replySessionId,
       toolName: toolCall?.name ?? action,
       toolId,
       input: toolCall?.input ?? { resources },
@@ -295,10 +329,11 @@ export class OpenCodeInteractionBridge {
     if (!requestId || !providerSessionId || this.pending.has(requestId)) {
       return;
     }
-    const session = this.sessions.get(providerSessionId);
-    if (!session) {
+    const resolved = this.resolveAttachedSession(providerSessionId);
+    if (!resolved) {
       return;
     }
+    const { session, replySessionId } = resolved;
     const metadata = readObjectRecord(form.metadata);
     const kind = readOptionalString(metadata?.kind);
     if (kind !== 'question') {
@@ -313,7 +348,7 @@ export class OpenCodeInteractionBridge {
       requestId,
       kind: 'form',
       appSessionId: session.appSessionId,
-      providerSessionId,
+      providerSessionId: replySessionId,
       toolName: QUESTION_TOOL_NAME,
       toolId: readOptionalString(tool?.id),
       input: { questions: fields.map(toPanelQuestion) },

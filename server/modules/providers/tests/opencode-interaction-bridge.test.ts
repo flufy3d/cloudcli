@@ -279,6 +279,83 @@ test('a reply the service refuses retracts the card with the failure as the reas
   assert.equal(frames[0].reason, 'session gone');
 });
 
+const CHILD_SESSION = 'ses_child_of_parent';
+
+/** Feeds the lifecycle and spawn events that link a child session to the attached parent. */
+const linkChildSession = (bridge: OpenCodeInteractionBridge): void => {
+  bridge.handleEvent({
+    type: 'session.tool.input.started',
+    data: { sessionID: PROVIDER_SESSION, id: CALL, name: 'subagent' },
+  });
+  bridge.handleEvent({
+    type: 'session.tool.called',
+    data: {
+      sessionID: PROVIDER_SESSION,
+      id: CALL,
+      input: { agent: 'general', description: 'Inspect the repo' },
+    },
+  });
+  bridge.handleEvent({
+    type: 'session.created',
+    data: {
+      sessionID: CHILD_SESSION,
+      parentID: PROVIDER_SESSION,
+      agent: 'general',
+      title: 'Inspect the repo',
+    },
+  });
+};
+
+test('a permission asked inside a subagent surfaces on the parent session and replies to the child', async () => {
+  const { bridge, calls, frames } = makeHarness();
+  linkChildSession(bridge);
+  frames.length = 0;
+
+  bridge.handleEvent(permissionAsked({ id: 'per_child', sessionID: CHILD_SESSION }));
+
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].kind, 'permission_request');
+  assert.equal(frames[0].sessionId, APP_SESSION, 'the card belongs to the parent chat session');
+  assert.equal(frames[0].requestId, 'per_child');
+  assert.equal(bridge.listPending(APP_SESSION).length, 1);
+  assert.equal(bridge.listPending(PROVIDER_SESSION).length, 1, 'the parent provider id finds it too');
+
+  bridge.resolve('per_child', { allow: true });
+  await flush();
+
+  assert.deepEqual(calls[0].args.slice(0, 2), [CHILD_SESSION, 'per_child'], 'the answer is addressed to the child session');
+  assert.equal(frames[frames.length - 1].kind, 'permission_resolved');
+});
+
+test('a question asked inside a subagent becomes the parent\'s card and replies to the child', async () => {
+  const { bridge, calls, frames } = makeHarness();
+  linkChildSession(bridge);
+  frames.length = 0;
+
+  const captured = formCreated();
+  const childForm = {
+    ...captured,
+    data: {
+      form: {
+        ...(captured.data as { form: Record<string, unknown> }).form,
+        sessionID: CHILD_SESSION,
+      },
+    },
+  };
+  bridge.handleEvent(childForm);
+
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].kind, 'permission_request');
+  assert.equal(frames[0].sessionId, APP_SESSION);
+  assert.equal(bridge.listPending(APP_SESSION).length, 1);
+
+  bridge.resolve('frm_147a8690a001Bf0LdLSgutFhNT', { allow: false, message: 'later' });
+  await flush();
+
+  assert.equal(calls[0].method, 'cancelForm');
+  assert.deepEqual(calls[0].args, [CHILD_SESSION, 'frm_147a8690a001Bf0LdLSgutFhNT', 'later']);
+});
+
 test('without a live service the card is retracted instead of hanging', async () => {
   const { bridge, frames } = makeHarness({ clientMissing: true });
   bridge.handleEvent(permissionAsked({ id: 'per_noservice' }));

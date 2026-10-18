@@ -1044,6 +1044,139 @@ test('a v2 compaction message renders as its own row with the summary flagged', 
   }
 });
 
+test('a v2 subagent launch carries the child session timeline, agent and settled status', { concurrency: false }, async () => {
+  // The parent's launch block names the child in `state.metadata.sessionID`
+  // but keeps `metadata.status: "running"` forever for a background spawn.
+  // The child session row is where the agent's name, title and final outcome
+  // live, and its own messages are the timeline the card shows.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-subagent-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          parent_id text,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          agent text,
+          model text,
+          idle_outcome text,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          time_idle integer
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+      `);
+      const insertSession = db.prepare(`
+        INSERT INTO session_v2 (
+          id, project_id, parent_id, slug, directory, title, version, agent, model,
+          idle_outcome, time_created, time_updated, time_idle
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      insertSession.run(
+        'ses_parent', 'proj_1', null, 'parent', '/tmp/proj', 'Parent', '2.0.32',
+        'build', null, null, 1000, 4000, null,
+      );
+      insertSession.run(
+        'ses_child', 'proj_1', 'ses_parent', 'child', '/tmp/proj', 'Echo the marker', '2.0.32',
+        'general', '{"providerID":"opencode-go","id":"glm-5.3"}', 'succeeded',
+        1100, 3500, 3400,
+      );
+
+      const insertMessage = db.prepare(`
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      insertMessage.run('msg_parent', 'ses_parent', 'assistant', 1, 1200, 1300, JSON.stringify({
+        time: { created: 1200 },
+        content: [{
+          type: 'tool',
+          id: 'call_subagent',
+          name: 'subagent',
+          state: {
+            status: 'completed',
+            input: { agent: 'general', description: 'Echo the marker', background: true },
+            metadata: { sessionID: 'ses_child', status: 'running', truncated: false },
+            content: [{
+              type: 'text',
+              text: 'The subagent is working in the background (sessionID: ses_child). You will be notified automatically when it finishes.',
+            }],
+          },
+        }],
+      }));
+      insertMessage.run('msg_child_user', 'ses_child', 'user', 1, 1100, 1100, JSON.stringify({
+        time: { created: 1100 },
+        text: 'Run the echo tool',
+      }));
+      insertMessage.run('msg_child_assistant', 'ses_child', 'assistant', 2, 1200, 3400, JSON.stringify({
+        time: { created: 1200 },
+        model: { providerID: 'opencode-go', id: 'glm-5.3' },
+        content: [
+          { type: 'reasoning', text: 'The child is thinking' },
+          {
+            type: 'tool',
+            id: 'call_child_bash',
+            name: 'bash',
+            state: {
+              status: 'completed',
+              input: { command: 'echo SUBAGENT_OK' },
+              content: [{ type: 'text', text: 'SUBAGENT_OK\n' }],
+              metadata: { status: 'completed' },
+            },
+          },
+          { type: 'text', text: 'SUBAGENT_OK' },
+        ],
+      }));
+    } finally {
+      db.close();
+    }
+
+    const history = await new OpenCodeSessionsProvider().fetchHistory('ses_parent');
+    const task = history.messages.find((message) => message.toolId === 'call_subagent');
+
+    assert.equal(task?.kind, 'tool_use');
+    assert.equal(task?.toolName, 'subagent');
+    assert.equal(task?.subagent?.id, 'ses_child');
+    assert.equal(task?.subagent?.name, 'general');
+    assert.equal(task?.subagent?.type, 'general');
+    assert.equal(task?.subagent?.description, 'Echo the marker');
+    assert.equal(task?.subagent?.status, 'completed', 'the child row settles a background launch');
+    assert.equal(task?.subagent?.model, 'opencode-go/glm-5.3');
+    assert.equal(task?.subagent?.activityCount, 3);
+    assert.deepEqual(
+      task?.subagentTools?.map((entry) => entry.kind),
+      ['thinking', 'tool', 'text'],
+    );
+    assert.equal(task?.subagentTools?.[1].toolResult?.content, 'SUBAGENT_OK');
+    assert.equal(task?.toolResult?.content, 'SUBAGENT_OK', 'the launch acknowledgement is not the result');
+    assert.deepEqual(task?.toolResult, { content: 'SUBAGENT_OK', isError: false });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('a failed v2 compaction says so and leaves the occupancy reading alone', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-compaction-failed-'));
   const restoreHomeDir = patchHomeDir(tempRoot);

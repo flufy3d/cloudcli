@@ -23,6 +23,7 @@ import {
 } from './opencode-context-usage.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import { OpenCodeSessionEventTranslator, type OpenCodeRunOutcome } from './opencode-event-translator.js';
+import { OpenCodeSubagentIndex } from './opencode-subagent-index.js';
 
 const PROVIDER = 'opencode' as const;
 const MIN_BUDGET_FRAME_INTERVAL_MS = 1500;
@@ -117,6 +118,10 @@ export type OpenCodeActiveRun = {
 export class OpenCodeRunRegistry {
   private readonly byApp = new Map<string, OpenCodeActiveRun>();
   private readonly byProvider = new Map<string, OpenCodeActiveRun>();
+  /** Child session → spawning run links, learned from session lifecycle events. */
+  private readonly subagents = new OpenCodeSubagentIndex();
+  /** Child events that arrived before their parent tool call was identifiable. */
+  private readonly deferredChildEvents = new Map<string, OpenCodeEventEnvelope[]>();
 
   create(
     appSessionId: string,
@@ -160,6 +165,12 @@ export class OpenCodeRunRegistry {
     }
     if (this.byProvider.get(run.providerSessionId) === run) {
       this.byProvider.delete(run.providerSessionId);
+      for (const childSessionId of this.deferredChildEvents.keys()) {
+        if (this.subagents.resolve(childSessionId)?.parentProviderSessionId === run.providerSessionId) {
+          this.deferredChildEvents.delete(childSessionId);
+        }
+      }
+      this.subagents.forgetParent(run.providerSessionId);
     }
   }
 
@@ -181,11 +192,68 @@ export class OpenCodeRunRegistry {
    * must not fail the user's turn.
    */
   dispatch(event: OpenCodeEventEnvelope, budgetTracker?: OpenCodeTokenBudgetTracker): void {
+    this.subagents.note(event);
     const providerSessionId = readOptionalString(readObjectRecord(event.data)?.sessionID);
-    const run = providerSessionId ? this.byProvider.get(providerSessionId) : null;
+    if (!providerSessionId) {
+      return;
+    }
+
+    // A child session's events belong to the run that spawned it, not to a
+    // run of their own: their frames are stamped with the spawn call id so
+    // the transcript folds them into the subagent container. Step occupancy
+    // and terminals stay with the child — the parent turn is settled by its
+    // own execution events.
+    const parent = this.subagents.resolve(providerSessionId);
+    if (parent) {
+      const run = this.byProvider.get(parent.parentProviderSessionId);
+      if (!run) {
+        this.deferredChildEvents.delete(providerSessionId);
+        return;
+      }
+      if (!parent.parentToolCallId) {
+        // The link exists but its launch call is still being resolved; hold
+        // the frames rather than leaking them to the top level untagged.
+        const queue = this.deferredChildEvents.get(providerSessionId) ?? [];
+        queue.push(event);
+        this.deferredChildEvents.set(providerSessionId, queue);
+        return;
+      }
+      const deferred = this.deferredChildEvents.get(providerSessionId);
+      if (deferred) {
+        this.deferredChildEvents.delete(providerSessionId);
+        for (const queued of deferred) {
+          this.deliverChildEvent(queued, run, parent.parentToolCallId);
+        }
+      }
+      this.deliverChildEvent(event, run, parent.parentToolCallId);
+      return;
+    }
+
+    const run = this.byProvider.get(providerSessionId);
     if (!run) {
       return;
     }
+    this.deliverEvent(event, run, budgetTracker);
+  }
+
+  /** Forwards a child session's translated frames under its spawn call id. */
+  private deliverChildEvent(
+    event: OpenCodeEventEnvelope,
+    run: OpenCodeActiveRun,
+    parentToolUseId: string,
+  ): void {
+    const { frames } = run.translator.translate(event);
+    for (const frame of frames) {
+      run.writer.send({ ...frame, parentToolUseId });
+    }
+  }
+
+  /** Forwards a run's own event: frames, occupancy, and terminals. */
+  private deliverEvent(
+    event: OpenCodeEventEnvelope,
+    run: OpenCodeActiveRun,
+    budgetTracker?: OpenCodeTokenBudgetTracker,
+  ): void {
     const { frames, terminal, stepTokens, compactionError } = run.translator.translate(event);
     for (const frame of frames) {
       run.writer.send(frame);

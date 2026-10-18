@@ -13,6 +13,8 @@ import type {
   NormalizedMessage,
   ProviderSessionUsageInput,
   ProviderTokenUsageResult,
+  SubagentActivity,
+  SubagentInfo,
 } from '@/shared/types.js';
 import {
   AppError,
@@ -25,6 +27,7 @@ import {
   readOptionalString,
   removePathIfExists,
   sliceTailPage,
+  truncateSubagentActivity,
   unwrapJsonStringLiteral,
 } from '@/shared/utils.js';
 
@@ -38,6 +41,18 @@ import { buildOpenCodeTextRowKey } from './opencode-event-translator.js';
 
 const PROVIDER = 'opencode';
 
+/**
+ * Upper bound on how much of a subagent's timeline is sent to the client.
+ *
+ * The panel shows a preview of the agent's work, not the agent's full
+ * transcript, so both this reader and the Claude/Codex ones cap the list the
+ * same way and report the true length as `activityCount`.
+ */
+const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
+
+/** The tool names that spawn a subagent: v2 `subagent`, v1 `task`. */
+const SUBAGENT_TOOL_NAMES = new Set(['subagent', 'task']);
+
 type OpenCodeHistoryRow = {
   message_id: string;
   message_time_created: number | null;
@@ -45,6 +60,17 @@ type OpenCodeHistoryRow = {
   part_id: string | null;
   part_time_created: number | null;
   part_data: string | null;
+};
+
+/** One child session row the parent's transcription refers to. */
+type OpenCodeChildSessionRow = {
+  id: string;
+  parent_id: string | null;
+  title: string | null;
+  agent: string | null;
+  model: string | null;
+  time_idle: number | null;
+  idle_outcome: string | null;
 };
 
 const openOpenCodeDatabase = (): Database.Database | null => {
@@ -290,6 +316,195 @@ const flattenOpenCodeV2HistoryRows = (
   return rows;
 };
 
+/**
+ * Reads one tool state's result text.
+ *
+ * v2 persists the result as a `content` block array on the tool state, while
+ * older rows and other engines put it under `output`/`error`. Error detail is
+ * preferred, then structured output, then the blocks, so a failed child tool
+ * shows why it failed rather than an empty result.
+ */
+const readOpenCodeToolResultContent = (state: AnyRecord): string => {
+  const formatValue = (value: unknown): string => {
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value
+        .map((block) => {
+          const record = readObjectRecord(block);
+          if (!record) {
+            return typeof block === 'string' ? block : '';
+          }
+          return readOptionalString(record.text) ?? (record.type === 'text' ? '' : formatToolContent(record));
+        })
+        .filter((text) => text.length > 0)
+        .join('\n');
+    }
+    return formatToolContent(value);
+  };
+
+  if (state.error !== undefined && state.error !== null) {
+    return formatValue(state.error);
+  }
+  if (state.output !== undefined && state.output !== null) {
+    return formatValue(state.output);
+  }
+  return formatValue(state.content);
+};
+
+/** The provider-prefixed label a child session's stored model reference yields. */
+const readOpenCodeChildModelLabel = (model: unknown): string | undefined => {
+  const record = readJsonRecord(readOptionalString(model) ?? model);
+  const providerId = readOptionalString(record?.providerID);
+  const modelId = readOptionalString(record?.id) ?? readOptionalString(record?.modelID);
+  if (!modelId) {
+    return undefined;
+  }
+  return providerId ? `${providerId}/${modelId}` : modelId;
+};
+
+/**
+ * Turns a child session's persisted rows into the shared subagent timeline.
+ *
+ * The prompt echo is skipped (the parent's card already states the task), and
+ * `patch`/`agent` parts become tool entries the way the parent transcript
+ * renders them, so an agent-heavy child reads the same in both places.
+ */
+const toSubagentActivity = (rows: OpenCodeHistoryRow[]): SubagentActivity[] => {
+  const activity: SubagentActivity[] = [];
+  for (const row of rows) {
+    if (!row.part_id) {
+      continue;
+    }
+    const messageInfo = readJsonRecord(row.message_data);
+    const role = readOptionalString(messageInfo?.role);
+    const partData = readJsonRecord(row.part_data) ?? {};
+    const partType = readOptionalString(partData.type);
+    const timestamp = normalizeProviderTimestamp(row.part_time_created ?? row.message_time_created);
+
+    if (partType === 'text') {
+      const content = extractText(partData);
+      if (role === 'assistant' && content.trim()) {
+        activity.push({ kind: 'text', content, timestamp });
+      }
+      continue;
+    }
+
+    if (partType === 'reasoning') {
+      const content = extractText(partData);
+      if (content.trim()) {
+        activity.push({ kind: 'thinking', content, timestamp });
+      }
+      continue;
+    }
+
+    if (partType === 'tool' || partType === 'patch' || partType === 'agent') {
+      const isEngineTool = partType === 'tool';
+      const state = isEngineTool ? readObjectRecord(partData.state) ?? {} : {};
+      const status = readOptionalString(state.status);
+      const tool: SubagentActivity = {
+        kind: 'tool',
+        timestamp,
+        toolId: readOptionalString(partData.callID) ?? row.part_id ?? undefined,
+        toolName: isEngineTool
+          ? readOptionalString(partData.tool) ?? 'Tool'
+          : partType === 'patch' ? 'Patch' : 'Agent',
+        toolInput: isEngineTool ? state.input ?? partData.input ?? {} : partData,
+      };
+      if (isEngineTool && (status === 'completed' || status === 'error')) {
+        tool.toolResult = {
+          content: readOpenCodeToolResultContent(state),
+          isError: status === 'error',
+        };
+      }
+      activity.push(tool);
+    }
+  }
+  return activity;
+};
+
+/** The child session ids the transcript's subagent tool blocks name. */
+const collectSubagentSessionIds = (rows: OpenCodeHistoryRow[]): Set<string> => {
+  const ids = new Set<string>();
+  for (const row of rows) {
+    if (!row.part_id) {
+      continue;
+    }
+    const partData = readJsonRecord(row.part_data);
+    if (!partData || readOptionalString(partData.type) !== 'tool' || !SUBAGENT_TOOL_NAMES.has(readOptionalString(partData.tool) ?? '')) {
+      continue;
+    }
+    const state = readObjectRecord(partData.state);
+    const sessionId = readOptionalString(readObjectRecord(state?.metadata)?.sessionID);
+    if (sessionId) {
+      ids.add(sessionId);
+    }
+  }
+  return ids;
+};
+
+/**
+ * The subagent status the child's own session row reports.
+ *
+ * The child row is authoritative — its `idle_outcome`/`time_idle` settle the
+ * agent even when the parent's launch block was never updated (a background
+ * launch keeps `metadata.status: "running"` in the parent transcript forever).
+ * The parent metadata is only the fallback for a child row an older database
+ * cannot describe.
+ */
+const resolveSubagentStatus = (
+  child: OpenCodeChildSessionRow | undefined,
+  metadataStatus: string | undefined,
+  toolStatus: string | undefined,
+): SubagentInfo['status'] => {
+  const outcome = readOptionalString(child?.idle_outcome);
+  if (outcome === 'succeeded' || outcome === 'completed') {
+    return 'completed';
+  }
+  if (outcome === 'failed') {
+    return 'failed';
+  }
+  if (outcome === 'interrupted' || outcome === 'stopped') {
+    return 'stopped';
+  }
+  if (child && child.time_idle !== null) {
+    return 'completed';
+  }
+  if (metadataStatus === 'completed') {
+    return 'completed';
+  }
+  if (metadataStatus === 'failed' || toolStatus === 'error') {
+    return 'failed';
+  }
+  if (metadataStatus === 'interrupted' || metadataStatus === 'stopped') {
+    return 'stopped';
+  }
+  return 'running';
+};
+
+/**
+ * The result text a subagent card shows under "Result".
+ *
+ * A foreground spawn wraps the child's final answer in a `<subagent>` tag; a
+ * background launch's tool content is only the launch acknowledgement. The
+ * acknowledgement must not be drawn as the agent's answer, so the timeline's
+ * last assistant text stands in for a background agent whose own result the
+ * parent transcript never records.
+ */
+const readSubagentResultText = (state: AnyRecord, activity: SubagentActivity[] | undefined): string => {
+  const raw = readOpenCodeToolResultContent(state).trim();
+  const wrapped = /^<subagent\b[^>]*>([\s\S]*?)<\/subagent>$/.exec(raw);
+  if (wrapped) {
+    return wrapped[1].trim();
+  }
+  if (raw.includes('The subagent is working in the background')) {
+    const lastText = [...(activity ?? [])].reverse().find((entry) => entry.kind === 'text');
+    return lastText?.content?.trim() ?? '';
+  }
+  return raw;
+};
+
 export class OpenCodeSessionsProvider implements IProviderSessions {
   /**
    * Normalizes live `opencode run --format json` events into frontend messages.
@@ -446,7 +661,23 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       // session-lifetime numbers ride along as `cumulative`.
       const tokenUsage = readOpenCodeContextUsage(db, providerSessionId);
 
-      const normalized = this.normalizeHistoryRows(rows, sessionId);
+      // Each spawn the transcript refers to gets the child session's own
+      // timeline attached, so a reload draws the same card the live fold did.
+      const childSessions = this.readChildSessions(db, providerSessionId);
+      const subagentActivityBySession = new Map<string, SubagentActivity[]>();
+      for (const childSessionId of collectSubagentSessionIds(rows)) {
+        if (!childSessions.has(childSessionId)) {
+          continue;
+        }
+        subagentActivityBySession.set(
+          childSessionId,
+          toSubagentActivity(layout === 'session_message'
+            ? flattenOpenCodeV2HistoryRows(db, childSessionId)
+            : this.readV1HistoryRows(db, childSessionId)),
+        );
+      }
+
+      const normalized = this.normalizeHistoryRows(rows, sessionId, childSessions, subagentActivityBySession);
       const normalizedOffset = Math.max(0, offset);
       const normalizedLimit = limit === null ? null : Math.max(0, limit);
       const total = normalized.length;
@@ -492,7 +723,59 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
     `).all(providerSessionId) as OpenCodeHistoryRow[];
   }
 
-  private normalizeHistoryRows(rows: OpenCodeHistoryRow[], sessionId: string): NormalizedMessage[] {
+  /**
+   * Reads the child sessions a parent session spawned, keyed by child id.
+   *
+   * Columns the running schema may not carry (`agent`, `time_idle`,
+   * `idle_outcome`) are selected as nulls, so a database predating them still
+   * answers with the rest of the row instead of failing the whole history.
+   */
+  private readChildSessions(
+    db: Database.Database,
+    parentProviderSessionId: string,
+  ): Map<string, OpenCodeChildSessionRow> {
+    const table = resolveOpenCodeSessionTableName(db);
+    if (!table) {
+      return new Map();
+    }
+    const columns = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has('parent_id')) {
+      return new Map();
+    }
+    const column = (name: keyof OpenCodeChildSessionRow): string => (
+      columns.has(name) ? name : `NULL AS ${name}`
+    );
+    const rows = db.prepare(`
+      SELECT
+        id,
+        parent_id,
+        ${column('title')},
+        ${column('agent')},
+        ${column('model')},
+        ${column('time_idle')},
+        ${column('idle_outcome')}
+      FROM ${table}
+      WHERE parent_id = ?
+    `).all(parentProviderSessionId) as OpenCodeChildSessionRow[];
+
+    const children = new Map<string, OpenCodeChildSessionRow>();
+    for (const row of rows) {
+      if (typeof row.id === 'string' && row.id) {
+        children.set(row.id, row);
+      }
+    }
+    return children;
+  }
+
+  private normalizeHistoryRows(
+    rows: OpenCodeHistoryRow[],
+    sessionId: string,
+    childSessions: Map<string, OpenCodeChildSessionRow> = new Map(),
+    subagentActivityBySession: Map<string, SubagentActivity[]> = new Map(),
+  ): NormalizedMessage[] {
     const normalized: NormalizedMessage[] = [];
     const emittedMessageErrors = new Set<string>();
     /**
@@ -605,22 +888,60 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       if (partType === 'tool') {
         const state = readObjectRecord(partData.state) ?? {};
         const status = readOptionalString(state.status);
+        const toolName = readOptionalString(partData.tool) ?? 'Tool';
+        const toolInput = state.input ?? partData.input ?? {};
         const toolMessage = createNormalizedMessage({
           id: baseId,
           sessionId,
           timestamp,
           provider: PROVIDER,
           kind: 'tool_use',
-          toolName: readOptionalString(partData.tool) ?? 'Tool',
-          toolInput: state.input ?? partData.input ?? {},
+          toolName,
+          toolInput,
           toolId: readOptionalString(partData.callID) ?? row.part_id,
         });
 
         if (status === 'completed' || status === 'error') {
           toolMessage.toolResult = {
-            content: formatToolContent(state.output ?? state.error),
+            content: readOpenCodeToolResultContent(state),
             isError: status === 'error',
           };
+        }
+
+        // A spawn names its child in `state.metadata.sessionID`. The child's
+        // own row and transcript are where its agent name, settled status and
+        // timeline live — the parent launch block keeps `status: "running"`
+        // forever for a background agent.
+        const metadata = readObjectRecord(state.metadata) ?? {};
+        const childSessionId = SUBAGENT_TOOL_NAMES.has(toolName)
+          ? readOptionalString(metadata.sessionID)
+          : undefined;
+        if (childSessionId) {
+          const child = childSessions.get(childSessionId);
+          const activity = subagentActivityBySession.get(childSessionId);
+          const input = readObjectRecord(toolInput) ?? {};
+          const agentName = readOptionalString(child?.agent) ?? readOptionalString(input.agent);
+          const model = readOpenCodeChildModelLabel(child?.model);
+          toolMessage.subagent = {
+            id: childSessionId,
+            ...(agentName ? { name: agentName, type: agentName } : {}),
+            description: readOptionalString(child?.title) ?? readOptionalString(input.description),
+            status: resolveSubagentStatus(child, readOptionalString(metadata.status), status),
+            ...(model ? { model } : {}),
+            ...(activity && activity.length > 0 ? { activityCount: activity.length } : {}),
+          };
+          if (activity && activity.length > 0) {
+            toolMessage.subagentTools = activity
+              .slice(-MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
+              .map(truncateSubagentActivity);
+          }
+          const result = readSubagentResultText(state, activity);
+          if (result || status === 'error') {
+            toolMessage.toolResult = {
+              content: result,
+              isError: status === 'error',
+            };
+          }
         }
 
         normalized.push(toolMessage);

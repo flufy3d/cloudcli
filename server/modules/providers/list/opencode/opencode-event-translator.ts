@@ -40,6 +40,9 @@ import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 
 const PROVIDER = 'opencode' as const;
 
+/** Spawn tool spellings: v2 `subagent`, v1 `task`. */
+const SUBAGENT_TOOL_NAMES = new Set(['subagent', 'task']);
+
 //----------------- TRANSLATION RESULTS ------------
 
 /** How a run ended, as reported by `session.execution.*`. */
@@ -117,6 +120,15 @@ const readErrorMessage = (error: unknown): string => {
     ?? readOptionalString(error)
     ?? readOptionalString(record?.type)
     ?? 'Unknown OpenCode error';
+};
+
+/**
+ * A foreground subagent's result is wrapped in `<subagent …>…</subagent>`.
+ * The card's result section wants the answer, not the transport envelope.
+ */
+const unwrapSubagentResult = (content: string): string => {
+  const match = /^<subagent\b[^>]*>([\s\S]*?)<\/subagent>$/.exec(content.trim());
+  return match ? match[1].trim() : content;
 };
 
 /**
@@ -269,7 +281,23 @@ export class OpenCodeSessionEventTranslator {
         if (!callId) {
           return { frames: [] };
         }
-        return { frames: [this.toolResultFrame(callId, formatToolOutput(data.content), false, timestamp)] };
+        const toolName = this.toolCalls.get(callId)?.name;
+        const isSubagent = toolName ? SUBAGENT_TOOL_NAMES.has(toolName) : false;
+        const content = formatToolOutput(data.content);
+        if (isSubagent) {
+          // A background launch's success is only its acknowledgement: the
+          // agent is still running, and its answer arrives with the child's
+          // terminal. Marking it async keeps the card's spinner on.
+          const metadataStatus = readOptionalString(readObjectRecord(data.metadata)?.status);
+          const launchedInBackground = metadataStatus === 'running'
+            || metadataStatus === 'pending'
+            || (!metadataStatus && content.includes('working in the background'));
+          if (launchedInBackground) {
+            return { frames: [this.toolResultFrame(callId, '', false, timestamp, { isAsync: true })] };
+          }
+          return { frames: [this.toolResultFrame(callId, unwrapSubagentResult(content), false, timestamp)] };
+        }
+        return { frames: [this.toolResultFrame(callId, content, false, timestamp)] };
       }
 
       case 'session.tool.failed': {
@@ -343,7 +371,13 @@ export class OpenCodeSessionEventTranslator {
     });
   }
 
-  private toolResultFrame(callId: string, content: string, isError: boolean, timestamp: string): NormalizedMessage {
+  private toolResultFrame(
+    callId: string,
+    content: string,
+    isError: boolean,
+    timestamp: string,
+    toolUseResult?: unknown,
+  ): NormalizedMessage {
     return createNormalizedMessage({
       id: `${callId}_result`,
       sessionId: this.sessionId,
@@ -353,7 +387,7 @@ export class OpenCodeSessionEventTranslator {
       toolId: callId,
       content,
       isError,
-      toolResult: { content, isError },
+      toolResult: { content, isError, ...(toolUseResult === undefined ? {} : { toolUseResult }) },
     });
   }
 }

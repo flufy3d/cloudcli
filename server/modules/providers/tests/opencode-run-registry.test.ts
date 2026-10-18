@@ -29,6 +29,88 @@ test('dispatch routes events by provider session and settles on the first termin
   assert.deepEqual(await runA.settled, outcome, 'first settlement wins over later terminals');
 });
 
+test('child session frames ride the parent run and are stamped with the spawn call id', async () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  const run = registry.create('app-parent', 'ses_parent', writer);
+
+  registry.dispatch({
+    type: 'session.tool.input.started',
+    data: { sessionID: 'ses_parent', id: 'call_subagent', name: 'subagent' },
+  });
+  registry.dispatch({
+    type: 'session.tool.called',
+    data: {
+      sessionID: 'ses_parent',
+      id: 'call_subagent',
+      input: { agent: 'general', description: 'Inspect it' },
+    },
+  });
+  registry.dispatch({
+    type: 'session.created',
+    data: {
+      sessionID: 'ses_child',
+      parentID: 'ses_parent',
+      agent: 'general',
+      title: 'Inspect it',
+    },
+  });
+
+  frames.length = 0;
+  registry.dispatch({
+    type: 'session.text.delta',
+    data: { sessionID: 'ses_child', assistantMessageID: 'm_child', ordinal: 0, delta: 'child says hi' },
+  });
+
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0]?.sessionId, 'app-parent');
+  assert.equal(frames[0]?.parentToolUseId, 'call_subagent');
+  assert.equal(frames[0]?.content, 'child says hi');
+
+  // The child's own terminal ends the child, not the parent turn.
+  registry.dispatch({ type: 'session.execution.succeeded', data: { sessionID: 'ses_child' } });
+  assert.equal(await Promise.race([run.settled, Promise.resolve('still-open')]), 'still-open');
+  registry.dispatch({ type: 'session.execution.succeeded', data: { sessionID: 'ses_parent' } });
+  assert.deepEqual(await run.settled, { outcome: 'succeeded' });
+});
+
+test('a child event that arrives before its launch call is held, then delivered in order', async () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+
+  // The session link is known from `session.created`, but its description did
+  // not match the launch (no `called` event was seen), so the tool call id is
+  // still unknown. The frame must not leak untagged to the top level.
+  registry.dispatch({
+    type: 'session.created',
+    data: { sessionID: 'ses_child', parentID: 'ses_parent', agent: 'general', title: 'Renamed child' },
+  });
+  registry.dispatch({
+    type: 'session.text.delta',
+    data: { sessionID: 'ses_child', assistantMessageID: 'm_child', ordinal: 0, delta: 'early' },
+  });
+  assert.equal(frames.length, 0);
+
+  registry.dispatch({
+    type: 'session.tool.progress',
+    data: {
+      sessionID: 'ses_parent',
+      id: 'call_subagent',
+      metadata: { sessionID: 'ses_child', status: 'running' },
+    },
+  });
+  registry.dispatch({
+    type: 'session.text.delta',
+    data: { sessionID: 'ses_child', assistantMessageID: 'm_child', ordinal: 0, delta: ' late' },
+  });
+
+  assert.deepEqual(
+    frames.map((frame) => [frame.content, frame.parentToolUseId]),
+    [['early', 'call_subagent'], [' late', 'call_subagent']],
+  );
+});
+
 test('dispatch fails a compact run on a failed compaction, and leaves a chat run alone', async () => {
   const registry = new OpenCodeRunRegistry();
   const compactWriter = writerOf();

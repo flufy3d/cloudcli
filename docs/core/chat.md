@@ -143,6 +143,8 @@ flowchart LR
 
 模块内的次级排序契约见 `sessionTimelineStore.ts` 头注释：内容帧先 flush 流式缓冲再落表（路由表的 flush 门）；服务端覆盖剪枝必须先于内容级短路；旧页拉取期间的偏移漂移要先做一次有界最新页校准；流式行时间戳锚定在分段开始且不刷新。
 
+**子代理容器只有一条判定，时间线只有两个来源。** 判定发生在 `useChatMessages`：`tool_use` 行带后端归一化的 `subagent` 元数据，或其工具名属于引擎的启动族（Claude `Task`/`Agent`、OpenCode `subagent`/v1 `task`、Antigravity `invoke_subagent`；`manage_task`/`manage_subagents` 这类管理工具不算），该行就必须画成子代理卡而非普通工具行。时间线有两个来源，互斥成事实上的同一阴影：**历史**把子代理子会话自身的消息翻成 `subagentTools`/`subagent` 挂在启动行上（服务端归一化，见 providers.md）；**实时**里子代理行带 `parentToolUseId` 流入，投影把按同 id 流的正文/思考增量折成一条 activity、并把 `tool_result` 按 toolId 挂到对应工具上——这些行**永不**作为顶层消息渲染，且实时列表与历史列表取较长者（中途刷新时一边可能只拿到一半）。容器行缓存必须以"折叠进它的最新一行"为失效键，否则新到的子代理行不会重绘。
+
 **判重只有一条依据：`id` 相等。** 转录行（`text`/`thinking`/`tool_use`/`tool_result`/
 `task_notification`）的 `id` 由引擎自己的记录推导，同一条记录在实时路与历史路、读多少遍都字节
 相同（契约与逐引擎依据见 [providers.md](./providers.md)）。于是"这条实时行是不是已经落盘"是一次

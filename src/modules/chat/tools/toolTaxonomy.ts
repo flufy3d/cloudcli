@@ -29,6 +29,8 @@ const TOOL_ALIASES: Record<string, string> = {
   manage_task: 'Task',
   manage_subagents: 'Subagent',
   invoke_subagent: 'Subagent',
+  subagent: 'Subagent',
+  task: 'Subagent',
   ExitPlanMode: 'Plan',
   exit_plan_mode: 'Plan',
   Plan: 'Plan',
@@ -38,6 +40,23 @@ const TOOL_ALIASES: Record<string, string> = {
 /** The engine-neutral name a tool alias resolves to (its grouping identity). */
 export function canonicalToolName(toolName: string): string {
   return TOOL_ALIASES[toolName] ?? toolName;
+}
+
+/**
+ * Whether a tool call spawns a subagent, so its row owns a collapsible
+ * timeline instead of rendering as an ordinary tool.
+ *
+ * Consumers: the chat message projection (`useChatMessages`) while a live
+ * spawn runs, before history has attached the backend's `subagent` metadata.
+ * Task-management tools (`manage_task`, `manage_subagents`) share the `Task`/
+ * `Subagent` canonical names but manage existing work, so they are excluded.
+ */
+export function isSubagentSpawnTool(toolName: string): boolean {
+  if (toolName === 'manage_task' || toolName === 'manage_subagents') {
+    return false;
+  }
+  const canonical = canonicalToolName(toolName);
+  return canonical === 'Subagent' || canonical === 'Task' || canonical === 'Agent';
 }
 
 const COMMAND_TOOLS = new Set(['Bash']);
@@ -72,7 +91,7 @@ const DISPLAY_CATEGORIES: ReadonlyArray<readonly [string, ReadonlySet<string>]> 
   ['bash', new Set(['Bash', 'run_command'])],
   ['todo', new Set(['TodoWrite', 'TodoRead'])],
   ['task', new Set(['TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'manage_task'])],
-  ['agent', new Set(['Task', 'invoke_subagent', 'manage_subagents', 'send_message'])],
+  ['agent', new Set(['Task', 'Subagent', 'subagent', 'task', 'invoke_subagent', 'manage_subagents', 'send_message'])],
   ['plan', new Set(['exit_plan_mode', 'ExitPlanMode'])],
   ['question', new Set(['AskUserQuestion'])],
 ];

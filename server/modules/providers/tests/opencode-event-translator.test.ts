@@ -126,6 +126,45 @@ test('tracks a tool call from input.started through called to success as upserta
   assert.deepEqual(result.toolResult, { content: 'cloudcli-probe-123\n', isError: false });
 });
 
+test('a subagent result is unwrapped, and a background launch stays running', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  translator.translate(event('session.tool.input.started', {
+    assistantMessageID: MESSAGE,
+    id: CALL,
+    name: 'subagent',
+  }));
+
+  const foreground = translator.translate(event('session.tool.success', {
+    assistantMessageID: MESSAGE,
+    id: CALL,
+    content: [{ type: 'text', text: '<subagent sessionID="ses_child" state="completed">\nSUBAGENT_OK\n</subagent>' }],
+    metadata: { sessionID: 'ses_child', status: 'completed', truncated: false },
+    executed: false,
+  }));
+  assert.equal(foreground.frames[0].content, 'SUBAGENT_OK');
+  assert.deepEqual(foreground.frames[0].toolResult, { content: 'SUBAGENT_OK', isError: false });
+
+  const backgroundCall = `${CALL}-background`;
+  translator.translate(event('session.tool.input.started', {
+    assistantMessageID: MESSAGE,
+    id: backgroundCall,
+    name: 'subagent',
+  }));
+  const background = translator.translate(event('session.tool.success', {
+    assistantMessageID: MESSAGE,
+    id: backgroundCall,
+    content: [{ type: 'text', text: 'The subagent is working in the background (sessionID: ses_child).' }],
+    metadata: { sessionID: 'ses_child', status: 'running', truncated: false },
+    executed: false,
+  }));
+  assert.equal(background.frames[0].content, '');
+  assert.deepEqual(background.frames[0].toolResult, {
+    content: '',
+    isError: false,
+    toolUseResult: { isAsync: true },
+  });
+});
+
 test('reports a rejected permission as an error tool_result carrying the engine message', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
   translator.translate(event('session.tool.input.started', { assistantMessageID: MESSAGE, id: CALL, name: 'shell' }));
