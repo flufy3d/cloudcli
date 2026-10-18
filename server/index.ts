@@ -13,6 +13,7 @@ import compression from 'compression';
 import { AppError, findApplicationRoot, getModuleDirectory, IS_PLATFORM, terminalTextStyles } from '@/shared/utils.js';
 import {
     closeSessionsWatcher,
+    configureOpenCodeExternalRunAdoption,
     initializeSessionsWatcher,
     providerRuntimeService,
     sessionsAutoArchiveService,
@@ -130,6 +131,15 @@ const agentRoutes = createAgentModule({
 // A completed run stays subscribable while its session's background work
 // (agents, workflows, backgrounded commands) is still reporting through it.
 chatRunRegistry.setRetentionGuard((sessionId) => providerRuntimeService.hasBackgroundWork(sessionId));
+
+// Executions the opencode engine starts on its own — a background subagent
+// completing resumes the parent session from its inbox, with no client prompt
+// behind it — are adopted as gateway runs so their frames, permission and
+// question cards, and terminal `complete` ride the normal chat pipeline. The
+// registry resolves the app session from the provider session id itself.
+configureOpenCodeExternalRunAdoption(({ providerSessionId }) =>
+    chatRunRegistry.adoptExternalRun({ provider: 'opencode', providerSessionId }),
+);
 
 createWebSocketServer(server, {
     verifyClient: {

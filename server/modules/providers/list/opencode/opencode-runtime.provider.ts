@@ -19,6 +19,15 @@
  * aborted `complete`, so none is sent here. The `permissions` facet answers
  * permission/question cards and replays them after a reload.
  *
+ * Executions the engine starts on its own are adopted instead of ignored: a
+ * background subagent completing makes the service enqueue a synthetic
+ * message and resume the parent session with no client prompt behind it, and
+ * without adoption those frames, interaction cards and the terminal `complete`
+ * would never reach the gateway (a question the model asks mid-resume stayed
+ * invisible and unanswerable). When an event that can only occur inside a live
+ * execution arrives for a session with no run of ours, the installed adopter
+ * opens a gateway run and the execution rides the normal pipeline from there.
+ *
  * @module opencode-runtime.provider
  */
 
@@ -36,6 +45,7 @@ import {
   createCompleteMessage,
   createNormalizedMessage,
   generateMessageId,
+  readObjectRecord,
   readOptionalString,
   resolveModelEffort,
 } from '@/shared/utils.js';
@@ -48,10 +58,11 @@ import {
 } from './opencode-api.client.js';
 import { readOpenCodeContextUsage } from './opencode-context-usage.js';
 import { getOpenCodeDatabasePath } from './opencode-data-root.js';
+import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import { OpenCodeEventStream } from './opencode-event-stream.js';
 import { OpenCodeInteractionBridge } from './opencode-interaction-bridge.js';
 import { buildOpenCodePromptFiles, buildOpenCodePromptText } from './opencode-prompt-attachments.js';
-import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker, type OpenCodeRunSettlement } from './opencode-run-registry.js';
+import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker, type OpenCodeActiveRun, type OpenCodeRunSettlement } from './opencode-run-registry.js';
 import { OpenCodeServiceError, OpenCodeServiceSupervisor } from './opencode-service.js';
 import {
   OpenCodeSessionSettingsApplier,
@@ -62,9 +73,79 @@ export { resolveOpenCodeSessionSettings } from './opencode-session-settings.js';
 
 const PROVIDER = 'opencode' as const;
 
+/**
+ * What the gateway hands back when it adopts an execution the engine started
+ * on its own: the app session its frames belong to, and the writer that
+ * remaps ids, assigns `seq`, buffers for replay and reaches the sockets.
+ */
+export type OpenCodeAdoptedRun = {
+  appSessionId: string;
+  writer: ProviderRuntimeWriter;
+};
+
+/**
+ * Opens a gateway run for an engine-initiated execution, or returns null when
+ * there is nothing to adopt (no app session maps to the provider session, the
+ * row is archived, or a run is already in flight).
+ */
+export type OpenCodeExternalRunAdopter = (input: { providerSessionId: string }) => OpenCodeAdoptedRun | null;
+
+/**
+ * Installed once by the composition root (`server/index.ts`), mirroring
+ * `chatRunRegistry.setRetentionGuard`: this module cannot import the websocket
+ * module (the gateway already depends on this one), so the adopter arrives as
+ * a callback. Tests pass their own through `createOpenCodeRuntime`.
+ */
+let externalRunAdopter: OpenCodeExternalRunAdopter | null = null;
+
+/** Installs (or clears, with null) the adopter used for engine-initiated runs. */
+export function configureOpenCodeExternalRunAdoption(adopter: OpenCodeExternalRunAdopter | null): void {
+  externalRunAdopter = adopter;
+}
+
+/**
+ * Event types that can only occur inside a live execution.
+ *
+ * One of these for a session with no run of ours is proof the engine started
+ * (or is continuing) an execution by itself — the service resumes an idle
+ * session from its inbox the moment a background subagent completes, and
+ * those events are the only announcement cloudcli gets. Lifecycle chatter
+ * (`session.created`, `*.selected`, `instructions.updated`,
+ * `session.inbox.enqueued`, …) is deliberately absent: it fires outside
+ * executions too, and adopting one would pin a phantom "running" entry on an
+ * idle session that never receives a terminal.
+ */
+const ADOPTABLE_EVENT_TYPES = new Set<string>([
+  'session.execution.started',
+  'session.inbox.delivered',
+  'session.step.started',
+  'session.step.streamed',
+  'session.step.failed',
+  'session.step.ended',
+  'session.text.started',
+  'session.text.delta',
+  'session.text.ended',
+  'session.reasoning.started',
+  'session.reasoning.delta',
+  'session.reasoning.ended',
+  'session.tool.input.started',
+  'session.tool.input.ended',
+  'session.tool.called',
+  'session.tool.success',
+  'session.tool.failed',
+  'session.compaction.started',
+  'session.compaction.delta',
+  'session.compaction.ended',
+  'session.compaction.failed',
+  'form.created',
+  'permission.asked',
+]);
+
 type RuntimeDependencies = {
   supervisor?: Pick<OpenCodeServiceSupervisor, 'ensureEndpoint' | 'onExit' | 'currentEndpoint'>;
   createClient?: (endpoint: OpenCodeServiceEndpoint) => OpenCodeApiClient;
+  /** Gateway adoption for engine-initiated executions; defaults to the installed adopter. */
+  adoptExternalRun?: OpenCodeExternalRunAdopter;
   /** Grace period before an interrupt is assumed to have landed; default 5s. */
   abortSettleGraceMs?: number;
 };
@@ -102,6 +183,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   let budgetTracker: OpenCodeTokenBudgetTracker | null = null;
 
   eventStream.subscribe((event) => {
+    adoptExternalExecution(event);
     bridge.handleEvent(event);
     runs.dispatch(event, budgetTracker ?? undefined);
   });
@@ -335,6 +417,88 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       userId, provider: PROVIDER, sessionId: appSessionId, sessionName: sessionSummary, error: settlement.error,
     });
     throw new Error(settlement.error);
+  };
+
+  /** The adopter for this instance: tests override it, production wires it at boot. */
+  const resolveAdopter = (): OpenCodeExternalRunAdopter | null => (
+    dependencies.adoptExternalRun ?? externalRunAdopter
+  );
+
+  /**
+   * Adopts an execution the engine started on its own.
+   *
+   * Called for every event before the bridge and the run registry see it. When
+   * the event proves a live execution (see `ADOPTABLE_EVENT_TYPES`) and the
+   * session has no run of ours, the adopter opens a gateway run and the
+   * execution becomes indistinguishable from a dispatched one: frames reach
+   * the writer, the bridge attaches so permission/question cards surface and
+   * replay, and the first `session.execution.*` terminal settles it. Events
+   * for sessions with an active run, for sessions no app session maps to
+   * (subagent and CLI-created conversations), or arriving after the run
+   * already settled pass through untouched.
+   */
+  const adoptExternalExecution = (event: OpenCodeEventEnvelope): void => {
+    if (!ADOPTABLE_EVENT_TYPES.has(event.type)) {
+      return;
+    }
+    const providerSessionId = readOptionalString(readObjectRecord(event.data)?.sessionID);
+    if (!providerSessionId || runs.get(providerSessionId)) {
+      return;
+    }
+    const adopter = resolveAdopter();
+    if (!adopter) {
+      return;
+    }
+
+    let adopted: OpenCodeAdoptedRun | null;
+    try {
+      adopted = adopter({ providerSessionId });
+    } catch (error) {
+      console.warn('[OpenCode] external run adoption failed:', error);
+      return;
+    }
+    if (!adopted) {
+      return;
+    }
+
+    const run = runs.create(adopted.appSessionId, providerSessionId, adopted.writer);
+    // The engine accepted this execution long before we saw it; the run is
+    // only a bookkeeping shell, so reconciliation may judge it right away.
+    run.promptAccepted = true;
+    bridge.attach({
+      appSessionId: adopted.appSessionId,
+      providerSessionId,
+      writer: adopted.writer,
+      resolveToolCall: (callId) => run.translator.getToolCall(callId),
+    });
+    void settleAdoptedRun(run);
+  };
+
+  /**
+   * Ends an adopted run exactly the way `run()` ends a dispatched one:
+   * release the registry slot, retract cards still pending, detach the bridge,
+   * publish the authoritative end-of-run occupancy reading, and emit the
+   * terminal `complete` plus its outcome notification. There is no awaiting
+   * caller, so a failing settlement is logged here instead of rethrown.
+   */
+  const settleAdoptedRun = async (run: OpenCodeActiveRun): Promise<void> => {
+    const settlement = await run.settled;
+    runs.release(run);
+    bridge.cancelSession(run.appSessionId, 'The run ended with cards still pending.');
+    bridge.detach(run.providerSessionId);
+    sendFinalTokenBudget(null, run.appSessionId, run.providerSessionId, run.writer);
+    try {
+      finishRun(
+        { appSessionId: run.appSessionId, sessionSummary: undefined, userId: null },
+        run.writer,
+        settlement,
+        run.aborted,
+      );
+    } catch (error) {
+      // finishRun rethrows failures so the gateway logs them; here nobody is
+      // awaiting the run, so this is the only place left to report them.
+      console.warn('[OpenCode] adopted run ended in failure:', error);
+    }
   };
 
   /**

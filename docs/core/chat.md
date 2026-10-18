@@ -28,6 +28,8 @@
 - **定时消息（Scheduled Messages）**：采用**显式抢断**策略（`interruptActiveRun: true`）。调度到期后直接抢占当前正在执行的交互回合，确保定时指令准时送达。
 - **异步任务接续（Task Continuation）**：采用**非抢断式空闲占用**策略（`interruptActiveRun: false`）。后台长耗时命令执行完成并原子落库后，派发器（`task-continuation-dispatcher.service.ts`）在领取事件时检查 `chatRunRegistry.isProcessing(sessionId)`。若用户正在输入或当前有正在进行的运行，派发器**主动释放租约并退回 pending**，等待下一次会话空闲轮询；仅当会话完全空闲时才启动唤醒回合，并将任务结果（`toolOutput`）送入引擎，转录落盘为 `status_note` 消息行。集中开关默认关闭；关闭后不领取新投递，但继续保存任务结果并核对已经发送的回合。
 
+这两者都是 cloudcli **主动发起**的自主回合。还有一个**引擎单方面发起**的方向（opencode）：后台子代理完成后，引擎给已空闲的会话投递合成消息并自行续跑，没有任何客户端提示词。这类执行过去完全游离在网关之外——无 run、无帧、无终态，交互卡（`permission.asked` / `form.created`）连实时都到不了 UI，刷新也没有可回放；现在 runtime 在事件流上发现「只可能发生在执行中」的事件且该会话无活跃 run 时，经 `server/index.ts` 注入的 adopter 调 `chatRunRegistry.adoptExternalRun` 开一个 `connection: null` 的 run（与定时消息同一条无附着通道），帧、权限/提问卡与终态 `complete` 全部走普通 run 的管线（seq/回放/保留/RunOutcome 不变）；`chat.subscribe` 记下的空闲订阅者会在收养时挂上该 run 的 writer，正开着页面的用户无需刷新即可看到续跑与卡片。机制细节与边界见 [providers.md](./providers.md) 的 OpenCode 一节。
+
 ### 一次提交只产生一次发送
 
 从点击发送到消息被后端接收之间存在一段异步窗口：附件上传、以及新会话在 `POST /api/providers/sessions` 里分配 id。窗口期内会话 id 还不存在，因此一次提交被重放就会各自开出一个新会话。以下闸门共同保证"一次提交 = 一个会话 = 一次 run"：

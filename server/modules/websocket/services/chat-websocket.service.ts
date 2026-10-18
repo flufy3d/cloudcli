@@ -804,6 +804,11 @@ function handleChatSubscribe(
       chatRunRegistry.attachConnection(sessionId, ws);
     }
 
+    // Remembered even while idle: an engine-initiated run that starts later
+    // (opencode resuming the session on its own) attaches this socket through
+    // `adoptExternalRun`, so the tab watching now sees it live.
+    chatRunRegistry.noteSessionSubscriber(sessionId, ws);
+
     // Pending approvals are tracked under the app session id inside the
     // Claude runtime, so they can be looked up directly.
     const pendingPermissions = dependencies.runtime.getPendingApprovalsForSession(sessionId);
@@ -1032,5 +1037,6 @@ export function handleChatConnection(
   ws.on('close', () => {
     console.log('[INFO] Chat client disconnected');
     connectedClients.delete(ws);
+    chatRunRegistry.forgetSessionSubscriber(ws);
   });
 }

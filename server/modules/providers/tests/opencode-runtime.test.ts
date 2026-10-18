@@ -184,7 +184,12 @@ const compactSession = (
   return runtime.compact(options, writer, context);
 };
 
-const withRuntime = async (run: (input: { service: FakeService; runtime: ReturnType<typeof createOpenCodeRuntime> }) => Promise<void>) => {
+const withRuntime = async (
+  run: (input: { service: FakeService; runtime: ReturnType<typeof createOpenCodeRuntime> }) => Promise<void>,
+  runtimeDependencies: {
+    adoptExternalRun?: (input: { providerSessionId: string }) => { appSessionId: string; writer: ProviderRuntimeWriter } | null;
+  } = {},
+) => {
   const service = await startFakeService();
   const endpoint = { url: service.url, authorization: 'Basic dGVzdA==' };
   const runtime = createOpenCodeRuntime({
@@ -196,11 +201,25 @@ const withRuntime = async (run: (input: { service: FakeService; runtime: ReturnT
       currentEndpoint: () => endpoint,
     },
     abortSettleGraceMs: 300,
+    ...runtimeDependencies,
   });
   try {
     await run({ service, runtime });
   } finally {
     service.close();
+  }
+};
+
+/** Polls until `predicate` holds; adopted-run settlement is fire-and-forget. */
+const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error('condition was not met before the timeout');
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
   }
 };
 
@@ -456,4 +475,99 @@ test('attachments ride along as data-URI file parts next to the path tags', asyn
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+/** One SSE event for the engine-initiated session the tests adopt. */
+const adoptedEvent = (type: string, data: Record<string, unknown> = {}) => ({
+  id: `evt_ext_${Math.random()}`,
+  created: Date.now(),
+  type,
+  data: { sessionID: 'ses_external', ...data },
+});
+
+test('an execution the engine starts on its own is adopted and rides the run pipeline', async () => {
+  const adopted = makeWriter();
+  const adoptCalls: string[] = [];
+  await withRuntime(async ({ service, runtime }) => {
+    // The event feed starts with the first dispatched run and stays open; the
+    // engine-initiated execution below then arrives over that live stream.
+    const warm = runtime.run('warm up', { sessionId: 'app-warm', projectPath: '/tmp/p' }, makeWriter().writer, makeContext(null));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    service.emit(session('session.execution.succeeded', {}));
+    await warm;
+
+    service.emit(adoptedEvent('session.execution.started'));
+    service.emit(adoptedEvent('session.text.delta', { assistantMessageID: 'msg_ext', ordinal: 0, delta: 'resumed on my own' }));
+    service.emit(adoptedEvent('form.created', {
+      form: {
+        id: 'frm_ext',
+        sessionID: 'ses_external',
+        title: 'Questions',
+        metadata: { kind: 'question', tool: { messageID: 'msg_ext', id: 'call_ext' } },
+        fields: [{
+          key: 'q0',
+          title: 'Beverage',
+          description: 'Which one?',
+          type: 'string',
+          options: [{ value: 'tea', label: 'Tea' }],
+        }],
+      },
+    }));
+
+    // The question card surfaces through the adopted writer and answers route
+    // back to the announcing session.
+    await waitFor(() => adopted.frames.some((frame) => frame.kind === 'permission_request'));
+    runtime.permissions?.resolve('frm_ext', { allow: true, updatedInput: { answers: { 'Which one?': 'Tea' } } });
+    const reply = await service.waitForRequest((request) => request.path.endsWith('/form/frm_ext/reply'));
+    assert.deepEqual(reply.body, { answer: { q0: 'Tea' } });
+    await waitFor(() => adopted.frames.some((frame) => frame.kind === 'permission_resolved'));
+
+    service.emit(adoptedEvent('session.execution.succeeded'));
+    await waitFor(() => adopted.frames.some((frame) => frame.kind === 'complete'));
+
+    assert.deepEqual(adoptCalls, ['ses_external']);
+    assert.deepEqual(adopted.frames.map((frame) => frame.kind), [
+      'stream_delta', 'permission_request', 'permission_resolved', 'complete',
+    ]);
+    assert.equal(adopted.frames[0].content, 'resumed on my own');
+    assert.equal(adopted.frames[0].sessionId, 'app-adopted');
+    assert.equal(adopted.frames[3].exitCode, 0);
+  }, {
+    adoptExternalRun: ({ providerSessionId }) => {
+      adoptCalls.push(providerSessionId);
+      return providerSessionId === 'ses_external'
+        ? { appSessionId: 'app-adopted', writer: adopted.writer }
+        : null;
+    },
+  });
+});
+
+test('sessions with an active run or no app mapping are never adopted', async () => {
+  const adopted = makeWriter();
+  const adoptCalls: string[] = [];
+  await withRuntime(async ({ service, runtime }) => {
+    const warm = runtime.run('warm up', { sessionId: 'app-warm', projectPath: '/tmp/p' }, makeWriter().writer, makeContext(null));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    // The warm session has a run of ours: the adopter must never be consulted.
+    service.emit(session('session.step.started', {}));
+    // A session the adopter declines (no app session row) plus lifecycle
+    // chatter that fires outside executions; only the step event may trigger.
+    service.emit({ id: 'x1', created: Date.now(), type: 'session.step.started', data: { sessionID: 'ses_foreign' } });
+    service.emit({ id: 'x2', created: Date.now(), type: 'session.inbox.enqueued', data: { sessionID: 'ses_foreign' } });
+
+    service.emit(session('session.execution.succeeded', {}));
+    await warm;
+    await waitFor(() => adoptCalls.length > 0);
+
+    assert.deepEqual(adoptCalls, ['ses_foreign']);
+    assert.equal(adopted.frames.length, 0);
+  }, {
+    adoptExternalRun: ({ providerSessionId }) => {
+      adoptCalls.push(providerSessionId);
+      return providerSessionId === 'ses_external'
+        ? { appSessionId: 'app-adopted', writer: adopted.writer }
+        : null;
+    },
+  });
 });
