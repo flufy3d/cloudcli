@@ -367,15 +367,30 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     }
 
     const settlement = await activeRun.settled;
+    sendFinalTokenBudget(budgetTrackerModel, appSessionId, providerSessionId, writer);
+
+    // The parent turn ends now (its `complete` must not wait on a subagent),
+    // but the run's writer and the bridge stay attached while child sessions
+    // still run: their frames, permission cards and the composer's background
+    // pill all flow through this run until the last child settles.
+    let failure: unknown = null;
+    try {
+      finishRun(identity, writer, settlement, activeRun.aborted);
+    } catch (error) {
+      failure = error;
+    }
+    if (runs.isBackgroundWorkPending(appSessionId)) {
+      await runs.whenBackgroundWorkClears(appSessionId);
+    }
     runs.release(activeRun);
     // Retract any cards still pending, then drop the run's writer from the
     // bridge so finished sessions do not pin memory forever.
     bridge.cancelSession(appSessionId, 'The run ended with cards still pending.');
     bridge.detach(providerSessionId);
     budgetTracker = null;
-
-    sendFinalTokenBudget(budgetTrackerModel, appSessionId, providerSessionId, writer);
-    finishRun(identity, writer, settlement, activeRun.aborted);
+    if (failure) {
+      throw failure;
+    }
   };
 
   /**
@@ -483,9 +498,6 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
    */
   const settleAdoptedRun = async (run: OpenCodeActiveRun): Promise<void> => {
     const settlement = await run.settled;
-    runs.release(run);
-    bridge.cancelSession(run.appSessionId, 'The run ended with cards still pending.');
-    bridge.detach(run.providerSessionId);
     sendFinalTokenBudget(null, run.appSessionId, run.providerSessionId, run.writer);
     try {
       finishRun(
@@ -499,6 +511,14 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       // awaiting the run, so this is the only place left to report them.
       console.warn('[OpenCode] adopted run ended in failure:', error);
     }
+    // Same hold as a dispatched run: a resumed turn can itself launch a
+    // background subagent, whose frames and cards need this writer/bridge.
+    if (runs.isBackgroundWorkPending(run.appSessionId)) {
+      await runs.whenBackgroundWorkClears(run.appSessionId);
+    }
+    runs.release(run);
+    bridge.cancelSession(run.appSessionId, 'The run ended with cards still pending.');
+    bridge.detach(run.providerSessionId);
   };
 
   /**
@@ -612,6 +632,28 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       listPending(sessionId: string): unknown[] {
         return bridge.listPending(sessionId);
       },
+    },
+    backgroundTasks: {
+      list(sessionId: string) {
+        return runs.backgroundTasksFor(sessionId);
+      },
+      isPending(sessionId: string): boolean {
+        return runs.isBackgroundWorkPending(sessionId);
+      },
+    },
+    listBackgroundWork() {
+      return runs.listBackgroundWork();
+    },
+    async stopBackgroundTask(_sessionId: string, taskId: string): Promise<boolean> {
+      if (!client) {
+        return false;
+      }
+      try {
+        return await client.interrupt(taskId);
+      } catch (error) {
+        console.warn('[OpenCode] failed to stop background task:', error);
+        return false;
+      }
     },
   };
 }

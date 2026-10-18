@@ -87,7 +87,7 @@ flowchart TD
 - **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台执行（如后台 `Bash`、Agent 或定时唤醒）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。`TaskCreate` 只创建待办项，不属于后台执行。
 - **状态同步与广播**：
   - `ActiveBackgroundTask` 表示输入框需要展示的执行任务，具体字段以共享协议为准。
-  - `status(background_tasks)` 帧携带卡片列表 `backgroundTasks`；`chat_subscribed` 握手帧另带后台等待状态 `backgroundWorkPending`（由带 `backgroundTasks.isPending` 切面的引擎回答，claude 不实现该切面、报 false）。归一化网关放行两者。
+  - `status(background_tasks)` 帧携带卡片列表 `backgroundTasks`；`chat_subscribed` 握手帧另带后台等待状态 `backgroundWorkPending`（由带 `backgroundTasks.isPending` 切面的引擎回答：opencode 的子会话与 antigravity 的后台任务实现该切面；claude 以任务列表为准，切面报 false）。归一化网关放行两者。
   - 卡片描述任务本身，等待状态还包括任务完成后的汇报回复。任务完成或唤醒到期时卡片立即消失，后续回复结束后才解除等待。未提供等待字段的引擎按卡片列表判断。
 - **输入防打断与智能排队**：
   - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），用户发送新消息自动转入 `queuedDraft` 排队，阻止过早发送打断正在运行的后台子进程。是否排队由能力矩阵 `inputWhileBusy` 决定：`backgroundWorkQueuesInput` = 有后台任务且为 `queue`；`turnQueuesInput` = 回合进行中且不是 `always`；两者之或即 `queuesInput`，composer 的排队、flush 与按钮形态都只看它。claude（`background`）后台任务期间直接注入活进程、任务条照常显示但不排队；opencode 随 client-mode 迁移后为 `queue`（回合中途插话暂缺），`always` 目前无引擎使用。注意 `useChatSessionState` 的 `isProcessing`（即 composer 的 `isLoading`）只表示"正在产出回复"，只剩后台任务的 `background` 活动条目不算——否则 `background` 档永远被回合排队吞掉；`hasActiveBackgroundTasks` 同时认这种条目，保证 `queue` 档照旧排队。

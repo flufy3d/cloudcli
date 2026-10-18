@@ -74,6 +74,90 @@ test('child session frames ride the parent run and are stamped with the spawn ca
   assert.deepEqual(await run.settled, { outcome: 'succeeded' });
 });
 
+test('a running child session is background work for the composer until it settles', async () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+
+  registry.dispatch({
+    type: 'session.tool.input.started',
+    data: { sessionID: 'ses_parent', id: 'call_subagent', name: 'subagent' },
+  });
+  registry.dispatch({
+    type: 'session.tool.called',
+    data: { sessionID: 'ses_parent', id: 'call_subagent', input: { agent: 'general', description: 'Audit the repo' } },
+  });
+  registry.dispatch({
+    type: 'session.created',
+    data: { sessionID: 'ses_child', parentID: 'ses_parent', agent: 'general', title: 'Audit the repo' },
+  });
+
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), true);
+  assert.deepEqual(registry.listBackgroundWork(), [{
+    sessionId: 'app-parent',
+    tasks: [{
+      taskId: 'ses_child',
+      toolUseId: 'call_subagent',
+      taskType: 'local_agent',
+      description: 'Audit the repo',
+      startedAt: registry.backgroundTasksFor('app-parent')[0]?.startedAt,
+    }],
+  }]);
+  assert.equal(registry.backgroundTasksFor('app-parent')[0]?.toolName, 'subagent');
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(announced.length, 1, 'the composer learns about the background work live');
+  assert.equal(announced[0]?.backgroundTasks?.length, 1);
+  assert.equal(announced[0]?.backgroundWorkPending, true);
+
+  let cleared = false;
+  void registry.whenBackgroundWorkClears('app-parent').then(() => { cleared = true; });
+  frames.length = 0;
+  registry.dispatch({ type: 'session.execution.succeeded', data: { sessionID: 'ses_child' } });
+  await Promise.resolve();
+
+  assert.equal(cleared, true);
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), false);
+  assert.deepEqual(registry.listBackgroundWork(), []);
+  const settled = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(settled.length, 1, 'the pill clears as soon as the child settles');
+  assert.deepEqual(settled[0]?.backgroundTasks, []);
+  assert.equal(settled[0]?.backgroundWorkPending, false);
+
+  // The child's own terminal must not settle the parent turn.
+  const parent = registry.get('app-parent');
+  assert.ok(parent);
+  assert.equal(await Promise.race([parent.settled, Promise.resolve('still-open')]), 'still-open');
+});
+
+test('the background hold times out so a lost child terminal cannot pin the run', async () => {
+  const registry = new OpenCodeRunRegistry();
+  const { writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+  registry.dispatch({
+    type: 'session.created',
+    data: { sessionID: 'ses_child', parentID: 'ses_parent', agent: 'general', title: 'Lost child' },
+  });
+  // The launch call is identified by the parent's progress event, which also
+  // flushes the queued `session.created` and records the background task.
+  registry.dispatch({
+    type: 'session.tool.progress',
+    data: {
+      sessionID: 'ses_parent',
+      id: 'call_subagent',
+      metadata: { sessionID: 'ses_child', status: 'running' },
+    },
+  });
+  // The queued child events flush on the next event that carries the child id.
+  registry.dispatch({
+    type: 'session.text.delta',
+    data: { sessionID: 'ses_child', assistantMessageID: 'm_child', ordinal: 0, delta: 'working' },
+  });
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), true);
+
+  await registry.whenBackgroundWorkClears('app-parent', 10);
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), false);
+});
+
 test('a child event that arrives before its launch call is held, then delivered in order', async () => {
   const registry = new OpenCodeRunRegistry();
   const { frames, writer } = writerOf();
@@ -106,7 +190,9 @@ test('a child event that arrives before its launch call is held, then delivered 
   });
 
   assert.deepEqual(
-    frames.map((frame) => [frame.content, frame.parentToolUseId]),
+    frames
+      .filter((frame) => frame.parentToolUseId)
+      .map((frame) => [frame.content, frame.parentToolUseId]),
     [['early', 'call_subagent'], [' late', 'call_subagent']],
   );
 });
