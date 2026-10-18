@@ -225,6 +225,46 @@ export const getSessionTitle = (session: ProjectSession): string =>
   (session.summary as string) || 'New Session';
 
 /**
+ * Worktree label for a session running in a git worktree of its owning
+ * project ("feat/x"): the branch name, falling back to the worktree
+ * directory's basename for a detached checkout. Null for main-checkout
+ * sessions, whose rows carry no worktree metadata.
+ *
+ * Used by the workspace header subtitle and the sidebar session rows.
+ */
+export const getSessionWorktreeLabel = (session: ProjectSession | null): string | null => {
+  if (!session) {
+    return null;
+  }
+
+  const branch = typeof session.worktreeBranch === 'string' ? session.worktreeBranch.trim() : '';
+  if (branch) {
+    return branch;
+  }
+
+  const worktreePath = typeof session.worktreePath === 'string' ? session.worktreePath.trim() : '';
+  if (!worktreePath) {
+    return null;
+  }
+
+  // Server paths arrive normalized per-platform (Windows keeps backslashes),
+  // so split on both separators before taking the last segment.
+  const segments = worktreePath.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] ?? null;
+};
+
+/**
+ * The full session subtitle: owning project name plus the worktree label when
+ * the session runs in a worktree ("MirLite · feat/x"). Mirrors the
+ * "repo · branch" naming the open-worktree-as-project flow uses, so both
+ * surfaces read the same. Rendered by WorkspaceTitle.
+ */
+export const getSessionSubtitle = (projectDisplayName: string, session: ProjectSession | null): string => {
+  const worktreeLabel = getSessionWorktreeLabel(session);
+  return worktreeLabel ? `${projectDisplayName} · ${worktreeLabel}` : projectDisplayName;
+};
+
+/**
  * Builds the browser tab title for the current selection: the session title when one is
  * open, otherwise the project name, otherwise the app name.
  */

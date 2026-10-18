@@ -3,9 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { LLMProviderLogo } from '@/shared/ui';
 import type { AppTab, Project, ProjectSession } from '@/shared/types';
 import { usePlugins } from '@/modules/plugins';
-import { getSessionTitle } from '@/shared/utils';
+import { getSessionSubtitle, getSessionTitle } from '@/shared/utils';
 import { useSessionTitleRename } from '@/modules/project-workspace/hooks/useSessionTitleRename';
-import { getSessionSubtitle } from '@/modules/project-workspace/utils/sessionWorktreeLabel';
 
 type WorkspaceTitleProps = {
   activeTab: AppTab;

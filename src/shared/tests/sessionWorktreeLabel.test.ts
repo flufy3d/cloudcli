@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 
 import { test } from 'vitest';
 
-import { getSessionSubtitle, getSessionWorktreeLabel } from '@/modules/project-workspace/utils/sessionWorktreeLabel';
+import { getSessionSubtitle, getSessionWorktreeLabel } from '@/shared/utils';
 import type { ProjectSession } from '@/shared/types';
 
 function sessionWith(overrides: Partial<ProjectSession>): ProjectSession {

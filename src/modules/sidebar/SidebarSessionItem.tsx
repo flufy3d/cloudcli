@@ -1,10 +1,10 @@
 import { memo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
-import { Check, CheckSquare, Edit2, Loader2, MoreHorizontal, Square, Trash2, X } from 'lucide-react';
+import { Check, CheckSquare, Edit2, GitBranch, Loader2, MoreHorizontal, Square, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 import { Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
-import { cn } from '@/shared/utils';
+import { cn, getSessionWorktreeLabel } from '@/shared/utils';
 import type { LLMProvider, Project, ProjectSession, SessionWithProvider } from '@/shared/types';
 import { createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
@@ -78,6 +78,21 @@ function SidebarSessionItem({
   const showProcessingIndicator = isProcessing && !showBackgroundIndicator;
   const showRecentIndicator = !showAttentionIndicator && !showProcessingIndicator && !showBackgroundIndicator && sessionView.isActive;
   const providerLabel = getProviderDisplayName(session.__provider);
+  // The session runs in a git worktree of its owning project; the icon marks
+  // the row and the tooltip names the branch (directory basename when detached).
+  const worktreeLabel = getSessionWorktreeLabel(session);
+
+  // Shared by both layouts: sits after the truncating title, before the age.
+  const worktreeIndicator = worktreeLabel ? (
+    <Tooltip content={worktreeLabel} position="top">
+      <span
+        aria-label={worktreeLabel}
+        className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground"
+      >
+        <GitBranch className="h-3 w-3" />
+      </span>
+    </Tooltip>
+  ) : null;
 
   // The desktop controls live in SessionOptions, which owns the rename panel and
   // its outside-click dismissal. The mobile rename sits inside the bottom sheet,
@@ -217,6 +232,7 @@ function SidebarSessionItem({
                 >
                   {sessionView.sessionName}
                 </div>
+                {worktreeIndicator}
                 {isProcessing ? (
                   <span className="ml-auto flex-shrink-0">
                     <Tooltip content={t('tooltips.processingSessionIndicator', 'Processing session')} position="top">
@@ -441,6 +457,7 @@ function SidebarSessionItem({
                 >
                   {sessionView.sessionName}
                 </div>
+                {worktreeIndicator}
                 {isProcessing ? (
                   <span
                     className={cn(
