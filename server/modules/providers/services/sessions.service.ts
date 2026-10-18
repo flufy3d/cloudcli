@@ -97,7 +97,7 @@ type SessionDetails = {
   } | null;
 };
 
-const MAX_CLOUDCLI_SESSION_NAME_WORDS = 4;
+const MAX_CLOUDCLI_SESSION_NAME_CHARS = 40;
 
 /**
  * How long a `clientRequestId` keeps pointing at the session it allocated.
@@ -152,9 +152,22 @@ function rememberIdempotentSession(clientRequestId: string, result: CreateAppSes
   });
 }
 
+/**
+ * Derives the initial session name from the first message: the first sentence
+ * (first line when it has no terminator), capped in length. Word-splitting is
+ * not usable here — Chinese text has no spaces, so the old word-based rule
+ * turned a whole message into the title.
+ */
 function buildCloudCliSessionName(initialMessage: string): string {
-  const words = initialMessage.trim().split(/\s+/).filter(Boolean);
-  return words.slice(0, MAX_CLOUDCLI_SESSION_NAME_WORDS).join(' ') || 'Untitled Session';
+  const firstLine = initialMessage
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? '';
+  // The Latin period is left out on purpose: "1." and "e.g." would otherwise
+  // gut the name. Chinese terminators and Latin !/?/; are safe sentence ends.
+  const [firstSentence] = firstLine.split(/[。？！；?!;]/);
+  return (firstSentence ?? firstLine).trim().slice(0, MAX_CLOUDCLI_SESSION_NAME_CHARS)
+    || 'Untitled Session';
 }
 
 /**
@@ -374,8 +387,10 @@ export const sessionsService = {
    * chat, navigates to the returned id immediately, and the id never changes
    * for the lifetime of the conversation. The provider-native id is mapped to
    * this row later, when the provider runtime announces it mid-run. Its title
-   * comes directly from the first visible CloudCLI message and is limited to
-   * four whole words before any provider-owned storage exists.
+   * comes directly from the first visible CloudCLI message — its first
+   * sentence, capped — and stays followable: once the engine generates its own
+   * title, a later synchronizer pass replaces this one (unless the user
+   * renames the session).
    */
   createAppSession(
     provider: LLMProvider,

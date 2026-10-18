@@ -92,19 +92,40 @@ test('provider session id returns the mapped native id', { concurrency: false },
   });
 });
 
-test('app session names use at most four whole words from the initial message', { concurrency: false }, async () => {
+test('app session names take the first sentence of the initial message', { concurrency: false }, async () => {
   await withIsolatedDatabase(() => {
     const result = sessionsService.createAppSession(
       'codex',
       '/tmp/session-name-project',
-      '  supercalifragilisticexpialidocious\nsecond   third fourth fifth  ',
+      '帮我看看登录重定向的问题。然后顺便把超时也调大一点',
     );
 
-    assert.equal(result.sessionName, 'supercalifragilisticexpialidocious second third fourth');
+    assert.equal(result.sessionName, '帮我看看登录重定向的问题');
     assert.equal(
       sessionsDb.getSessionById(result.sessionId)?.custom_name,
-      'supercalifragilisticexpialidocious second third fourth',
+      '帮我看看登录重定向的问题',
     );
+  });
+});
+
+test('app session names fall back to the first line capped at 40 characters', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const longLine = '这个消息没有任何句读就是一长串文字'.repeat(4);
+    const result = sessionsService.createAppSession('codex', '/tmp/session-name-project', longLine);
+
+    assert.equal(result.sessionName, longLine.slice(0, 40));
+  });
+});
+
+test('app session names cut at Latin exclamation or question marks but not periods', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const excited = sessionsService.createAppSession('claude', '/tmp/session-name-project', 'Fix this! Then also that');
+    assert.equal(excited.sessionName, 'Fix this');
+
+    // A Latin period is often a list marker or abbreviation ("1.", "e.g."),
+    // so it never splits the name.
+    const listed = sessionsService.createAppSession('claude', '/tmp/session-name-project', '1. 先做这个 2. 再做那个');
+    assert.equal(listed.sessionName, '1. 先做这个 2. 再做那个');
   });
 });
 
