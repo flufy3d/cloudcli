@@ -943,6 +943,30 @@ test('an agent still running when the turn ends is settled as stopped, because c
   assert.deepEqual(codexRuntime.listBackgroundWork(), []);
 });
 
+test('a running agent\'s own steps arrive tied to its card, without its prompt or lifecycle items', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    // The agent works on its own thread of the same connection.
+    const childPrompt = { type: 'userMessage', id: 'child-user', content: [{ type: 'text', text: 'review it', text_elements: [] }] };
+    const command = { type: 'commandExecution', id: 'child-exec', command: "/bin/zsh -lc 'ls'", status: 'completed', aggregatedOutput: 'a.txt\n', exitCode: 0 };
+    notify('item/completed', { threadId: 'thread_child_1', item: childPrompt });
+    notify('item/completed', { threadId: 'thread_child_1', item: command });
+    // A thread nobody here spawned stays out.
+    notify('item/completed', { threadId: 'thread_stranger', item: { ...command, id: 'stranger-exec' } });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-child', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const childRows = messages.filter((message) => message.parentToolUseId === 'call_spawn_1');
+  assert.deepEqual(childRows.map((row) => [row.type, row.toolCallId]), [['tool_use', 'child-exec'], ['tool_result', 'child-exec']]);
+  assert.equal(messages.some((message) => message.toolCallId === 'stranger-exec'), false);
+  assert.equal(messages.some((message) => message.type === 'user'), false, 'the agent\'s prompt is the card\'s task, not a thread row');
+});
+
 test('an agent that reports back during the turn is settled once, as completed', async (t) => {
   installFakeAppServer(t, (server) => {
     const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);

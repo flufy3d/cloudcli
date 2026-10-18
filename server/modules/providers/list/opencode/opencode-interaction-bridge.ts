@@ -92,6 +92,15 @@ type ReplyClient = Pick<OpenCodeApiClient, 'replyPermission' | 'replyForm' | 'ca
 
 type BridgeDependencies = {
   getClient: () => ReplyClient | null;
+  /**
+   * Who owns a session the engine created for a subagent: the root run's
+   * provider session and the child's own tool-call lookup. Its requests carry
+   * the child's id, so without this they match no attached run.
+   */
+  resolveChild?: (providerSessionId: string) => {
+    rootProviderSessionId: string;
+    resolveToolCall: (callId: string) => OpenCodeToolCall | null;
+  } | null;
   now?: () => number;
   pendingTtlMs?: number;
 };
@@ -149,6 +158,7 @@ const toPanelQuestion = (field: FormField) => ({
  */
 export class OpenCodeInteractionBridge {
   private readonly getClient: () => ReplyClient | null;
+  private readonly resolveChild: NonNullable<BridgeDependencies['resolveChild']>;
   private readonly now: () => number;
   private readonly pendingTtlMs: number;
   private readonly sessions = new Map<string, OpenCodeInteractionSession>();
@@ -156,8 +166,26 @@ export class OpenCodeInteractionBridge {
 
   constructor(dependencies: BridgeDependencies) {
     this.getClient = dependencies.getClient;
+    this.resolveChild = dependencies.resolveChild ?? (() => null);
     this.now = dependencies.now ?? Date.now;
     this.pendingTtlMs = dependencies.pendingTtlMs ?? DEFAULT_PENDING_TTL_MS;
+  }
+
+  /**
+   * The run a request belongs to: the attached run itself, or the root run of
+   * a subagent's session. For a child the card is shown under the root's app
+   * session while the reply goes to the child's own provider session.
+   */
+  private sessionFor(providerSessionId: string): OpenCodeInteractionSession | undefined {
+    const direct = this.sessions.get(providerSessionId);
+    if (direct) {
+      return direct;
+    }
+    const child = this.resolveChild(providerSessionId);
+    const root = child ? this.sessions.get(child.rootProviderSessionId) : undefined;
+    return child && root
+      ? { ...root, providerSessionId, resolveToolCall: child.resolveToolCall }
+      : undefined;
   }
 
   attach(session: OpenCodeInteractionSession): void {
@@ -260,7 +288,7 @@ export class OpenCodeInteractionBridge {
     if (!requestId || !providerSessionId || this.pending.has(requestId)) {
       return;
     }
-    const session = this.sessions.get(providerSessionId);
+    const session = this.sessionFor(providerSessionId);
     if (!session) {
       return;
     }
@@ -295,7 +323,7 @@ export class OpenCodeInteractionBridge {
     if (!requestId || !providerSessionId || this.pending.has(requestId)) {
       return;
     }
-    const session = this.sessions.get(providerSessionId);
+    const session = this.sessionFor(providerSessionId);
     if (!session) {
       return;
     }

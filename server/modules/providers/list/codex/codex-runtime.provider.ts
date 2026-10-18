@@ -550,6 +550,28 @@ async function queryCodex(
     }
   };
 
+  /**
+   * A running agent's own finished item, as a row tied to its card. Agents
+   * work on their own thread of this connection; the thread id is how the
+   * registry finds the card. The agent's prompt (the card's task) and its
+   * lifecycle items are left out, the same as when history rebuilds the
+   * timeline from the agent's rollout, so the card reads alike either way.
+   * Threads this run did not spawn are ignored.
+   */
+  const emitAgentItem = (agentThreadId: string, rawItem: unknown, timestamp: string): void => {
+    const owner = codexBackgroundWork.find(agentThreadId);
+    const runKey = sessionId || capturedSessionId;
+    const item = readCodexAppServerItem(rawItem);
+    if (!owner || owner.sessionKey !== runKey || !item || item.kind === 'user_message' || item.kind === 'subagent_activity') {
+      return;
+    }
+    for (const row of codexThreadItemToRows(item, timestamp)) {
+      for (const message of context.normalizeMessage(row, capturedSessionId || sessionId || null)) {
+        sendMessage(ws, { ...message, parentToolUseId: owner.task.toolUseId });
+      }
+    }
+  };
+
   /** Approvals this run opened, so the run's end can retract them. */
   const openApprovalIds = new Set<string>();
 
@@ -682,6 +704,9 @@ async function queryCodex(
         // app-server connection. Only events for the target thread (the parent session)
         // drive this turn's terminal state, live transcript, and token updates.
         if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
+          if (method === 'item/completed') {
+            emitAgentItem(eventThreadId, params.item, new Date().toISOString());
+          }
           return;
         }
 

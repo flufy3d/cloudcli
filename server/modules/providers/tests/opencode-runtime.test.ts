@@ -375,3 +375,144 @@ test('a run that ends on an unfinished subagent call settles the card as stopped
     assert.ok(frames.indexOf(settle!) < frames.findIndex((frame) => frame.kind === 'complete' || frame.kind === 'status'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Child sessions: the events and requests of a subagent's own session belong
+// to the root run (shapes captured from OpenCode 2.0.31).
+// ---------------------------------------------------------------------------
+
+const CHILD = 'ses_child';
+const GRANDCHILD = 'ses_grandchild';
+const SPAWN_CALL = 'call_spawn';
+
+const spawnChild = (service: FakeService, options: { child?: string; parent?: string; call?: string } = {}) => {
+  const child = options.child ?? CHILD;
+  const parent = options.parent ?? 'ses_new';
+  const call = options.call ?? SPAWN_CALL;
+  service.emit(session('session.tool.called', {
+    sessionID: parent, assistantMessageID: 'm_p', id: call, name: 'subagent',
+    input: { agent: 'general', description: 'Create the file', prompt: 'make probe.txt' },
+  }));
+  service.emit(session('session.created', { sessionID: child, parentID: parent, title: 'Create the file' }));
+  service.emit(session('session.tool.progress', { sessionID: parent, assistantMessageID: 'm_p', id: call, metadata: { sessionID: child, status: 'running' } }));
+};
+
+test('a subagent\'s permission request reaches the page under the parent session and is answered on the child session', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('delegate', { sessionId: 'app-1', projectPath: '/tmp/p', permissionMode: 'default' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    spawnChild(service);
+    service.emit(session('session.tool.called', { sessionID: CHILD, assistantMessageID: 'm_c', id: 'call_shell', name: 'shell', input: { command: 'echo hi' } }));
+    service.emit({ type: 'permission.asked', data: { id: 'per_child', sessionID: CHILD, action: 'shell', resources: ['echo hi'], source: { type: 'tool', messageID: 'm_c', id: 'call_shell' } } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const card = frames.find((frame) => frame.kind === 'permission_request');
+    assert.ok(card, 'the approval card must reach the writer');
+    assert.equal(card.requestId, 'per_child');
+    assert.equal(card.sessionId, 'app-1');
+    assert.equal(card.toolName, 'shell', 'labelled by the child\'s own tool call');
+    assert.equal(runtime.permissions?.listPending('app-1').length, 1);
+
+    runtime.permissions?.resolve('per_child', { allow: true });
+    const reply = await service.waitForRequest((request) => request.path.endsWith('/permission/per_child/reply'));
+    assert.equal(reply.path, `/api/session/${CHILD}/permission/per_child/reply`);
+    assert.deepEqual(reply.body, { decision: 'once' });
+
+    service.emit(session('session.tool.success', { sessionID: CHILD, assistantMessageID: 'm_c', id: 'call_shell', content: [{ type: 'text', text: 'hi\n' }] }));
+    service.emit(session('session.tool.success', { sessionID: 'ses_new', assistantMessageID: 'm_p', id: SPAWN_CALL, content: [{ type: 'text', text: 'done' }], metadata: { sessionID: CHILD } }));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+    assert.ok(frames.some((frame) => frame.kind === 'permission_resolved'));
+  });
+});
+
+test('a subagent\'s steps arrive as rows tied to its Agent card, and its end does not end the parent run', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    let finished = false;
+    const running = runtime.run('delegate', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new'))
+      .then(() => { finished = true; });
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    spawnChild(service);
+    service.emit(session('session.tool.called', { sessionID: CHILD, assistantMessageID: 'm_c', id: 'call_shell', name: 'shell', input: { command: 'ls' } }));
+    service.emit(session('session.tool.success', { sessionID: CHILD, assistantMessageID: 'm_c', id: 'call_shell', content: [{ type: 'text', text: 'a.txt' }] }));
+    service.emit(session('session.text.delta', { sessionID: CHILD, assistantMessageID: 'm_c2', ordinal: 0, delta: 'Listing' }));
+    service.emit(session('session.text.ended', { sessionID: CHILD, assistantMessageID: 'm_c2', ordinal: 0, text: 'Listing done.' }));
+    service.emit(session('session.execution.succeeded', { sessionID: CHILD }));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    assert.equal(finished, false, 'the child\'s terminal event must not settle the parent run');
+    const childRows = frames.filter((frame) => frame.parentToolUseId === SPAWN_CALL);
+    assert.deepEqual(childRows.map((frame) => frame.kind), ['tool_use', 'tool_result', 'text']);
+    assert.equal(childRows[0].toolName, 'shell');
+    assert.equal(childRows[2].content, 'Listing done.');
+    assert.equal(childRows[0].sessionId, 'app-1');
+    assert.equal(frames.some((frame) => frame.kind === 'stream_delta'), false, 'a child\'s streaming deltas stay out of the main thread');
+
+    service.emit(session('session.tool.success', { sessionID: 'ses_new', assistantMessageID: 'm_p', id: SPAWN_CALL, content: [{ type: 'text', text: 'ok' }], metadata: { sessionID: CHILD } }));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+    assert.equal(finished, true);
+  });
+});
+
+test('events that precede the spawn call\'s progress event are held and then tied to the card', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('delegate', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    service.emit(session('session.created', { sessionID: CHILD, parentID: 'ses_new' }));
+    service.emit(session('session.tool.called', { sessionID: CHILD, assistantMessageID: 'm_c', id: 'call_early', name: 'read', input: { path: '/tmp/a' } }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(frames.some((frame) => frame.toolId === 'call_early'), false, 'nothing is sent without a card to attach to');
+
+    service.emit(session('session.tool.progress', { sessionID: 'ses_new', id: SPAWN_CALL, metadata: { sessionID: CHILD } }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const early = frames.find((frame) => frame.toolId === 'call_early');
+    assert.equal(early?.parentToolUseId, SPAWN_CALL);
+
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+  });
+});
+
+test('a grandchild session belongs to the same root run and its rows tie to the outer card', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('delegate', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    spawnChild(service);
+    spawnChild(service, { child: GRANDCHILD, parent: CHILD, call: 'call_inner' });
+    service.emit(session('session.tool.called', { sessionID: GRANDCHILD, assistantMessageID: 'm_g', id: 'call_deep', name: 'read', input: { path: '/x' } }));
+    service.emit({ type: 'permission.asked', data: { id: 'per_deep', sessionID: GRANDCHILD, action: 'read', resources: ['/x'], source: { type: 'tool', messageID: 'm_g', id: 'call_deep' } } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const deep = frames.find((frame) => frame.toolId === 'call_deep');
+    assert.equal(deep?.parentToolUseId, SPAWN_CALL, 'nested rows tie to the card the user sees');
+    assert.equal(frames.find((frame) => frame.kind === 'permission_request')?.sessionId, 'app-1');
+
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+  });
+});
+
+test('a session nobody here owns is still ignored', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('go', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    service.emit(session('session.created', { sessionID: 'ses_other_child', parentID: 'ses_other_parent' }));
+    service.emit(session('session.tool.called', { sessionID: 'ses_other_child', id: 'call_x', name: 'shell', input: {} }));
+    service.emit({ type: 'permission.asked', data: { id: 'per_x', sessionID: 'ses_other_child', action: 'shell', resources: [], source: { id: 'call_x' } } });
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    assert.equal(frames.some((frame) => frame.kind === 'permission_request' || frame.toolId === 'call_x'), false);
+  });
+});

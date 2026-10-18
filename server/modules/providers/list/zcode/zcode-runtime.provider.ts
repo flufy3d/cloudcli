@@ -612,6 +612,8 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
 
     subagentWatchers.set(zcodeSessionId, watcher);
     protocolClient.addSessionListener(zcodeSessionId, watcher);
+    // The agents may still ask for approval; their cards go to this writer.
+    runLifecycle.adoptIdleTarget(zcodeSessionId, { writer, appSessionId: appSessionKey });
   }
 
   private standDownSubagentWatcher(zcodeSessionId: string): void {
@@ -621,6 +623,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     }
     subagentWatchers.delete(zcodeSessionId);
     protocolClient.removeSessionListener(zcodeSessionId, watcher);
+    runLifecycle.releaseIdleTarget(zcodeSessionId);
   }
 
   /**

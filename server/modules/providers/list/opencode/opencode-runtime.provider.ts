@@ -89,8 +89,11 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   });
   let client: OpenCodeApiClient | null = null;
 
-  const bridge = new OpenCodeInteractionBridge({ getClient: () => client });
   const runs = new OpenCodeRunRegistry();
+  const bridge = new OpenCodeInteractionBridge({
+    getClient: () => client,
+    resolveChild: (providerSessionId) => runs.childOwner(providerSessionId),
+  });
   const settings = new OpenCodeSessionSettingsApplier();
 
   eventStream.subscribe((event) => {
@@ -240,13 +243,15 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     }
 
     const settlement = await activeRun.settled;
+    // Read before release forgets the children: calls they never resolved.
+    const childSettleFrames = runs.settleChildren(activeRun);
     runs.release(activeRun);
     // Retract any cards still pending, then drop the run's writer from the
     // bridge so finished sessions do not pin memory forever.
     bridge.cancelSession(appSessionId, 'The run ended with cards still pending.');
     bridge.detach(providerSessionId);
     // A spawn call the run never resolved would spin on its card forever.
-    for (const frame of activeRun.translator.settleOpenSubagents()) {
+    for (const frame of [...activeRun.translator.settleOpenSubagents(), ...childSettleFrames]) {
       writer.send(frame);
     }
 

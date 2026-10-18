@@ -150,6 +150,10 @@ rl.on('line', (line) => {
         send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
       }
     }
+    if (msg.id === 'server-perm-bg') {
+      log('perm_answer', msg);
+      send({ method: 'session/event', params: { sessionId, type: 'subagent_stopped', payload: { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg', status: 'completed', totalDurationMs: 10, totalToolUseCount: 1, totalTokens: 5 } } });
+    }
     if (msg.id === 'server-perm-e2e') {
       log('perm_answer', msg);
       // Late re-announcement of the SAME business requestId under a fresh
@@ -263,7 +267,7 @@ rl.on('line', (line) => {
       send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
       return;
     }
-    if (readMode() === 'subagent-bg' || readMode() === 'subagent-bg-crash') {
+    if (readMode() === 'subagent-bg' || readMode() === 'subagent-bg-crash' || readMode() === 'subagent-bg-permission') {
       // A background agent: the engine announces the Agent call, reports the
       // spawn on the parent session once the child is ready, returns the
       // launch acknowledgement as the tool result and ends the turn. The
@@ -271,6 +275,7 @@ rl.on('line', (line) => {
       // — or, in the crash variant, the engine dies with the agent still
       // running and never reports.
       const crash = readMode() === 'subagent-bg-crash';
+      const asksPermission = readMode() === 'subagent-bg-permission';
       const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
       const agent = { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg' };
       ev('model_streaming', { kind: 'tool_call', toolCallId: 'call_agent_bg', toolName: 'Agent', input: { description: 'Review the fix', prompt: 'look', run_in_background: true, subagent_type: 'general-purpose' } });
@@ -280,6 +285,17 @@ rl.on('line', (line) => {
       setTimeout(() => {
         if (crash) {
           process.exit(1);
+        }
+        if (asksPermission) {
+          // The engine rewrites a subagent's request to the PARENT session id
+          // and tags it with the subagent as its origin; the parent turn is
+          // over by now.
+          send({ id: 'server-perm-bg', method: 'interaction/requestPermission', params: {
+            requestId: 'perm_bg_1', sessionId, toolCallId: 'call_child_bash', toolName: 'Bash',
+            input: { command: 'touch /tmp/bg' }, reason: 'Tool Bash requires approval', riskLevel: 'medium',
+            origin: { kind: 'subagent', childSessionId: 'sess_subagent_agent_bg_1', parentSessionId: sessionId, parentToolCallId: 'call_agent_bg' },
+          } });
+          return;
         }
         ev('subagent_stopped', { ...agent, status: 'completed', totalDurationMs: 1500, totalToolUseCount: 2, totalTokens: 300 });
       }, 400);
@@ -1279,6 +1295,31 @@ test('a setup failure in a new run releases its listener and hands the session b
 
   // Once the watcher has stood down, nothing of the failed run still listens.
   assert.equal(attached.size, 0, 'the failed run leaked its session listener');
+});
+
+test('a background agent asking for approval after its turn ended still reaches the page, and the answer reaches the engine', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg-permission\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+  await runtime.run('review it', { sessionId: 'app-sess-bg-perm', cwd: stubDir }, writer, context);
+
+  for (let i = 0; i < 100 && !messages.some((msg) => msg.kind === 'permission_request'); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const card = messages.find((msg) => msg.kind === 'permission_request');
+  assert.ok(card, 'the approval card must reach the page although no turn is running');
+  assert.equal(card.requestId, 'perm_bg_1');
+  assert.deepEqual((zcodeRuntimePermissions.listPending('app-sess-bg-perm') as Array<{ requestId: string }>).map((entry) => entry.requestId), ['perm_bg_1']);
+
+  zcodeRuntimePermissions.resolve('perm_bg_1', { allow: true });
+  const deadline = Date.now() + 3000;
+  while (runtime.listBackgroundWork().length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const answer = readStubLog().filter((entry) => entry.name === 'perm_answer' && (entry.value as { id?: string }).id === 'server-perm-bg');
+  assert.equal(answer.length, 1);
+  assert.deepEqual((answer[0].value as { result: unknown }).result, { decision: 'allow' });
+  assert.equal(messages.some((msg) => msg.kind === 'permission_cancelled'), true, 'the card is retracted once answered');
 });
 
 // Last: both crash modes kill the shared stub subprocess.

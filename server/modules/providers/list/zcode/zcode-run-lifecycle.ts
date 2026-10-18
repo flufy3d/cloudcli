@@ -223,6 +223,7 @@ export class ZCodeRunLifecycle {
   private readonly runs = new Map<string, RunHandle>();
   /** Live runs by ZCode-native session id — what the permission bridge and engine events resolve against. */
   private readonly runsByEngineSession = new Map<string, RunHandle>();
+  private readonly idleTargets = new Map<string, { writer: ProviderRuntimeWriter; appSessionId: string | null }>();
 
   /**
    * One resolver per in-flight protocol request id: the engine re-announces a
@@ -271,6 +272,30 @@ export class ZCodeRunLifecycle {
   /** Whether this handle is still the run registered for its abort key. */
   isActiveRun(handle: RunHandle): boolean {
     return this.runs.get(handle.abortKey) === handle;
+  }
+
+  /**
+   * Where an engine session's approval and question cards go: the run on it,
+   * else the watcher keeping its background agents (see `adoptIdleTarget`).
+   */
+  private requestTargetFor(engineSessionId: string): { writer: ProviderRuntimeWriter; appSessionId: string | null } | undefined {
+    return this.runsByEngineSession.get(engineSessionId) ?? this.idleTargets.get(engineSessionId);
+  }
+
+  /**
+   * Lets requests for an engine session reach `writer` while no run is active
+   * on it. A background agent keeps working after its turn ended and can still
+   * ask for approval (the engine files the request under the parent session);
+   * without a target such a request is denied on the spot. The lifecycle
+   * watcher registers its writer here while it waits on the session's agents.
+   */
+  adoptIdleTarget(engineSessionId: string, target: { writer: ProviderRuntimeWriter; appSessionId: string | null }): void {
+    this.idleTargets.set(engineSessionId, target);
+  }
+
+  /** Stops routing an idle session's requests; a run takes over, or its agents are done. */
+  releaseIdleTarget(engineSessionId: string): void {
+    this.idleTargets.delete(engineSessionId);
   }
 
   /**
@@ -461,8 +486,8 @@ export class ZCodeRunLifecycle {
       });
     }
 
-    const handle = sessionId ? this.runsByEngineSession.get(sessionId) : undefined;
-    if (!sessionId || !handle) {
+    const target = sessionId ? this.requestTargetFor(sessionId) : undefined;
+    if (!sessionId || !target) {
       return { result: { decision: 'deny', reason: 'No active chat stream for this session' } };
     }
 
@@ -484,13 +509,13 @@ export class ZCodeRunLifecycle {
       input: params.input,
       context,
       sessionId,
-      appSessionId: handle.appSessionId ?? undefined,
+      appSessionId: target.appSessionId ?? undefined,
       receivedAt: new Date(),
       lastAnnouncedAt: Date.now(),
     });
     this.pendingPermissionResolvers.set(requestId, []);
 
-    handle.writer.send(createNormalizedMessage({
+    target.writer.send(createNormalizedMessage({
       id: generateMessageId('zcode'),
       sessionId,
       provider: 'zcode',
@@ -579,8 +604,8 @@ export class ZCodeRunLifecycle {
       });
     }
 
-    const handle = sessionId ? this.runsByEngineSession.get(sessionId) : undefined;
-    if (!sessionId || !handle) {
+    const target = sessionId ? this.requestTargetFor(sessionId) : undefined;
+    if (!sessionId || !target) {
       return { result: { action: 'cancel', reason: 'No active chat stream for this session' } };
     }
 
@@ -596,13 +621,13 @@ export class ZCodeRunLifecycle {
       input: params.input,
       context: { reason: readOptionalString(params.prompt) },
       sessionId,
-      appSessionId: handle.appSessionId ?? undefined,
+      appSessionId: target.appSessionId ?? undefined,
       receivedAt: new Date(),
       lastAnnouncedAt: Date.now(),
     });
     this.pendingPermissionResolvers.set(requestId, []);
 
-    handle.writer.send(createNormalizedMessage({
+    target.writer.send(createNormalizedMessage({
       id: generateMessageId('zcode'),
       sessionId,
       provider: 'zcode',
@@ -678,7 +703,7 @@ export class ZCodeRunLifecycle {
     if (!sessionId) {
       return;
     }
-    const writer = this.runsByEngineSession.get(sessionId)?.writer;
+    const writer = this.requestTargetFor(sessionId)?.writer;
     if (!writer) {
       return;
     }
