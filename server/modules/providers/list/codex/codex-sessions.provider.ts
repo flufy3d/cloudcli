@@ -7,8 +7,8 @@ import readline from 'node:readline';
 import { sessionsDb } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import {
+  buildCodexSubagentTaskRow,
   codexThreadItemToRows,
-  humanizeCodexToolName,
   readCodexItemText,
   readCodexProposedPlan,
   readCodexRolloutItem,
@@ -604,15 +604,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       if (item.activity === 'started' && !existing) {
         // The spawn itself reaches the item stream only as this lifecycle
         // event, so the `Task` row is built from it and keeps its id.
-        const label = item.agentPath?.split('/').filter(Boolean).pop() ?? 'agent';
-        const taskMessage: AnyRecord = {
-          uuid: item.id,
-          type: 'tool_use',
-          timestamp,
-          toolName: 'Task',
-          toolInput: JSON.stringify({ description: humanizeCodexToolName(label) }),
-          toolCallId: item.id,
-        };
+        const taskMessage = buildCodexSubagentTaskRow(item, timestamp);
         messages.push(taskMessage);
         indexSubagent({
           toolCallId: item.id,

@@ -33,10 +33,14 @@ import {
   type CodexAppServerConnection,
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import {
+  buildCodexSubagentTaskRow,
   codexThreadItemToRows,
   readCodexAppServerItem,
   readCodexCommandLine,
+  readCodexSubagentLabel,
+  type CodexThreadItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
+import { BackgroundWorkRegistry } from '@/modules/providers/shared/background-work/background-work-registry.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import {
   appendFilesInputTag,
@@ -53,7 +57,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
-import type { BackgroundTaskSummary } from '@/shared/types.js';
+import type { BackgroundTaskSummary, NormalizedMessage } from '@/shared/types.js';
 import { readObjectRecord } from '@/shared/utils.js';
 
 const TASK_MCP_NAME = 'cloudcli_task_continuations';
@@ -120,18 +124,19 @@ type ActiveCodexSession = {
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
 
 /**
- * Collab agents still running, keyed by app session id, then by the collab
- * item id that spawned the agent.
+ * Collab agents still running, keyed by app session id, then by the agent's
+ * thread id (or the spawning item id for engines that announce a spawn as a
+ * tool call).
  *
  * Unlike Claude — where one CLI process owns a turn and dies with it — the
  * codex engine outlives turns, so an agent spawned mid-turn keeps working
- * after the turn's `result`. This map is what the running-sessions poll reads
- * (through `listBackgroundWork`) so the composer's background-work strip can
- * show and name that work while it runs. A terminal item event (completed,
- * failed, declined, interrupted) retires the entry; a session the cleanup
- * timer removes takes its entries with it.
+ * after the turn's `result`. This registry is what the running-sessions poll
+ * reads (through `listBackgroundWork`) so the composer's background-work
+ * strip can show and name that work while it runs. A terminal activity
+ * (completed, interrupted) retires the entry; a session the cleanup timer
+ * removes takes its entries with it.
  */
-const codexBackgroundWork = new Map<string, Map<string, BackgroundTaskSummary>>();
+const codexBackgroundWork = new BackgroundWorkRegistry();
 
 const CODEX_BACKGROUND_TASK_TYPE = 'collab_agent';
 const DETACHED_COMMAND_ENV_ALLOWLIST = [
@@ -148,26 +153,21 @@ const TASK_CREDENTIAL_ENV_NAMES = [
 ] as const;
 const DETACHED_COMMAND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
-function recordCodexBackgroundStart(appSessionId: string, item: { id: string; label: string; prompt?: string }): void {
-  let tasks = codexBackgroundWork.get(appSessionId);
-  if (!tasks) {
-    tasks = new Map();
-    codexBackgroundWork.set(appSessionId, tasks);
-  }
-  // Re-recorded starts refresh the entry in place; the original startedAt
-  // survives so the strip's elapsed time does not jump.
-  const previous = tasks.get(item.id);
-  tasks.set(item.id, {
-    taskId: item.id,
-    toolUseId: item.id,
+/**
+ * One `task_status` frame for a collab agent, in the shape the client folds
+ * onto the Task card that launched it (`toolUseId` is that card's call id).
+ */
+function createCodexTaskStatus(
+  sessionId: string | null,
+  fields: Pick<NormalizedMessage, 'event' | 'taskId' | 'toolUseId' | 'description' | 'status'>,
+): NormalizedMessage {
+  return createNormalizedMessage({
+    kind: 'task_status',
+    sessionId,
+    provider: 'codex',
     taskType: CODEX_BACKGROUND_TASK_TYPE,
-    description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
-    startedAt: previous?.startedAt ?? Date.now(),
+    ...fields,
   });
-}
-
-function recordCodexBackgroundEnd(appSessionId: string, itemId: string): void {
-  codexBackgroundWork.get(appSessionId)?.delete(itemId);
 }
 
 /**
@@ -455,6 +455,61 @@ async function queryCodex(
    */
   const approvalSubjects = new Map<string, { toolName: string; input: unknown }>();
 
+  /**
+   * Draws and settles the Task card of an agent announced only through its
+   * activity record (the shape real engines use; see
+   * `buildCodexSubagentTaskRow`). `started` opens the card, marks it running
+   * and tracks the agent as background work under its thread id; `completed`
+   * and `interrupted` settle the card they started — found through that
+   * thread id, since the item id differs between the two — and retire the
+   * entry. An end with no tracked start (the server restarted while the
+   * agent ran) has no card to settle and is dropped. `interacted` is the
+   * agents talking among themselves and draws nothing.
+   */
+  const emitSubagentActivity = (
+    item: Extract<CodexThreadItem, { kind: 'subagent_activity' }>,
+    timestamp: string,
+    backgroundWorkKey: string | null | undefined,
+  ): void => {
+    const messageSessionId = capturedSessionId || sessionId || null;
+    if (item.activity === 'started') {
+      const taskId = item.agentThreadId ?? item.id;
+      if (backgroundWorkKey && codexBackgroundWork.get(backgroundWorkKey, taskId)) {
+        return;
+      }
+      for (const message of context.normalizeMessage(buildCodexSubagentTaskRow(item, timestamp), messageSessionId)) {
+        sendMessage(ws, message);
+      }
+      const description = readCodexSubagentLabel(item);
+      if (backgroundWorkKey) {
+        codexBackgroundWork.start(backgroundWorkKey, {
+          taskId,
+          toolUseId: item.id,
+          taskType: CODEX_BACKGROUND_TASK_TYPE,
+          description,
+        });
+      }
+      sendMessage(ws, createCodexTaskStatus(messageSessionId, { event: 'started', taskId, toolUseId: item.id, description }));
+      return;
+    }
+
+    if (item.activity !== 'completed' && item.activity !== 'interrupted') {
+      return;
+    }
+    const tracked = backgroundWorkKey && item.agentThreadId
+      ? codexBackgroundWork.end(backgroundWorkKey, item.agentThreadId)
+      : undefined;
+    if (!tracked) {
+      return;
+    }
+    sendMessage(ws, createCodexTaskStatus(messageSessionId, {
+      event: 'notification',
+      taskId: tracked.taskId,
+      toolUseId: tracked.toolUseId,
+      status: item.activity === 'completed' ? 'completed' : 'stopped',
+    }));
+  };
+
   const emitItem = (rawItem: unknown, timestamp: string, source: 'started' | 'completed'): void => {
     const item = readCodexAppServerItem(rawItem);
     if (!item) {
@@ -473,10 +528,19 @@ async function queryCodex(
     const backgroundWorkKey = sessionId || capturedSessionId;
     if (item.kind === 'collab_spawn' && backgroundWorkKey) {
       if (source === 'started') {
-        recordCodexBackgroundStart(backgroundWorkKey, item);
+        codexBackgroundWork.start(backgroundWorkKey, {
+          taskId: item.id,
+          toolUseId: item.id,
+          taskType: CODEX_BACKGROUND_TASK_TYPE,
+          description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
+        });
       } else {
-        recordCodexBackgroundEnd(backgroundWorkKey, item.id);
+        codexBackgroundWork.end(backgroundWorkKey, item.id);
       }
+    }
+    if (item.kind === 'subagent_activity') {
+      emitSubagentActivity(item, timestamp, backgroundWorkKey);
+      return;
     }
     for (const row of codexThreadItemToRows(item, timestamp)) {
       if (row.type === 'tool_use' && !approvalSubjects.has(item.id)) {
@@ -1019,13 +1083,7 @@ export const codexRuntime = {
    * after the turn's `result` — this is how the UI learns it is still going.
    */
   listBackgroundWork(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
-    const entries: Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> = [];
-    for (const [sessionId, tasks] of codexBackgroundWork) {
-      if (tasks.size > 0) {
-        entries.push({ sessionId, tasks: Array.from(tasks.values()) });
-      }
-    }
-    return entries;
+    return codexBackgroundWork.list();
   },
 };
 
@@ -1092,7 +1150,7 @@ const completedSessionCleanupTimer = setInterval(() => {
         activeCodexSessions.delete(id);
         // The session's tracked agents went with its connection; entries left
         // here would keep a dead task on the background-work strip forever.
-        codexBackgroundWork.delete(id);
+        codexBackgroundWork.clearSession(id);
       }
     }
   }

@@ -882,50 +882,87 @@ test('subagent notifications with different threadId are ignored and do not sett
 // Background work tracking (collab agents that outlive their turn)
 // ---------------------------------------------------------------------------
 
-test('a collab agent spawned mid-turn is listed as background work once the turn ends', async (t) => {
+// Real engines never announce a spawn as a collab tool-call item: every
+// recorded `CollabAgentToolCall` is a `wait`. The only word of a new agent is
+// its `subAgentActivity` record, whose item id differs between the start and
+// the end of the same agent; the thread id is what pairs them.
+const spawnActivity = { type: 'subAgentActivity', id: 'call_spawn_1', kind: 'started', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
+const doneActivity = { type: 'subAgentActivity', id: 'call_done_1', kind: 'completed', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
+
+test('a spawned agent builds its Task card from its activity record and is tracked as background work', async (t) => {
   installFakeAppServer(t, (server) => {
     const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
     // The agent starts; no terminal event arrives before the turn settles —
     // the agent outlives the turn, which is the whole point.
-    notify('item/started', {
-      threadId: THREAD_ID,
-      turnId: TURN_ID,
-      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', prompt: 'Audit the sidebar', status: 'inProgress' },
-    });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
     notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
   });
 
   assert.deepEqual(codexRuntime.listBackgroundWork(), []);
 
+  const messages: any[] = [];
   await codexRuntime.run('go', {
     sessionId: 'app-session',
     cwd: process.cwd(),
-  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  // The harness passes rows through un-normalized, so the card is the raw
+  // `tool_use` row the renderer would receive.
+  const launch = messages.find((message) => message.type === 'tool_use');
+  assert.equal(launch?.toolName, 'Task', 'the activity record becomes the subagent card');
+  assert.equal(launch?.toolCallId, 'call_spawn_1');
+  assert.match(JSON.stringify(launch?.toolInput), /Standards/);
+  const started = messages.find((message) => message.kind === 'task_status' && message.event === 'started');
+  assert.equal(started?.taskId, 'thread_child_1');
+  assert.equal(started?.toolUseId, 'call_spawn_1');
+  assert.equal(started?.taskType, 'collab_agent');
 
   const listed = codexRuntime.listBackgroundWork();
   assert.equal(listed.length, 1, 'the session appears on the background-work list');
   assert.equal(listed[0].sessionId, 'app-session');
-  assert.equal(listed[0].tasks.length, 1);
-  assert.equal(listed[0].tasks[0].taskId, 'item_agent_1');
-  assert.equal(listed[0].tasks[0].taskType, 'collab_agent');
-  assert.match(listed[0].tasks[0].description, /Audit the sidebar/);
+  assert.deepEqual(listed[0].tasks.map((task) => [task.taskId, task.toolUseId, task.taskType, task.description]), [
+    ['thread_child_1', 'call_spawn_1', 'collab_agent', 'Standards'],
+  ]);
   assert.equal(typeof listed[0].tasks[0].startedAt, 'number');
 
-  // The terminal item event retires the entry.
-  const server = installFakeAppServer(t, (fake) => {
+  // The agent reports back in a later turn under a different item id. That
+  // settles the card it started — it does not open a second one — and
+  // retires the background-work entry.
+  installFakeAppServer(t, (fake) => {
     const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
-    notify('item/completed', {
-      threadId: THREAD_ID,
-      turnId: TURN_ID,
-      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', status: 'completed' },
-    });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: doneActivity });
     notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
   });
+  const later: any[] = [];
   await codexRuntime.run('again', {
     sessionId: 'app-session',
     cwd: process.cwd(),
-  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+  }, { isWebSocketWriter: true, send: (message) => later.push(message) }, runtimeContext(true));
   assert.deepEqual(codexRuntime.listBackgroundWork(), [], 'the completed agent is retired');
+  const settled = later.find((message) => message.kind === 'task_status' && message.status === 'completed');
+  assert.equal(settled?.toolUseId, 'call_spawn_1');
+  assert.equal(later.filter((message) => message.type === 'tool_use').length, 0);
+});
+
+test('an interrupted agent settles its card as stopped', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: { ...doneActivity, id: 'call_int_1', kind: 'interrupted' } });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', {
+    sessionId: 'app-session-interrupted',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  assert.equal(messages.filter((message) => message.type === 'tool_use').length, 1);
+  const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'stopped');
+  assert.equal(stopped?.toolUseId, 'call_spawn_1');
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
 });

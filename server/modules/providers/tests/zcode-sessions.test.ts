@@ -14,24 +14,7 @@ import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/datab
 import { AppError } from '@/shared/utils.js';
 
 import { createWorkspaceFixture } from './workspace-fixture.js';
-
-/** Redirects ZCODE_STORAGE_DIR to a temp dir for fixture isolation. */
-const withZCodeStorage = async (runTest: (storageDir: string) => Promise<void>): Promise<void> => {
-  const previous = process.env.ZCODE_STORAGE_DIR;
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'zcode-sessions-'));
-  process.env.ZCODE_STORAGE_DIR = tempDir;
-
-  try {
-    await runTest(tempDir);
-  } finally {
-    if (previous === undefined) {
-      delete process.env.ZCODE_STORAGE_DIR;
-    } else {
-      process.env.ZCODE_STORAGE_DIR = previous;
-    }
-    await rm(tempDir, { recursive: true, force: true });
-  }
-};
+import { withZCodeStorage } from './zcode-storage-fixture.js';
 
 /**
  * Creates a fixture ZCode database with one user prompt and one assistant

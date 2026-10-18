@@ -30,6 +30,7 @@ import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type { ChatAttachmentDescriptor } from '@/shared/image-attachments.js';
 import type {
   AnyRecord,
+  BackgroundTaskSummary,
   NormalizedMessage,
   ProviderPermissionDecision,
   ProviderRuntimeContext,
@@ -39,9 +40,16 @@ import { createCompleteMessage, createNormalizedMessage, generateMessageId, read
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 
+import { ZCODE_AGENT_TASK_TYPE, zcodeBackgroundWork } from './zcode-background-work.js';
 import { SESSION_LOST_METHOD } from './zcode-codec.js';
 import { protocolClient } from './zcode-protocol.client.js';
-import { ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from './zcode-live-event-normalizer.js';
+import {
+  isZCodeSubagentLifecycleEvent,
+  normalizeZCodeSubagentLifecycleEvent,
+  readZCodeSessionEvent,
+  ZCODE_CANCELLED_NOTICE,
+  ZCODE_CANCELLED_NOTICE_KEY,
+} from './zcode-live-event-normalizer.js';
 import { buildZCodeSendModelParams } from './zcode-models.provider.js';
 import { EngineSilenceTimeoutError, ZCodeRunLifecycle, resolveSilenceTimeoutMs } from './zcode-run-lifecycle.js';
 import type { RunHandle, RunSettle } from './zcode-run-lifecycle.js';
@@ -98,6 +106,19 @@ function rememberAppliedPermissionMode(sessionId: string, zcodeMode: string): vo
  * instance's runs bridged, so both facets must see the same registries.
  */
 const runLifecycle = new ZCodeRunLifecycle();
+
+/**
+ * The subagent lifecycle watcher left on each engine session whose
+ * background agents outlived their turn, keyed by ZCode-native session id.
+ *
+ * A run's own listener leaves with the turn, but a background agent keeps
+ * working after `turn_complete`, and its `subagent_stopped` lands on the
+ * parent session with nobody listening. The watcher stays on the session for
+ * exactly the lifecycle events — nothing else, so it never competes with a
+ * run's listener for the stream — until the last tracked agent reports or
+ * the next run takes the session over.
+ */
+const subagentWatchers = new Map<string, (notification: AnyRecord) => void>();
 
 /**
  * ZCode permissions facet: answers the engine's pending
@@ -256,6 +277,9 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       const modelParams = await this.resolveSendModelParams(options, context);
 
       const eventListener = this.createSessionEventListener(handle, writer, context);
+      // The run's listener owns the whole stream, lifecycle events included;
+      // a watcher a previous turn left behind must not double-handle them.
+      this.standDownSubagentWatcher(zcodeSessionId);
       protocolClient.addSessionListener(zcodeSessionId, eventListener);
 
       let settle: RunSettle | null = null;
@@ -283,7 +307,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
           return { sessionId: zcodeSessionId, success: false };
         }
 
-        protocolClient.removeSessionListener(zcodeSessionId, eventListener);
+        this.releaseSessionListener(handle, eventListener, writer);
 
         if (settle.kind === 'aborted') {
           // A delivered session/stop settles the run here: report it as
@@ -316,7 +340,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
 
         throw new Error('ZCode run was superseded by a newer run for this session');
       } catch (error) {
-        protocolClient.removeSessionListener(zcodeSessionId, eventListener);
+        this.releaseSessionListener(handle, eventListener, writer);
 
         // Surface the failure to the chat stream before propagating.
         this.sendRuntimeError(writer, zcodeSessionId, error);
@@ -450,6 +474,109 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     console.info(`[ZCodeRuntime] Aborted session ${handle.sessionId}`);
     runLifecycle.requestAbort(handle);
     return true;
+  }
+
+  /**
+   * Sessions with spawned agents still running, for the running-sessions
+   * poll. The engine outlives turns, so an agent launched in the background
+   * keeps working after the turn's `complete` — this is how the composer's
+   * background-work strip and the sidebar learn it is still going.
+   */
+  listBackgroundWork(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
+    return zcodeBackgroundWork.list();
+  }
+
+  /**
+   * Keeps the background-work registry in step with the lifecycle events
+   * the stream translated: a spawn registers the agent on the app session,
+   * a settled status retires it. `taskId` and `toolUseId` are guaranteed by
+   * the normalizer (an event naming neither never becomes a message).
+   */
+  private recordSubagentLifecycle(appSessionKey: string, message: NormalizedMessage): void {
+    if (!message.taskId || !message.toolUseId) {
+      return;
+    }
+    if (message.event === 'started') {
+      zcodeBackgroundWork.start(appSessionKey, {
+        taskId: message.taskId,
+        toolUseId: message.toolUseId,
+        taskType: message.taskType ?? ZCODE_AGENT_TASK_TYPE,
+        description: message.description ?? '',
+      });
+      return;
+    }
+    if (message.status === 'completed' || message.status === 'failed' || message.status === 'stopped') {
+      zcodeBackgroundWork.end(appSessionKey, message.taskId);
+    }
+  }
+
+  /**
+   * Detaches a run's listener from the engine session and, when agents it
+   * launched are still running, leaves the lifecycle watcher behind so their
+   * stops still reach the page and retire them from the background list.
+   */
+  private releaseSessionListener(
+    handle: RunHandle,
+    eventListener: (notification: AnyRecord) => void,
+    writer: ProviderRuntimeWriter,
+  ): void {
+    protocolClient.removeSessionListener(handle.sessionId, eventListener);
+    if (zcodeBackgroundWork.hasSession(handle.abortKey)) {
+      this.armSubagentWatcher(handle.sessionId, handle.abortKey, writer);
+    }
+  }
+
+  /**
+   * Installs (or re-installs, on the latest run's writer) the narrow
+   * listener that forwards only subagent lifecycle events while the session
+   * has agents outstanding. It stands itself down once the last one reports,
+   * or when the engine dies and takes the agents with it.
+   */
+  private armSubagentWatcher(zcodeSessionId: string, appSessionKey: string, writer: ProviderRuntimeWriter): void {
+    this.standDownSubagentWatcher(zcodeSessionId);
+
+    const watcher = (notification: AnyRecord): void => {
+      try {
+        const method = readOptionalString(notification.method);
+        if (method === SESSION_LOST_METHOD) {
+          zcodeBackgroundWork.clearSession(appSessionKey);
+          this.standDownSubagentWatcher(zcodeSessionId);
+          return;
+        }
+        if (method && method !== 'session/event') {
+          return;
+        }
+
+        const event = readZCodeSessionEvent(notification.params ?? notification, zcodeSessionId);
+        if (!event || !isZCodeSubagentLifecycleEvent(event.type)) {
+          return;
+        }
+        const status = normalizeZCodeSubagentLifecycleEvent(event);
+        if (!status) {
+          return;
+        }
+
+        this.recordSubagentLifecycle(appSessionKey, status);
+        writer.send(status);
+        if (!zcodeBackgroundWork.hasSession(appSessionKey)) {
+          this.standDownSubagentWatcher(zcodeSessionId);
+        }
+      } catch (error) {
+        console.error('[ZCodeRuntime] Error processing subagent lifecycle event:', error);
+      }
+    };
+
+    subagentWatchers.set(zcodeSessionId, watcher);
+    protocolClient.addSessionListener(zcodeSessionId, watcher);
+  }
+
+  private standDownSubagentWatcher(zcodeSessionId: string): void {
+    const watcher = subagentWatchers.get(zcodeSessionId);
+    if (!watcher) {
+      return;
+    }
+    subagentWatchers.delete(zcodeSessionId);
+    protocolClient.removeSessionListener(zcodeSessionId, watcher);
   }
 
   /**
@@ -826,6 +953,8 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
             (notification.params as Record<string, unknown> | undefined)?.stderrTail,
           );
           runLifecycle.recordSessionLost(handle, stderrTail);
+          // The engine's agents died with it: nothing can still report them.
+          zcodeBackgroundWork.clearSession(handle.abortKey);
           return;
         }
 
@@ -881,6 +1010,10 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
             // the run completed-as-failed so the settle wait and the final
             // complete message reflect it instead of timing out after 10 min.
             runLifecycle.recordEngineError(handle, readOptionalString(message.text) ?? undefined);
+          }
+
+          if (message.kind === 'task_status') {
+            this.recordSubagentLifecycle(handle.abortKey, message);
           }
 
           writer.send(message);
@@ -969,7 +1102,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
             : { failed: false, stopReason: 'completed' },
         });
       } finally {
-        protocolClient.removeSessionListener(handle.sessionId, eventListener);
+        this.releaseSessionListener(handle, eventListener, writer);
         if (runLifecycle.isActiveRun(handle)) {
           context.resetLiveMessageState?.(handle.sessionId);
           runLifecycle.dispose(handle);

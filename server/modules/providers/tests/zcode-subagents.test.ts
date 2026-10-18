@@ -1,0 +1,280 @@
+import assert from 'node:assert/strict';
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import test from 'node:test';
+
+import Database from 'better-sqlite3';
+
+import { ZCodeSessionsProvider } from '@/modules/providers/list/zcode/zcode-sessions.provider.js';
+import { zcodeBackgroundWork } from '@/modules/providers/list/zcode/zcode-background-work.js';
+
+import { withZCodeStorage } from './zcode-storage-fixture.js';
+
+// Payloads as the engine emits them on the PARENT session (`emitSubagentEvent`
+// → `emitParentEvent`): the spawn carries the launch details, the stop the
+// outcome and totals. Both name the launching tool call.
+const spawnedPayload = {
+  agentId: 'agent_a',
+  agentType: 'general-purpose',
+  background: true,
+  childSessionId: 'sess_subagent_agent_a',
+  description: 'Review the fix',
+  prompt: 'Review the diff and report',
+  parentToolCallId: 'call_agent',
+  status: 'running',
+  allowedTools: ['Read'],
+  model: 'bigmodel/GLM-5.3',
+};
+
+const stoppedPayload = {
+  agentId: 'agent_a',
+  agentType: 'general-purpose',
+  background: true,
+  childSessionId: 'sess_subagent_agent_a',
+  parentToolCallId: 'call_agent',
+  status: 'completed',
+  outputFile: '/tmp/agents/sess_1/agent_a/output.txt',
+  totalDurationMs: 854566,
+  totalToolUseCount: 40,
+  totalTokens: 2216983,
+};
+
+const liveEvent = (type: string, payload: Record<string, unknown>) => ({
+  method: 'session/event',
+  params: { id: `evt_${type}`, sessionId: 'sess_1', type, timestamp: '2026-10-18T02:00:27.398Z', payload },
+});
+
+test('subagent_spawned becomes a running task_status on the launching call', () => {
+  const provider = new ZCodeSessionsProvider();
+  const messages = provider.normalizeMessage(liveEvent('subagent_spawned', spawnedPayload), 'sess_1');
+
+  assert.equal(messages.length, 1);
+  const [status] = messages;
+  assert.equal(status.kind, 'task_status');
+  assert.equal(status.event, 'started');
+  assert.equal(status.taskId, 'agent_a');
+  assert.equal(status.toolUseId, 'call_agent');
+  assert.equal(status.taskType, 'local_agent');
+  assert.equal(status.description, 'Review the fix');
+  assert.equal(status.sessionId, 'sess_1');
+});
+
+test('subagent_stopped settles the task with the agent totals', () => {
+  const provider = new ZCodeSessionsProvider();
+  const [completed] = provider.normalizeMessage(liveEvent('subagent_stopped', stoppedPayload), 'sess_1');
+
+  assert.equal(completed.kind, 'task_status');
+  assert.equal(completed.event, 'notification');
+  assert.equal(completed.taskId, 'agent_a');
+  assert.equal(completed.toolUseId, 'call_agent');
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.outputFile, '/tmp/agents/sess_1/agent_a/output.txt');
+  assert.deepEqual(completed.usage, { totalTokens: 2216983, toolUses: 40, durationMs: 854566 });
+
+  const [failed] = provider.normalizeMessage(
+    liveEvent('subagent_stopped', { ...stoppedPayload, status: 'failed', error: 'child runtime failed', totalTokens: undefined, totalToolUseCount: undefined }),
+    'sess_1',
+  );
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.summary, 'child runtime failed');
+  assert.deepEqual(failed.usage, { totalTokens: 0, toolUses: 0, durationMs: 854566 });
+});
+
+test('a subagent event without the launching call is dropped rather than sent unattached', () => {
+  const provider = new ZCodeSessionsProvider();
+  const { parentToolCallId: _omitted, ...orphan } = spawnedPayload;
+  assert.deepEqual(provider.normalizeMessage(liveEvent('subagent_spawned', orphan), 'sess_1'), []);
+});
+
+test("the engine's Agent tool is normalized to Task on every live shape", () => {
+  const provider = new ZCodeSessionsProvider();
+
+  const [snapshot] = provider.normalizeMessage(
+    { type: 'model_streaming', payload: { kind: 'tool_call', toolCallId: 'call_1', toolName: 'Agent', input: { description: 'Review' } } },
+    'sess_1',
+  );
+  assert.equal(snapshot.kind, 'tool_use');
+  assert.equal(snapshot.toolName, 'Task');
+
+  const [announced] = provider.normalizeMessage(
+    { type: 'tool.updated', payload: { kind: 'scheduled', toolCallId: 'call_2', toolName: 'Agent', input: { description: 'Audit' } } },
+    'sess_1',
+  );
+  assert.equal(announced.toolName, 'Task');
+
+  provider.normalizeMessage(
+    { type: 'model_streaming', payload: { kind: 'tool_input_start', toolCallId: 'call_3', toolName: 'Agent' } },
+    'sess_1',
+  );
+  const [streamed] = provider.normalizeMessage(
+    { type: 'model_streaming', payload: { kind: 'tool_input_end', toolCallId: 'call_3', input: { description: 'Scan' } } },
+    'sess_1',
+  );
+  assert.equal(streamed.toolName, 'Task');
+
+  // Every other tool keeps its engine name.
+  const [bash] = provider.normalizeMessage(
+    { type: 'model_streaming', payload: { kind: 'tool_call', toolCallId: 'call_4', toolName: 'Bash', input: { command: 'ls' } } },
+    'sess_1',
+  );
+  assert.equal(bash.toolName, 'Bash');
+});
+
+// ---------------------------------------------------------------------------
+// History: the Task row reads its outcome off the engine's agent sidecar
+// ---------------------------------------------------------------------------
+
+type AgentMetadata = Record<string, unknown>;
+
+/**
+ * A parent session whose assistant turn launched one agent, in the engine's
+ * SQLite shape, plus the child session that agent ran in (its first assistant
+ * row names the model).
+ */
+const createParentWithAgent = async (
+  storageDir: string,
+  parentSessionId: string,
+  options: { output: string; childModelId?: string },
+): Promise<void> => {
+  const dbDir = path.join(storageDir, 'cli', 'db');
+  await mkdir(dbDir, { recursive: true });
+  const db = new Database(path.join(dbDir, 'db.sqlite'));
+  try {
+    db.exec(`
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL, sequence INTEGER);
+      CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL, sequence INTEGER);
+    `);
+    const insertMessage = db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?)');
+    const insertPart = db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?, ?)');
+
+    insertMessage.run('msg_user', parentSessionId, 1000, 1000, JSON.stringify({ role: 'user', text: 'Review this' }), 0);
+    insertMessage.run('msg_asst', parentSessionId, 2000, 2000, JSON.stringify({ role: 'assistant', modelID: 'GLM-5.3' }), 1);
+    insertPart.run('part_agent', 'msg_asst', parentSessionId, 2100, 2100, JSON.stringify({
+      type: 'tool',
+      callID: 'call_agent',
+      tool: 'Agent',
+      state: {
+        status: 'completed',
+        input: { description: 'Review the fix', prompt: 'Review the diff', run_in_background: true, subagent_type: 'general-purpose' },
+        output: options.output,
+      },
+    }), 0);
+
+    if (options.childModelId) {
+      insertMessage.run('msg_child_user', 'sess_subagent_agent_a', 2200, 2200, JSON.stringify({ role: 'user', text: 'Review the diff' }), 0);
+      insertMessage.run('msg_child_asst', 'sess_subagent_agent_a', 2300, 2300, JSON.stringify({ role: 'assistant', modelId: options.childModelId }), 1);
+    }
+  } finally {
+    db.close();
+  }
+};
+
+/** Writes the sidecar the engine keeps at `cli/agents/<parent>/<agent>/metadata.json`. */
+const writeAgentMetadata = async (storageDir: string, parentSessionId: string, agentId: string, metadata: AgentMetadata): Promise<void> => {
+  const dir = path.join(storageDir, 'cli', 'agents', parentSessionId, agentId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, 'metadata.json'), JSON.stringify({
+    agentId,
+    childSessionId: `sess_subagent_${agentId}`,
+    createdAt: '2026-10-18T02:00:27.398Z',
+    description: 'Review the fix',
+    parentSessionId,
+    parentToolUseId: 'call_agent',
+    profileId: 'general-purpose',
+    prompt: 'Review the diff',
+    ...metadata,
+  }));
+};
+
+const backgroundLaunchOutput = 'Async agent launched successfully.\nagentId: agent_a (internal ID - do not mention to user.)';
+
+test('history renames the Agent row to Task and reads the finished agent off its sidecar', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: backgroundLaunchOutput, childModelId: 'GLM-5.3-Flash' });
+    await writeAgentMetadata(storageDir, 'sess_parent', 'agent_a', {
+      status: 'completed',
+      completedAt: '2026-10-18T02:14:42.142Z',
+      totalDurationMs: 854566,
+      totalTokens: 2216983,
+      totalToolUseCount: 40,
+    });
+
+    const provider = new ZCodeSessionsProvider();
+    const { messages } = await provider.fetchHistory('sess_parent');
+    const task = messages.find((message) => message.kind === 'tool_use');
+
+    assert.ok(task, 'the launch row is kept');
+    assert.equal(task.toolName, 'Task');
+    assert.equal(task.toolId, 'call_agent');
+    assert.deepEqual(task.subagent, {
+      id: 'agent_a',
+      name: 'general-purpose',
+      type: 'general-purpose',
+      description: 'Review the fix',
+      status: 'completed',
+      model: 'GLM-5.3-Flash',
+    });
+  });
+});
+
+test('history reports a failed agent as failed', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: backgroundLaunchOutput });
+    await writeAgentMetadata(storageDir, 'sess_parent', 'agent_a', { status: 'failed', error: 'child runtime failed' });
+
+    const provider = new ZCodeSessionsProvider();
+    const { messages } = await provider.fetchHistory('sess_parent');
+    const task = messages.find((message) => message.kind === 'tool_use');
+    assert.equal(task?.subagent?.status, 'failed');
+  });
+});
+
+test('an agent the sidecar still calls running is running only while the runtime tracks it', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: backgroundLaunchOutput });
+    await writeAgentMetadata(storageDir, 'sess_parent', 'agent_a', { status: 'running' });
+
+    const tracked = new ZCodeSessionsProvider({ isSubagentRunning: (agentId) => agentId === 'agent_a' });
+    const live = await tracked.fetchHistory('sess_parent');
+    assert.equal(live.messages.find((message) => message.kind === 'tool_use')?.subagent?.status, 'running');
+
+    // The process that ran it is gone (server restart, engine crash): nothing
+    // can still report, so the card must not spin forever.
+    const untracked = new ZCodeSessionsProvider({ isSubagentRunning: () => false });
+    const stale = await untracked.fetchHistory('sess_parent');
+    assert.equal(stale.messages.find((message) => message.kind === 'tool_use')?.subagent?.status, 'stopped');
+  });
+});
+
+test('the default liveness check consults the runtime background-work registry', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: backgroundLaunchOutput });
+    await writeAgentMetadata(storageDir, 'sess_parent', 'agent_a', { status: 'running' });
+
+    zcodeBackgroundWork.start('app_parent', { taskId: 'agent_a', toolUseId: 'call_agent', taskType: 'local_agent', description: 'Review the fix' });
+    try {
+      const provider = new ZCodeSessionsProvider();
+      const { messages } = await provider.fetchHistory('sess_parent');
+      assert.equal(messages.find((message) => message.kind === 'tool_use')?.subagent?.status, 'running');
+    } finally {
+      zcodeBackgroundWork.end('app_parent', 'agent_a');
+    }
+
+    const provider = new ZCodeSessionsProvider();
+    const { messages } = await provider.fetchHistory('sess_parent');
+    assert.equal(messages.find((message) => message.kind === 'tool_use')?.subagent?.status, 'stopped');
+  });
+});
+
+test('a Task row without a sidecar keeps rendering from its own input and result', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    await createParentWithAgent(storageDir, 'sess_parent', { output: 'The review found no blockers.' });
+
+    const provider = new ZCodeSessionsProvider();
+    const { messages } = await provider.fetchHistory('sess_parent');
+    const task = messages.find((message) => message.kind === 'tool_use');
+    assert.equal(task?.toolName, 'Task');
+    assert.equal(task?.subagent, undefined);
+    assert.equal(task?.toolResult?.content, 'The review found no blockers.');
+  });
+});

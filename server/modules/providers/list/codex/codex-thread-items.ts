@@ -598,14 +598,46 @@ export function readCodexProposedPlan(text: string): string | null {
 /**
  * Turns a tool name into the label the transcript shows.
  *
- * Consumer: this module's renderer, and the subagent panel in
- * `codex-sessions.provider.ts`.
+ * Consumer: this module's renderer and `readCodexSubagentLabel`.
  */
 export function humanizeCodexToolName(toolName: string): string {
   return toolName
     .replace(/__/g, ' ')
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+/**
+ * The name a spawned agent shows under, from the last segment of its agent
+ * path (`/root/standards` → "Standards"). The engine assigns no other label
+ * to an agent announced only through its activity record.
+ *
+ * Consumers: `buildCodexSubagentTaskRow` and the codex runtime's
+ * background-work entries.
+ */
+export function readCodexSubagentLabel(item: { agentPath?: string }): string {
+  return humanizeCodexToolName(item.agentPath?.split('/').filter(Boolean).pop() ?? 'agent');
+}
+
+/**
+ * The `Task` row for an agent whose only announcement is its activity
+ * record. Real engines never send a spawn tool-call item — every recorded
+ * collab tool call is a `wait` — so the row is built from the `started`
+ * activity and keeps that item's id as its call id; the agent's later
+ * activity pairs with it through the thread id, not the item id.
+ *
+ * Consumers: codex history (rollout replay) and the codex runtime (live
+ * stream), so a reload rebuilds exactly the card the stream drew.
+ */
+export function buildCodexSubagentTaskRow(item: { id: string; agentPath?: string }, timestamp: string): AnyRecord {
+  return {
+    uuid: item.id,
+    type: 'tool_use',
+    timestamp,
+    toolName: 'Task',
+    toolInput: JSON.stringify({ description: readCodexSubagentLabel(item) }),
+    toolCallId: item.id,
+  };
 }
 
 /**

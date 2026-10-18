@@ -50,6 +50,18 @@ flowchart LR
   G -->|没有| I[释放输入流]
 ```
 
+## 子 agent 卡片：Codex 与 ZCode 的共用机制
+
+前端只为工具名为 `Task` 的调用渲染子 agent 面板（运行中/完成/失败状态、用量、agent 自己的时间线），卡片上的实时状态只认 `task_status` 事件，并按 `toolUseId` 折回派出 agent 的那次调用。Codex 和 ZCode 的引擎各有自己的派 agent 形态，适配器在边界把它们翻成这两样东西，前端零引擎分支。
+
+两家共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent，运行时切面的 `listBackgroundWork()` 直接返回它，供运行中会话轮询给输入框的后台工作条和侧栏使用。引擎进程活得比一轮对话久，agent 在 `complete` 之后还在跑，这张表就是页面知道"还没完"的唯一来源。
+
+**ZCode**：引擎的派 agent 工具叫 `Agent`，`normalizeZCodeToolName` 在实时流和历史读取两处统一改名为 `Task`。引擎把 `subagent_spawned` / `subagent_stopped` 发在**父会话**上（载荷带 `agentId`、`parentToolCallId`、描述、是否后台、结束状态和 `totalTokens` / `totalToolUseCount` / `totalDurationMs`），`normalizeZCodeSubagentLifecycleEvent` 翻成 `task_status`：spawned → `started`，stopped → `notification` 并带状态与用量；不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认这两种事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记；下一轮开始先撤掉它，由新一轮的监听器接管。历史重载读引擎的 agent 旁车 `cli/agents/<父会话>/<agentId>/metadata.json`（`getZCodeAgentSidecarDir`）：按 `parentToolUseId` 对上 Task 行，写入 `subagent`（类型、描述、状态、从子会话首条助手行取的模型）。旁车的 `completed` / `failed` 是定论；`running` 只在登记簿里仍有该 agent 时才算运行中，否则读作 `stopped`（进程没了，没人能再汇报）。
+
+**Codex**：真实引擎从不把派 agent 发成协作工具调用条目（所有记录在案的 `CollabAgentToolCall` 都是 `wait`），唯一的宣告是 `SubAgentActivity` 记录，而且同一个 agent 开始与结束的条目 id 不同、靠 `agent_thread_id` 配对。`buildCodexSubagentTaskRow` 从 `started` 记录合成 `Task` 行，历史读取与实时流共用，刷新后重建的就是直播画过的那张卡。实时流在 `started` 时发卡、发 `task_status started`、按线程 id 登记；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。`interacted` 是 agent 之间的往来，不画。
+
+Claude 的派 agent 工具在上游已从 `Task` 改名为 `Agent`，当前仍走普通工具卡加 `parentToolUseId` 嵌套，不经过这块面板；OpenCode 的 `agent` part 同样以 `Agent` 名上报。两者都不能靠放宽前端的 `Task` 判定接入——OpenCode 的 agent 行没有结束信号，会在面板里永远转圈。
+
 ## IProvider 七切面
 
 契约在 `server/shared/interfaces.ts`，基类在 `server/modules/providers/shared/base/abstract.provider.ts`：
@@ -85,6 +97,7 @@ flowchart LR
 - `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
 - `sessions/session-worktree-placement.ts`：会话目录的工作树认亲改判，见下节。
 - `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类。
+- `background-work/background-work-registry.ts`：`BackgroundWorkRegistry`——按应用会话登记引擎里仍在跑的后台工作（当前是 codex / zcode 的子 agent），运行时切面的 `listBackgroundWork()` 从它作答，见上文「子 agent 卡片」。
 Codex 的模型目录由 `codex-models.provider.ts` 通过 `codex-app-server.client.ts` 的连接读取。例如 CLI 的 `model/list` 只返回当前可见模型时，选择器只显示这些模型，不会补回写死的旧型号。查询使用对话运行时同一份内置 `@openai/codex`，不使用终端 PATH 上的另一份 CLI。适配器读取所有分页，过滤隐藏模型，按模型 ID 去重，并使用引擎返回的名称、说明、推理强度和默认模型；没有默认标记时使用首个可见模型。自定义模型由 `provider-models.service.ts` 合并。同 ID 的自定义记录与引擎目录只显示一项，保留用户名称和可编辑记录，并继承引擎的推理强度。引擎收录已有自定义 ID 后，用户仍可修改名称；创建或修改为其他已存在 ID 仍会被拒绝。删除已被引擎收录的自定义记录只移除用户名称，型号继续显示，已有会话的型号与强度保持不变；删除仅存在于自定义记录中的型号才切换到默认型号并清空强度。
 
 成功目录缓存五分钟，并发查询共用一次加载。缓存过期后，下次查询触发刷新；失败会记录错误，保留最近成功目录，十秒后允许重试。首次加载失败、空目录、格式异常或分页游标循环会报错，前端沿用模型加载失败的重试入口，不补入静态模型列表。每次查询结束都关闭 app-server 子进程。缓存只在当前服务进程内保存；页面已经加载的目录不会由服务端主动推送更新。能力表里的默认型号只供目录加载前显示，没有用户选择记录时采用动态默认；已保存且仍在目录里的选择继续保留。前端按引擎分别重试目录加载失败，其他引擎成功不会掩盖 Codex 的错误。已有会话保存的型号独立于可见目录，不因目录隐藏而自动替换。

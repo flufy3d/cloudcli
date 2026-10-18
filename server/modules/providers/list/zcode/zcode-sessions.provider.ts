@@ -1,4 +1,5 @@
 import fsSync from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -11,6 +12,7 @@ import type {
   NormalizedMessage,
   ProviderSessionUsageInput,
   ProviderTokenUsageResult,
+  SubagentInfo,
 } from '@/shared/types.js';
 import {
   ProviderDisplayAssetError,
@@ -29,8 +31,17 @@ import {
 import { getGlobalImageAssetsDir } from '@/shared/image-attachments.js';
 import { resolveAttachmentAssetFile } from '@/modules/assets/index.js';
 
-import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
-import { buildZCodeTextRowKey, isZCodeCancelledEngineError, readZCodeTokenUsedCount, ZCodeLiveEventNormalizer, ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from './zcode-live-event-normalizer.js';
+import { zcodeBackgroundWork } from './zcode-background-work.js';
+import { getZCodeAgentSidecarDir, getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
+import {
+  buildZCodeTextRowKey,
+  isZCodeCancelledEngineError,
+  normalizeZCodeToolName,
+  readZCodeTokenUsedCount,
+  ZCodeLiveEventNormalizer,
+  ZCODE_CANCELLED_NOTICE,
+  ZCODE_CANCELLED_NOTICE_KEY,
+} from './zcode-live-event-normalizer.js';
 
 const PROVIDER = 'zcode';
 
@@ -341,6 +352,92 @@ function aggregateZCodeSessionTokenUsage(
 }
 
 /**
+ * What the engine's per-agent sidecar (`metadata.json`) says about one
+ * spawned agent, reduced to the fields a Task card reads.
+ */
+type ZCodeAgentSidecar = {
+  agentId: string;
+  childSessionId?: string;
+  /** The `Agent` call that spawned it: how the sidecar pairs with its card. */
+  parentToolUseId: string;
+  profileId?: string;
+  description?: string;
+  /** `running` at spawn, rewritten to `completed`/`failed` when the agent stops. */
+  status?: string;
+};
+
+/**
+ * Reads every agent sidecar one session wrote, keyed by the launching call.
+ * A session that spawned nothing has no directory; an unreadable or
+ * malformed sidecar is skipped rather than failing the whole history, since
+ * the card still renders from its own input and result.
+ */
+async function readZCodeAgentSidecars(parentSessionId: string): Promise<Map<string, ZCodeAgentSidecar>> {
+  const byToolUseId = new Map<string, ZCodeAgentSidecar>();
+  const dir = getZCodeAgentSidecarDir(parentSessionId);
+
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(dir);
+  } catch {
+    return byToolUseId;
+  }
+
+  for (const entry of entries) {
+    try {
+      const parsed = readJsonRecord(await fsp.readFile(path.join(dir, entry, 'metadata.json'), 'utf8'));
+      const agentId = readOptionalString(parsed?.agentId);
+      const parentToolUseId = readOptionalString(parsed?.parentToolUseId);
+      if (!parsed || !agentId || !parentToolUseId) {
+        continue;
+      }
+      byToolUseId.set(parentToolUseId, {
+        agentId,
+        parentToolUseId,
+        childSessionId: readOptionalString(parsed.childSessionId),
+        profileId: readOptionalString(parsed.profileId),
+        description: readOptionalString(parsed.description),
+        status: readOptionalString(parsed.status),
+      });
+    } catch {
+      // Not every entry is an agent directory with a finished sidecar.
+    }
+  }
+
+  return byToolUseId;
+}
+
+/**
+ * The model the agent's own session ran on, read off its first assistant
+ * row. The sidecar does not record it, and the spawn event's `model` is not
+ * persisted anywhere.
+ */
+function readZCodeChildSessionModel(db: Database.Database, childSessionId: string): string | undefined {
+  const rows = db.prepare(
+    'SELECT data FROM message WHERE session_id = ? ORDER BY COALESCE(time_created, 0), sequence, id',
+  ).iterate(childSessionId) as Iterable<{ data: string }>;
+  for (const row of rows) {
+    const info = readJsonRecord(row.data);
+    if (readOptionalString(info?.role) !== 'assistant') {
+      continue;
+    }
+    return readOptionalString(info?.modelId) ?? readOptionalString(info?.modelID);
+  }
+  return undefined;
+}
+
+type ZCodeSessionsProviderOptions = {
+  /**
+   * Whether the runtime still tracks this agent as running. Only consulted
+   * for an agent whose sidecar still says `running`: the sidecar is rewritten
+   * when the agent stops, so `running` with no tracker means the process
+   * that ran it is gone and nothing can still report. Injected so history
+   * tests can pin both readings without driving a real engine.
+   */
+  isSubagentRunning?: (agentId: string) => boolean;
+};
+
+/**
  * Session history provider for ZCode's SQLite-backed session store.
  *
  * Implements the IProviderSessions interface to normalize ZCode-specific
@@ -349,6 +446,11 @@ function aggregateZCodeSessionTokenUsage(
  */
 export class ZCodeSessionsProvider implements IProviderSessions {
   private readonly liveEventNormalizer = new ZCodeLiveEventNormalizer();
+  private readonly isSubagentRunning: (agentId: string) => boolean;
+
+  constructor({ isSubagentRunning = (agentId) => zcodeBackgroundWork.has(agentId) }: ZCodeSessionsProviderOptions = {}) {
+    this.isSubagentRunning = isSubagentRunning;
+  }
 
   /**
    * Normalizes live protocol events into frontend messages.
@@ -421,6 +523,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
       `).iterate(providerSessionId) as Iterable<ZCodeHistoryRow>;
 
       const normalized = this.normalizeHistoryRows(rows, sessionId);
+      await this.attachSubagents(db, normalized, providerSessionId);
       const tokenUsage = aggregateZCodeSessionTokenUsage(db, providerSessionId);
 
       const normalizedOffset = Math.max(0, offset);
@@ -635,7 +738,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
 
       // Handle tool parts (callID/tool/state per Phase 0.3 part schema)
       if (partType === 'tool' || partType === 'function_call') {
-        const toolName = readOptionalString(partData.tool) ?? readOptionalString(partData.name) ?? 'Tool';
+        const toolName = normalizeZCodeToolName(readOptionalString(partData.tool) ?? readOptionalString(partData.name) ?? 'Tool');
         const state = readObjectRecord(partData.state);
 
         const toolMessage = createNormalizedMessage({
@@ -676,6 +779,64 @@ export class ZCodeSessionsProvider implements IProviderSessions {
     }
 
     return normalized;
+  }
+
+  /**
+   * Publishes each spawned agent's outcome on the Task row that launched it.
+   *
+   * The launch row alone cannot say how the agent ended: a background
+   * launch's result is only the acknowledgement ("Async agent launched
+   * successfully…"), and the lifecycle events that reported the stop live
+   * were never persisted. The engine's sidecar is the durable record, and
+   * the card reads its status off `subagent`, so the row gets one whenever
+   * a sidecar names its call.
+   */
+  private async attachSubagents(
+    db: Database.Database,
+    messages: NormalizedMessage[],
+    providerSessionId: string,
+  ): Promise<void> {
+    const launches = messages.filter((message) => message.kind === 'tool_use' && message.toolName === 'Task' && message.toolId);
+    if (launches.length === 0) {
+      return;
+    }
+
+    const sidecars = await readZCodeAgentSidecars(providerSessionId);
+    for (const launch of launches) {
+      const sidecar = sidecars.get(launch.toolId as string);
+      if (!sidecar) {
+        continue;
+      }
+
+      const input = readObjectRecord(launch.toolInput);
+      const subagent: SubagentInfo = {
+        id: sidecar.agentId,
+        name: sidecar.profileId,
+        type: sidecar.profileId,
+        description: sidecar.description ?? readOptionalString(input?.description),
+        status: this.resolveSidecarStatus(sidecar),
+        model: sidecar.childSessionId ? readZCodeChildSessionModel(db, sidecar.childSessionId) : undefined,
+      };
+      launch.subagent = subagent;
+    }
+  }
+
+  /**
+   * `completed` and `failed` are the engine's final word. `running` is only
+   * final while the runtime still tracks the agent; otherwise the process
+   * that ran it is gone and the card must not spin forever. Anything else
+   * the engine may write (a stop, a cancellation) reads as stopped.
+   */
+  private resolveSidecarStatus(sidecar: ZCodeAgentSidecar): SubagentInfo['status'] {
+    switch (sidecar.status) {
+      case 'completed':
+      case 'failed':
+        return sidecar.status;
+      case 'running':
+        return this.isSubagentRunning(sidecar.agentId) ? 'running' : 'stopped';
+      default:
+        return 'stopped';
+    }
   }
 
   /**

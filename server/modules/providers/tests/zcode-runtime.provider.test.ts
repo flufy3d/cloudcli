@@ -235,6 +235,22 @@ rl.on('line', (line) => {
       send({ method: 'session/event', params: { sessionId, type: 'turn.failed', payload: { error: { message: 'provider auth failed', attribution: { statusCode: 401, reason: 'auth_failed' } } } } });
       return;
     }
+    if (readMode() === 'subagent-bg') {
+      // A background agent: the engine announces the Agent call, reports the
+      // spawn on the parent session once the child is ready, returns the
+      // launch acknowledgement as the tool result and ends the turn. The
+      // agent keeps working and reports its stop well after the turn settled.
+      const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
+      const agent = { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg' };
+      ev('model_streaming', { kind: 'tool_call', toolCallId: 'call_agent_bg', toolName: 'Agent', input: { description: 'Review the fix', prompt: 'look', run_in_background: true, subagent_type: 'general-purpose' } });
+      ev('subagent_spawned', { ...agent, description: 'Review the fix', prompt: 'look', status: 'running' });
+      ev('model_streaming', { kind: 'tool_result', toolCallId: 'call_agent_bg', result: { success: true, content: 'Async agent launched successfully.\\nagentId: agent_bg_1' } });
+      ev('turn_complete', { usage: { inputTokens: 3, outputTokens: 4 } });
+      setTimeout(() => {
+        ev('subagent_stopped', { ...agent, status: 'completed', totalDurationMs: 1500, totalToolUseCount: 2, totalTokens: 300 });
+      }, 400);
+      return;
+    }
     if (readMode() === 'perm-bridge') {
       // The turn blocks on a permission server request until answered.
       permPending = 2;
@@ -1061,4 +1077,47 @@ test('runtime delivers native tool outputs before turn completion without fetchi
   const nextTextIndex = messages.findIndex((message) => message.kind === 'stream_delta');
   for (const message of results) assert.ok(messages.indexOf(message) < nextTextIndex);
   assert.equal(messages.at(-1)?.kind, 'complete');
+});
+
+test('a background agent shows as a running Task card, is listed as background work, and settles after the turn', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+
+  assert.deepEqual(runtime.listBackgroundWork(), []);
+
+  const result = await runtime.run('review it', { sessionId: 'app-sess-subagent', cwd: stubDir }, writer, context);
+  assert.deepEqual(result, { sessionId: 'sess_stub_1', success: true });
+
+  // The launch renders through the shared subagent card: the engine's
+  // `Agent` call reaches the client as `Task`, and the spawn event marks it
+  // running on that very call.
+  const launch = messages.find((message) => message.kind === 'tool_use');
+  assert.equal(launch?.toolName, 'Task');
+  assert.equal(launch?.toolId, 'call_agent_bg');
+  const started = messages.find((message) => message.kind === 'task_status' && message.event === 'started');
+  assert.equal(started?.taskId, 'agent_bg_1');
+  assert.equal(started?.toolUseId, 'call_agent_bg');
+  assert.ok(messages.indexOf(started!) < messages.findIndex((message) => message.kind === 'complete'));
+
+  // The turn is over but the agent is not: the running-sessions poll must
+  // still see it.
+  const listed = runtime.listBackgroundWork();
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].sessionId, 'app-sess-subagent');
+  assert.deepEqual(listed[0].tasks.map((task) => [task.taskId, task.toolUseId, task.taskType, task.description]), [
+    ['agent_bg_1', 'call_agent_bg', 'local_agent', 'Review the fix'],
+  ]);
+
+  // The stop lands after the run settled. The lifecycle watcher the run left
+  // behind still forwards it, so the open page settles the card without a
+  // reload, and the agent leaves the background-work list.
+  const deadline = Date.now() + 3000;
+  while (runtime.listBackgroundWork().length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(runtime.listBackgroundWork(), [], 'the stopped agent is retired');
+  const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'completed');
+  assert.equal(stopped?.toolUseId, 'call_agent_bg');
+  assert.deepEqual(stopped?.usage, { totalTokens: 300, toolUses: 2, durationMs: 1500 });
 });
