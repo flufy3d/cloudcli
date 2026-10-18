@@ -177,7 +177,12 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   let client: OpenCodeApiClient | null = null;
 
   const bridge = new OpenCodeInteractionBridge({ getClient: () => client });
-  const runs = new OpenCodeRunRegistry();
+  const runs = new OpenCodeRunRegistry({
+    // The deadline re-check judges a tracked child by the same session row the
+    // reconnect reconciliation reads for a run whose terminal was lost.
+    readChildSnapshot: (childSessionId) => client?.getSession(childSessionId)
+      ?? Promise.reject(new OpenCodeApiError('GET', '/api/session', 503, 'OpenCode service is not running')),
+  });
   const settings = new OpenCodeSessionSettingsApplier();
   /** Live occupancy publisher for the run in flight; recreated per run. */
   let budgetTracker: OpenCodeTokenBudgetTracker | null = null;

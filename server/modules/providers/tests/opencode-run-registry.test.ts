@@ -10,6 +10,29 @@ const writerOf = () => {
   return { frames, writer: { send: (data: unknown) => { frames.push(data as NormalizedMessage); } } };
 };
 
+/**
+ * Registers one background child the way the service announces it: the child's
+ * own creation, the parent's launch acknowledgement, and a first child frame
+ * (which is what flushes the queued link and records the background task).
+ */
+const startBackgroundChild = (
+  registry: OpenCodeRunRegistry,
+  { childId = 'ses_child', callId = 'call_subagent', title = 'Audit the repo' } = {},
+) => {
+  registry.dispatch({
+    type: 'session.created',
+    data: { sessionID: childId, parentID: 'ses_parent', agent: 'general', title },
+  });
+  registry.dispatch({
+    type: 'session.tool.progress',
+    data: { sessionID: 'ses_parent', id: callId, metadata: { sessionID: childId, status: 'running' } },
+  });
+  registry.dispatch({
+    type: 'session.text.delta',
+    data: { sessionID: childId, assistantMessageID: 'm_child', ordinal: 0, delta: 'working' },
+  });
+};
+
 test('dispatch routes events by provider session and settles on the first terminal only', async () => {
   const registry = new OpenCodeRunRegistry();
   const first = writerOf();
@@ -129,6 +152,10 @@ test('a running child session is background work for the composer until it settl
   assert.equal(settled.length, 1, 'the pill clears as soon as the child settles');
   assert.deepEqual(settled[0]?.backgroundTasks, []);
   assert.equal(settled[0]?.backgroundWorkPending, false);
+  const cardSettle = frames.filter((frame) => frame.kind === 'task_status');
+  assert.equal(cardSettle.length, 1, 'the card is settled by the terminal, not by the next reload');
+  assert.equal(cardSettle[0]?.status, 'completed');
+  assert.equal(cardSettle[0]?.toolUseId, 'call_subagent');
 
   // The child's own terminal must not settle the parent turn.
   const parent = registry.get('app-parent');
@@ -138,31 +165,86 @@ test('a running child session is background work for the composer until it settl
 
 test('the background hold times out so a lost child terminal cannot pin the run', async () => {
   const registry = new OpenCodeRunRegistry();
-  const { writer } = writerOf();
+  const { frames, writer } = writerOf();
   registry.create('app-parent', 'ses_parent', writer);
-  registry.dispatch({
-    type: 'session.created',
-    data: { sessionID: 'ses_child', parentID: 'ses_parent', agent: 'general', title: 'Lost child' },
-  });
   // The launch call is identified by the parent's progress event, which also
   // flushes the queued `session.created` and records the background task.
-  registry.dispatch({
-    type: 'session.tool.progress',
-    data: {
-      sessionID: 'ses_parent',
-      id: 'call_subagent',
-      metadata: { sessionID: 'ses_child', status: 'running' },
-    },
-  });
-  // The queued child events flush on the next event that carries the child id.
-  registry.dispatch({
-    type: 'session.text.delta',
-    data: { sessionID: 'ses_child', assistantMessageID: 'm_child', ordinal: 0, delta: 'working' },
-  });
+  startBackgroundChild(registry, { title: 'Lost child' });
   assert.equal(registry.isBackgroundWorkPending('app-parent'), true);
 
+  // No reader is wired here, so the deadline cannot judge the child and drops
+  // it — the backstop for a terminal (and a service) that is simply gone.
   await registry.whenBackgroundWorkClears('app-parent', 10);
   assert.equal(registry.isBackgroundWorkPending('app-parent'), false);
+
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(announced.at(-1)?.backgroundWorkPending, false, 'the composer is told the work is gone');
+  assert.deepEqual(announced.at(-1)?.backgroundTasks, []);
+});
+
+test('a deadline verdict from the child\'s own row settles it with the engine outcome', async () => {
+  const registry = new OpenCodeRunRegistry({
+    readChildSnapshot: async () => ({ outcome: 'succeeded', idleAt: Date.now() + 1_000, tokens: null }),
+  });
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+  startBackgroundChild(registry);
+  frames.length = 0;
+
+  await registry.whenBackgroundWorkClears('app-parent', 10);
+
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), false);
+  const settled = frames.filter((frame) => frame.kind === 'task_status');
+  assert.equal(settled.length, 1, 'the card is settled without waiting for a history refresh');
+  assert.equal(settled[0]?.status, 'completed');
+  assert.equal(settled[0]?.toolUseId, 'call_subagent');
+  assert.equal(settled[0]?.taskId, 'ses_child');
+});
+
+test('a child the engine still reports mid-turn survives its deadline and settles on a later verdict', async () => {
+  // The session row keeps its previous idle stamp while the child is woken
+  // again and works, so a verdict older than the launch means "still running".
+  let idleAt: number | null = Date.now() - 60_000;
+  const registry = new OpenCodeRunRegistry({
+    readChildSnapshot: async () => ({ outcome: 'succeeded', idleAt, tokens: null }),
+  });
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+  startBackgroundChild(registry);
+
+  const cleared = registry.whenBackgroundWorkClears('app-parent', 10);
+  let resolved = false;
+  void cleared.then(() => { resolved = true; });
+  await new Promise((resolve) => { setTimeout(resolve, 40); });
+
+  assert.equal(resolved, false, 'a mid-turn child is not dropped at the deadline');
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), true);
+
+  frames.length = 0;
+  idleAt = Date.now();
+  await Promise.race([cleared, new Promise((resolve) => { setTimeout(resolve, 1_000); })]);
+
+  assert.equal(resolved, true);
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), false);
+  assert.equal(frames.filter((frame) => frame.kind === 'task_status').length, 1);
+});
+
+test('the hold cap drops a child the engine keeps reporting mid-turn', async () => {
+  const registry = new OpenCodeRunRegistry({
+    readChildSnapshot: async () => ({ outcome: 'succeeded', idleAt: Date.now() - 60_000, tokens: null }),
+    maxBackgroundHoldMs: 1,
+  });
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+  startBackgroundChild(registry);
+  frames.length = 0;
+
+  await registry.whenBackgroundWorkClears('app-parent', 10);
+
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), false, 'the cap is the last backstop');
+  assert.equal(frames.filter((frame) => frame.kind === 'task_status').length, 0, 'nothing knew how it ended');
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.deepEqual(announced.at(-1)?.backgroundTasks, []);
 });
 
 test('a child event that arrives before its launch call is held, then delivered in order', async () => {

@@ -73,6 +73,7 @@ import type {
 } from '../../shared/protocol/quota.js';
 import type {
   ActiveBackgroundTask,
+  BackgroundTaskStatus,
   BackgroundTaskSummary,
   CompactionInfo,
   GatewayEventKind,
@@ -96,6 +97,7 @@ import type {
 
 export type {
   ActiveBackgroundTask,
+  BackgroundTaskStatus,
   BackgroundTaskSummary,
   CompactionInfo,
   GatewayEventKind,

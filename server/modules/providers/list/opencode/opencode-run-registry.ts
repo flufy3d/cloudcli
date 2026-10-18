@@ -13,6 +13,7 @@
 
 import type {
   ActiveBackgroundTask,
+  BackgroundTaskStatus,
   BackgroundTaskSummary,
   ProviderRuntimeWriter,
   ProviderTokenUsageResult,
@@ -34,10 +35,24 @@ const PROVIDER = 'opencode' as const;
 const MIN_BUDGET_FRAME_INTERVAL_MS = 1500;
 /**
  * How long a completed run's bookkeeping is kept alive for a child session
- * that never reported a terminal. The engine reports one on its own, so this
- * only backstops a lost stream — without it the runtime would wait forever.
+ * that never reported a terminal, and the interval its tracking is re-judged
+ * at. The engine reports a terminal on its own, so a deadline only backstops a
+ * lost stream — or a child that legitimately runs longer than the window, in
+ * which case the re-check below keeps it tracked instead of dropping it.
  */
 const BACKGROUND_WORK_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Total wall-clock one background child may stay tracked before its deadline
+ * drops it regardless of what the engine says.
+ *
+ * The re-check settles a child the engine reports idle and leaves one that is
+ * mid-turn alone, which bounds tracking to a live run — except when the engine
+ * is gone but its session row still reads mid-turn. Nothing else would stop
+ * the runtime from holding the run's writer for that child, so this cap is the
+ * last backstop.
+ */
+const BACKGROUND_WORK_MAX_HOLD_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Live context-occupancy publisher for one opencode run.
@@ -122,6 +137,17 @@ export type OpenCodeActiveRun = {
 };
 
 /**
+ * How the registry judges one child at its deadline: the runtime wires the
+ * service's `GET /api/session/:id` reader here, the same row the run
+ * reconciliation reads for a lost parent terminal. Tests pass their own.
+ */
+export type OpenCodeRunRegistryOptions = {
+  readChildSnapshot?: (childSessionId: string) => Promise<OpenCodeSessionSnapshot>;
+  /** Total wall-clock a child may stay tracked before its deadline drops it. */
+  maxBackgroundHoldMs?: number;
+};
+
+/**
  * Tracks the runs of one runtime instance.
  *
  * Consumer: opencode runtime.
@@ -144,6 +170,19 @@ export class OpenCodeRunRegistry {
   private readonly backgroundAppByChild = new Map<string, string>();
   /** Resolvers waiting for one app session's background work to clear. */
   private readonly backgroundClearWaiters = new Map<string, Set<() => void>>();
+  /** The one pending deadline per app session whose background work is tracked. */
+  private readonly backgroundDeadlineTimers = new Map<string, NodeJS.Timeout>();
+  private readonly readChildSnapshot: (childSessionId: string) => Promise<OpenCodeSessionSnapshot>;
+  private readonly maxBackgroundHoldMs: number;
+
+  constructor(options: OpenCodeRunRegistryOptions = {}) {
+    this.readChildSnapshot = options.readChildSnapshot ?? (async () => {
+      // No reader wired: nothing can judge a child, so its deadline drops it —
+      // the backstop's original behavior, kept for tests and host-less use.
+      throw new Error('No child session reader is configured.');
+    });
+    this.maxBackgroundHoldMs = options.maxBackgroundHoldMs ?? BACKGROUND_WORK_MAX_HOLD_MS;
+  }
 
   create(
     appSessionId: string,
@@ -233,9 +272,10 @@ export class OpenCodeRunRegistry {
   }
 
   /**
-   * Resolves once every child of this app session has settled, or after the
-   * timeout that backstops a lost terminal. Consumer: the runtime, which keeps
-   * the run's writer/bridge alive for that long after the parent turn ends.
+   * Resolves once every child of this app session has settled, or once a
+   * deadline gives up on one that cannot be judged (see `recheckBackgroundWork`).
+   * Consumer: the runtime, which keeps the run's writer/bridge alive for that
+   * long after the parent turn ends.
    */
   whenBackgroundWorkClears(
     appSessionId: string,
@@ -244,28 +284,100 @@ export class OpenCodeRunRegistry {
     if (!this.backgroundByApp.has(appSessionId)) {
       return Promise.resolve();
     }
+    this.armBackgroundDeadline(appSessionId, timeoutMs);
     return new Promise<void>((resolve) => {
-      let settled = false;
-      const done = () => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        resolve();
-      };
-      const timer = setTimeout(() => {
-        this.clearBackgroundWorkForSession(appSessionId);
-        done();
-      }, timeoutMs);
-      timer.unref?.();
       let waiters = this.backgroundClearWaiters.get(appSessionId);
       if (!waiters) {
         waiters = new Set();
         this.backgroundClearWaiters.set(appSessionId, waiters);
       }
-      waiters.add(done);
+      waiters.add(resolve);
     });
+  }
+
+  /**
+   * Arms an app session's deadline timer, if none is pending.
+   *
+   * One deadline per session is enough: every waiter shares the verdict of the
+   * next one, and a child settling naturally resolves them all.
+   */
+  private armBackgroundDeadline(appSessionId: string, intervalMs: number): void {
+    if (this.backgroundDeadlineTimers.has(appSessionId)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.backgroundDeadlineTimers.delete(appSessionId);
+      this.recheckBackgroundWork(appSessionId, intervalMs);
+    }, intervalMs);
+    timer.unref?.();
+    this.backgroundDeadlineTimers.set(appSessionId, timer);
+  }
+
+  private clearBackgroundDeadline(appSessionId: string): void {
+    const timer = this.backgroundDeadlineTimers.get(appSessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.backgroundDeadlineTimers.delete(appSessionId);
+    }
+  }
+
+  /**
+   * Judges one app session's background work at a deadline instead of dropping
+   * it blindly.
+   *
+   * A child that has gone idle since it was launched has settled — its card
+   * gets the outcome the engine reports, and tracking ends. A child still
+   * mid-turn is left alone and re-judged at the next deadline, so work that
+   * legitimately outlives the window (an hour-long batch monitor, say) keeps
+   * its composer entry, its card's live frames and its question cards. A child
+   * nothing can describe — the service is gone, or the row is unreadable — is
+   * dropped: that is the backstop a plain timeout used to be, for the state no
+   * verdict can be had about. The hold cap keeps a session row that reads
+   * mid-turn forever — the engine died under it — from pinning the run.
+   */
+  private recheckBackgroundWork(appSessionId: string, intervalMs: number): void {
+    const tasks = this.backgroundByApp.get(appSessionId);
+    if (!tasks || tasks.size === 0) {
+      // Settled naturally while the timer was pending; waiters are resolved.
+      return;
+    }
+
+    const oldestStartedAt = Math.min(...[...tasks.values()].map((task) => task.startedAt));
+    if (Date.now() - oldestStartedAt >= this.maxBackgroundHoldMs) {
+      for (const childSessionId of [...tasks.keys()]) {
+        this.finishBackgroundWork(childSessionId);
+      }
+      return;
+    }
+
+    void this.recheckChildren(appSessionId, intervalMs);
+  }
+
+  private async recheckChildren(appSessionId: string, intervalMs: number): Promise<void> {
+    const tasks = this.backgroundByApp.get(appSessionId);
+    if (!tasks) {
+      return;
+    }
+
+    for (const [childSessionId, task] of [...tasks]) {
+      let snapshot: OpenCodeSessionSnapshot;
+      try {
+        snapshot = await this.readChildSnapshot(childSessionId);
+      } catch {
+        // Nothing can be said about this child anymore; drop just it, so a
+        // verdict for its siblings is not thrown away with it.
+        this.finishBackgroundWork(childSessionId);
+        continue;
+      }
+      if (snapshot.idleAt !== null && snapshot.idleAt >= task.startedAt) {
+        this.finishBackgroundWork(childSessionId, settledStatusFromSnapshot(snapshot));
+      }
+      // Otherwise it is mid-turn: still running, re-judged next deadline.
+    }
+
+    if (this.backgroundByApp.has(appSessionId)) {
+      this.armBackgroundDeadline(appSessionId, intervalMs);
+    }
   }
 
   /**
@@ -293,7 +405,9 @@ export class OpenCodeRunRegistry {
     if (isChildTerminal) {
       // No-ops for the parent; this is the child's own terminal, which must
       // clear its background entry even when the parent run is already gone.
-      this.finishBackgroundWork(providerSessionId);
+      // The terminal is also what settles the child's card without waiting for
+      // a history refresh.
+      this.finishBackgroundWork(providerSessionId, terminalStatusForEvent(event.type));
     }
 
     // A child session's events belong to the run that spawned it, not to a
@@ -390,20 +504,45 @@ export class OpenCodeRunRegistry {
     this.broadcastBackgroundWork(run.appSessionId);
   }
 
-  /** Drops a child from its parent's background list and tells the composer. */
-  private finishBackgroundWork(childSessionId: string): void {
+  /**
+   * Drops a child from its parent's background list and tells the composer.
+   *
+   * `outcome` is set when the registry knows how the child ended (its own
+   * terminal, or a deadline verdict from its session row): the card reads its
+   * live word off `task_status`, so sending it here stops the card's spinner
+   * without waiting for the next history refresh. A child dropped because
+   * nothing could judge it gets no frame — its card keeps whatever the
+   * transcript says.
+   */
+  private finishBackgroundWork(childSessionId: string, outcome?: BackgroundTaskStatus): void {
     const appSessionId = this.backgroundAppByChild.get(childSessionId);
     if (!appSessionId) {
       return;
     }
     this.backgroundAppByChild.delete(childSessionId);
     const tasks = this.backgroundByApp.get(appSessionId);
+    const task = tasks?.get(childSessionId);
     tasks?.delete(childSessionId);
 
     const writer = this.backgroundWriterByApp.get(appSessionId);
+    if (outcome && task && task.toolUseId) {
+      writer?.send(createNormalizedMessage({
+        id: generateMessageId(PROVIDER),
+        sessionId: appSessionId,
+        provider: PROVIDER,
+        kind: 'task_status',
+        event: 'updated',
+        status: outcome,
+        taskId: task.taskId,
+        toolUseId: task.toolUseId,
+        taskType: task.taskType,
+        description: task.description,
+      }));
+    }
     if (!tasks || tasks.size === 0) {
       this.backgroundByApp.delete(appSessionId);
       this.backgroundWriterByApp.delete(appSessionId);
+      this.clearBackgroundDeadline(appSessionId);
       this.resolveBackgroundWaiters(appSessionId);
     }
     writer?.send(createNormalizedMessage({
@@ -438,6 +577,7 @@ export class OpenCodeRunRegistry {
     }
     this.backgroundByApp.delete(appSessionId);
     this.backgroundWriterByApp.delete(appSessionId);
+    this.clearBackgroundDeadline(appSessionId);
     this.resolveBackgroundWaiters(appSessionId);
   }
 
@@ -515,4 +655,30 @@ function settlementFromSnapshot(snapshot: OpenCodeSessionSnapshot): OpenCodeRunS
     return { outcome: 'failed', error: 'The run failed while the event stream was disconnected.' };
   }
   return { outcome: 'succeeded' };
+}
+
+/**
+ * How a child ended, from its session row, for the card's settled status. A
+ * row that went idle without recording an outcome reads as completed, the same
+ * rule the history reader applies to the same column.
+ */
+function settledStatusFromSnapshot(snapshot: OpenCodeSessionSnapshot): BackgroundTaskStatus {
+  if (snapshot.outcome === 'failed') {
+    return 'failed';
+  }
+  if (snapshot.outcome === 'interrupted' || snapshot.outcome === 'stopped') {
+    return 'stopped';
+  }
+  return 'completed';
+}
+
+/** How a child ended, from its own terminal event, for the card's settled status. */
+function terminalStatusForEvent(eventType: string): BackgroundTaskStatus {
+  if (eventType === 'session.execution.failed') {
+    return 'failed';
+  }
+  if (eventType === 'session.execution.interrupted') {
+    return 'stopped';
+  }
+  return 'completed';
 }
