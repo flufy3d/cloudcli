@@ -1,6 +1,6 @@
 # 子 agent 卡片统一
 
-> 状态：已实施（2026-10-18）
+> 状态：实施中（子 agent 的过程送达与子会话归属尚未完成）
 > 分支：`feat/subagent-cards`（工作树 `.worktrees/subagent-cards`）
 > 目标：六家引擎派出的子 agent 都画成同一种卡片（运行中 / 完成 / 失败 / 无结果 + 子时间线），历史重载和实时直播画出同一张卡，并且每张卡都有结算的那一刻，不会永远转圈。
 
@@ -85,3 +85,28 @@ Antigravity 拆成多张卡是选定方案，原因是 `SubagentPanel` 一次只
 - 拿本机真实数据各跑一次历史读取探针：Claude、Codex、ZCode、OpenCode 各取一个含子 agent 的会话，确认产出 `Agent` 行，状态没有永久 `running`。
 - `docs/core/providers.md` 子 agent 一节重写成六家对照（写机制，不抄字段表）；`docs/core/chat.md` 写明前端只认 `Agent`。文档和代码在同一个提交里。
 - 设计稿状态行改为「已实施（日期）」。
+
+## 子 agent 的过程送达与子会话归属
+
+前面几节解决的是"认出卡片、按时结算"。下面三个问题都发生在卡片认出来之后，即子 agent 的过程和请求有没有送到用户面前。三者都在本机核实过。
+
+**前端断了子 agent 的状态与时间线。** `useChatMessages.ts` 的 `normalizedToChatMessages` 生成工具卡时，不复制后端给的 `subagent` 和 `subagentTools`，所以 `SubagentPanel` 收到的 `subagent`、`activity` 永远为空。这一步在提交 `32c8648e`（transcript 视图模型改类型）时被删掉，之后再没恢复。修法：把 `msg.subagent` 原样交给 `subagent`，把 `msg.subagentTools` 交给 `subagentActivity`，并用转换测试钉住。
+
+**OpenCode 子会话的请求和事件找不到主人。** 下面是用真实 OpenCode 2.0.31 跑一遍看到的过程。父会话调用 `subagent` 工具后，引擎新建一个子会话，`session.created` 里带 `parentID` 和继承来的 `permissions`。父会话上的 `session.tool.progress` 事件里，`id` 是派 agent 的调用，`metadata.sessionID` 是子会话。子 agent 执行 shell 时，`permission.asked` 带的是子会话 id。cloudcli 的权限桥（`opencode-interaction-bridge.ts` 的 `onPermissionAsked`）和事件分发（`opencode-run-registry.ts` 的 `dispatch`）都只按父会话 id 精确匹配，于是：
+- 在"询问"或"计划"模式下，子 agent 的批准卡片不出现，子 agent 和父对话一起挂住；
+- 直播时，子 agent 的每一步都被丢掉，卡片里看不到过程。
+
+修法：从 `session.created.parentID` 和 `tool.progress.metadata.sessionID` 建立"子会话 → 根会话 + 派它的调用"的归属表，嵌套多层的子会话归到同一个根会话。
+- 权限请求和提问卡片按根会话显示，回复仍发给子会话。
+- 子会话的事件翻译成这张 `Agent` 卡的实时时间线。
+- 子会话的结束事件不结算父会话这一轮。
+- 归属表在父会话这一轮结束、或引擎退出时清理。
+
+直播时间线的呈现方式先查清 Claude 现在怎么做（实时流里子工具调用带 `parentToolUseId`），五家统一用一种方式，不为 OpenCode 另造一套。
+
+**其他引擎的同类问题。** "子 agent 发出的请求只认父会话 id"是同一类缺陷。ZCode 的 `requestPermission` 按 `runsByEngineSession` 找当前轮次，找不到就自动拒绝（`zcode-run-lifecycle.ts` 约 455 行）。Claude、Codex、Antigravity 同样要逐家拿证据核实：子 agent 的权限请求和提问能不能送到页面、能不能被回复。核实有问题的按同一个机制修，没有问题的写明证据。
+
+验收在前文标准之外，再加两条：
+- 前端转换测试和面板渲染测试证明时间线能显示；
+- 用真实 OpenCode 引擎做一次端到端验证：在"询问"模式下派子 agent 执行 shell，批准卡片出现，批准后跑完，直播时卡片里能看到子 agent 的步骤。
+
