@@ -52,6 +52,16 @@ Saying "发布/发版本" (release a version) means running this whole pipeline 
 7. Stop before the restart-producing deploy step. Tell the user to run `node scripts/deploy.mjs` from the worktree themselves; non-interactive shells need `PATH="$HOME/Library/pnpm:$PATH" PNPM_HOME="$HOME/Library/pnpm"` so pnpm and the stable global CLI entry are available. Resume verification only after the user confirms it completed.
 8. Verify four things: pm2 online with the new version, `curl http://localhost:3030/` returns 200, the fixed runtime's `dist/assets/*.js` fingerprint has no `-dirty`, and `gh release view` confirms the release.
 
+## Parallel development worktrees
+
+`scripts/worktree/` (ported from nexus-kit's devflow) manages isolated dev worktrees under `.worktrees/` — multiple terminals or AI sessions work without stepping on each other. When told to work in parallel (or when the main-repo edit guard sends you to a worktree), use these instead of hand-running `git worktree add`:
+
+- `npm run worktree:new <branch>` — create a worktree (installs deps via `npm ci`, registers a dev port). Start the tree's dev servers with `SERVER_PORT=<P> VITE_PORT=<P+1> npm run dev` (the ports are printed by the command).
+- `npm run worktree:merge <branch>` — run from the main repo after rebasing and re-verifying in the tree; fast-forward only, then validates with `npm ci && npm run build`.
+- `npm run worktree:rm <name> [-- --force]` / `worktree:ls` / `worktree:isolate` — recycle (stops the tree's servers and pm2 apps, refuses to drop unrecoverable files) / inspect / detach a shared item.
+
+Workflow and invariants: `docs/design/并行开发工作树.md`. Defaults (ports, recycle whitelist, post-merge commands) live in `scripts/worktree/config.ts`.
+
 ## Frontend code
 
 For every task that creates, modifies, refactors, or reviews frontend code under `src/`, load and follow `$frontend-module-standards` from `.agents/skills/frontend-module-standards/SKILL.md`. Apply it only to frontend code; do not impose those architecture rules on the backend.
