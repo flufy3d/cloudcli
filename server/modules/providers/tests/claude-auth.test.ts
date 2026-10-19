@@ -101,6 +101,95 @@ const validSubscriptionCredentials = (email?: string) => ({
   ...(email ? { email } : {}),
 });
 
+test('getStatus: subscription logins use the account email from ~/.claude.json', async () => {
+  for (const source of ['credentials_file', 'keychain_missing_file', 'keychain_mcp_file', 'keychain_expired_file']) {
+    await withTempHome(async (homeDir) => {
+      await writeFile(path.join(homeDir, '.claude.json'), JSON.stringify({
+        oauthAccount: { emailAddress: '  subscriber@example.com  ' },
+      }));
+      if (source === 'credentials_file') {
+        await writeCredentialsFile(homeDir, validSubscriptionCredentials());
+      } else if (source === 'keychain_mcp_file') {
+        await writeCredentialsFile(homeDir, { mcpOAuth: {} });
+      } else if (source === 'keychain_expired_file') {
+        await writeCredentialsFile(homeDir, { claudeAiOauth: { accessToken: 'expired', expiresAt: 1 } });
+      }
+      await withEnv({}, async () => {
+        const auth = source === 'credentials_file' ? authWithoutKeychain() : authWithKeychain();
+        const status = await getStatusWithCliInstalled(auth);
+        assert.equal(status.authenticated, true, source);
+        assert.equal(status.email, 'subscriber@example.com', source);
+        assert.equal(status.method, source === 'credentials_file' ? source : 'keychain');
+      });
+    });
+  }
+});
+
+test('getStatus: account metadata alone never authenticates a subscription', async () => {
+  await withTempHome(async (homeDir) => {
+    await writeFile(path.join(homeDir, '.claude.json'), JSON.stringify({
+      oauthAccount: { emailAddress: 'previous@example.com' },
+    }));
+    await withEnv({}, async () => {
+      const status = await getStatusWithCliInstalled(authWithoutKeychain());
+      assert.equal(status.authenticated, false);
+      assert.equal(status.email, null);
+    });
+  });
+});
+
+test('getStatus: account metadata does not replace explicit credential emails or token labels', async () => {
+  await withTempHome(async (homeDir) => {
+    await writeFile(path.join(homeDir, '.claude.json'), JSON.stringify({
+      oauthAccount: { emailAddress: 'previous@example.com' },
+    }));
+    await writeCredentialsFile(homeDir, validSubscriptionCredentials('current@example.com'));
+    await withEnv({}, async () => {
+      assert.equal((await getStatusWithCliInstalled(authWithoutKeychain())).email, 'current@example.com');
+    });
+    await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'independent-token' }, async () => {
+      assert.equal((await getStatusWithCliInstalled(authWithoutKeychain())).email, 'OAuth Token (long-lived)');
+    });
+    await withEnv({ ANTHROPIC_API_KEY: 'independent-key' }, async () => {
+      assert.equal((await getStatusWithCliInstalled(authWithoutKeychain())).email, 'API Key Auth');
+    });
+  });
+});
+
+test('getStatus: subscription override uses the account metadata email', async () => {
+  await withTempHome(async (homeDir) => {
+    await writeFile(path.join(homeDir, '.claude.json'), JSON.stringify({
+      oauthAccount: { emailAddress: 'subscriber@example.com' },
+    }));
+    await withEnv({ ANTHROPIC_API_KEY: 'independent-key' }, async () => {
+      const status = await getStatusWithCliInstalled(authWithKeychain());
+      assert.equal(status.email, 'API Key Auth');
+      assert.equal(status.subscriptionOverride?.subscriptionEmail, 'subscriber@example.com');
+    });
+  });
+});
+
+test('getStatus: missing, malformed, or invalid account metadata keeps the authenticated fallback', async (t) => {
+  for (const content of [undefined, '{bad json', 'null', '[]', '{"oauthAccount":[]}',
+    '{"oauthAccount":{"emailAddress":123}}', '{"oauthAccount":{"emailAddress":"  "}}']) {
+    await withTempHome(async (homeDir) => {
+      if (content !== undefined) await writeFile(path.join(homeDir, '.claude.json'), content);
+      const warnings: unknown[][] = [];
+      t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args); });
+      try {
+        await withEnv({}, async () => {
+          const status = await getStatusWithCliInstalled(authWithKeychain());
+          assert.equal(status.authenticated, true);
+          assert.equal(status.email, 'Authenticated');
+          if (content === '{bad json') assert.equal(warnings.length, 1);
+        });
+      } finally {
+        t.mock.restoreAll();
+      }
+    });
+  }
+});
+
 
 test('checkCredentials: CLAUDE_CODE_OAUTH_TOKEN set is authenticated via environment, even with a stale credentials file', async () => {
   await withTempHome(async (homeDir) => {
