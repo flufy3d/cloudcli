@@ -54,13 +54,14 @@ Saying "发布/发版本" (release a version) means running this whole pipeline 
 
 ## Parallel development worktrees
 
-`scripts/worktree/` (ported from nexus-kit's devflow) manages isolated dev worktrees under `.worktrees/` — multiple terminals or AI sessions work without stepping on each other. When told to work in parallel (or when the main-repo edit guard sends you to a worktree), use these instead of hand-running `git worktree add`:
+Every code change starts in its own worktree under `.worktrees/`, so multiple terminals or AI sessions work without stepping on each other. Do not edit code directly in the main repo, and never hand-run `git worktree add`. The `npm run worktree:*` scripts call the shared `nexus-devflow` CLI from nexus-kit, which must be on `PATH`. The cloudcli settings (directory, ports, recycle whitelist, post-create and post-merge commands) live in `nexus.config.json`.
 
-- `npm run worktree:new <branch>` — create a worktree (installs deps via `npm ci`, registers a dev port). Start the tree's dev servers with `SERVER_PORT=<P> VITE_PORT=<P+1> npm run dev` (the ports are printed by the command).
-- `npm run worktree:merge <branch>` — run from the main repo after rebasing and re-verifying in the tree; fast-forward only, then validates with `npm ci && npm run build`.
-- `npm run worktree:rm <name> [-- --force]` / `worktree:ls` / `worktree:isolate` — recycle (stops the tree's servers and pm2 apps, refuses to drop unrecoverable files) / inspect / detach a shared item.
+1. `npm run worktree:new <branch>` creates the tree, runs `npm ci` in it, and registers a dev port P. Ignore the `--port P --strictPort` hint the command prints; start this repo's dev servers with `SERVER_PORT=<P> VITE_PORT=<P+1> npm run dev`.
+2. When the work is done and verified, run `git rebase main` in the tree and verify again on the rebased code.
+3. `cd` back to the main repo and run `npm run worktree:merge <branch>` on its own. It fast-forwards only, then runs `npm ci && npm run build` in the main repo; a non-zero exit means merged but not validated, so keep fixing.
+4. After the merge succeeds, run `npm run worktree:rm <name>` from the main repo. It refuses to run while your shell sits inside that tree. It stops the tree's servers and pm2 apps, and it refuses to drop uncommitted or unrecoverable files unless you pass `-- --force`.
 
-Workflow and invariants: `docs/design/并行开发工作树.md`. Defaults (ports, recycle whitelist, post-merge commands) live in `scripts/worktree/config.ts`.
+`worktree:ls` lists trees, and `worktree:isolate` detaches a shared item. `.claude/settings.json` wires the WorktreeCreate and WorktreeRemove hooks to the same CLI, so `claude --worktree` and subagents with `isolation: "worktree"` get the same tree setup. Details: `docs/design/并行开发工作树.md`.
 
 ## Frontend code
 
