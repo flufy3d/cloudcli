@@ -153,6 +153,17 @@ type ChatComposerProps = {
   onForceSendQueuedDraft?: () => void;
 }
 
+/**
+ * Whether the composer offers the "send later" (定时发送) trigger.
+ *
+ * Off for now: the button sat right next to Send, and the scheduled-message
+ * flow was not used. The popover, the scheduling hook and the server-side
+ * dispatcher are all still in place, so flipping this back to `true` restores
+ * the entry point. Messages scheduled before it was switched off still show
+ * in the list above the input and are still sent on time.
+ */
+const SHOW_SCHEDULE_TRIGGER = false;
+
 function ChatComposer({
   pendingPermissionRequests,
   handlePermissionDecision,
@@ -554,10 +565,12 @@ function ChatComposer({
               </div>
             )}
 
-            <ScheduleMessagePopover
-              disabled={!input.trim()}
-              onSchedule={onScheduleMessage}
-            />
+            {SHOW_SCHEDULE_TRIGGER && (
+              <ScheduleMessagePopover
+                disabled={!input.trim()}
+                onSchedule={onScheduleMessage}
+              />
+            )}
 
             <ComposerModelMenu
               effort={effort}
