@@ -22,11 +22,29 @@ import * as sharedUtils from '@/shared/utils.js';
 
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ1sAAAAASUVORK5CYII=';
 
+/**
+ * Storage-dir overrides production resolves before homedir. The app injects
+ * ZCODE_STORAGE_DIR into every process it hosts, which would silently point
+ * path-reading tests at the real database instead of the isolated home.
+ */
+const STORAGE_DIR_OVERRIDES = ['ZCODE_STORAGE_DIR', 'CLOUDCLI_ANTIGRAVITY_DATA_DIR'] as const;
+
 async function withAssetStore(run: (home: string) => void | Promise<void>): Promise<void> {
   const home = await mkdtemp(path.join(os.tmpdir(), 'provider-media-'));
   const original = os.homedir;
+  const saved = STORAGE_DIR_OVERRIDES.map((key) => [key, process.env[key]] as const);
+  for (const key of STORAGE_DIR_OVERRIDES) delete process.env[key];
   os.homedir = () => home;
-  try { await run(home); } finally { os.homedir = original; await rm(home, { recursive: true, force: true }); }
+  try {
+    await run(home);
+  } finally {
+    os.homedir = original;
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(home, { recursive: true, force: true });
+  }
 }
 
 test('provider image results retain text and replace embedded bytes with stable assets', async () => {
