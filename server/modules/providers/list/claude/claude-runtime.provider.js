@@ -311,9 +311,9 @@ function mapCliOptionsToSDK(options = {}) {
     sdkOptions.cwd = cwd;
   }
 
-  if (permissionMode && permissionMode !== 'default') {
-    sdkOptions.permissionMode = permissionMode;
-  }
+  // Pinned explicitly: since SDK 0.3.286 an omitted permissionMode defers to the
+  // CLI settings' defaultMode, which can start sessions in an auto-approving mode.
+  sdkOptions.permissionMode = permissionMode && permissionMode !== 'default' ? permissionMode : 'default';
 
   const settings = toolsSettings || {
     allowedTools: [],
