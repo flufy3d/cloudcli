@@ -52,7 +52,7 @@ test('provider image results retain text and replace embedded bytes with stable 
     const image = { type: 'image', mimeType: 'image/png', data: PNG };
     const claudeImage = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } };
     const results = [
-      new ClaudeSessionsProvider().normalizeMessage({ uuid: 'r', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: [{ type: 'text', text: 'kept' }, claudeImage] }] } }, 's'),
+      new ClaudeSessionsProvider().normalizeMessage({ type: 'user', uuid: 'r', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: [{ type: 'text', text: 'kept' }, claudeImage] }] } }, 's'),
       readCodexRolloutItem({ id: 't', type: 'McpToolCall', server: 'mcp', tool: 'read', result: { content: [{ type: 'text', text: 'kept' }, image] }, status: 'completed' }),
       new OpenCodeSessionEventTranslator('s').translate({ id: 'e', created: 1, type: 'session.tool.success', location: { directory: '/tmp' }, data: { id: 't', content: [{ type: 'text', text: 'kept' }, { type: 'image', uri: `data:image/png;base64,${PNG}` }] } }),
       new ZCodeLiveEventNormalizer().normalize({ id: 'r', type: 'model_streaming', payload: { kind: 'tool_result', toolCallId: 't', result: { content: [{ type: 'text', text: 'kept' }, image] } } }, 's'),
@@ -109,7 +109,7 @@ test('non-JSON logs mentioning images still obey the large text boundary', async
 test('long user prompts retain the complete editable text while their image attachments become references', async () => {
   await withAssetStore(() => {
     const text = 'x'.repeat(300_000) + '\nKEEP_THE_END';
-    const raw = { uuid: 'user', message: { role: 'user', content: [{ type: 'text', text }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } }] } };
+    const raw = { type: 'user', uuid: 'user', message: { role: 'user', content: [{ type: 'text', text }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } }] } };
     const rows = new ClaudeSessionsProvider().normalizeMessage(raw, 'probe');
     assert.ok(rows[0].content === text, 'editing must receive the complete original prompt');
     assert.ok(!JSON.stringify(rows[0].images).includes(PNG));

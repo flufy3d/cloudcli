@@ -24,6 +24,7 @@ const storedImage = (base64: string, extension: string) => `/api/assets/images/i
 test('claude history: base64 image blocks surface as user message images', () => {
   const provider = new ClaudeSessionsProvider();
   const entry = {
+    type: 'user',
     uuid: 'u1',
     timestamp: '2026-07-03T10:00:00.000Z',
     message: {
@@ -51,6 +52,7 @@ test('claude history: base64 image blocks surface as user message images', () =>
 test('claude history: image-only user turns still produce a bubble', () => {
   const provider = new ClaudeSessionsProvider();
   const entry = {
+    type: 'user',
     uuid: 'u2',
     timestamp: '2026-07-03T10:00:00.000Z',
     message: {
@@ -72,6 +74,7 @@ test('claude history: image-only user turns still produce a bubble', () => {
 test('claude history: plain text user turns carry no images field', () => {
   const provider = new ClaudeSessionsProvider();
   const entry = {
+    type: 'user',
     uuid: 'u3',
     timestamp: '2026-07-03T10:00:00.000Z',
     message: { role: 'user', content: [{ type: 'text', text: 'hello' }] },
@@ -85,6 +88,7 @@ test('claude history: plain text user turns carry no images field', () => {
 test('claude history: file reference blocks restore non-image attachments', () => {
   const provider = new ClaudeSessionsProvider();
   const entry = {
+    type: 'user',
     uuid: 'u4',
     timestamp: '2026-07-03T10:00:00.000Z',
     message: {

@@ -3,6 +3,7 @@ export {
   createCompleteMessage,
   createNormalizedMessage,
   findApplicationRoot,
+  isClaudeConversationRecord,
   resolveCodexExecutionPolicy,
   resolveModelEffort,
 } from './utils.js';

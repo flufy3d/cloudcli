@@ -45,6 +45,21 @@ export function sha256Hex(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+//----------------- CLAUDE CONVERSATION RECORDS ------------
+/**
+ * Used by provider history, subagent activity and conversation search to accept
+ * actual Claude conversation records only. API request diagnostics also embed
+ * `message.role` and content, but are copies rather than conversation events.
+ * This deliberately does not require a UUID: record identity and supported
+ * realtime control events are validated by their respective consumers.
+ */
+export function isClaudeConversationRecord(value: unknown): value is AnyRecord & { type: 'user' | 'assistant'; message: AnyRecord } {
+  const record = readObjectRecord(value);
+  return Boolean(record && (record.type === 'user' || record.type === 'assistant')
+    && readObjectRecord(record.message)?.role === record.type);
+}
+
+// ---------------------------
 //----------------- PROVIDER DISPLAY PAYLOADS ------------
 const INLINE_IMAGE_EXTENSIONS: Record<string, string> = {
   'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',

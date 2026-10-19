@@ -47,6 +47,7 @@ import { sessionsDb } from '@/modules/database/index.js';
 import { getClaudeSDKSessionStartTime } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 import { summarizeClaudeTokenUsage } from '@/modules/providers/services/claude-usage.js';
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
+import { isClaudeConversationRecord } from '@/shared/index.js';
 
 const PROVIDER = 'claude';
 
@@ -124,6 +125,7 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
 
       try {
         const entry = parseProviderJson(line) as AnyRecord;
+        if (!isClaudeConversationRecord(entry)) continue;
         const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
         if (timestamp && !transcript.startedAt) {
           transcript.startedAt = timestamp;
@@ -371,7 +373,7 @@ function readTaskNotificationTexts(message: AnyRecord): string[] {
     return typeof message.content === 'string' ? [message.content] : [];
   }
 
-  if (message.message?.role !== 'user') {
+  if (!isClaudeConversationRecord(message) || message.type !== 'user') {
     return [];
   }
 
@@ -465,14 +467,20 @@ function replaceLaunchToolResultContent(message: AnyRecord, replacement: string)
 async function readTranscriptRows(jsonlPath: string, providerSessionId: string): Promise<AnyRecord[]> {
   const rows: AnyRecord[] = [];
   for await (const entry of readJsonlRecords(jsonlPath)) {
-    if (entry.sessionId === providerSessionId) rows.push(compactProviderPayload(entry));
+    if (entry.sessionId !== providerSessionId) continue;
+    // Preserve graph/control records for their own consumers. A nested message
+    // in any other record is a diagnostic payload, not another conversation.
+    if (isClaudeConversationRecord(entry)
+      || ['last-prompt', 'progress', 'system', 'attachment', 'queue-operation'].includes(entry.type)) {
+      rows.push(compactProviderPayload(entry));
+    }
   }
   return rows;
 }
 
 /** True for a row the user typed, as opposed to a tool result or an injected note. */
 function isUserPromptRow(row: AnyRecord): boolean {
-  if (row.type !== 'user' || row.isMeta === true || row.isCompactSummary === true) {
+  if (!isClaudeConversationRecord(row) || row.type !== 'user' || row.isMeta === true || row.isCompactSummary === true) {
     return false;
   }
 
@@ -1268,6 +1276,15 @@ export class ClaudeSessionsProvider implements IProviderSessions {
    * of them would show up as a message the user silently cannot edit.
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
+    const record = readObjectRecord(rawMessage);
+    const role = readObjectRecord(record?.message)?.role;
+    // Reject copied/unknown message wrappers before materializing assets,
+    // minting row identities or consuming the compact-summary latch. Flat
+    // realtime records keep their explicit handlers below.
+    if ((role === 'user' || role === 'assistant') && !isClaudeConversationRecord(record)
+      && !['thinking', 'tool_use', 'tool_result'].includes(String(record?.type))) {
+      return [];
+    }
     const messages = this.normalizeMessageRows(rawMessage, sessionId);
     // A synthesized id is useless as an anchor — it changes on every read — so
     // a row without its own uuid produces messages with no anchor at all.
@@ -1395,7 +1412,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       return [];
     }
 
-    if (raw.message?.role === 'user') {
+    if (isClaudeConversationRecord(raw) && raw.type === 'user') {
       /**
        * Claude stores compact summaries as synthetic "user" rows so the CLI can
        * resume the next session turn with the summary in-context. For the web
@@ -1434,7 +1451,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
      * dropped rather than attributed to a prompt the user never sent.
      */
     if (
-      raw.message?.role === 'user'
+      isClaudeConversationRecord(raw) && raw.type === 'user'
       && raw.message?.content
       && raw.isMeta !== true
       && raw.isVisibleInTranscriptOnly !== true
@@ -1651,7 +1668,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       return messages;
     }
 
-    if (raw.message?.role === 'assistant' && raw.message?.content) {
+    if (isClaudeConversationRecord(raw) && raw.type === 'assistant' && raw.message?.content) {
       // Which model actually answered. It rides on the assistant row itself in
       // both the transcript and the live SDK stream, so history renders it
       // retroactively with no migration. Only prose carries it: a tool call has
@@ -1859,7 +1876,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
 
     const toolResultMap = new Map<string, ClaudeToolResult>();
     for (const raw of rawMessages) {
-      if (raw.message?.role === 'user' && Array.isArray(raw.message?.content)) {
+      if (isClaudeConversationRecord(raw) && raw.type === 'user' && Array.isArray(raw.message?.content)) {
         for (const part of raw.message.content) {
           if (part.type === 'tool_result' && part.tool_use_id) {
             toolResultMap.set(part.tool_use_id, {

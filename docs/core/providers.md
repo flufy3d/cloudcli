@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.10.0 / 2026-10-19
+> 基准：2.10.0 / 2026-10-20
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -27,6 +27,14 @@ Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结�
 }
 ```
 引擎以工具结果为契机唤醒新回合汇报。`codex-thread-items.ts` 只把名称为 `cloudcli_task_result` 的孤立 `FunctionCallOutput` / `functionCallOutput` 归一化为纯说明性质的 `status_note`，不生成缺失前置调用的残缺工具卡，也不伪造用户提问。其他工具的输出不会被误认成异步任务通知。其他引擎（Claude 等）保持其原生的输入流保持机制，第一版异步任务外部接续由 Codex 首发支持。
+
+## Claude 转录记录边界
+
+Claude JSONL 同时保存真实对话和模型请求诊断快照。例如，`api-request-blob` 的 `message.role` 可以是 `user`，正文也可以完整复制原提问。快照不代表用户又发送了一次消息。
+
+`server/shared/utils.ts` 的 `isClaudeConversationRecord` 只认顶层 `type` 与 `message.role` 相符的 `user`、`assistant` 记录。主历史、普通消息归一化、工具结果配对、后台通知、子代理活动和搜索共用这个判定。诊断快照不能生成消息身份、消耗压缩摘要标记，也不能改写工具结果或子代理状态。判定不要求 UUID，合法实时事件仍由各自明确的类型分支处理。
+
+`ClaudeSessionsProvider` 的历史读取器另行保留 `last-prompt`、`progress`、`system`、`attachment` 和 `queue-operation`，分别供恢复分支、压缩边界和后台通知使用。整个转录不能只筛成普通对话。用户真实发送两次相同正文时，两条记录都保留；输入边界不按正文去重。
 
 ## Claude 后台任务生命周期
 
