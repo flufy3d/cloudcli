@@ -1030,3 +1030,19 @@ test('turning on bypass permissions starts a new process, since the CLI refuses 
     await second.done;
   });
 });
+
+test('a held process outlasts two hours of silence minus a minute, and is let go after two', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await withRun(async ({ script }) => {
+    await holdForBackgroundBash(script);
+
+    // A dev server left running prints nothing back to the CLI for long stretches.
+    t.mock.timers.tick(119 * 60 * 1000);
+    await tick();
+    assert.equal(script.released(), false, 'still held after 1h59m of silence');
+
+    t.mock.timers.tick(2 * 60 * 1000);
+    await tick();
+    assert.equal(script.released(), true, 'released once two silent hours have passed');
+  });
+});

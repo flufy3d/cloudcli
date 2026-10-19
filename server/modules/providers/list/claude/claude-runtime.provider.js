@@ -98,10 +98,11 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 // The hold normally ends long before this: a turn with nothing outstanding closes
 // stdin immediately, and background work releases it as soon as it reports back;
 // a new turn either continues on the held process or supersedes it. This ceiling
-// only catches background work
-// that never reports at all, so an abandoned session cannot leak a CLI process
-// forever. The timer resets on every message, so it measures silence, not total time.
-const BG_WAIT_CEILING_MS = 30 * 60 * 1000;
+// only catches background work that never reports at all, so an abandoned session
+// cannot leak a CLI process forever. The timer resets on every message, so it
+// measures silence, not total time — and a dev server left running in the
+// background prints nothing back for long stretches, hence two hours.
+const BG_WAIT_CEILING_MS = 2 * 60 * 60 * 1000;
 
 const TOOLS_REQUIRING_INTERACTION = new Set(['AskUserQuestion', 'ExitPlanMode']);
 
