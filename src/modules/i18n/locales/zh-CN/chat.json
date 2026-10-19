@@ -1,4 +1,7 @@
 {
+  "replay": {
+    "recoveryFailed": "聊天同步失败，正在自动重试，已有内容已保留。也可以刷新页面重试。"
+  },
   "misc": {
     "outputAssets": "结果附件（{{count}}）",
     "fullOutput": "完整输出.txt"

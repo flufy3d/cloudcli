@@ -262,6 +262,7 @@ function ChatInterface({
 
   useChatRealtimeHandlers({
     isActive,
+    sendMessage,
     subscribe,
     provider,
     selectedSession,

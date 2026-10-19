@@ -448,10 +448,7 @@ export function useChatSessionState({
     statusCheckSentAtRef.current.set(selectedSession.id, Date.now());
     sendMessage({
       type: 'chat.subscribe',
-      sessions: [{
-        sessionId: selectedSession.id,
-        lastSeq: sessionStore.getResumeSeq(selectedSession.id),
-      }],
+      sessions: [sessionStore.getSubscriptionCursor(selectedSession.id)],
     });
   }, [selectedProject, selectedSession, sendMessage, sessionStore, statusCheckSentAtRef, ws]);
 

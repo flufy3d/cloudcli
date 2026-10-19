@@ -1,6 +1,6 @@
 # 聊天链路（Chat Pipeline）
 
-> 基准：2.10.0 / 2026-10-19
+> 基准：2.10.0 / 2026-10-20
 > **核心文档**：改动 `server/modules/websocket/**` 或 `src/modules/chat/**` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -76,7 +76,16 @@ flowchart TD
 
 ## 断线恢复
 
-- `seq` 由 run registry 按 session 维护单调水位：跨 run 续数、不随缓冲驱逐失效，服务端单方定义，客户端只透传（取 max 对账）。重连后发 `chat.subscribe`（带 `lastSeq`）→ 活跃 run 从缓冲精确补发；ack 带权威 `lastSeq` 与 `stale` 标志——`stale: true` 表示需要的事件已被条数、字节预算或保留期限驱逐，客户端补一次 REST 刷新。完成态 run 不 replay，走 REST。
+`chat-run-registry.service.ts` 在网关进程启动时生成 `streamEpoch`，并为每个会话跨回合续增 `seq`。传输事件身份是 `(streamEpoch, sessionId, seq)`，重放保留原身份，引擎不能指定网关代次。历史行继续使用引擎行 ID 和 `providerRowKey`，不参加传输事件账。
+
+例如，页面已连续处理到事件 931，再收到事件 818，`SessionTimelineStore.applyServerEvent` 会直接退出，文字、思考和完成指令都不再执行。页面仅处理到 817 却先收到 931 时，Store 委托 `sessionEventReplay.ts` 暂存后续事件并补订阅。缺口补齐后，每条事件先改状态、登记成功，再执行对应指令，然后处理下一条。状态应用失败不前进游标。
+
+`chat.subscribe` 携带已确认代次和连续应用游标。`chat_subscribed.lastSeq` 是服务端产生进度，不能当作页面应用进度；`replayFromSeq` 声明完整重放窗口下界。缺口超出窗口、缓存超限或服务端重启时，Store 关闭旧流段，保留可见输出，使用确认中的后台任务和权限快照对账，并通过历史刷新建立恢复基线。历史失败不推进基线。完成态不补事件，确认声明需要历史对账的位置。共享预算以 `shared/protocol/frames.ts` 的 `CHAT_REPLAY_LIMITS` 为准。
+
+恢复失败会保留错误提示并退避重试；成功后清除提示。观察者通知失败不重复应用已提交状态，也不阻断后续连续缓存；错误仍沿接收链报告。
+
+新 socket 的确认建立代次，确认前的事件有界暂存；同连接代次冲突报告错误并补订阅。没有代次的旧服务端保留旧接收行为，不启用新过滤。完整修复需要前后端同时更新，旧页面需要重载。
+
 - WS 鉴权用 query token 或 Authorization 头（`websocket-auth.service.ts`）；30s 心跳在 `websocket-server.service.ts`。
 - `websocket_reconnected` 帧是前端 `src/shared/context/WebSocketContext.tsx` 本地合成的，用于各订阅方追赶。
 

@@ -21,6 +21,7 @@ function mount() {
     const protection = useSessionProtection();
     const [pending, setPending] = useState<PendingPermissionRequest[]>([]);
     useChatRealtimeHandlers({
+      sendMessage: () => {},
       isActive: true, subscribe, selectedSession: session, currentSessionId: session.id, provider: 'zcode',
       setTokenBudget: () => {}, pendingPermissionRequests: pending, setPendingPermissionRequests: setPending,
       statusCheckSentAtRef: { current: new Map() }, requestLatestMessages: async () => {}, sessionStore,

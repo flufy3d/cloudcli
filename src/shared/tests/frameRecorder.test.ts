@@ -80,6 +80,17 @@ test('a restored frame is marked as belonging to an earlier page load', async ()
   assert.notEqual(fresh.load, restored.load, 'a new page load must be distinguishable from the restored one');
 });
 
+test('diagnostics retain replay namespaces and subscription windows without chat bodies', () => {
+  recordOutboundFrame({ type: 'chat.subscribe', sessions: [{ sessionId: 'sess-a', lastSeq: 7, streamEpoch: 'gateway-a' }] });
+  recordInboundFrame({ kind: 'chat_subscribed', sessionId: 'sess-a', lastSeq: 10, streamEpoch: 'gateway-a', replayFromSeq: 4, stale: false });
+  const [request, ack] = readRecordedFrames();
+  assert.deepEqual(request.subscriptions, [{ sessionId: 'sess-a', lastSeq: 7, streamEpoch: 'gateway-a' }]);
+  assert.equal(ack.streamEpoch, 'gateway-a');
+  assert.equal(ack.lastSeq, 10);
+  assert.equal(ack.replayFromSeq, 4);
+  assert.equal(ack.stale, false);
+});
+
 test('clearing the recorder also clears what a reload would restore', () => {
   recordOutboundFrame({ type: 'chat.send', sessionId: 'sess-a', content: '继续' });
   persistRecordedFrames();

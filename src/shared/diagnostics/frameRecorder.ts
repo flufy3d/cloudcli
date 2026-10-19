@@ -56,6 +56,11 @@ export type RecordedFrame = {
   toolId?: string;
   role?: string;
   seq?: number;
+  streamEpoch?: string;
+  lastSeq?: number;
+  replayFromSeq?: number;
+  stale?: boolean;
+  subscriptions?: Array<{ sessionId: string; lastSeq?: number; streamEpoch?: string }>;
   /** First characters of whatever the frame's payload is, for recognizing it. */
   summary?: string;
 };
@@ -196,6 +201,10 @@ export function recordInboundFrame(frame: unknown): void {
     toolId: readString(record, 'toolId'),
     role: readString(record, 'role'),
     seq: typeof seq === 'number' ? seq : undefined,
+    streamEpoch: truncate(record.streamEpoch),
+    lastSeq: typeof record.lastSeq === 'number' ? record.lastSeq : undefined,
+    replayFromSeq: typeof record.replayFromSeq === 'number' ? record.replayFromSeq : undefined,
+    stale: typeof record.stale === 'boolean' ? record.stale : undefined,
     summary: truncate(record.content ?? record.error ?? record.text),
   });
 }
@@ -213,6 +222,17 @@ export function recordOutboundFrame(message: unknown): void {
     sessionId: readString(record, 'sessionId') ?? null,
     kind: readString(record, 'type') ?? 'unknown',
     load: currentLoadId,
+    subscriptions: record.type === 'chat.subscribe' && Array.isArray(record.sessions)
+      ? record.sessions.slice(0, MAX_SUMMARY_LENGTH).flatMap((value: unknown) => {
+          if (!value || typeof value !== 'object') return [];
+          const cursor = value as Record<string, unknown>;
+          if (typeof cursor.sessionId !== 'string') return [];
+          return [{ sessionId: truncate(cursor.sessionId)!,
+            ...(typeof cursor.lastSeq === 'number' ? { lastSeq: cursor.lastSeq } : {}),
+            ...(typeof cursor.streamEpoch === 'string' ? { streamEpoch: truncate(cursor.streamEpoch) } : {}),
+          }];
+        })
+      : undefined,
     summary: truncate(record.content),
   });
 }

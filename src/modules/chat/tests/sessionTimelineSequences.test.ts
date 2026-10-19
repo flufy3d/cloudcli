@@ -105,6 +105,7 @@ function mountTimeline(activeSessionId: string | null = SESSION_ID): TimelineHar
   handlersRoot = renderHook(
     ({ pendingRequests: pr }: { pendingRequests: PendingPermissionRequest[] }) =>
       useChatRealtimeHandlers({
+      sendMessage: () => {},
         isActive: true,
         subscribe,
         provider: 'claude',
@@ -175,6 +176,7 @@ test('real processing state clears a background reply but retains a new turn wit
     const sessionStore = useSessionStore();
     const protection = useSessionProtection();
     useChatRealtimeHandlers({
+      sendMessage: () => {},
       isActive: true, subscribe, provider: 'claude', selectedSession: null,
       currentSessionId: SESSION_ID, setTokenBudget: vi.fn(), pendingPermissionRequests: [],
       setPendingPermissionRequests: vi.fn(), statusCheckSentAtRef: { current: new Map() },
@@ -728,4 +730,70 @@ test('a replayed or live permission_request followed by permission_resolved clea
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+test('history recovery automatically retries a transient failure and releases buffered text and permission effects', async () => {
+  vi.useFakeTimers();
+  let attempts = 0;
+  vi.stubGlobal('fetch', vi.fn(async () => {
+    attempts += 1;
+    return new Response(attempts === 1 ? 'offline' : JSON.stringify({ messages: [], total: 0, hasMore: false }), {
+      status: attempts === 1 ? 503 : 200, headers: { 'Content-Type': 'application/json' },
+    });
+  }));
+  const harness = mountTimeline();
+  try {
+    await act(async () => {
+      harness.emit({ kind: 'chat_subscribed', sessionId: SESSION_ID, streamEpoch: 'gateway-a', lastSeq: 5,
+        replayFromSeq: 6, stale: true, isProcessing: true, pendingPermissions: [], timestamp: '2026-10-20T00:00:00Z' });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    assert.equal(attempts, 1);
+    assert.equal(harness.sessionStore.getMessages(SESSION_ID).filter(row => row.kind === 'error').length, 1);
+    harness.emit(msg(6, { kind: 'permission_request', streamEpoch: 'gateway-a', seq: 6, requestId: 'after-gap', toolName: 'Bash',
+      context: { subagent: { toolUseId: 'agent-call' } } }) as ServerEvent);
+    harness.emit(msg(7, { role: 'assistant', streamEpoch: 'gateway-a', seq: 7, content: 'resumed reply' }) as ServerEvent);
+    assert.equal(harness.getPendingRequests().length, 0);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    assert.equal(attempts, 2);
+    assert.deepEqual(harness.getPendingRequests().map(request => request.requestId), ['after-gap']);
+    assert.deepEqual(harness.sessionStore.getMessages(SESSION_ID).map(row => row.content), ['resumed reply']);
+    assert.equal(harness.sessionStore.getResumeSeq(SESSION_ID), 7);
+  } finally {
+    harness.cleanup();
+    vi.useRealTimers();
+  }
+});
+
+test('persistent history failures back off without parallel requests and unmount cancels retry', async () => {
+  vi.useFakeTimers();
+  let attempts = 0;
+  vi.stubGlobal('fetch', vi.fn(async () => {
+    attempts += 1;
+    return new Response('offline', { status: 503 });
+  }));
+  const harness = mountTimeline();
+  let cleaned = false;
+  try {
+    await act(async () => {
+      harness.emit({ kind: 'chat_subscribed', sessionId: SESSION_ID, streamEpoch: 'gateway-a', lastSeq: 5,
+        replayFromSeq: 6, stale: true, isProcessing: true, pendingPermissions: [], timestamp: '2026-10-20T00:00:00Z' });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    assert.equal(attempts, 1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    assert.equal(attempts, 2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1999); });
+    assert.equal(attempts, 2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    assert.equal(attempts, 3);
+    assert.equal(harness.sessionStore.getResumeSeq(SESSION_ID), 0);
+    assert.equal(harness.sessionStore.getMessages(SESSION_ID).filter(row => row.kind === 'error').length, 1);
+    harness.cleanup(); cleaned = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    assert.equal(attempts, 3);
+  } finally {
+    if (!cleaned) harness.cleanup();
+    vi.useRealTimers();
+  }
 });

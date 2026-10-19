@@ -111,11 +111,13 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       if (!wsUrl) return console.warn('No authentication token found for WebSocket connection');
 
       const websocket = new WebSocket(wsUrl);
+      setIsConnected(false);
       // Store connecting sockets too, so a token refresh can close them before
       // their handshake completes with stale credentials.
       wsRef.current = websocket;
 
       websocket.onopen = () => {
+        if (wsRef.current !== websocket || unmountedRef.current) return;
         setIsConnected(true);
         if (hasConnectedRef.current) {
           // This is a reconnect — signal so components can catch up on missed messages
@@ -125,6 +127,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       };
 
       websocket.onmessage = (event) => {
+        if (wsRef.current !== websocket || unmountedRef.current) return;
         try {
           const data = JSON.parse(event.data) as ServerEvent;
           // Recorded before dispatch, so the report shows arrival order even
@@ -151,6 +154,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       };
 
       websocket.onerror = (error) => {
+        if (wsRef.current !== websocket || unmountedRef.current) return;
         console.error('WebSocket error:', error);
       };
 
@@ -178,7 +182,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
 
   const value: WebSocketContextType = useMemo(() =>
   ({
-    ws: wsRef.current,
+    ws: isConnected ? wsRef.current : null,
     sendMessage,
     subscribe,
     isConnected

@@ -1,4 +1,7 @@
 {
+  "replay": {
+    "recoveryFailed": "Chat sync failed. Retrying automatically; your existing messages are kept. You can also reload this page to retry."
+  },
   "codeBlock": {
     "copy": "Copy",
     "copied": "Copied",

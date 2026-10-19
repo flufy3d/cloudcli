@@ -78,3 +78,13 @@ export function readFrameSessionId(event: ServerEvent): string | null {
 export function readFrameSeq(event: ServerEvent): number | null {
   return 'seq' in event && typeof event.seq === 'number' ? event.seq : null;
 }
+
+/** Used by the gateway boundary and client replay ledger to validate a sequence namespace. */
+export function isValidStreamEpoch(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/** Validates wire sequence numbers; subscription cursors and watermarks may also be zero. */
+export function isValidReplaySeq(value: unknown, allowZero = false): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= (allowZero ? 0 : 1);
+}

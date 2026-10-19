@@ -140,3 +140,13 @@ test('an engine-derived id on a transcript row passes clean', () => {
   assert.ok(result.ok);
   assert.deepEqual(result.contractViolations, []);
 });
+
+test('transport metadata accepts only nonempty epochs and positive integer event sequences', () => {
+  const envelope = { kind: 'text', provider: 'codex', id: 'engine-reply' };
+  for (const fields of [{ seq: 0 }, { seq: -1 }, { seq: 1.2 }, { seq: NaN }, { streamEpoch: '' }, { streamEpoch: 8 }]) {
+    assert.equal(enforceNormalizedMessageContract({ ...envelope, ...fields }).ok, false);
+  }
+  const valid = enforceNormalizedMessageContract({ ...envelope, seq: 1, streamEpoch: 'gateway-a' });
+  assert.ok(valid.ok);
+  assert.equal(valid.message.streamEpoch, 'gateway-a');
+});

@@ -28,6 +28,10 @@ export type ChatSubscribedEvent = {
   isProcessing: boolean;
   /** The session's authoritative sequence watermark. */
   lastSeq: number;
+  /** Gateway process identity. Old clients may omit it on subscribe. */
+  streamEpoch?: string;
+  /** First seq from which every event through lastSeq is still replayable. */
+  replayFromSeq?: number;
   /**
    * Whether the client's `lastSeq` already fell out of the replay buffer, in
    * which case catching up needs a REST refresh rather than a replay.
@@ -92,3 +96,11 @@ export type ServerEvent =
   | LoadingProgressEvent
   | ProtocolErrorEvent
   | WebsocketReconnectedEvent;
+
+/** Shared transport budgets used by the gateway replay log and client gap buffer. */
+export const CHAT_REPLAY_LIMITS = {
+  events: 5000,
+  eventBytes: 1024 * 1024,
+  sessionBytes: 8 * 1024 * 1024,
+  totalBytes: 32 * 1024 * 1024,
+} as const;

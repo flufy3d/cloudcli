@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { sessionsDb } from '@/modules/database/index.js';
 import { recordRunOutcome } from '@/modules/diagnostics/index.js';
 import { ChatSessionWriter } from '@/modules/websocket/services/chat-session-writer.service.js';
@@ -8,6 +10,8 @@ import type {
   RealtimeClientConnection,
   RunOutcomeReason,
 } from '@/shared/types.js';
+
+import { CHAT_REPLAY_LIMITS } from '../../../../shared/protocol/frames.js';
 
 type ChatRunStatus = 'running' | 'completed';
 
@@ -21,7 +25,12 @@ export type ChatReplayResult = {
   events: NormalizedMessage[];
   lastSeq: number;
   stale: boolean;
+  streamEpoch: string;
+  replayFromSeq: number;
 };
+
+// One namespace for this gateway process, independent of run eviction/reset.
+const streamEpoch = randomUUID();
 
 /**
  * One live (or recently finished) provider run for a single app session.
@@ -74,10 +83,10 @@ const COMPLETED_RUN_RETENTION_MS = 5 * 60 * 1000;
  * a reconnecting client whose `lastSeq` predates the buffer falls back to a
  * REST history refresh, which is always the authoritative source.
  */
-const MAX_BUFFERED_EVENTS_PER_RUN = 5000;
-const MAX_BUFFERED_EVENT_BYTES = 1024 * 1024;
-const MAX_BUFFERED_RUN_BYTES = 8 * 1024 * 1024;
-const MAX_BUFFERED_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_BUFFERED_EVENTS_PER_RUN = CHAT_REPLAY_LIMITS.events;
+const MAX_BUFFERED_EVENT_BYTES = CHAT_REPLAY_LIMITS.eventBytes;
+const MAX_BUFFERED_RUN_BYTES = CHAT_REPLAY_LIMITS.sessionBytes;
+const MAX_BUFFERED_TOTAL_BYTES = CHAT_REPLAY_LIMITS.totalBytes;
 let totalBufferedBytes = 0;
 
 function dropOldestEvent(run: ChatRun): void {
@@ -175,6 +184,7 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
     ...message,
     sessionId: run.appSessionId,
     seq: run.lastSeq,
+    streamEpoch,
   };
 
   if (message.kind === 'complete') {
@@ -400,15 +410,13 @@ export const chatRunRegistry = {
     const lastSeq = sessionWatermarks.get(appSessionId) ?? 0;
     const run = runs.get(appSessionId);
     if (!run) {
-      return { events: [], lastSeq, stale: afterSeq < lastSeq };
+      return { events: [], lastSeq, stale: afterSeq !== lastSeq, streamEpoch, replayFromSeq: lastSeq + 1 };
     }
 
     const events = run.events.filter((event) => typeof event.seq === 'number' && event.seq > afterSeq);
     const oldestBuffered = run.events.find((event) => typeof event.seq === 'number')?.seq;
-    const stale = afterSeq < run.lastDroppedSeq
-      || (typeof oldestBuffered === 'number' && oldestBuffered > afterSeq + 1);
-
-    return { events, lastSeq, stale };
+    const replayFromSeq = Math.max(run.lastDroppedSeq + 1, oldestBuffered ?? lastSeq + 1);
+    return { events, lastSeq, stale: afterSeq < replayFromSeq - 1 || afterSeq > lastSeq, streamEpoch, replayFromSeq };
   },
 
   /**

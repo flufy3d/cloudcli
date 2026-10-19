@@ -22,6 +22,28 @@ class FakeConnection {
   }
 }
 
+test('gateway stamps one epoch across runs and replay declares its complete lower bound', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'epoch-session', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    run.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'first', streamEpoch: 'provider-forgery' } as any);
+    const replay = chatRunRegistry.replayEvents('epoch-session', 0);
+    assert.equal(typeof (replay as any).streamEpoch, 'string');
+    assert.notEqual((replay as any).streamEpoch, 'provider-forgery');
+    assert.equal((replay as any).replayFromSeq, 1);
+    assert.equal((replay.events[0] as any).streamEpoch, (replay as any).streamEpoch);
+    run.writer.sendComplete({ exitCode: 0 });
+    const next = chatRunRegistry.startRun({ appSessionId: 'epoch-session', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(next);
+    next.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'next' });
+    const nextReplay = chatRunRegistry.replayEvents('epoch-session', 2);
+    assert.equal((nextReplay as any).streamEpoch, (replay as any).streamEpoch);
+    assert.equal((nextReplay as any).replayFromSeq, 3);
+    assert.equal(nextReplay.events[0].seq, 3);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
 test('replay buffers are bounded by bytes and report a gap even from sequence zero', () => {
   chatRunRegistry.clearAll();
   try {

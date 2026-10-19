@@ -1,12 +1,11 @@
 import { useEffect, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
 import type { ServerEvent } from '@/shared/context/WebSocketContext';
 import { showCompletionTitleIndicator } from '@/modules/chat/utils/pageTitleNotification';
 import { playChatCompletionSound, playNotificationSound } from '@/modules/chat/utils/notificationSound';
-import type { MarkSessionIdle, MarkSessionProcessing, SessionActivityMap } from '@/shared/types';
-import type { PendingPermissionRequest } from '@/shared/types';
-import type { ProjectSession, LLMProvider } from '@/shared/types';
+import type { MarkSessionIdle, MarkSessionProcessing, SessionActivityMap, PendingPermissionRequest, ProjectSession, LLMProvider } from '@/shared/types';
 import type { ServerEventDirective } from '@/modules/chat/utils/sessionTimelineStore';
 import type { SessionStore } from '@/modules/chat/hooks/useSessionStore';
 
@@ -25,6 +24,7 @@ const hasActionablePermissionRequests = (requests: Array<{ toolName?: unknown }>
 
 type UseChatRealtimeHandlersArgs = {
   isActive: boolean;
+  sendMessage: (message: unknown) => void;
   subscribe: (listener: (event: ServerEvent) => void) => () => void;
   provider: LLMProvider;
   selectedSession: ProjectSession | null;
@@ -58,6 +58,7 @@ type UseChatRealtimeHandlersArgs = {
  */
 export function useChatRealtimeHandlers({
   isActive,
+  sendMessage,
   subscribe,
   provider,
   selectedSession,
@@ -73,6 +74,21 @@ export function useChatRealtimeHandlers({
   requestLatestMessages,
   sessionStore,
 }: UseChatRealtimeHandlersArgs) {
+  const { t } = useTranslation('chat');
+  // One retry chain per recovery identity; ordinary rerenders must not restart it.
+  const recoveryRetriesRef = useRef(new Map<string, { id: number; attempts: number; timer: ReturnType<typeof setTimeout> | null }>());
+  // Async failures after unmount must not schedule a new retry chain.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    const retries = recoveryRetriesRef.current;
+    return () => {
+      mountedRef.current = false;
+      for (const retry of retries.values()) if (retry.timer !== null) clearTimeout(retry.timer);
+      retries.clear();
+    };
+  }, []);
+
   // Session switches can send `chat.subscribe` before this effect has a chance
   // to rebind the websocket listener. Read the visible session id from a ref
   // so a fast `chat_subscribed` ack is matched against the current view, not
@@ -105,6 +121,10 @@ export function useChatRealtimeHandlers({
 
       // Transport-synthesized (no timeline state; the store never sees it).
       if (msg.kind === 'websocket_reconnected') {
+        sessionStore.beginConnection();
+        const sessions = new Set(sessionStore.getKnownSessionIds());
+        if (activeViewSessionIdRef.current) sessions.add(activeViewSessionIdRef.current);
+        for (const sessionId of sessions) executeDirective({ effect: 'replay_request', sessionId });
         onWebSocketReconnect?.();
         return;
       }
@@ -114,20 +134,48 @@ export function useChatRealtimeHandlers({
         return;
       }
 
-      const directive = sessionStore.applyServerEvent(msg, {
+      sessionStore.applyServerEvent(msg, {
         fallbackSessionId: activeViewSessionIdRef.current,
         provider,
+        onDirective: executeDirective,
       });
-      if (!directive) {
-        return;
-      }
-
-      executeDirective(directive);
     };
 
     /** Runs the app reactions one frame requires. No timeline state in here. */
     function executeDirective(directive: ServerEventDirective): void {
       switch (directive.effect) {
+        case 'replay_request': {
+          statusCheckSentAtRef.current.set(directive.sessionId, Date.now());
+          sendMessage({ type: 'chat.subscribe', sessions: [sessionStore.getSubscriptionCursor(directive.sessionId)] });
+          return;
+        }
+        case 'recover_stream': {
+          const { sessionId, recoveryId } = directive;
+          const previous = recoveryRetriesRef.current.get(sessionId);
+          if (previous?.id === recoveryId) return;
+          if (previous?.timer != null) clearTimeout(previous.timer);
+          const retry = { id: recoveryId, attempts: 0, timer: null as ReturnType<typeof setTimeout> | null };
+          recoveryRetriesRef.current.set(sessionId, retry);
+          const current = () => mountedRef.current && recoveryRetriesRef.current.get(sessionId) === retry
+            && sessionStore.isEventRecoveryCurrent(sessionId, recoveryId);
+          const attempt = () => {
+            retry.timer = null;
+            if (!current()) return;
+            void sessionStore.recoverEventStream(sessionId, recoveryId, {
+              provider, onDirective: executeDirective,
+            }).then(() => {
+              if (recoveryRetriesRef.current.get(sessionId) === retry) recoveryRetriesRef.current.delete(sessionId);
+            }).catch((error) => {
+              console.error('[Chat] History recovery failed:', error);
+              if (!current()) return;
+              sessionStore.setEventRecoveryError(sessionId, t('replay.recoveryFailed'), provider);
+              const delay = Math.min(1000 * 2 ** Math.min(retry.attempts++, 5), 30_000);
+              retry.timer = setTimeout(attempt, delay);
+            });
+          };
+          attempt();
+          return;
+        }
         case 'chat_subscribed': {
           // The ack's `lastSeq` is already merged into the store. `stale`
           // means the replay cursor predates the server's replay buffer, so
@@ -348,6 +396,8 @@ export function useChatRealtimeHandlers({
 
     return subscribe(handleEvent);
   }, [
+    t,
+    sendMessage,
     subscribe,
     provider,
     selectedSession,

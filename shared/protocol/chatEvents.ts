@@ -411,6 +411,8 @@ export type NormalizedMessage = {
    * reconnects. History messages loaded over REST do not carry it.
    */
   seq?: number;
+  /** Gateway process identity; event identity is (streamEpoch, sessionId, seq). Absent on REST history and legacy servers. */
+  streamEpoch?: string;
   role?: 'user' | 'assistant';
   content?: string;
   /**

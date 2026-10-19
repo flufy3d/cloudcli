@@ -49,6 +49,7 @@ async function mountComposer(tasks: ActiveBackgroundTask[], processingSessions?:
       sessionStore, showThinking: false, processingSessions: activities,
     });
     useChatRealtimeHandlers({
+      sendMessage: () => {},
       isActive: true, subscribe, selectedSession, currentSessionId: state.currentSessionId,
       provider: 'claude', setTokenBudget: () => {}, pendingPermissionRequests: [],
       setPendingPermissionRequests: () => {}, statusCheckSentAtRef: { current: new Map() },

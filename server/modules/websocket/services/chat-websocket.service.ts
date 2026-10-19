@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 
 import type { WebSocket } from 'ws';
 
+import { isValidReplaySeq, isValidStreamEpoch } from '../../../../shared/protocol/frameNarrowing.js';
+
 import { sessionsDb } from '@/modules/database/index.js';
 import { providerModelsService, sessionsService } from '@/modules/providers/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
@@ -683,9 +685,13 @@ function handleChatSubscribe(
     }
 
     const lastSeqRaw = (target as AnyRecord).lastSeq;
-    const lastSeq = typeof lastSeqRaw === 'number' && Number.isFinite(lastSeqRaw)
-      ? Math.max(0, Math.floor(lastSeqRaw))
-      : 0;
+    const epoch = (target as AnyRecord).streamEpoch;
+    if ((lastSeqRaw !== undefined && !isValidReplaySeq(lastSeqRaw, true))
+      || ('streamEpoch' in target && !isValidStreamEpoch(epoch))) {
+      sendProtocolError(ws, 'INVALID_SUBSCRIPTION', 'Invalid replay cursor.', sessionId);
+      continue;
+    }
+    const lastSeq = lastSeqRaw ?? 0;
 
     const isProcessing = chatRunRegistry.isProcessing(sessionId);
 
@@ -707,14 +713,18 @@ function handleChatSubscribe(
     // `lastSeq` is the session's authoritative watermark (clients realign to
     // it); `stale` tells the client its `lastSeq` predates the replay buffer
     // and it must refresh history over REST instead of trusting the replay.
-    const replay = chatRunRegistry.replayEvents(sessionId, lastSeq);
+    let replay = chatRunRegistry.replayEvents(sessionId, lastSeq);
+    const changedEpoch = epoch !== undefined && epoch !== replay.streamEpoch;
+    if (changedEpoch) replay = chatRunRegistry.replayEvents(sessionId, 0);
 
     sendJson(ws, {
       kind: 'chat_subscribed',
       sessionId,
       isProcessing,
       lastSeq: replay.lastSeq,
-      stale: replay.stale,
+      streamEpoch: replay.streamEpoch,
+      replayFromSeq: isProcessing ? replay.replayFromSeq : replay.lastSeq + 1,
+      stale: changedEpoch || replay.stale || (!isProcessing && lastSeq < replay.lastSeq),
       pendingPermissions,
       backgroundTasks,
       backgroundWorkPending: dependencies.runtime.isBackgroundWorkPending(sessionId),

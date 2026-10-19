@@ -1,6 +1,6 @@
 # 前端架构（Frontend）
 
-> 基准：2.10.0 / 2026-10-18
+> 基准：2.10.0 / 2026-10-20
 > **核心文档**：改动 `src/shared/**` 或聊天渲染/性能相关代码时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 
@@ -27,6 +27,8 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 `SessionProtectionContext` 的活动表区分主轮和后台等待两个阶段。后台等待包括任务执行和后续汇报，卡片消失不等于活动结束；后台结束事件只清后台阶段，新主轮会建立自己的活动。阶段交接不依赖毫秒时间比较。消息排队、中止资格和提示音按后台等待状态判断，具体链路见 [chat.md](./chat.md)。
 
 前后端共用的 `NormalizedMessage` 是聊天时间线的 wire contract；provider 给出的跨路行身份和历史正文完整度必须由 WebSocket 与历史接口原样传入 `SessionTimelineStore`，不能在视图模型层重新生成。身份的分段与对账规则见 [chat.md](./chat.md)。本地 Markdown 图片经授权端点转换为 Blob URL 后，组件换图或卸载必须中止请求并恰好释放一次 URL。
+
+`WebSocketContext` 只分发当前 socket 的回调，已被替换连接的迟到正文、打开和错误回调不能改变新连接。连接建立后，聊天接收器主动订阅已有会话，先通过确认建立网关代次，再让带代次的事件进入时间线。`SessionTimelineStore` 的连续应用游标与确认水位分开；有界缺口缓存、逐事件状态和指令执行、历史恢复基线见 [chat.md](./chat.md)。接收器不另建去重账。历史恢复失败提示使用 `chat.replay.recoveryFailed` 文案，简体、繁体和英文登记在各语言的 `chat.json`，其他语言沿现有英文回退。提示复用错误卡，不增加持久化消息；恢复成功后移除。
 
 ## Provider 相关前端（零分支原则）
 
@@ -115,7 +117,7 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
   注册一个读取器，导出控件按当前会话 id 取。
 
 隐私是格式契约：报告不得包含聊天正文、凭证、Cookie、请求头或 URL query。帧只留决定行身份的
-字段（`kind` / `id` / `toolId` / `role` / `seq` + 截断摘要）；只有构建产物的 `/assets/`
+字段（`kind` / `id` / `toolId` / `role` / `seq`、网关代次与订阅游标、确认窗口和 `stale` + 截断摘要）；只有构建产物的 `/assets/`
 路径可保留文件名，API、其他同源资源和外站资源分别归类为 `/api`、`same_origin_other`、
 `external`；服务端运行记录只有标识、计时和计数。浏览器不支持的性能条目写 `null`，不可伪造为零。
 应用可用性路径若变更，须继续用 `markStartupMilestone()` 标记入口执行、React 首次提交、
