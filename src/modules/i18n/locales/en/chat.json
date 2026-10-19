@@ -143,7 +143,10 @@
       "label": "Queued",
       "willSend": "Will send when this finishes",
       "edit": "Edit queued message",
-      "delete": "Delete queued message"
+      "delete": "Delete queued message",
+      "willSendAfterBackground": "Will send when the background tasks finish",
+      "forceSend": "Send now; background tasks keep running",
+      "forceSendButton": "Send now"
     }
   },
   "composer": {
@@ -157,6 +160,18 @@
       "title": "Replacing an earlier message",
       "filesNotReverted": "files the agent already changed are not reverted",
       "cancel": "Cancel"
+    },
+    "backgroundTasks": {
+      "title_one": "Background task running ({{count}})",
+      "title_other": "Background tasks running ({{count}})",
+      "hint": "Messages are queued and sent when the tasks finish",
+      "hintShort": "Sending queues",
+      "hintTurn": "Messages are queued and sent when this turn ends",
+      "hintTurnShort": "Sent after this turn",
+      "abort": "Stop background tasks",
+      "abortButton": "Stop",
+      "hintContinue": "Send anytime; background tasks keep running",
+      "hintContinueShort": "Send anytime"
     }
   },
   "providerSelection": {

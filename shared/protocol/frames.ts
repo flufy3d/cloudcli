@@ -49,6 +49,8 @@ export type ChatSubscribedEvent = {
    * outlive their turn); the client then offers no stop button for it.
    */
   backgroundCanInterrupt?: boolean;
+  /** See `backgroundWorkQueuesInput` on the `background_tasks` status frame. */
+  backgroundWorkQueuesInput?: boolean;
   timestamp: string;
 };
 

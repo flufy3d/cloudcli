@@ -57,6 +57,13 @@ export interface IProviderRuntime {
      * run to cancel. Left undefined, or true, the work counts as stoppable.
      */
     canInterrupt?(sessionId: string): boolean;
+    /**
+     * False when a message sent during this session's background work does
+     * not disturb it — the runtime takes the turn alongside the work (Claude's
+     * held process) — so the page sends at once instead of queueing.
+     * Undefined counts as true: the message waits for the work.
+     */
+    queuesInput?(sessionId: string): boolean;
   };
   /**
    * Sessions with background tasks still outstanding, whether or not their

@@ -125,6 +125,10 @@ export function createProviderRuntimeService(
       );
     },
 
+    backgroundWorkQueuesInput(providerName: LLMProvider, sessionId: string): boolean {
+      return dependencies.resolveProvider(providerName).runtime.backgroundTasks?.queuesInput?.(sessionId) ?? true;
+    },
+
     canInterruptBackgroundWork(sessionId: string): boolean {
       return dependencies.listProviders()
         .every((provider) => provider.runtime.backgroundTasks?.canInterrupt?.(sessionId) !== false);

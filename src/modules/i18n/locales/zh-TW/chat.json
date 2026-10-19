@@ -122,7 +122,18 @@
     "clickToChangeMode": "點擊變更權限模式（或在輸入框中按 Tab）",
     "showAllCommands": "顯示所有指令",
     "clearInput": "清空輸入",
-    "scrollToBottom": "捲動到底部"
+    "scrollToBottom": "捲動到底部",
+    "queue": {
+      "sendNext": "排隊傳送下一則訊息",
+      "update": "更新排隊訊息",
+      "label": "已排隊",
+      "willSend": "將在目前完成後傳送",
+      "edit": "編輯排隊訊息",
+      "delete": "刪除排隊訊息",
+      "willSendAfterBackground": "背景任務完成後將自動傳送",
+      "forceSend": "立即傳送，背景任務繼續執行",
+      "forceSendButton": "立即傳送"
+    }
   },
   "thinkingMode": {
     "selector": {
@@ -263,6 +274,17 @@
       "title": "正在取代先前的訊息",
       "filesNotReverted": "已修改的檔案不會還原",
       "cancel": "取消"
+    },
+    "backgroundTasks": {
+      "title": "背景任務執行中 ({{count}})",
+      "hint": "傳送訊息將排隊，任務完成後自動傳送",
+      "hintShort": "傳送將排隊",
+      "hintTurn": "傳送訊息將排隊，本輪結束後傳送",
+      "hintTurnShort": "本輪結束後傳送",
+      "abort": "中止背景任務",
+      "abortButton": "中止",
+      "hintContinue": "可直接傳送，背景任務繼續執行",
+      "hintContinueShort": "可繼續傳送"
     }
   },
   "export": {

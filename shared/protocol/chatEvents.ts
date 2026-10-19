@@ -488,6 +488,12 @@ export type NormalizedMessage = {
   /** True while background execution or its follow-up reply still blocks queued messages. */
   backgroundWorkPending?: boolean;
   /**
+   * False when a message sent during the background work does not disturb it
+   * (Claude takes it as a turn of the held process), so the page sends it at
+   * once. Omitted means the message waits for the work.
+   */
+  backgroundWorkQueuesInput?: boolean;
+  /**
    * Live background-work events (`task_status` rows): what a launched agent,
    * workflow or backgrounded command is doing while its turn has ended. The
    * run is tracking. `taskId` is the provider's task handle; `toolUseId` names

@@ -119,6 +119,8 @@ function ChatInterface({
     requestLatestMessages,
     backgroundTasks,
     hasActiveBackgroundTasks,
+    isReplyInFlight,
+    isInputBlocked,
   } = useChatSessionState({
     isActive,
     selectedProject,
@@ -230,6 +232,7 @@ function ChatInterface({
     addMessage,
     setPendingPermissionRequests,
     resolvePermissionModeForProvider,
+    isInputBlocked,
     backgroundTasks,
     hasActiveBackgroundTasks,
   });
@@ -536,6 +539,8 @@ function ChatInterface({
           sendByCtrlEnter={sendByCtrlEnter}
           backgroundTasks={backgroundTasks}
           hasActiveBackgroundTasks={hasActiveBackgroundTasks}
+          isInputBlocked={isInputBlocked}
+          isReplyInFlight={isReplyInFlight}
           onForceSendQueuedDraft={canForceSendQueuedDraft ? forceSendQueuedDraft : undefined}
         />
         </div>

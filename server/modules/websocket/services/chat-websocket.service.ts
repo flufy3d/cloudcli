@@ -87,6 +87,8 @@ export type ProviderRuntimeGateway = {
   getBackgroundTasksForSession?(sessionId: string): ActiveBackgroundTask[];
   /** False when the session's background work is held by a runtime that can no longer stop it. */
   canInterruptBackgroundWork?(sessionId: string): boolean;
+  /** False when the provider takes a new turn alongside the session's background work. */
+  backgroundWorkQueuesInput?(provider: LLMProvider, sessionId: string): boolean;
 };
 
 type ChatWebSocketDependencies = {
@@ -644,6 +646,15 @@ async function handleChatStopTask(
   }
 }
 
+/** Whether the session's provider holds a new message back while background work runs; true when unknown. */
+function readBackgroundWorkQueuesInput(sessionId: string, dependencies: ChatWebSocketDependencies): boolean {
+  const provider = sessionsDb.getSessionById(sessionId)?.provider;
+  if (!provider || !dependencies.runtime.backgroundWorkQueuesInput) {
+    return true;
+  }
+  return dependencies.runtime.backgroundWorkQueuesInput(provider as LLMProvider, sessionId);
+}
+
 /**
  * Handles `chat.subscribe`: for each requested session, reports whether a run
  * is processing, re-attaches the live stream to this socket, replays missed
@@ -708,6 +719,7 @@ function handleChatSubscribe(
       backgroundTasks,
       backgroundWorkPending: dependencies.runtime.isBackgroundWorkPending(sessionId),
       backgroundCanInterrupt: dependencies.runtime.canInterruptBackgroundWork?.(sessionId) ?? true,
+      backgroundWorkQueuesInput: readBackgroundWorkQueuesInput(sessionId, dependencies),
       timestamp: new Date().toISOString(),
     });
 

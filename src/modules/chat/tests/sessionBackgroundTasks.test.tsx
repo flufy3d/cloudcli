@@ -185,3 +185,42 @@ test('a reconnect acknowledgement carries whether the background work can be sto
   expect(result.current.hasActiveBackgroundTasks).toBe(true);
   expect(result.current.canAbortSession).toBe(false);
 });
+
+test('Claude background work leaves the input open; other engines\' work holds it back', async () => {
+  const { result } = mountSession([]);
+  await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+
+  act(() => {
+    result.current.sessionStore.applyServerEvent({ ...taskStatus([agent]), backgroundWorkQueuesInput: false } as ServerEvent);
+  });
+  expect(result.current.hasActiveBackgroundTasks).toBe(true);
+  expect(result.current.isInputBlocked).toBe(false);
+
+  act(() => {
+    result.current.sessionStore.applyServerEvent(taskStatus([agent]));
+  });
+  expect(result.current.isInputBlocked).toBe(true);
+});
+
+test('a reply in flight holds the input back even when the background work would not', async () => {
+  const responding = new Map([[session.id, { statusText: 'Thinking', canInterrupt: true, startedAt: 7 }]]);
+  const { result } = mountSession([], responding);
+  await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+  act(() => {
+    result.current.sessionStore.applyServerEvent({ ...taskStatus([agent]), backgroundWorkQueuesInput: false } as ServerEvent);
+  });
+  expect(result.current.isInputBlocked).toBe(true);
+});
+
+test('a reconnect acknowledgement carries whether the background work holds the input back', async () => {
+  const { result } = mountSession([]);
+  await waitFor(() => expect(result.current.isLoadingSessionMessages).toBe(false));
+  act(() => {
+    result.current.sessionStore.applyServerEvent({
+      kind: 'chat_subscribed', sessionId: session.id, isProcessing: false,
+      timestamp: '2026-10-19T00:00:00.000Z', lastSeq: 0, stale: false,
+      pendingPermissions: [], backgroundTasks: [agent], backgroundWorkQueuesInput: false,
+    });
+  });
+  expect(result.current.isInputBlocked).toBe(false);
+});

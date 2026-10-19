@@ -30,6 +30,7 @@ const TRANSCRIPT_ROW_KIND_SET: ReadonlySet<string> = new Set(TRANSCRIPT_ROW_KIND
  */
 const NORMALIZED_MESSAGE_KEYS = [
   'backgroundWorkPending',
+  'backgroundWorkQueuesInput',
   'aborted',
   'agents',
   'actualSessionId',

@@ -69,4 +69,22 @@ describe('BackgroundTaskIndicator', () => {
     abortButton.click();
     expect(onAbort).toHaveBeenCalledTimes(1);
   });
+
+  const runningBash: ActiveBackgroundTask[] = [{ id: 'task-1', toolName: 'Bash', command: 'npm run dev', startedAt: Date.now() }];
+
+  it('says a message waits for the tasks when the background work holds the input back', () => {
+    render(<BackgroundTaskIndicator tasks={runningBash} queuesInput />);
+    expect(screen.getByText('Messages are queued and sent when the tasks finish')).toBeTruthy();
+  });
+
+  it('says a message waits for the turn while a reply is streaming', () => {
+    render(<BackgroundTaskIndicator tasks={runningBash} queuesInput isReplyInFlight />);
+    expect(screen.getByText('Messages are queued and sent when this turn ends')).toBeTruthy();
+  });
+
+  it('says a message can go out now when the background work does not hold the input back', () => {
+    render(<BackgroundTaskIndicator tasks={runningBash} queuesInput={false} />);
+    expect(screen.getByText('Send anytime; background tasks keep running')).toBeTruthy();
+    expect(screen.queryByText(/queued/)).toBeNull();
+  });
 });

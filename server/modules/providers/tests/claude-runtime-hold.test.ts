@@ -32,6 +32,14 @@ type Scripted = {
   stopped: string[];
   drain: () => Promise<void>;
   interrupt: () => Promise<void>;
+  /** Every user message the CLI read from its stdin, in order. */
+  prompts: Array<Record<string, unknown>>;
+  /** `setModel` / `setPermissionMode` / `applyFlagSettings` calls, as `[method, value]`. */
+  switches: Array<[string, unknown]>;
+  /** Makes those calls reject, as a CLI that refuses the switch does. */
+  rejectSwitches: boolean;
+  /** Makes the stream throw, as a CLI that dies does. */
+  fail: (error: Error) => void;
 };
 
 /** A stand-in for the SDK query: yields what the test emits, and reads the held prompt to notice its release. */
@@ -41,12 +49,19 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
   let released = false;
   const drained = new Set<() => void>();
   const stopped: string[] = [];
+  const prompts: Array<Record<string, unknown>> = [];
+  const switches: Array<[string, unknown]> = [];
+  let failure: Error | null = null;
 
   const script: Scripted = {
     emit: (message) => { queue.push(message); wake?.(); },
     end: () => { queue.push(null); wake?.(); },
     released: () => released,
     stopped,
+    prompts,
+    switches,
+    rejectSwitches: false,
+    fail: (error) => { failure = error; wake?.(); },
     interrupt: async () => {},
     drain: () => {
       if (wake && queue.length === 0) return new Promise((resolve) => setImmediate(resolve));
@@ -63,12 +78,13 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
 
   const createQuery: NonNullable<ProviderRuntimeContext['createQuery']> = ({ prompt }) => {
     void (async () => {
-      for await (const _message of prompt) { /* the CLI reads its stdin */ }
+      for await (const message of prompt) { prompts.push(message as Record<string, unknown>); }
       released = true;
     })();
 
     const iterator = (async function* () {
       for (;;) {
+        if (failure) throw failure;
         if (queue.length === 0) {
           for (const finish of drained) finish();
           await new Promise<void>((resolve) => { wake = resolve; });
@@ -87,17 +103,47 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
     return Object.assign(iterator, {
       interrupt: () => script.interrupt(),
       stopTask: async (taskId: string) => { stopped.push(taskId); },
+      setModel: async (model?: string) => {
+        if (script.rejectSwitches) throw new Error('switch refused');
+        switches.push(['setModel', model]);
+      },
+      setPermissionMode: async (mode: string) => {
+        if (script.rejectSwitches) throw new Error('switch refused');
+        switches.push(['setPermissionMode', mode]);
+      },
+      applyFlagSettings: async (settings: Record<string, unknown>) => {
+        if (script.rejectSwitches) throw new Error('switch refused');
+        switches.push(['applyFlagSettings', settings]);
+      },
     });
   };
 
   return { createQuery, script };
 }
 
+type NextTurn = (command: string, options?: Record<string, unknown>) => { sent: NormalizedMessage[]; done: Promise<unknown> };
+
 async function withRun(
-  runTest: (context: { script: Scripted; sent: NormalizedMessage[]; done: Promise<unknown> }) => Promise<void>,
+  runTest: (context: {
+    script: Scripted;
+    sent: NormalizedMessage[];
+    done: Promise<unknown>;
+    /** Sends the session's next turn through the same runtime, on a writer of its own. */
+    nextTurn: NextTurn;
+    /** One scripted CLI process per `createQuery` call, the first being `script`. */
+    processes: Scripted[];
+    cwd: string;
+  }) => Promise<void>,
 ): Promise<void> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'claude-runtime-hold-'));
-  const { createQuery, script } = createScriptedQuery();
+  const first = createScriptedQuery();
+  const script = first.script;
+  const processes: Scripted[] = [];
+  const createQuery: NonNullable<ProviderRuntimeContext['createQuery']> = (args) => {
+    const scripted = processes.length === 0 ? first : createScriptedQuery();
+    processes.push(scripted.script);
+    return scripted.createQuery(args);
+  };
   const sent: NormalizedMessage[] = [];
   const writer = { send: (message: NormalizedMessage) => { sent.push(message); }, userId: null };
   const sessions = new ClaudeSessionsProvider({ getLiveRunStartTime: () => null });
@@ -109,14 +155,23 @@ async function withRun(
     isProviderInstalled: async () => true,
     createQuery,
   };
+  const turns: Array<Promise<unknown>> = [];
+  const nextTurn: NextTurn = (command, options = {}) => {
+    const turnSent: NormalizedMessage[] = [];
+    const turnWriter = { send: (message: NormalizedMessage) => { turnSent.push(message); }, userId: null };
+    const turnDone = queryClaudeSDK(command, { sessionId: SESSION_ID, cwd, ...options }, turnWriter as never, context);
+    turns.push(turnDone);
+    return { sent: turnSent, done: turnDone };
+  };
 
   try {
     const done = queryClaudeSDK('hello', { sessionId: SESSION_ID, cwd }, writer as never, context);
     try {
-      await runTest({ script, sent, done });
+      await runTest({ script, sent, done, nextTurn, processes, cwd });
     } finally {
-      script.end();
+      for (const scripted of processes.length ? processes : [script]) scripted.end();
       await done;
+      await Promise.all(turns);
     }
   } finally {
     await rm(cwd, { recursive: true, force: true });
@@ -638,5 +693,340 @@ test('a stopped reply whose result never arrives still lets the process go', asy
     t.mock.timers.tick(60_000);
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(script.released(), true, 'a CLI that never ends the interrupted turn is not left running');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Turns continued on the held process
+// ---------------------------------------------------------------------------
+// Measured against claude CLI via the agent SDK (2026-10-19): one process
+// takes message after message on its stdin, each becoming a turn of its own
+// with its own `init` and `result`, and a background Bash started in the
+// first turn survives the turns after it. A message written while a turn is
+// still running is folded into that turn. `setModel` / `setPermissionMode`
+// mid-process take effect from the next turn's `init`.
+
+const assistantText = (text: string) => ({
+  type: 'assistant', session_id: NATIVE_ID, parent_tool_use_id: null,
+  message: { role: 'assistant', content: [{ type: 'text', text }] },
+});
+const promptText = (message: Record<string, unknown> | undefined) => JSON.stringify(message ?? {});
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+const completes = (messages: NormalizedMessage[]) => messages.filter((message) => message.kind === 'complete');
+/** Waits (up to 2s) for the runtime's file reads and handover to reach `condition`. */
+async function until(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!condition() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+}
+
+/** Ends the first turn with a background Bash still running, so the process is held. */
+async function holdForBackgroundBash(script: Scripted): Promise<void> {
+  script.emit(init());
+  script.emit(toolUse('toolu_bg', 'Bash', { command: 'npm run dev', run_in_background: true }));
+  script.emit(taskStarted('b1', 'toolu_bg', 'local_bash'));
+  script.emit(ack('toolu_bg', 'Running in background with ID: b1', { backgroundTaskId: 'b1' }));
+  script.emit(result());
+  await script.drain();
+  assert.equal(script.released(), false, 'the process is held for the background Bash');
+}
+
+test('a turn sent while the process is held goes into that process, and the background work survives it', async () => {
+  await withRun(async ({ script, sent, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('change direction');
+    await until(() => script.prompts.length >= 2);
+
+    assert.equal(processes.length, 1, 'no second CLI process');
+    assert.match(promptText(script.prompts[1]), /change direction/);
+
+    script.emit(init());
+    script.emit(assistantText('on it'));
+    script.emit(result());
+    await second.done;
+
+    assert.equal(completes(second.sent).length, 1, 'the second turn completes on its own writer');
+    assert.ok(second.sent.some((message) => message.kind === 'text' && message.content === 'on it'));
+    assert.equal(completes(sent).length, 1, 'the first writer saw only its own turn complete');
+    assert.equal(script.released(), false, 'still held for the background Bash');
+    assert.deepEqual(listClaudeSDKBackgroundWork().map((entry) => entry.tasks.map((task) => task.taskId)), [['b1']]);
+  });
+});
+
+test('a model or permission change switches the held process instead of replacing it', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('again', { model: 'haiku', permissionMode: 'acceptEdits' });
+    await until(() => script.prompts.length >= 2);
+
+    assert.equal(processes.length, 1);
+    assert.deepEqual(script.switches, [['setModel', 'haiku'], ['setPermissionMode', 'acceptEdits']]);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+  });
+});
+
+for (const [label, options] of [
+  ['another working directory', { cwd: '/tmp' }],
+  ['an edited message', { resumeAnchorId: 'uuid-keep' }],
+] as const) {
+  test(`a turn with ${label} starts a new process and ends the held one`, async () => {
+    await withRun(async ({ script, nextTurn, processes }) => {
+      await holdForBackgroundBash(script);
+      const second = nextTurn('again', options);
+      await until(() => processes.length >= 2);
+
+      assert.equal(processes.length, 2, 'a fresh CLI process');
+      await until(() => script.released());
+      assert.equal(script.released(), true, 'the held process is let go');
+      processes[1].emit(init());
+      processes[1].emit(result());
+      // The stand-in CLI exits when told to, not when its stdin closes.
+      processes[1].end();
+      await second.done;
+      assert.equal(completes(second.sent).length, 1);
+    });
+  });
+}
+
+test('a turn sent while the CLI relays a finished task waits for that relay to end', async () => {
+  await withRun(async ({ script, sent, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    script.emit(taskNotification('b1', 'toolu_bg', 'completed'));
+    script.emit(init());
+    await script.drain();
+
+    const second = nextTurn('next');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(script.prompts.length, 1, 'not written into the relay turn');
+
+    script.emit(result());
+    await script.drain();
+    await until(() => script.prompts.length >= 2);
+    assert.match(promptText(script.prompts[1]), /next/);
+    assert.equal(completes(second.sent).length, 0, 'the relay turn ending is not the new turn ending');
+
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+    assert.equal(completes(second.sent).length, 1);
+    assert.equal(completes(sent).length, 1);
+  });
+});
+
+test('a CLI that dies during a continued turn reports to that turn and ends it', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('next');
+    await until(() => script.prompts.length >= 2);
+
+    script.fail(new Error('CLI crashed'));
+    await second.done;
+    assert.ok(second.sent.some((message) => message.kind === 'error' && String(message.content).includes('CLI crashed')));
+    assert.equal(completes(second.sent).length, 1);
+  });
+});
+
+test('stopping a continued reply stops only that turn while the background work runs', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('next');
+    await until(() => script.prompts.length >= 2);
+    script.emit(init());
+    await script.drain();
+
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    script.emit(interruptedResult());
+    await second.done;
+    await script.drain();
+    assert.equal(script.released(), false, 'the background Bash keeps the process');
+    assert.equal(completes(second.sent).length, 0, 'the abort path reports the stopped turn');
+  });
+});
+
+test('the strip tells the page that Claude background work does not hold back the next message', async () => {
+  await withRun(async ({ script, sent }) => {
+    await holdForBackgroundBash(script);
+    const strip = lastStatus(sent);
+    assert.equal(strip?.backgroundWorkQueuesInput, false, 'the next turn goes into the held process');
+  });
+});
+
+// Measured through a logging proxy in front of the API (2026-10-19): a
+// process started with `--effort low` sends `output_config.effort: "low"`;
+// `applyFlagSettings({ effortLevel })` mid-process changes the next request's
+// effort (`high`, `max` both honoured); after `setModel('haiku')` the CLI
+// drops `output_config` on its own; `effortLevel: null` falls back to what the
+// process started with, which is the CLI default only when it started with
+// no `--effort`.
+
+test('another effort level is applied to the held process instead of replacing it', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('again', { model: 'opus', effort: 'low' });
+    await until(() => script.prompts.length >= 2);
+    assert.equal(processes.length, 1);
+    assert.deepEqual(script.switches, [['setModel', 'opus'], ['applyFlagSettings', { effortLevel: 'low' }]]);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+  });
+});
+
+test('a model without effort tiers keeps the held process and leaves the effort to the CLI', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('again', { model: 'haiku', effort: 'high' });
+    await until(() => script.prompts.length >= 2);
+    assert.equal(processes.length, 1);
+    assert.deepEqual(script.switches, [['setModel', 'haiku']]);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+  });
+});
+
+test('entering plan mode keeps the held process', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('plan it', { permissionMode: 'plan' });
+    await until(() => script.prompts.length >= 2);
+    assert.equal(processes.length, 1, 'plan mode adds auto-allowed tools, but that is not a reason to restart');
+    assert.deepEqual(script.switches, [['setPermissionMode', 'plan']]);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+  });
+});
+
+test('a switch the CLI refuses moves the turn to a fresh process, which still completes it', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    script.rejectSwitches = true;
+    const second = nextTurn('again', { model: 'haiku' });
+    await until(() => processes.length >= 2);
+    assert.equal(processes.length, 2);
+    processes[1].emit(init());
+    processes[1].emit(result());
+    processes[1].end();
+    await second.done;
+    assert.equal(completes(second.sent).length, 1);
+  });
+});
+
+test('stopping a turn that still waits for the relay withdraws only that turn', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    script.emit(taskStarted('b2', 'toolu_bg2', 'local_bash'));
+    script.emit(taskNotification('b1', 'toolu_bg', 'completed'));
+    script.emit(init());
+    await script.drain();
+    const second = nextTurn('next');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    await second.done;
+    script.emit(result());
+    await script.drain();
+    await tick();
+    assert.equal(script.prompts.length, 1, 'the withdrawn message never reaches the CLI');
+    assert.equal(script.released(), false, 'the other background Bash keeps the process');
+  });
+});
+
+test('a message sent right after stopping a reply joins the process once the interrupted turn ends', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('next');
+    await until(() => script.prompts.length >= 2);
+    script.emit(init());
+    await script.drain();
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    void second.done;
+
+    // The page already shows the turn stopped, so the user sends again
+    // before the CLI has ended the interrupted turn.
+    const third = nextTurn('correction');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(processes.length, 1);
+    assert.equal(script.prompts.length, 2, 'held back until the interrupted turn ends');
+    script.emit(interruptedResult());
+    await until(() => script.prompts.length >= 3);
+    assert.match(promptText(script.prompts[2]), /correction/);
+    script.emit(init());
+    script.emit(result());
+    await third.done;
+    assert.equal(completes(third.sent).length, 1);
+    assert.equal(script.released(), false);
+  });
+});
+
+test('an earlier stop\'s fallback timer cannot release the process during a later stop', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await withRun(async ({ script, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('next');
+    for (let i = 0; i < 50 && script.prompts.length < 2; i += 1) { t.mock.timers.tick(10); await tick(); }
+    script.emit(init());
+    await script.drain();
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    script.emit(interruptedResult());
+    await script.drain();
+    await second.done;
+
+    const third = nextTurn('again');
+    for (let i = 0; i < 50 && script.prompts.length < 3; i += 1) { t.mock.timers.tick(10); await tick(); }
+    script.emit(init());
+    await script.drain();
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    void third.done;
+
+    // The first stop's 30s timer comes due while the second (started at
+    // least 10ms later) still waits for its result.
+    t.mock.timers.tick(29_995);
+    await tick();
+    assert.equal(script.released(), false);
+    script.emit(interruptedResult());
+    await script.drain();
+  });
+});
+
+test('stopping a message sent right after a stop withdraws it before the interrupted turn ends', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('next');
+    await until(() => script.prompts.length >= 2);
+    script.emit(init());
+    await script.drain();
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    void second.done;
+
+    const third = nextTurn('sent by mistake');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    await third.done;
+
+    script.emit(interruptedResult());
+    await script.drain();
+    await tick();
+    assert.equal(script.prompts.length, 2, 'the withdrawn message never reaches the CLI');
+    assert.equal(script.released(), false);
+  });
+});
+
+// Measured against claude CLI (2026-10-19): `setPermissionMode('bypassPermissions')`
+// throws "Cannot set permission mode to bypassPermissions because the session
+// was not launched with --dangerously-skip-permissions".
+test('turning on bypass permissions starts a new process, since the CLI refuses that switch', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('again', { toolsSettings: { allowedTools: [], disallowedTools: [], skipPermissions: true } });
+    await until(() => processes.length >= 2);
+    assert.equal(processes.length, 2);
+    assert.deepEqual(script.switches, [], 'no switch is attempted on the held process');
+    processes[1].emit(init());
+    processes[1].emit(result());
+    processes[1].end();
+    await second.done;
   });
 });

@@ -6,6 +6,10 @@ import type { ActiveBackgroundTask } from '@/shared/types';
 type BackgroundTaskIndicatorProps = {
   tasks: ActiveBackgroundTask[];
   onAbort?: () => void;
+  /** A message sent now is queued; without it the strip says a message can go out at once. */
+  queuesInput?: boolean;
+  /** A reply is streaming, so a queued message goes out when this turn ends. */
+  isReplyInFlight?: boolean;
 };
 
 function formatElapsed(elapsedSeconds: number): string {
@@ -18,7 +22,7 @@ function formatElapsed(elapsedSeconds: number): string {
 }
 
 /** Used by ChatComposer to display running background tasks. */
-export default function BackgroundTaskIndicator({ tasks, onAbort }: BackgroundTaskIndicatorProps) {
+export default function BackgroundTaskIndicator({ tasks, onAbort, queuesInput = true, isReplyInFlight = false }: BackgroundTaskIndicatorProps) {
   const { t } = useTranslation('chat');
   const [, setTick] = useState(0);
 
@@ -57,14 +61,18 @@ export default function BackgroundTaskIndicator({ tasks, onAbort }: BackgroundTa
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-muted-foreground/80">
             <span className="hidden sm:inline">
-              {t('composer.backgroundTasks.hint', {
-                defaultValue: '发送消息将排队，任务完成后自动发送',
-              })}
+              {isReplyInFlight
+                ? t('composer.backgroundTasks.hintTurn', { defaultValue: 'Messages are queued and sent when this turn ends' })
+                : queuesInput
+                  ? t('composer.backgroundTasks.hint', { defaultValue: 'Messages are queued and sent when the tasks finish' })
+                  : t('composer.backgroundTasks.hintContinue', { defaultValue: 'Send anytime; background tasks keep running' })}
             </span>
             <span className="sm:hidden">
-              {t('composer.backgroundTasks.hintShort', {
-                defaultValue: '发送将排队',
-              })}
+              {isReplyInFlight
+                ? t('composer.backgroundTasks.hintTurnShort', { defaultValue: 'Sent after this turn' })
+                : queuesInput
+                  ? t('composer.backgroundTasks.hintShort', { defaultValue: 'Sending queues' })
+                  : t('composer.backgroundTasks.hintContinueShort', { defaultValue: 'Send anytime' })}
             </span>
           </span>
           {onAbort && (

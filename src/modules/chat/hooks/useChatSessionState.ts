@@ -221,6 +221,13 @@ export function useChatSessionState({
     } : processingActivity;
   const isProcessing = sessionActivity !== null;
   const canAbortSession = isProcessing && sessionActivity.canInterrupt;
+  // A reply in flight always holds a new message back. Background work does
+  // too, unless its runtime takes the next turn alongside it (Claude's held
+  // process), in which case sending at once disturbs nothing.
+  const isReplyInFlight = Boolean(processingActivity && !processingActivity.background);
+  const isInputBlocked = isReplyInFlight
+    || ((isProcessing || hasActiveBackgroundTasks)
+      && !(activeSessionId && !sessionStore.backgroundWorkQueuesInput(activeSessionId)));
 
   // Ref mirror so effects can read the latest map without re-running on
   // every activity transition.
@@ -759,6 +766,8 @@ export function useChatSessionState({
     canAbortSession,
     backgroundTasks,
     hasActiveBackgroundTasks,
+    isReplyInFlight,
+    isInputBlocked,
     currentSessionId,
     setCurrentSessionId,
     isLoadingSessionMessages,

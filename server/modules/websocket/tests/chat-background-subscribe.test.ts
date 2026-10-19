@@ -206,6 +206,7 @@ test('the subscribe ack says whether the session\'s background work can still be
         getPendingApprovalsForSession: () => [],
         getBackgroundTasksForSession: () => [{ id: 'call_agent', toolName: 'Agent', startedAt: 1 }],
         canInterruptBackgroundWork: (sessionId: string) => sessionId !== SESSION_ID,
+        backgroundWorkQueuesInput: (provider: string) => provider !== 'claude',
       } as never },
     );
     newTab.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 0 }] }));
@@ -213,5 +214,7 @@ test('the subscribe ack says whether the session\'s background work can still be
 
     assert.equal(newTab.frames[0]?.kind, 'chat_subscribed');
     assert.equal(newTab.frames[0]?.backgroundCanInterrupt, false);
+    // The session row is a Claude session, whose next turn joins its held process.
+    assert.equal(newTab.frames[0]?.backgroundWorkQueuesInput, false);
   });
 });

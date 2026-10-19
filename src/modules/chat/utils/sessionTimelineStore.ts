@@ -147,6 +147,12 @@ export type SessionSlot = {
    * ZCode agent outliving its turn); undefined means stoppable.
    */
   backgroundCanInterrupt?: boolean;
+  /**
+   * False when the server said a message sent during this work does not
+   * disturb it (Claude takes it as a turn of the held process); undefined
+   * means the message waits for the work.
+   */
+  backgroundWorkQueuesInput?: boolean;
 }
 
 const EMPTY: NormalizedMessage[] = [];
@@ -968,7 +974,7 @@ export class SessionTimelineStore {
         }
         const ackBgTasks = Array.isArray(msg.backgroundTasks) ? msg.backgroundTasks : undefined;
         if (ackBgTasks) {
-          this.setBackgroundState(sid, ackBgTasks, msg.backgroundWorkPending, msg.backgroundCanInterrupt);
+          this.setBackgroundState(sid, ackBgTasks, msg.backgroundWorkPending, msg.backgroundCanInterrupt, msg.backgroundWorkQueuesInput);
         }
         return {
           effect: 'chat_subscribed',
@@ -1033,7 +1039,7 @@ export class SessionTimelineStore {
       case 'status': {
         const statusBgTasks = Array.isArray(message?.backgroundTasks) ? message.backgroundTasks : undefined;
         if (sid && statusBgTasks) {
-          this.setBackgroundState(sid, statusBgTasks, message?.backgroundWorkPending, message?.canInterrupt);
+          this.setBackgroundState(sid, statusBgTasks, message?.backgroundWorkPending, message?.canInterrupt, message?.backgroundWorkQueuesInput);
         }
         return {
           effect: 'status',
@@ -1850,12 +1856,18 @@ export class SessionTimelineStore {
     return this.slots.get(sessionId)?.backgroundCanInterrupt !== false;
   }
 
-  private setBackgroundState(sid: string, tasks: ActiveBackgroundTask[], pending: unknown, canInterrupt: unknown): void {
+  /** Used by the composer: whether a message sent during this session's background work has to wait for it. */
+  backgroundWorkQueuesInput(sessionId: string): boolean {
+    return this.slots.get(sessionId)?.backgroundWorkQueuesInput !== false;
+  }
+
+  private setBackgroundState(sid: string, tasks: ActiveBackgroundTask[], pending: unknown, canInterrupt: unknown, queuesInput: unknown): void {
     const slot = this.getSlot(sid);
     const wasPending = this.hasPendingBackgroundWork(sid);
     slot.backgroundTasks = tasks;
     slot.backgroundWorkPending = typeof pending === 'boolean' ? pending : undefined;
     slot.backgroundCanInterrupt = typeof canInterrupt === 'boolean' ? canInterrupt : undefined;
+    slot.backgroundWorkQueuesInput = typeof queuesInput === 'boolean' ? queuesInput : undefined;
     if (!this.hasPendingBackgroundWork(sid)) {
       slot.backgroundWorkSince = undefined;
     } else if (!wasPending) {

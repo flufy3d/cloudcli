@@ -145,6 +145,10 @@ type ChatComposerProps = {
   sendByCtrlEnter?: boolean;
   backgroundTasks?: ActiveBackgroundTask[];
   hasActiveBackgroundTasks?: boolean;
+  /** Whether a new message has to be queued; see `isInputBlocked` in useChatSessionState. */
+  isInputBlocked?: boolean;
+  /** A reply is streaming, so anything sent waits for this turn to end. */
+  isReplyInFlight?: boolean;
   /** Present only while a force send can be taken: the turn is over and only background work is waited on. */
   onForceSendQueuedDraft?: () => void;
 }
@@ -224,6 +228,8 @@ function ChatComposer({
   sendByCtrlEnter = false,
   backgroundTasks = [],
   hasActiveBackgroundTasks = false,
+  isInputBlocked,
+  isReplyInFlight = false,
   onForceSendQueuedDraft,
 }: ChatComposerProps) {
   const { t } = useTranslation('chat');
@@ -291,11 +297,14 @@ function ChatComposer({
   const hasActivityIndicator = Boolean(activity && !hasPendingPermissions);
 
   const hasQueuedDraft = Boolean(queuedDraft);
-  const isBusy = isLoading || Boolean(hasActiveBackgroundTasks);
+  const isBusy = isInputBlocked ?? (isLoading || Boolean(hasActiveBackgroundTasks));
+  const hasDraftContent = Boolean(input.trim() || attachedFiles.length > 0);
   // The button is Stop only when stopping can do something. Otherwise it stays
   // the send button: disabled while the input is empty, queueing once typed.
-  const offersStop = isLoading && canAbortSession;
-  const canQueueDraft = isBusy && Boolean(input.trim() || attachedFiles.length > 0);
+  // A typed message that nothing holds back (Claude's background phase) is
+  // sent by this button, so it is Send rather than Stop then.
+  const offersStop = isLoading && canAbortSession && !(hasDraftContent && !isBusy);
+  const canQueueDraft = isBusy && hasDraftContent;
   const submitHint = canQueueDraft
     ? hasQueuedDraft
       ? sendByCtrlEnter
@@ -366,6 +375,8 @@ function ChatComposer({
       {hasActiveBackgroundTasks && backgroundTasks.length > 0 && (
         <BackgroundTaskIndicator
           tasks={backgroundTasks}
+          queuesInput={isBusy}
+          isReplyInFlight={isReplyInFlight}
           onAbort={backgroundTasks.every((task) => task.taskId) ? onAbortBackgroundTasks : undefined}
         />
       )}
@@ -379,7 +390,7 @@ function ChatComposer({
           onEdit={onEditQueuedDraft}
           onDelete={onDeleteQueuedDraft}
           onForceSend={onForceSendQueuedDraft}
-          isWaitingForBackgroundTasks={Boolean(hasActiveBackgroundTasks)}
+          isWaitingForBackgroundTasks={Boolean(hasActiveBackgroundTasks) && !isReplyInFlight}
         />
       )}
 

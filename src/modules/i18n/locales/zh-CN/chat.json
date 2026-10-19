@@ -140,7 +140,10 @@
       "label": "已排队",
       "willSend": "将在当前完成后发送",
       "edit": "编辑排队消息",
-      "delete": "删除排队消息"
+      "delete": "删除排队消息",
+      "willSendAfterBackground": "后台任务完成后将自动发送",
+      "forceSend": "立即发送，后台任务继续运行",
+      "forceSendButton": "立即发送"
     }
   },
   "providerSelection": {
@@ -248,6 +251,17 @@
       "title": "正在替换先前的消息",
       "filesNotReverted": "已修改的文件不会被还原",
       "cancel": "取消"
+    },
+    "backgroundTasks": {
+      "title": "后台任务运行中 ({{count}})",
+      "hint": "发送消息将排队，任务完成后自动发送",
+      "hintShort": "发送将排队",
+      "hintTurn": "发送消息将排队，本轮结束后发送",
+      "hintTurnShort": "本轮结束后发送",
+      "abort": "中止后台任务",
+      "abortButton": "中止",
+      "hintContinue": "可直接发送，后台任务继续运行",
+      "hintContinueShort": "可继续发送"
     }
   },
   "export": {
