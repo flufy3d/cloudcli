@@ -886,6 +886,19 @@ test('a model without effort tiers keeps the held process and leaves the effort 
   });
 });
 
+test('a model the catalog does not list keeps its effort, as an older session\'s opusplan does', async () => {
+  await withRun(async ({ script, nextTurn, processes }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('again', { model: 'opusplan', effort: 'low' });
+    await until(() => script.prompts.length >= 2);
+    assert.equal(processes.length, 1);
+    assert.deepEqual(script.switches, [['setModel', 'opusplan'], ['applyFlagSettings', { effortLevel: 'low' }]]);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+  });
+});
+
 test('entering plan mode keeps the held process', async () => {
   await withRun(async ({ script, nextTurn, processes }) => {
     await holdForBackgroundBash(script);

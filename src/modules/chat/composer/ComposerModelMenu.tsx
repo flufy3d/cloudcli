@@ -6,6 +6,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import type { ProviderModelOption } from '@/shared/types';
 import { DEFAULT_EFFORT_VALUE } from '@/shared/constants';
 import { useComposerMenuAnchor } from '@/modules/chat/hooks/useComposerMenuAnchor';
+import { findCatalogModelOption } from '@/modules/chat/utils/catalogModel';
 import {
   ComposerMenuHeading,
   ComposerMenuItem,
@@ -73,7 +74,7 @@ function ComposerModelMenu({
   }, [model]);
 
   const selectedModelOption = useMemo(
-    () => modelOptions.find((option) => option.value === model) ?? null,
+    () => findCatalogModelOption(modelOptions, model),
     [model, modelOptions],
   );
   const modelLabel = selectedModelOption?.label || fallbackModelLabel;
@@ -103,14 +104,14 @@ function ComposerModelMenu({
       <ComposerMenuItem
         key={option.value}
         label={option.label || option.value}
-        isSelected={option.value === model}
+        isSelected={option === selectedModelOption}
         onSelect={() => {
           onSelectModel(option.value);
           setIsOpen(false);
         }}
       />
     ),
-    [model, onSelectModel],
+    [selectedModelOption, onSelectModel],
   );
 
   const hasEffortSection = resolvedEffortOptions.length > 0;

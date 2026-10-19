@@ -18,6 +18,7 @@ import {
   FALLBACK_PROVIDER_EFFORT_VALUES,
   toProviderEffortOptions,
 } from '@/modules/chat/constants/providerEffort';
+import { findCatalogModelOption } from '@/modules/chat/utils/catalogModel';
 import { readProviderToolsSettings } from '@/modules/chat/utils/chatStorage';
 import { PROVIDER_FALLBACK_CATALOG, PROVIDER_FALLBACK_ORDER } from '@/shared/providerCatalogFallback';
 import { subscribeToUserPreferences } from '@/shared/userSettings';
@@ -254,21 +255,6 @@ export function useChatProviderState({
     return Boolean(FALLBACK_PROVIDER_EFFORT_VALUES[targetProvider]?.length);
   }, [providerCapabilities]);
 
-  const pickStoredOrCurrent = (
-    storageKey: string,
-    current: string,
-    def: ProviderModelsDefinition,
-  ): string => {
-    const stored = localStorage.getItem(storageKey);
-    if (stored && def.OPTIONS.some((o) => o.value === stored)) {
-      return stored;
-    }
-    if (current && def.OPTIONS.some((o) => o.value === current)) {
-      return current;
-    }
-    return def.DEFAULT;
-  };
-
   const getModelOption = useCallback((
     targetProvider: LLMProvider,
     model: string,
@@ -278,7 +264,7 @@ export function useChatProviderState({
       return null;
     }
 
-    return definition.OPTIONS.find((option) => option.value === model) ?? null;
+    return findCatalogModelOption(definition.OPTIONS, model);
   }, [providerModelCatalog]);
 
   const getEffortOptionsForModel = useCallback((
@@ -341,13 +327,11 @@ export function useChatProviderState({
 
         const stored = localStorage.getItem(`${targetProvider}-model`);
         const current = previous[targetProvider];
-        let resolved = definition.DEFAULT;
-        if (stored && definition.OPTIONS.some((option) => option.value === stored)) {
-          resolved = stored;
-        } else if (current && current !== FALLBACK_DEFAULT_MODEL[targetProvider]
-          && definition.OPTIONS.some((option) => option.value === current)) {
-          resolved = current;
-        }
+        const storedOption = findCatalogModelOption(definition.OPTIONS, stored);
+        const currentOption = current !== FALLBACK_DEFAULT_MODEL[targetProvider]
+          ? findCatalogModelOption(definition.OPTIONS, current)
+          : null;
+        const resolved = (storedOption ?? currentOption)?.value ?? definition.DEFAULT;
 
         if (resolved !== current) {
           next[targetProvider] = resolved;

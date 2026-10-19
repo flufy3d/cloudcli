@@ -83,9 +83,9 @@ const isUniqueConstraintError = (error: unknown): boolean => (
  * Creates the provider model application service used by Providers routes,
  * Commands, and provider runtimes.
  *
- * Curated adapter definitions stay source-controlled and are merged at read
- * time with custom SQLite rows. This deliberately has no predefined-model
- * persistence, memory cache, disk cache, TTL, or provider-native discovery.
+ * Each adapter supplies its definitions (a source-controlled list, or the
+ * engine's own catalog that the adapter discovers and caches); this service
+ * merges them at read time with custom SQLite rows and keeps no cache of its own.
  * Tests inject a small custom-model store through the same boundary.
  */
 export const createProviderModelsService = (dependencies: ProviderModelsServiceDependencies = {}) => {

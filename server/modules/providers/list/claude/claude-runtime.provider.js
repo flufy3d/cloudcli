@@ -136,6 +136,33 @@ function applyClaudeEffort(sdkOptions, resolvedEffort) {
   };
 }
 
+const CLAUDE_CLI_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/**
+ * The catalog entry whose effort tiers a model is checked against: the exact id, or the base
+ * entry for a 1M alias an older session saved (`opus[1m]` -> `opus`), since the CLI's base
+ * aliases now run at 1M context themselves.
+ */
+function findEffortCatalogOption(model, catalog) {
+  const options = catalog?.OPTIONS || [];
+  const exact = options.find((option) => option.value === model);
+  if (exact || typeof model !== 'string' || !model.endsWith('[1m]')) return exact || null;
+  return options.find((option) => option.value === model.slice(0, -'[1m]'.length)) || null;
+}
+
+/**
+ * Validates the effort against the model's catalog entry. A model with no entry (an older
+ * session's `opusplan`, a custom id) has no tiers to check, so a plain CLI level passes
+ * through: measured on 2.1.303, `--effort high` with a model that has no tiers runs normally.
+ */
+export function resolveClaudeEffort(model, effort, catalog) {
+  const option = findEffortCatalogOption(model, catalog);
+  if (option) {
+    return resolveModelEffort(option.value, effort, catalog);
+  }
+  return CLAUDE_CLI_EFFORT_LEVELS.has(effort) ? effort : undefined;
+}
+
 function createRequestId() {
   if (typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -319,7 +346,7 @@ function mapCliOptionsToSDK(options = {}) {
 
   sdkOptions.model = options.model || CLAUDE_PREDEFINED_MODELS.DEFAULT;
 
-  applyClaudeEffort(sdkOptions, resolveModelEffort(
+  applyClaudeEffort(sdkOptions, resolveClaudeEffort(
     sdkOptions.model,
     effort,
     options.effortModels || CLAUDE_PREDEFINED_MODELS,
@@ -776,7 +803,7 @@ async function prepareTurnInputs(command, options, context, providerSessionId) {
   // own stream because an async generator cannot be replayed once consumed.
   const promptMessages = await buildPromptMessages(command, options.images, options.files, options.cwd);
   const baseAllowedTools = [...(options.toolsSettings?.allowedTools || [])];
-  const modelOption = effortModels?.OPTIONS?.find((option) => option.value === sdkOptions.model);
+  const modelOption = findEffortCatalogOption(sdkOptions.model, effortModels);
   return {
     sdkOptions,
     promptMessages,
@@ -784,7 +811,8 @@ async function prepareTurnInputs(command, options, context, providerSessionId) {
     compatibilityKey: heldProcessCompatibilityKey(sdkOptions, baseAllowedTools),
     // Whether the model takes an effort at all; the CLI ignores one for a
     // model that does not (measured: no `output_config` after `setModel('haiku')`).
-    modelTakesEffort: Boolean(modelOption?.effort?.values?.length),
+    // A model with no catalog entry is assumed to, as `resolveClaudeEffort` does.
+    modelTakesEffort: modelOption ? Boolean(modelOption.effort?.values?.length) : true,
   };
 }
 
