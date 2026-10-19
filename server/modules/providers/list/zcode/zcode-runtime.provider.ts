@@ -41,6 +41,7 @@ import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index
 import { sessionsDb } from '@/modules/database/index.js';
 import {
   LOCAL_AGENT_TASK_TYPE,
+  createBackgroundTasksStatusMessage,
   createTaskStatusMessage,
 } from '@/modules/providers/shared/background-work/task-status.js';
 
@@ -493,11 +494,43 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
   /**
    * Sessions with spawned agents still running, for the running-sessions
    * poll. The engine outlives turns, so an agent launched in the background
-   * keeps working after the turn's `complete` — this is how the composer's
-   * background-work strip and the sidebar learn it is still going.
+   * keeps working after the turn's `complete` — this is how the sidebar
+   * and the activity indicator learn it is still going.
    */
   listBackgroundWork(): SessionBackgroundWork[] {
     return zcodeBackgroundWork.list();
+  }
+
+  /**
+   * What the composer's strip shows for a session that subscribes, and
+   * whether that work can still be stopped: `abort` stops the run on the
+   * session, so once the turn has ended its agents keep running with nothing
+   * left to cancel. A session whose agents this runtime does not hold is none
+   * of its business and answers true.
+   */
+  readonly backgroundTasks = {
+    list: (sessionId: string) => zcodeBackgroundWork.listStripTasks(sessionId),
+    canInterrupt: (sessionId: string) => !zcodeBackgroundWork.hasSession(sessionId)
+      || Boolean(runLifecycle.handleOf(sessionId)),
+  };
+
+  /**
+   * Re-sends the composer strip's list for an app session; called after
+   * every change to its tracked agents. `canInterrupt` is true while a run
+   * is on the session and false once only the lifecycle watcher is left
+   * (see `backgroundTasks.canInterrupt`).
+   */
+  private broadcastBackgroundTasks(
+    appSessionKey: string,
+    engineSessionId: string | null,
+    writer: ProviderRuntimeWriter,
+    canInterrupt: boolean,
+  ): void {
+    writer.send(createBackgroundTasksStatusMessage(
+      { provider: 'zcode', sessionId: engineSessionId },
+      zcodeBackgroundWork.listStripTasks(appSessionKey),
+      canInterrupt,
+    ));
   }
 
   /**
@@ -506,7 +539,12 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    * a settled status retires it. `taskId` and `toolUseId` are guaranteed by
    * the normalizer (an event naming neither never becomes a message).
    */
-  private recordSubagentLifecycle(appSessionKey: string, message: NormalizedMessage): void {
+  private recordSubagentLifecycle(
+    appSessionKey: string,
+    message: NormalizedMessage,
+    writer: ProviderRuntimeWriter,
+    runOnSession: boolean,
+  ): void {
     if (!message.taskId || !message.toolUseId) {
       return;
     }
@@ -517,10 +555,13 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
         taskType: message.taskType ?? LOCAL_AGENT_TASK_TYPE,
         description: message.description ?? '',
       });
+      this.broadcastBackgroundTasks(appSessionKey, message.sessionId || null, writer, runOnSession);
       return;
     }
     if (message.status === 'completed' || message.status === 'failed' || message.status === 'stopped') {
-      zcodeBackgroundWork.end(appSessionKey, message.taskId);
+      if (zcodeBackgroundWork.end(appSessionKey, message.taskId)) {
+        this.broadcastBackgroundTasks(appSessionKey, message.sessionId || null, writer, runOnSession);
+      }
       // Its unanswered approval cards have nobody left to answer them.
       if (message.sessionId) {
         runLifecycle.retractSubagentPermissions(message.sessionId, message.toolUseId);
@@ -546,6 +587,8 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     protocolClient.removeSessionListener(handle.sessionId, eventListener);
     if (zcodeBackgroundWork.hasSession(handle.abortKey) && runLifecycle.isNewestRunForEngineSession(handle)) {
       this.armSubagentWatcher(handle.sessionId, handle.abortKey, writer, context);
+      // The agents outlive the turn with no run left to stop them.
+      this.broadcastBackgroundTasks(handle.abortKey, handle.sessionId, writer, false);
     }
   }
 
@@ -557,7 +600,11 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    */
   private settleAgentsOfLostEngine(appSessionKey: string, engineSessionId: string, writer: ProviderRuntimeWriter): void {
     runLifecycle.retractSubagentPermissions(engineSessionId);
-    for (const task of zcodeBackgroundWork.clearSession(appSessionKey)) {
+    const outstanding = zcodeBackgroundWork.clearSession(appSessionKey);
+    if (outstanding.length > 0) {
+      this.broadcastBackgroundTasks(appSessionKey, engineSessionId, writer, false);
+    }
+    for (const task of outstanding) {
       writer.send(createTaskStatusMessage(
         { provider: 'zcode', sessionId: engineSessionId, taskId: task.taskId, toolUseId: task.toolUseId, taskType: LOCAL_AGENT_TASK_TYPE },
         { event: 'notification', status: 'stopped' },
@@ -604,7 +651,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
           if (message.kind !== 'task_status') {
             continue;
           }
-          this.recordSubagentLifecycle(appSessionKey, message);
+          this.recordSubagentLifecycle(appSessionKey, message, writer, false);
           writer.send(message);
         }
         if (!zcodeBackgroundWork.hasSession(appSessionKey)) {
@@ -1085,7 +1132,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
           }
 
           if (message.kind === 'task_status') {
-            this.recordSubagentLifecycle(handle.abortKey, message);
+            this.recordSubagentLifecycle(handle.abortKey, message, writer, true);
           }
 
           writer.send(message);

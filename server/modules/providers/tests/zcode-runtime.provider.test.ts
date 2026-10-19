@@ -1177,6 +1177,36 @@ test('a background agent shows as a running Agent card, is listed as background 
   assert.deepEqual(stopped?.usage, { totalTokens: 300, toolUses: 2, durationMs: 1500 });
 });
 
+test('the composer strip lists a background agent past the turn, without a stop the runtime cannot honour', async () => {
+  fsSync.writeFileSync(modeFilePath, 'subagent-bg\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { messages, writer } = createWriter();
+  await runtime.run('review it', { sessionId: 'app-sess-strip', cwd: stubDir }, writer, context);
+
+  // The agent outlives the turn: a page that subscribes now gets it back from
+  // the runtime, and is told the session has no run left to stop.
+  const stripTask = { id: 'call_agent_bg', toolName: 'Agent', command: 'Review the fix', description: 'Review the fix' };
+  const withoutStart = (tasks: any[]) => tasks.map(({ startedAt: _startedAt, ...task }) => task);
+  assert.deepEqual(withoutStart(runtime.backgroundTasks.list('app-sess-strip')), [stripTask]);
+  assert.equal(runtime.backgroundTasks.canInterrupt('app-sess-strip'), false);
+
+  const deadline = Date.now() + 3000;
+  while (runtime.listBackgroundWork().length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  // Spawned mid-turn, the agent's work stops with the turn; once the turn
+  // has ended there is no run to stop, which the strip must say before the
+  // page sees the turn complete.
+  const strips = messages.filter((message) => message.kind === 'status' && message.text === 'background_tasks');
+  assert.deepEqual(
+    strips.map((message) => [withoutStart(message.backgroundTasks ?? []), message.canInterrupt]),
+    [[[stripTask], true], [[stripTask], false], [[], false]],
+  );
+  assert.ok(messages.indexOf(strips[1]) < messages.findIndex((message) => message.kind === 'complete'));
+  assert.deepEqual(runtime.backgroundTasks.list('app-sess-strip'), []);
+});
+
 test('a new run takes the session over from the lifecycle watcher: a late stop is forwarded exactly once', async () => {
   fsSync.writeFileSync(modeFilePath, 'subagent-bg\n');
   const runtime = new ZCodeRuntimeProvider();
@@ -1366,6 +1396,8 @@ test('an engine crash settles the agents the watcher was waiting on as stopped, 
     ['call_agent_bg', 'agent_bg_1', 'stopped'],
   ]);
   assert.equal(settled[0].usage, undefined, 'no usage is invented for an agent that never reported');
+  const lastStrip = messages.filter((message) => message.kind === 'status' && message.text === 'background_tasks').at(-1);
+  assert.deepEqual(lastStrip?.backgroundTasks, [], 'the strip empties with the dead engine');
 });
 
 test('an engine crash mid-turn settles the agents the run was waiting on as stopped', async () => {

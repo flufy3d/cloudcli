@@ -43,6 +43,12 @@ export type ChatSubscribedEvent = {
   backgroundTasks?: import('./chatEvents.js').ActiveBackgroundTask[];
   /** Includes a follow-up reply whose task card has already disappeared. */
   backgroundWorkPending?: boolean;
+  /**
+   * Whether `chat.abort` can still stop the session's background work. False
+   * once a runtime's turn has ended with no run left to cancel (ZCode's agents
+   * outlive their turn); the client then offers no stop button for it.
+   */
+  backgroundCanInterrupt?: boolean;
   timestamp: string;
 };
 

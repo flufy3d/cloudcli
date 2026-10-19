@@ -148,6 +148,7 @@ test('allows forceSendQueuedDraft to send message immediately with forceInterrup
 
   assert.equal(sent.length, 0);
   assert.ok(result.current.queuedDraft);
+  assert.equal(result.current.canForceSendQueuedDraft, true);
 
   // User explicitly clicks force send
   await act(async () => {
@@ -211,4 +212,36 @@ test('appends subsequent inputs into existing queued draft without overwriting',
   });
 
   assert.equal(result.current.queuedDraft?.content, 'first part\n\nsecond part');
+});
+
+test('a queued draft offers no force send while a reply is still in flight', async () => {
+  const { useChatComposerState } = await import('@/modules/chat/hooks/useChatComposerState');
+  // The server refuses a second run while one is going (RUN_IN_PROGRESS), so
+  // a force send mid-turn could only fail.
+  const responding = new Map([['session-1', { statusText: 'Thinking', canInterrupt: true, startedAt: 1 }]]);
+  const { result } = renderHook(() =>
+    useChatComposerState({
+      selectedProject,
+      selectedSession,
+      currentSessionId: 'session-1',
+      provider: 'codex',
+      permissionMode: 'bypassPermissions',
+      cyclePermissionMode: () => undefined,
+      resolvePermissionModeForProvider: () => 'bypassPermissions',
+      currentProviderModel: 'gpt-5',
+      currentProviderEffort: 'default',
+      isLoading: true,
+      hasActiveBackgroundTasks: true,
+      backgroundTasks: [{ id: 'call_agent', toolName: 'Agent', command: 'Review', startedAt: 1 }],
+      canAbortSession: true,
+      processingSessions: responding,
+      tokenBudget: null,
+      sendMessage: () => undefined,
+      stickToBottomAfterSend: () => undefined,
+      addMessage: () => undefined,
+      setPendingPermissionRequests: () => undefined,
+    }),
+  );
+
+  assert.equal(result.current.canForceSendQueuedDraft, false);
 });

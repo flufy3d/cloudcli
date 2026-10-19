@@ -192,3 +192,26 @@ test('background work without a tracked reply phase does not mark the subscriber
     assert.equal(newTab.frames[0]?.backgroundWorkPending, false);
   });
 });
+
+test('the subscribe ack says whether the session\'s background work can still be stopped', async () => {
+  await withIsolatedDatabase(async () => {
+    startAndCompleteRun(createFakeSocket());
+    const newTab = createFakeSocket();
+    handleChatConnection(
+      newTab as never,
+      { user: { id: 1 } } as never,
+      { runtime: {
+        hasBackgroundWork: () => true,
+        isBackgroundWorkPending: () => false,
+        getPendingApprovalsForSession: () => [],
+        getBackgroundTasksForSession: () => [{ id: 'call_agent', toolName: 'Agent', startedAt: 1 }],
+        canInterruptBackgroundWork: (sessionId: string) => sessionId !== SESSION_ID,
+      } as never },
+    );
+    newTab.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 0 }] }));
+    await settle();
+
+    assert.equal(newTab.frames[0]?.kind, 'chat_subscribed');
+    assert.equal(newTab.frames[0]?.backgroundCanInterrupt, false);
+  });
+});

@@ -51,6 +51,12 @@ export interface IProviderRuntime {
     list(sessionId: string): ActiveBackgroundTask[];
     /** Includes pending execution and the follow-up reply after its task settles. */
     isPending?(sessionId: string): boolean;
+    /**
+     * False only for a session whose listed work this runtime holds and
+     * `abort` can no longer stop — its turn has ended and the runtime keeps no
+     * run to cancel. Left undefined, or true, the work counts as stoppable.
+     */
+    canInterrupt?(sessionId: string): boolean;
   };
   /**
    * Sessions with background tasks still outstanding, whether or not their

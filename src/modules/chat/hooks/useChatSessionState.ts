@@ -206,17 +206,18 @@ export function useChatSessionState({
   const hasActiveBackgroundTasks = activeSessionId ? sessionStore.hasPendingBackgroundWork(activeSessionId) : false;
   const processingActivity = (activeSessionId && processingSessions?.get(activeSessionId)) || null;
   const backgroundStartedAt = activeSessionId ? sessionStore.getBackgroundWorkStartedAt(activeSessionId) : undefined;
+  const backgroundCanInterrupt = activeSessionId ? sessionStore.canInterruptBackgroundWork(activeSessionId) : true;
   // A response turn keeps its own activity. The background phase times from
-  // its tasks rather than from whenever this tab marked it busy, and stays
-  // cancellable even when an activity poll lists it as not interruptible;
-  // only Claude broadcasts the frames that make it pending here.
+  // its tasks rather than from whenever this tab marked it busy, and its Stop
+  // follows what the runtime that broadcast the tasks says — not the activity
+  // poll, which lists every background session as not interruptible.
   const sessionActivity = hasActiveBackgroundTasks && backgroundStartedAt !== undefined
     && !(processingActivity && !processingActivity.background) ? {
       statusText: null,
       ...processingActivity,
       startedAt: backgroundStartedAt,
       background: backgroundTasks.length > 0,
-      canInterrupt: true,
+      canInterrupt: backgroundCanInterrupt,
     } : processingActivity;
   const isProcessing = sessionActivity !== null;
   const canAbortSession = isProcessing && sessionActivity.canInterrupt;

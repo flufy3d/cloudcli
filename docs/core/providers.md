@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.10.0 / 2026-10-18
+> 基准：2.10.0 / 2026-10-19
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -70,11 +70,11 @@ flowchart LR
 
 `agent` part 在 OpenCode 里是用户在提示框里 @ 某个 agent 的标记（提示文本已含这段 @ 文字），不是派发，所以不画成卡片。
 
-Codex、ZCode、Antigravity 共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent。运行时切面的 `listBackgroundWork()`（返回 `SessionBackgroundWork[]`）直接读它，供运行中会话轮询给输入框的后台工作条和侧栏使用；历史读取用 `has` 区分"进程还活着的 agent"和"进程已死、永远等不到结束记录的 agent"；Antigravity 的 `backgroundTasks.list` 从它推出输入框卡片。`clearSession` 返回被清掉的登记项，调用方据此给每张卡补发结算。三家各有一个模块级实例（`codex-background-work.ts`、`zcode-background-work.ts`、`antigravity-subagent.ts`），因为同一进程里只有它们自己的引擎子进程能产生这些 agent，登记簿里没有的 agent 不可能还在跑。`shared/background-work/task-status.ts` 的 `createTaskStatusMessage` 是 `task_status` 事件的唯一构造函数，`TaskUsage` 的三个字段都可缺省：引擎没上报的数字留空，不填 0。
+Codex、ZCode、Antigravity 共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的 agent。运行时切面的 `listBackgroundWork()`（返回 `SessionBackgroundWork[]`）直接读它，供运行中会话轮询给活动指示和侧栏使用；历史读取用 `has` 区分"进程还活着的 agent"和"进程已死、永远等不到结束记录的 agent"。输入框上方的后台任务条也从它来：三家的 `backgroundTasks.list` 都返回 `listStripTasks(会话)`，供订阅确认恢复；登记簿每次增减后，运行时用 `createBackgroundTasksStatusMessage` 广播完整列表（清空时发空列表，否则任务条不会消失）。`listStripTasks` 故意不带 `taskId`：三家都没有单独停一个 agent 的接口，任务条因此不给逐个中止。`clearSession` 返回被清掉的登记项，调用方据此给每张卡补发结算。三家各有一个模块级实例（`codex-background-work.ts`、`zcode-background-work.ts`、`antigravity-subagent.ts`），因为同一进程里只有它们自己的引擎子进程能产生这些 agent，登记簿里没有的 agent 不可能还在跑。`shared/background-work/task-status.ts` 的 `createTaskStatusMessage` 是 `task_status` 事件的唯一构造函数，`TaskUsage` 的三个字段都可缺省：引擎没上报的数字留空，不填 0。
 
-**Codex** 的进程模型决定了它的结算点：`queryCodex` 在轮次结束时 `connection.close()` 会杀掉 app-server，它派出的 agent 随之消失，完成事件永远到不了。所以 agent 只在轮次进行中被登记：实时流在 `started` 时发卡、发 `task_status started`、按线程 id 登记；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。轮次结束时（正常完成、报错、被中止，三条路径都经过 `settleOutstandingAgents`）对还登记着的 agent 逐个补发 `stopped` 并清空，且发在终态 `complete` 之前，页面不会看到轮次已结束而卡片还在转。`interacted` 是 agent 之间的往来，不画。
+**Codex** 的进程模型决定了它的结算点（任务条也因此只在轮次进行中出现，`settleOutstandingAgents` 清空登记簿时同时广播空列表，发在 `complete` 之前）：`queryCodex` 在轮次结束时 `connection.close()` 会杀掉 app-server，它派出的 agent 随之消失，完成事件永远到不了。所以 agent 只在轮次进行中被登记：实时流在 `started` 时发卡、发 `task_status started`、按线程 id 登记；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。轮次结束时（正常完成、报错、被中止，三条路径都经过 `settleOutstandingAgents`）对还登记着的 agent 逐个补发 `stopped` 并清空，且发在终态 `complete` 之前，页面不会看到轮次已结束而卡片还在转。`interacted` 是 agent 之间的往来，不画。
 
-**ZCode** 的引擎进程比一轮对话活得久，后台 agent 在 `complete` 之后还在跑。一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认 subagent 生命周期事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记。窄监听器和运行中监听器走同一个出口 `context.normalizeMessage`，载荷里不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。下一轮开始时，`run()` 在第一个 await 之前就撤掉窄监听器、挂上本轮监听器，所以订阅、设模式、解析模型这三次异步等待期间到达的事件只进本轮的 writer；本轮在发出提示词之前不接受 `complete` / `error`，因为那时到达的终态只可能属于上一轮。被新一轮取代的旧监听器在旧轮次的 100ms 轮询发现自己被取代之前，除引擎死亡通知外一律不转发。引擎死亡时，运行中监听器和窄监听器都调用 `settleAgentsOfLostEngine`，先对登记簿里每个 agent 发 `stopped` 再清空。引擎的失败 stop 不带 token 和工具调用总数，这两个字段在 `task_status.usage` 里直接缺省。
+**ZCode** 的引擎进程比一轮对话活得久，后台 agent 在 `complete` 之后还在跑。一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认 subagent 生命周期事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记。窄监听器和运行中监听器走同一个出口 `context.normalizeMessage`，载荷里不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。下一轮开始时，`run()` 在第一个 await 之前就撤掉窄监听器、挂上本轮监听器，所以订阅、设模式、解析模型这三次异步等待期间到达的事件只进本轮的 writer；本轮在发出提示词之前不接受 `complete` / `error`，因为那时到达的终态只可能属于上一轮。被新一轮取代的旧监听器在旧轮次的 100ms 轮询发现自己被取代之前，除引擎死亡通知外一律不转发。引擎死亡时，运行中监听器和窄监听器都调用 `settleAgentsOfLostEngine`，先对登记簿里每个 agent 发 `stopped` 再清空。一轮结束后 `abort` 已经找不到运行可停（`session/stop` 针对的是运行，协议里没有单停 agent 的请求），所以窄监听器接手时会重发一次任务条并带 `canInterrupt: false`，`backgroundTasks.canInterrupt` 在订阅确认里给出同样的答案，页面不显示一个只会报 `ABORT_FAILED` 的停止按钮。引擎的失败 stop 不带 token 和工具调用总数，这两个字段在 `task_status.usage` 里直接缺省。
 
 ### 子 agent 的请求和过程归谁
 
@@ -96,7 +96,7 @@ Codex、ZCode、Antigravity 共用 `shared/background-work/background-work-regis
 
 | 切面 | 职责 | 关键成员 / 消费服务 |
 | --- | --- | --- |
-| `runtime` | 拉起/中止引擎执行 | `run(command, options, writer, context)`、`abort(sessionId)`；可选 `permissions`（权限批准网关）、`backgroundTasks`（后台活跃任务列表）→ `providerRuntimeService` |
+| `runtime` | 拉起/中止引擎执行 | `run(command, options, writer, context)`、`abort(sessionId)`；可选 `permissions`（权限批准网关）、`backgroundTasks`（输入框任务条列表；`isPending` 含汇报回复阶段；`canInterrupt` 为 false 表示这批工作 `abort` 已停不了）→ `providerRuntimeService` |
 | `models` | 模型目录 | `getSupportedModels()`（引擎目录或预置目录）、`getCurrentActiveModel()`（只读兜底）→ `providerModelsService` |
 | `auth` | 安装/登录状态 | `getStatus()`（"未安装/未登录"是数据不是异常）；可选 `getQuota()`（配额）→ `providerAuthService` |
 | `mcp` | 引擎原生 MCP 配置读写 | `McpProvider` 基类（scope/transport 校验）→ `providerMcpService` |

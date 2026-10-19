@@ -965,6 +965,56 @@ test('an agent still running when the turn ends is settled as stopped, because c
   assert.deepEqual(codexRuntime.listBackgroundWork(), []);
 });
 
+test('the composer strip lists a running agent while the turn waits on it and empties when it settles', async (t) => {
+  const midTurn: unknown[] = [];
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    midTurn.push(codexRuntime.backgroundTasks.list('app-session-strip'));
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: doneActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-strip', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  // The strip names the agent by its card; there is no handle to stop it on
+  // its own, so the frame carries no `taskId`.
+  const stripTask = { id: 'call_spawn_1', toolName: 'Agent', command: 'Standards', description: 'Standards' };
+  const strips = messages.filter((message) => message.kind === 'status' && message.text === 'background_tasks');
+  assert.deepEqual(
+    strips.map((message) => message.backgroundTasks.map(({ startedAt: _startedAt, ...task }: any) => task)),
+    [[stripTask], []],
+  );
+  // The turn is in flight while the agent runs, so the strip's work stops
+  // with the turn.
+  assert.ok(strips.every((message) => message.canInterrupt === true));
+  assert.deepEqual((midTurn[0] as any[]).map(({ startedAt: _startedAt, ...task }) => task), [stripTask]);
+  assert.deepEqual(codexRuntime.backgroundTasks.list('app-session-strip'), []);
+});
+
+test('an agent the turn leaves running is cleared from the strip before the turn completes', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-strip-left', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const strips = messages.filter((message) => message.kind === 'status' && message.text === 'background_tasks');
+  assert.deepEqual(strips.map((message) => message.backgroundTasks.length), [1, 0]);
+  assert.ok(
+    messages.indexOf(strips.at(-1)) < messages.findIndex((message) => message.kind === 'complete'),
+    'the strip empties before the page sees the turn complete',
+  );
+});
+
 test('a running agent\'s own steps arrive tied to its card, without its prompt or lifecycle items', async (t) => {
   installFakeAppServer(t, (server) => {
     const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);

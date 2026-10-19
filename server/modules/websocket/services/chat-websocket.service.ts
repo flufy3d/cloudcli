@@ -85,6 +85,8 @@ export type ProviderRuntimeGateway = {
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
   getBackgroundTasksForSession?(sessionId: string): ActiveBackgroundTask[];
+  /** False when the session's background work is held by a runtime that can no longer stop it. */
+  canInterruptBackgroundWork?(sessionId: string): boolean;
 };
 
 type ChatWebSocketDependencies = {
@@ -705,6 +707,7 @@ function handleChatSubscribe(
       pendingPermissions,
       backgroundTasks,
       backgroundWorkPending: dependencies.runtime.isBackgroundWorkPending(sessionId),
+      backgroundCanInterrupt: dependencies.runtime.canInterruptBackgroundWork?.(sessionId) ?? true,
       timestamp: new Date().toISOString(),
     });
 

@@ -41,7 +41,7 @@ import {
   readCodexSubagentLabel,
   type CodexThreadItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
-import { createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
+import { createBackgroundTasksStatusMessage, createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import {
   appendFilesInputTag,
@@ -435,6 +435,20 @@ async function queryCodex(
   );
 
   /**
+   * Re-sends the composer strip's list for this run's session; called after
+   * every change to the agents tracked under `backgroundWorkKey`. The turn is
+   * in flight for as long as an agent is tracked (the turn's end clears the
+   * rest), so the work is always stoppable through the turn.
+   */
+  const broadcastBackgroundTasks = (backgroundWorkKey: string): void => {
+    sendMessage(ws, createBackgroundTasksStatusMessage(
+      { provider: 'codex', sessionId: capturedSessionId || sessionId || null },
+      codexBackgroundWork.listStripTasks(backgroundWorkKey),
+      true,
+    ));
+  };
+
+  /**
    * Draws and settles the Agent card of an agent announced only through its
    * activity record (the shape real engines use; see
    * `buildCodexSubagentAgentRow`). `started` opens the card, marks it running
@@ -467,6 +481,7 @@ async function queryCodex(
           taskType: CODEX_BACKGROUND_TASK_TYPE,
           description,
         });
+        broadcastBackgroundTasks(backgroundWorkKey);
       }
       sendMessage(ws, codexTaskStatus(messageSessionId, taskId, item.id, { event: 'started', description }));
       return;
@@ -478,9 +493,10 @@ async function queryCodex(
     const tracked = backgroundWorkKey && item.agentThreadId
       ? codexBackgroundWork.end(backgroundWorkKey, item.agentThreadId)
       : undefined;
-    if (!tracked) {
+    if (!backgroundWorkKey || !tracked) {
       return;
     }
+    broadcastBackgroundTasks(backgroundWorkKey);
     sendMessage(ws, codexTaskStatus(messageSessionId, tracked.taskId, tracked.toolUseId, {
       event: 'notification',
       status: item.activity === 'completed' ? 'completed' : 'stopped',
@@ -500,7 +516,12 @@ async function queryCodex(
     if (!backgroundWorkKey) {
       return;
     }
-    for (const task of codexBackgroundWork.clearSession(backgroundWorkKey)) {
+    const outstanding = codexBackgroundWork.clearSession(backgroundWorkKey);
+    if (outstanding.length === 0) {
+      return;
+    }
+    broadcastBackgroundTasks(backgroundWorkKey);
+    for (const task of outstanding) {
       sendMessage(ws, codexTaskStatus(capturedSessionId || sessionId || null, task.taskId, task.toolUseId, {
         event: 'notification',
         status: 'stopped',
@@ -532,8 +553,9 @@ async function queryCodex(
           taskType: CODEX_BACKGROUND_TASK_TYPE,
           description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
         });
-      } else {
-        codexBackgroundWork.end(backgroundWorkKey, item.id);
+        broadcastBackgroundTasks(backgroundWorkKey);
+      } else if (codexBackgroundWork.end(backgroundWorkKey, item.id)) {
+        broadcastBackgroundTasks(backgroundWorkKey);
       }
     }
     if (item.kind === 'subagent_activity') {
@@ -1117,6 +1139,10 @@ export const codexRuntime = {
    */
   listBackgroundWork(): SessionBackgroundWork[] {
     return codexBackgroundWork.list();
+  },
+  /** What the composer's strip shows for a session that subscribes mid-turn. */
+  backgroundTasks: {
+    list: (sessionId: string) => codexBackgroundWork.listStripTasks(sessionId),
   },
 };
 

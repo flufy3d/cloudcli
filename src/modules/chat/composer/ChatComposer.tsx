@@ -143,6 +143,7 @@ type ChatComposerProps = {
   sendByCtrlEnter?: boolean;
   backgroundTasks?: ActiveBackgroundTask[];
   hasActiveBackgroundTasks?: boolean;
+  /** Present only while a force send can be taken: the turn is over and only background work is waited on. */
   onForceSendQueuedDraft?: () => void;
 }
 
@@ -371,7 +372,7 @@ function ChatComposer({
           }
           onEdit={onEditQueuedDraft}
           onDelete={onDeleteQueuedDraft}
-          onForceSend={hasActiveBackgroundTasks ? onForceSendQueuedDraft : undefined}
+          onForceSend={onForceSendQueuedDraft}
           isWaitingForBackgroundTasks={Boolean(hasActiveBackgroundTasks)}
         />
       )}

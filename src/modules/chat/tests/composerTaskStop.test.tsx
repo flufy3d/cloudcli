@@ -54,6 +54,7 @@ async function mountComposer(tasks: ActiveBackgroundTask[], processingSessions?:
       setPendingPermissionRequests: () => {}, statusCheckSentAtRef: { current: new Map() },
       requestLatestMessages: async () => {}, sessionStore,
       onSessionIdle: protection.markSessionIdle, onSessionProcessing: protection.markSessionProcessing,
+      processingSessions: activities,
     });
     const composer = useChatComposerState({
       selectedProject: project, selectedSession, currentSessionId: state.currentSessionId,
@@ -66,12 +67,14 @@ async function mountComposer(tasks: ActiveBackgroundTask[], processingSessions?:
     });
     return { ...composer, sessionStore, isLoadingSessionMessages: state.isLoadingSessionMessages,
       isProcessing: state.isProcessing, canAbortSession: state.canAbortSession,
-      markSessionProcessing: protection.markSessionProcessing,
+      markSessionProcessing: protection.markSessionProcessing, activities,
     };
   }, { initialProps: { selectedSession: session } });
   await waitFor(() => expect(mounted.result.current.isLoadingSessionMessages).toBe(false));
-  return { ...mounted, sendMessage, emit: (frame: ServerEvent) => {
-    act(() => { for (const listener of listeners) listener(frame); });
+  // Frames passed together reach the handlers before React re-renders, the
+  // way two socket messages can land between renders.
+  return { ...mounted, sendMessage, emit: (...frames: ServerEvent[]) => {
+    act(() => { for (const frame of frames) for (const listener of listeners) listener(frame); });
   } };
 }
 
@@ -177,7 +180,7 @@ test('switching sessions cannot stop the previous session tasks', async () => {
   ]);
 });
 
-test.each(['NO_SUCH_TASK', 'TASK_ID_REQUIRED', 'TASK_STOP_FAILED', 'ABORT_FAILED'])(
+test.each(['NO_SUCH_TASK', 'TASK_ID_REQUIRED', 'TASK_STOP_FAILED', 'ABORT_FAILED', 'RUN_IN_PROGRESS'])(
   '%s cannot clear a still running foreground reply or flush queued input', async (code) => {
   const { result, sendMessage, emit } = await mountComposer([task]);
   act(() => result.current.markSessionProcessing(session.id, { canInterrupt: true }));
@@ -196,3 +199,35 @@ test.each(['NO_SUCH_TASK', 'TASK_ID_REQUIRED', 'TASK_STOP_FAILED', 'ABORT_FAILED
   expect(result.current.sessionStore.getMessages(session.id).some((message) => message.content === 'The task has already ended.')).toBe(true);
   },
 );
+
+test('agents that come and go during a reply leave the reply in flight and stoppable', async () => {
+  const { result, sendMessage, emit } = await mountComposer([]);
+  act(() => result.current.markSessionProcessing(session.id, { canInterrupt: true }));
+  const agent: ActiveBackgroundTask = { id: 'call_agent', toolName: 'Agent', command: 'Review', startedAt: 2 };
+
+  // Codex and ZCode announce agents mid-turn; the strip lists them, but the
+  // turn is still the thing in flight.
+  emit(backgroundStatus([agent], false));
+  expect(result.current.isProcessing).toBe(true);
+  expect(result.current.activities.get(session.id)?.background).toBeUndefined();
+
+  // The agent settling before the turn ends must not end the reply with it.
+  emit(backgroundStatus([], false));
+  expect(result.current.isProcessing).toBe(true);
+  act(() => result.current.handleAbortSession());
+  expect(sendMessage).toHaveBeenLastCalledWith({ type: 'chat.abort', sessionId: 'session-1' });
+});
+
+test('agents that settle right after the turn completes end the background phase even before a re-render', async () => {
+  const { result, emit } = await mountComposer([]);
+  act(() => result.current.markSessionProcessing(session.id, { canInterrupt: true }));
+  const agent: ActiveBackgroundTask = { id: 'call_agent', toolName: 'Agent', command: 'Review', startedAt: 2 };
+  emit(backgroundStatus([agent], false));
+
+  emit(
+    { kind: 'complete', sessionId: session.id, provider: 'claude', exitCode: 0, timestamp: '2026-10-19T00:00:01.000Z' } as ServerEvent,
+    backgroundStatus([], false),
+  );
+  expect(result.current.activities.has(session.id)).toBe(false);
+  expect(result.current.isProcessing).toBe(false);
+});

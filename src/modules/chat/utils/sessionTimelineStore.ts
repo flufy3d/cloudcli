@@ -142,6 +142,11 @@ export type SessionSlot = {
   backgroundWorkPending?: boolean;
   /** Client clock when the session last entered background waiting; set exactly while it waits. */
   backgroundWorkSince?: number;
+  /**
+   * False when the server said `chat.abort` can no longer stop this work (a
+   * ZCode agent outliving its turn); undefined means stoppable.
+   */
+  backgroundCanInterrupt?: boolean;
 }
 
 const EMPTY: NormalizedMessage[] = [];
@@ -963,7 +968,7 @@ export class SessionTimelineStore {
         }
         const ackBgTasks = Array.isArray(msg.backgroundTasks) ? msg.backgroundTasks : undefined;
         if (ackBgTasks) {
-          this.setBackgroundState(sid, ackBgTasks, msg.backgroundWorkPending);
+          this.setBackgroundState(sid, ackBgTasks, msg.backgroundWorkPending, msg.backgroundCanInterrupt);
         }
         return {
           effect: 'chat_subscribed',
@@ -1028,7 +1033,7 @@ export class SessionTimelineStore {
       case 'status': {
         const statusBgTasks = Array.isArray(message?.backgroundTasks) ? message.backgroundTasks : undefined;
         if (sid && statusBgTasks) {
-          this.setBackgroundState(sid, statusBgTasks, message?.backgroundWorkPending);
+          this.setBackgroundState(sid, statusBgTasks, message?.backgroundWorkPending, message?.canInterrupt);
         }
         return {
           effect: 'status',
@@ -1840,11 +1845,17 @@ export class SessionTimelineStore {
     return Math.min(...slot.backgroundTasks.map((task) => task.startedAt));
   }
 
-  private setBackgroundState(sid: string, tasks: ActiveBackgroundTask[], pending: unknown): void {
+  /** Used by the viewed session's activity indicator to decide whether its background phase offers Stop. */
+  canInterruptBackgroundWork(sessionId: string): boolean {
+    return this.slots.get(sessionId)?.backgroundCanInterrupt !== false;
+  }
+
+  private setBackgroundState(sid: string, tasks: ActiveBackgroundTask[], pending: unknown, canInterrupt: unknown): void {
     const slot = this.getSlot(sid);
     const wasPending = this.hasPendingBackgroundWork(sid);
     slot.backgroundTasks = tasks;
     slot.backgroundWorkPending = typeof pending === 'boolean' ? pending : undefined;
+    slot.backgroundCanInterrupt = typeof canInterrupt === 'boolean' ? canInterrupt : undefined;
     if (!this.hasPendingBackgroundWork(sid)) {
       slot.backgroundWorkSince = undefined;
     } else if (!wasPending) {

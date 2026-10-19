@@ -1,4 +1,5 @@
-import type { BackgroundTaskSummary, SessionBackgroundWork } from '@/shared/types.js';
+import type { ActiveBackgroundTask, BackgroundTaskSummary, SessionBackgroundWork } from '@/shared/types.js';
+import { SUBAGENT_TOOL_NAME } from '@/shared/utils.js';
 
 /**
  * The background work a provider runtime still has outstanding, keyed by app
@@ -13,7 +14,8 @@ import type { BackgroundTaskSummary, SessionBackgroundWork } from '@/shared/type
  * each leftover card.
  *
  * Consumers: the Codex, ZCode and Antigravity runtime providers
- * (start/end/list/clear) and their sessions providers (`has`).
+ * (start/end/list/clear, and `listStripTasks` for the composer's strip) and
+ * their sessions providers (`has`).
  */
 export class BackgroundWorkRegistry {
   private readonly bySession = new Map<string, Map<string, BackgroundTaskSummary>>();
@@ -86,6 +88,22 @@ export class BackgroundWorkRegistry {
     const outstanding = Array.from(this.bySession.get(sessionKey)?.values() ?? []);
     this.bySession.delete(sessionKey);
     return outstanding;
+  }
+
+  /**
+   * One session's agents in the shape the composer's background-task strip
+   * lists, each named by its `Agent` card. `taskId` is left out on purpose:
+   * the strip offers a per-task stop only for a handle `stopBackgroundTask`
+   * accepts, and none of these runtimes can stop one agent on its own.
+   */
+  listStripTasks(sessionKey: string): ActiveBackgroundTask[] {
+    return Array.from(this.bySession.get(sessionKey)?.values() ?? [], (task) => ({
+      id: task.toolUseId,
+      toolName: SUBAGENT_TOOL_NAME,
+      command: task.description,
+      description: task.description,
+      startedAt: task.startedAt,
+    }));
   }
 
   /** Every session with work outstanding, in the shape `listBackgroundWork` returns. */

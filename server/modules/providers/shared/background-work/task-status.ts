@@ -1,4 +1,4 @@
-import type { NormalizedMessage } from '@/shared/types.js';
+import type { ActiveBackgroundTask, NormalizedMessage } from '@/shared/types.js';
 import { createNormalizedMessage } from '@/shared/utils.js';
 
 /**
@@ -37,5 +37,32 @@ export function createTaskStatusMessage(subject: TaskStatusSubject, fields: Task
     kind: 'task_status',
     ...subject,
     ...fields,
+  });
+}
+
+/**
+ * Builds one `background_tasks` status frame: the full list of what the
+ * composer's background-task strip shows for a session, replacing whatever the
+ * client held. A runtime sends it every time that list changes, an empty list
+ * included, because nothing else clears the strip.
+ *
+ * `canInterrupt` says whether `chat.abort` can still stop that work. Omitted,
+ * the client treats it as stoppable; a runtime whose turn has ended without a
+ * process left to stop sends `false`, so the strip offers no stop button that
+ * would only fail.
+ *
+ * Consumers: the Codex, ZCode and Antigravity runtime providers.
+ */
+export function createBackgroundTasksStatusMessage(
+  subject: { provider: NormalizedMessage['provider']; sessionId: string | null },
+  backgroundTasks: ActiveBackgroundTask[],
+  canInterrupt?: boolean,
+): NormalizedMessage {
+  return createNormalizedMessage({
+    kind: 'status',
+    text: 'background_tasks',
+    ...subject,
+    backgroundTasks,
+    ...(canInterrupt === undefined ? {} : { canInterrupt }),
   });
 }

@@ -204,6 +204,7 @@ function ChatInterface({
     closeCommandModal,
     showCostModal,
     forceSendQueuedDraft,
+    canForceSendQueuedDraft,
   } = useChatComposerState({
     selectedProject,
     selectedSession,
@@ -268,6 +269,7 @@ function ChatInterface({
     statusCheckSentAtRef,
     onSessionProcessing,
     onSessionIdle,
+    processingSessions,
     onWebSocketReconnect: handleWebSocketReconnect,
     requestLatestMessages,
     sessionStore,
@@ -533,7 +535,7 @@ function ChatInterface({
           sendByCtrlEnter={sendByCtrlEnter}
           backgroundTasks={backgroundTasks}
           hasActiveBackgroundTasks={hasActiveBackgroundTasks}
-          onForceSendQueuedDraft={forceSendQueuedDraft}
+          onForceSendQueuedDraft={canForceSendQueuedDraft ? forceSendQueuedDraft : undefined}
         />
         </div>
       </div>

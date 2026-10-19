@@ -46,3 +46,16 @@ test('an agent is found across sessions by its id and cleared with its session',
   assert.equal(registry.has('agent_1'), true);
   assert.deepEqual(registry.list().map((entry) => entry.sessionId), ['sess_a']);
 });
+
+test('the strip lists a session\'s agents by their cards, with no stop handle', () => {
+  const registry = new BackgroundWorkRegistry();
+  registry.start('sess_a', { ...agent, startedAt: 1_000 });
+  registry.start('sess_b', { ...agent, taskId: 'agent_2', toolUseId: 'call_2' });
+
+  // No `taskId`: the strip offers a per-task stop only for a handle the
+  // runtime can stop, and these runtimes cannot stop one agent on its own.
+  assert.deepEqual(registry.listStripTasks('sess_a'), [
+    { id: 'call_1', toolName: 'Agent', command: 'Review', description: 'Review', startedAt: 1_000 },
+  ]);
+  assert.deepEqual(registry.listStripTasks('sess_none'), []);
+});

@@ -4,7 +4,7 @@ import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import type { ServerEvent } from '@/shared/context/WebSocketContext';
 import { showCompletionTitleIndicator } from '@/modules/chat/utils/pageTitleNotification';
 import { playChatCompletionSound, playNotificationSound } from '@/modules/chat/utils/notificationSound';
-import type { MarkSessionIdle, MarkSessionProcessing } from '@/shared/types';
+import type { MarkSessionIdle, MarkSessionProcessing, SessionActivityMap } from '@/shared/types';
 import type { PendingPermissionRequest } from '@/shared/types';
 import type { ProjectSession, LLMProvider } from '@/shared/types';
 import type { ServerEventDirective } from '@/modules/chat/utils/sessionTimelineStore';
@@ -36,6 +36,8 @@ type UseChatRealtimeHandlersArgs = {
   statusCheckSentAtRef: MutableRefObject<Map<string, number>>;
   onSessionProcessing?: MarkSessionProcessing;
   onSessionIdle?: MarkSessionIdle;
+  /** Which sessions are busy; a `background_tasks` frame must not demote a reply in flight. */
+  processingSessions?: SessionActivityMap;
   onWebSocketReconnect?: () => void;
   requestLatestMessages: (sessionId: string, allowNetwork?: boolean) => Promise<void>;
   sessionStore: SessionStore;
@@ -66,6 +68,7 @@ export function useChatRealtimeHandlers({
   statusCheckSentAtRef,
   onSessionProcessing,
   onSessionIdle,
+  processingSessions,
   onWebSocketReconnect,
   requestLatestMessages,
   sessionStore,
@@ -84,10 +87,15 @@ export function useChatRealtimeHandlers({
   // notification sound before React finishes a rerender.
   const pendingPermissionRequestsRef = useRef(pendingPermissionRequests);
   const sessionHadBackgroundTasksRef = useRef<Map<string, boolean>>(new Map());
+  const processingSessionsRef = useRef(processingSessions);
 
   useEffect(() => {
     pendingPermissionRequestsRef.current = pendingPermissionRequests;
   }, [pendingPermissionRequests]);
+
+  useEffect(() => {
+    processingSessionsRef.current = processingSessions;
+  }, [processingSessions]);
 
   useEffect(() => {
     const handleEvent = (msg: ServerEvent) => {
@@ -167,12 +175,14 @@ export function useChatRealtimeHandlers({
         }
 
         case 'protocol_error': {
-          // A rejected stop is not a terminal event. The store has shown the
-          // error, but only the runtime can settle the foreground/background
+          // A rejected stop is not a terminal event, and neither is a send the
+          // server refused because a run is still going. The store has shown
+          // the error, but only the runtime can settle the foreground/background
           // state and release queued input.
           console.error('[Chat] Protocol error:', directive.code, directive.error);
           if (directive.code === 'NO_SUCH_TASK' || directive.code === 'TASK_ID_REQUIRED'
-            || directive.code === 'TASK_STOP_FAILED' || directive.code === 'ABORT_FAILED') {
+            || directive.code === 'TASK_STOP_FAILED' || directive.code === 'ABORT_FAILED'
+            || directive.code === 'RUN_IN_PROGRESS') {
             return;
           }
           onSessionIdle?.(directive.sessionId);
@@ -187,6 +197,16 @@ export function useChatRealtimeHandlers({
           // derives from the processing map, so deleting the entry hides it
           // immediately and atomically.
           const backgroundPending = Boolean(sessionId && sessionStore.hasPendingBackgroundWork(sessionId));
+          if (sessionId) {
+            // The reply is over now, not at the next render: a task frame
+            // landing before React re-renders must see it as over.
+            const turnActivity = processingSessionsRef.current?.get(sessionId);
+            if (turnActivity && !turnActivity.background) {
+              const settled = new Map(processingSessionsRef.current);
+              settled.delete(sessionId);
+              processingSessionsRef.current = settled;
+            }
+          }
           if (sessionId && backgroundPending && success && !aborted) {
             onSessionProcessing?.(sessionId, { background: true });
           } else {
@@ -247,6 +267,13 @@ export function useChatRealtimeHandlers({
           if (directive.text === 'token_budget' && directive.tokenBudget) {
             setTokenBudget(directive.tokenBudget as Record<string, unknown>);
           } else if (directive.text === 'background_tasks' && directive.sessionId) {
+            // Agents launched and settled mid-turn (Codex, ZCode) are the
+            // turn's business: the reply stays the thing in flight, and the
+            // turn's own `complete` decides whether a background phase follows.
+            const activity = processingSessionsRef.current?.get(directive.sessionId);
+            if (activity && !activity.background) {
+              return;
+            }
             if (sessionStore.hasPendingBackgroundWork(directive.sessionId)) {
               sessionHadBackgroundTasksRef.current.set(directive.sessionId, true);
               onSessionProcessing?.(directive.sessionId, { background: true });

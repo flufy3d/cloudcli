@@ -125,6 +125,11 @@ export function createProviderRuntimeService(
       );
     },
 
+    canInterruptBackgroundWork(sessionId: string): boolean {
+      return dependencies.listProviders()
+        .every((provider) => provider.runtime.backgroundTasks?.canInterrupt?.(sessionId) !== false);
+    },
+
     getBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
       return dependencies.listProviders().flatMap(
         (provider) => provider.runtime.backgroundTasks?.list(sessionId) ?? [],

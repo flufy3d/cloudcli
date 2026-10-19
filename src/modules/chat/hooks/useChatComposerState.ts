@@ -1121,6 +1121,13 @@ export function useChatComposerState({
     setQueuedDraft(null);
   }, []);
 
+  // Force send starts a new run, which the server refuses while a reply is
+  // still in flight (RUN_IN_PROGRESS); only a session whose turn has ended
+  // and that waits on background work alone can take one.
+  const queueTargetActivity = processingSessions?.get(selectedSession?.id || currentSessionId || '');
+  const canForceSendQueuedDraft = Boolean(hasActiveBackgroundTasks)
+    && !(queueTargetActivity && !queueTargetActivity.background);
+
   const forceSendQueuedDraft = useCallback(() => {
     if (!queuedDraft) {
       return;
@@ -1463,6 +1470,7 @@ export function useChatComposerState({
     editQueuedDraft,
     deleteQueuedDraft,
     forceSendQueuedDraft,
+    canForceSendQueuedDraft,
     backgroundTasks,
     hasActiveBackgroundTasks,
     handleVoiceTranscript,

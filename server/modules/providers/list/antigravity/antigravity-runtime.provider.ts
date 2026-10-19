@@ -22,6 +22,7 @@ import {
 } from '@/shared/image-attachments.js';
 import {
   LOCAL_AGENT_TASK_TYPE,
+  createBackgroundTasksStatusMessage,
   createTaskStatusMessage,
 } from '@/modules/providers/shared/background-work/task-status.js';
 import type { IProviderRuntime } from '@/shared/interfaces.js';
@@ -38,7 +39,6 @@ import {
   readObjectRecord,
   readOptionalString,
   sanitizeLeafDirectoryName,
-  SUBAGENT_TOOL_NAME,
 } from '@/shared/utils.js';
 
 import { getAntigravityDataRoot } from './antigravity-data-root.js';
@@ -142,16 +142,7 @@ export function getAntigravityBackgroundKeyAliasCount(): number {
  * `id` is the id of each agent's `Agent` card.
  */
 export function getAntigravityBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
-  const key = backgroundKeyAliases.get(sessionId) ?? sessionId;
-  return antigravityBackgroundWork.list()
-    .filter((entry) => entry.sessionId === key)
-    .flatMap((entry) => entry.tasks.map((task) => ({
-      id: task.toolUseId,
-      toolName: SUBAGENT_TOOL_NAME,
-      command: task.description,
-      description: task.description,
-      startedAt: task.startedAt,
-    })));
+  return antigravityBackgroundWork.listStripTasks(backgroundKeyAliases.get(sessionId) ?? sessionId);
 }
 
 /**
@@ -265,14 +256,10 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       const processKey = sessionId || capturedSessionId || `agy_${Date.now()}_${keylessRunCounter += 1}`;
       const sessionKey = sessionId || capturedSessionId || processKey;
       const broadcastBackgroundTasks = () => {
-        writer.send(createNormalizedMessage({
-          id: generateMessageId(PROVIDER),
-          kind: 'status',
-          text: 'background_tasks',
-          backgroundTasks: getAntigravityBackgroundTasksForSession(sessionKey),
-          sessionId: capturedSessionId || sessionId || null,
-          provider: PROVIDER,
-        }));
+        writer.send(createBackgroundTasksStatusMessage(
+          { provider: PROVIDER, sessionId: capturedSessionId || sessionId || null },
+          getAntigravityBackgroundTasksForSession(sessionKey),
+        ));
       };
 
       // The agents' own work lives in their transcripts, not in `agy`'s
