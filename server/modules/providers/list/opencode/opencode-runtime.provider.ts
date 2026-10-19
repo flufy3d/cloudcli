@@ -189,8 +189,6 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       ?? Promise.reject(new OpenCodeApiError('GET', '/api/session', 503, 'OpenCode service is not running')),
   });
   const settings = new OpenCodeSessionSettingsApplier();
-  /** Live occupancy publisher for the run in flight; recreated per run. */
-  let budgetTracker: OpenCodeTokenBudgetTracker | null = null;
   /** App sessions whose pending set is being re-read right now. */
   const reconcilingPending = new Set<string>();
 
@@ -253,7 +251,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   eventStream.subscribe((event) => {
     adoptExternalExecution(event);
     bridge.handleEvent(event);
-    runs.dispatch(event, budgetTracker ?? undefined);
+    runs.dispatch(event);
   });
   eventStream.onReconnect(() => {
     void runs.reconcile({ getSession: (sessionId) => client?.getSession(sessionId)
@@ -416,8 +414,8 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
 
     // One tracker per run: the window comes from the model this run switched
     // to, and the throttle state must not leak across runs.
-    budgetTracker = new OpenCodeTokenBudgetTracker(budgetTrackerModel?.providerID ?? null, budgetTrackerModel?.id ?? null);
     const activeRun = runs.create(appSessionId, providerSessionId, writer);
+    activeRun.budgetTracker = new OpenCodeTokenBudgetTracker(budgetTrackerModel?.providerID ?? null, budgetTrackerModel?.id ?? null);
     bridge.attach({
       appSessionId,
       providerSessionId,
@@ -460,7 +458,6 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     // bridge so finished sessions do not pin memory forever.
     bridge.cancelSession(appSessionId, 'The run ended with cards still pending.');
     bridge.detach(providerSessionId);
-    budgetTracker = null;
     if (failure) {
       throw failure;
     }

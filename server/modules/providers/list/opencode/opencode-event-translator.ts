@@ -37,6 +37,7 @@ import { createNormalizedMessage, readObjectRecord, readOptionalString } from '@
 import type { OpenCodeStepTokens } from './opencode-context-usage.js';
 import { readOpenCodeStepTokens } from './opencode-context-usage.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
+import { formatOpenCodeToolBlock } from './opencode-tool-output.js';
 
 const PROVIDER = 'opencode' as const;
 
@@ -108,7 +109,7 @@ const formatToolOutput = (content: unknown): string => {
       if (!record) {
         return typeof block === 'string' ? block : '';
       }
-      return readVerbatimString(record.text) ?? (record.type === 'text' ? '' : JSON.stringify(record));
+      return readVerbatimString(record.text) ?? (record.type === 'text' ? '' : formatOpenCodeToolBlock(record));
     })
     .filter((text) => text.length > 0)
     .join('\n');

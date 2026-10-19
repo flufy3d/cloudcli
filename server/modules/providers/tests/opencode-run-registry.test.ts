@@ -390,8 +390,8 @@ test('reconcile: 404 loses the run, other errors keep it open, unaccepted prompt
 test('dispatch publishes a budget frame from a step.ended event when a tracker is registered', () => {
   const registry = new OpenCodeRunRegistry();
   const { frames, writer } = writerOf();
-  registry.create('app-a', 'ses_a', writer);
-  const tracker = new OpenCodeTokenBudgetTracker(null, null);
+  const run = registry.create('app-a', 'ses_a', writer);
+  run.budgetTracker = new OpenCodeTokenBudgetTracker(null, null);
 
   registry.dispatch({
     type: 'session.step.ended',
@@ -399,7 +399,7 @@ test('dispatch publishes a budget frame from a step.ended event when a tracker i
       sessionID: 'ses_a',
       tokens: { input: 2798, output: 509, reasoning: 711, cache: { read: 488192, write: 0 } },
     },
-  }, tracker);
+  });
 
   const budgetFrames = frames.filter((frame) => frame.kind === 'status' && frame.text === 'token_budget');
   assert.equal(budgetFrames.length, 1);
@@ -414,7 +414,7 @@ test('dispatch publishes a budget frame from a step.ended event when a tracker i
 test('dispatch drops step tokens when no tracker is registered, and throttles repeats', () => {
   const registry = new OpenCodeRunRegistry();
   const { frames, writer } = writerOf();
-  registry.create('app-a', 'ses_a', writer);
+  const run = registry.create('app-a', 'ses_a', writer);
   const stepEvent = {
     type: 'session.step.ended',
     data: { sessionID: 'ses_a', tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } },
@@ -424,9 +424,29 @@ test('dispatch drops step tokens when no tracker is registered, and throttles re
   registry.dispatch(stepEvent);
   assert.equal(frames.length, 0);
 
-  const tracker = new OpenCodeTokenBudgetTracker(null, null);
-  registry.dispatch(stepEvent, tracker);
-  registry.dispatch(stepEvent, tracker);
+  run.budgetTracker = new OpenCodeTokenBudgetTracker(null, null);
+  registry.dispatch(stepEvent);
+  registry.dispatch(stepEvent);
   const budgetFrames = frames.filter((frame) => frame.kind === 'status' && frame.text === 'token_budget');
   assert.equal(budgetFrames.length, 1, 'an unchanged value inside the interval must not repaint');
+});
+
+test('concurrent runs each publish occupancy through their own tracker', () => {
+  const registry = new OpenCodeRunRegistry();
+  const first = writerOf();
+  const second = writerOf();
+  const runA = registry.create('app-a', 'ses_a', first.writer);
+  const runB = registry.create('app-b', 'ses_b', second.writer);
+  runA.budgetTracker = new OpenCodeTokenBudgetTracker(null, null);
+  // A run started later must not take over the earlier run's publisher.
+  runB.budgetTracker = new OpenCodeTokenBudgetTracker(null, null);
+  const tokens = { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } };
+
+  registry.dispatch({ type: 'session.step.ended', data: { sessionID: 'ses_a', tokens } });
+  registry.dispatch({ type: 'session.step.ended', data: { sessionID: 'ses_b', tokens } });
+
+  const budgetsOf = (frames: typeof first.frames) => frames.filter((frame) => frame.text === 'token_budget');
+  assert.equal(budgetsOf(first.frames).length, 1);
+  assert.equal(budgetsOf(second.frames).length, 1, "B's equal reading is not throttled by A's");
+  assert.equal(budgetsOf(first.frames)[0]?.sessionId, 'app-a');
 });

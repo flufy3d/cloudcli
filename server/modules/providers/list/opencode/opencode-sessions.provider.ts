@@ -38,6 +38,7 @@ import {
 } from './opencode-data-root.js';
 import { readOpenCodeContextUsage } from './opencode-context-usage.js';
 import { buildOpenCodeTextRowKey } from './opencode-event-translator.js';
+import { formatOpenCodeToolBlock } from './opencode-tool-output.js';
 
 const PROVIDER = 'opencode';
 
@@ -337,7 +338,7 @@ const readOpenCodeToolResultContent = (state: AnyRecord): string => {
           if (!record) {
             return typeof block === 'string' ? block : '';
           }
-          return readOptionalString(record.text) ?? (record.type === 'text' ? '' : formatToolContent(record));
+          return readOptionalString(record.text) ?? (record.type === 'text' ? '' : formatOpenCodeToolBlock(record));
         })
         .filter((text) => text.length > 0)
         .join('\n');

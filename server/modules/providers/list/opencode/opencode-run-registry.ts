@@ -131,6 +131,12 @@ export type OpenCodeActiveRun = {
   aborted: boolean;
   /** Set once the prompt was accepted; only then can reconciliation judge the run. */
   promptAccepted: boolean;
+  /**
+   * This run's live occupancy publisher. Per run, never shared: the window
+   * belongs to the run's model, so concurrent sessions on different models
+   * must not divide each other's tokens by the wrong window.
+   */
+  budgetTracker?: OpenCodeTokenBudgetTracker;
   /** Resolves on the first settlement; later settlements are ignored. */
   settled: Promise<OpenCodeRunSettlement>;
   settle: (settlement: OpenCodeRunSettlement) => void;
@@ -391,7 +397,7 @@ export class OpenCodeRunRegistry {
    * reports that turn's outcome separately, and a compaction it decided to run
    * must not fail the user's turn.
    */
-  dispatch(event: OpenCodeEventEnvelope, budgetTracker?: OpenCodeTokenBudgetTracker): void {
+  dispatch(event: OpenCodeEventEnvelope): void {
     this.subagents.note(event);
     const data = readObjectRecord(event.data) ?? {};
     const providerSessionId = readOptionalString(data.sessionID);
@@ -457,7 +463,7 @@ export class OpenCodeRunRegistry {
     if (!run) {
       return;
     }
-    this.deliverEvent(event, run, budgetTracker);
+    this.deliverEvent(event, run);
   }
 
   /** Forwards a child session's translated frames under its spawn call id. */
@@ -604,14 +610,13 @@ export class OpenCodeRunRegistry {
   private deliverEvent(
     event: OpenCodeEventEnvelope,
     run: OpenCodeActiveRun,
-    budgetTracker?: OpenCodeTokenBudgetTracker,
   ): void {
     const { frames, terminal, stepTokens, compactionError } = run.translator.translate(event);
     for (const frame of frames) {
       run.writer.send(frame);
     }
-    if (stepTokens && budgetTracker) {
-      budgetTracker.report(stepTokens, run.writer, run.appSessionId);
+    if (stepTokens && run.budgetTracker) {
+      run.budgetTracker.report(stepTokens, run.writer, run.appSessionId);
     }
     if (compactionError && run.purpose === 'compact') {
       run.settle({ outcome: 'failed', error: compactionError });

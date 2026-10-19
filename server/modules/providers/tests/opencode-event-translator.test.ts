@@ -126,6 +126,19 @@ test('tracks a tool call from input.started through called to success as upserta
   assert.deepEqual(result.toolResult, { content: 'cloudcli-probe-123\n', isError: false });
 });
 
+test('an image read collapses its inline data URI to a short label', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  const success = translator.translate(event('session.tool.success', {
+    assistantMessageID: MESSAGE,
+    id: CALL,
+    content: [
+      { type: 'text', text: 'Image read successfully' },
+      { type: 'file', uri: `data:image/png;base64,${'A'.repeat(4096)}`, mime: 'image/png', name: 'frame.png' },
+    ],
+  }));
+  assert.equal(success.frames[0]?.content, 'Image read successfully\n[image/png frame.png, 3 KB]');
+});
+
 test('a subagent result is unwrapped, and a background launch stays running', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
   translator.translate(event('session.tool.input.started', {
