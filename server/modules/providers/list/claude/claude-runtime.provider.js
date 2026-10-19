@@ -60,6 +60,15 @@ const abortedInstances = new WeakSet();
 // (see addSession). Their run loops must stay silent on wind-down: the map
 // entry, the abort flag, and all client-facing events belong to the new run.
 const supersededInstances = new WeakSet();
+// Query instances whose reply the user stopped while background work it
+// launched was still running. Like Esc in the CLI, only the turn is
+// interrupted: the process stays up for that work, and the interrupted
+// turn's `result` hands the run over to the usual post-turn hold.
+const turnOnlyAbortedInstances = new WeakSet();
+// How long a turn-only stop waits for the interrupted turn's `result` before
+// giving up on the process. The CLI answers interrupt() at once; this only
+// catches one that never does, so it cannot sit on stdin for ever.
+const TURN_ONLY_ABORT_RESULT_WAIT_MS = 30_000;
 
 const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEOUT_MS, 10) || 55000;
 
@@ -339,8 +348,9 @@ function mapCliOptionsToSDK(options = {}) {
  * @param {Object} queryInstance - SDK query instance
  * @param {Object} writer - WebSocket writer for reconnect support
  * @param {Function} releaseInput - Closes the held stdin stream so the CLI can exit
+ * @param {Function} isTurnInFlight - Whether the run's own reply has not ended yet
  */
-function addSession(sessionId, queryInstance, writer = null, releaseInput = null) {
+function addSession(sessionId, queryInstance, writer = null, releaseInput = null, isTurnInFlight = null) {
   const existing = activeSessions.get(sessionId);
   // A different live instance under the same key means an earlier run was
   // superseded without being stopped (e.g. an abort that raced run setup and
@@ -370,7 +380,8 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
     status: 'active',
     writer,
     // Re-registered mid-run once the provider session id lands; keep the closer.
-    releaseInput: releaseInput || carried?.releaseInput || null
+    releaseInput: releaseInput || carried?.releaseInput || null,
+    isTurnInFlight: isTurnInFlight || carried?.isTurnInFlight || null
   });
   // The history reader reports a background agent as running or stopped by
   // whether this entry exists, and the cached history does not see this map.
@@ -1042,9 +1053,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       });
     }
 
+    const isTurnInFlight = () => !turnCompleteSent;
     // Track the query instance for abort capability
     if (sessionKey()) {
-      addSession(sessionKey(), queryInstance, ws, releasePromptStream);
+      addSession(sessionKey(), queryInstance, ws, releasePromptStream, isTurnInFlight);
     }
     // The new owner clears stale cards even if its turn starts no background work.
     broadcastBackgroundTasks();
@@ -1063,7 +1075,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       if (message.session_id && !capturedSessionId) {
 
         capturedSessionId = message.session_id;
-        addSession(sessionKey(), queryInstance, ws, releasePromptStream);
+        addSession(sessionKey(), queryInstance, ws, releasePromptStream, isTurnInFlight);
 
         // Set session ID on writer
         if (ws.setSessionId && typeof ws.setSessionId === 'function') {
@@ -1156,6 +1168,20 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       }
 
       if (message.type === 'result') {
+        // The turn the user stopped ends here. The abort already told the
+        // client it was over, so from now on this run is in its post-turn
+        // hold like any other, and later results are background replies.
+        if (turnOnlyAbortedInstances.delete(queryInstance)) {
+          abortedInstances.delete(queryInstance);
+          turnCompleteSent = true;
+          notifyRunStopped({
+            userId: ws?.userId || null,
+            provider: 'claude',
+            sessionId: sessionId || capturedSessionId || null,
+            sessionName: sessionSummary,
+            stopReason: 'aborted'
+          });
+        }
         backgroundReplyPending = false;
         const workLapsed = backgroundWork.endTurn(sessionKey());
         if (workLapsed || (lastBroadcastPending && !backgroundWork.hasPending(sessionKey()))) broadcastBackgroundTasks();
@@ -1350,15 +1376,39 @@ async function abortClaudeSDKSession(sessionId) {
     return false;
   }
 
+  // The turn is already being stopped and only waits for its `result`; a
+  // repeated press must not interrupt again or disturb that bookkeeping.
+  if (turnOnlyAbortedInstances.has(session.instance)) {
+    return true;
+  }
+
   try {
     console.log(`Aborting SDK session: ${sessionId}`);
+
+    // A reply stopped while background work it launched is still running
+    // stops only the turn, as Esc does in the CLI: interrupt() leaves a
+    // background Bash running (the CLI itself stops background agents and
+    // reports them `stopped`), and closing stdin is what would kill the rest. Stopping in the
+    // background phase itself (no reply in flight) still ends everything.
+    const turnOnly = Boolean(session.isTurnInFlight?.()) && backgroundWork.hasPending(sessionId);
 
     // Mark before interrupting so the run loop knows not to emit its own
     // terminal complete (the abort handler sends the aborted one).
     abortedInstances.add(session.instance);
+    if (turnOnly) turnOnlyAbortedInstances.add(session.instance);
 
     // Call interrupt() on the query instance
     await session.instance.interrupt();
+
+    if (turnOnly) {
+      const { instance } = session;
+      setTimeout(() => {
+        if (!turnOnlyAbortedInstances.delete(instance)) return;
+        console.warn(`[Claude SDK] Session ${sessionId} never ended its interrupted turn; releasing the process`);
+        session.releaseInput?.();
+      }, TURN_ONLY_ABORT_RESULT_WAIT_MS).unref?.();
+      return true;
+    }
 
     // Release the held stdin stream; without this the CLI stays up for the rest
     // of the post-turn hold even though the user cancelled.
@@ -1377,6 +1427,7 @@ async function abortClaudeSDKSession(sessionId) {
     console.error(`Error aborting session ${sessionId}:`, error);
     // The run keeps going; let it emit its own terminal complete.
     abortedInstances.delete(session.instance);
+    turnOnlyAbortedInstances.delete(session.instance);
     return false;
   }
 }

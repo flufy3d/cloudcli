@@ -556,3 +556,87 @@ for (const [toolName, input, output] of [
     });
   });
 }
+
+// Measured against claude CLI via the agent SDK: `interrupt()` mid-turn ends
+// the turn at once with a `result` of subtype `error_during_execution`, and a
+// background Bash launched earlier in that turn keeps running — it reports
+// `task_notification completed` later and the CLI relays it in a turn of its
+// own. Only closing stdin would kill it, which is what Esc in the CLI never does.
+const interruptedResult = () => ({ type: 'result', subtype: 'error_during_execution', session_id: NATIVE_ID, duration_ms: 1, num_turns: 1 });
+
+test('stopping a reply stops only the turn; background work it launched keeps running and reports back', async () => {
+  await withRun(async ({ script, sent }) => {
+    script.emit(init());
+    script.emit(toolUse('toolu_bg', 'Bash', { command: 'sleep 25', run_in_background: true }));
+    script.emit(taskStarted('b1', 'toolu_bg', 'local_bash'));
+    script.emit(ack('toolu_bg', 'Running in background with ID: b1', { backgroundTaskId: 'b1' }));
+    await script.drain();
+
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    script.emit(interruptedResult());
+    await script.drain();
+
+    assert.equal(script.released(), false, 'the process stays up for the background Bash');
+    assert.deepEqual(listClaudeSDKBackgroundWork().map((entry) => entry.tasks.map((task) => task.taskId)), [['b1']]);
+    assert.equal(sent.some((message) => message.kind === 'complete'), false, 'the abort path reports the stopped turn, not the runtime');
+    assert.deepEqual(lastStatus(sent)?.backgroundTasks?.map((task) => task.taskId), ['b1'], 'the strip keeps the task and its stop handle');
+
+    // The task finishes and the CLI relays it; that turn ends the hold.
+    script.emit(taskNotification('b1', 'toolu_bg', 'completed'));
+    script.emit(result());
+    await script.drain();
+    assert.equal(script.released(), true);
+    assert.equal(sent.some((message) => message.kind === 'complete'), false, 'the relay turn is not a second completion');
+  });
+});
+
+test('stopping a reply with no background work still lets the process go', async () => {
+  await withRun(async ({ script }) => {
+    script.emit(init());
+    script.emit(toolUse('toolu_fg', 'Bash', { command: 'sleep 60' }));
+    await script.drain();
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    // The held prompt stream notices its release on the next tick.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(script.released(), true);
+  });
+});
+
+test('a second stop while the first is still waiting for its result changes nothing', async () => {
+  await withRun(async ({ script, sent }) => {
+    script.emit(init());
+    script.emit(toolUse('toolu_bg', 'Bash', { command: 'sleep 25', run_in_background: true }));
+    script.emit(taskStarted('b1', 'toolu_bg', 'local_bash'));
+    await script.drain();
+
+    let interrupts = 0;
+    script.interrupt = async () => {
+      interrupts += 1;
+      if (interrupts > 1) throw new Error('already interrupting');
+    };
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    assert.equal(interrupts, 1, 'the turn is interrupted once');
+
+    script.emit(interruptedResult());
+    await script.drain();
+    assert.equal(sent.some((message) => message.kind === 'complete'), false, 'the stopped turn is not reported complete');
+    assert.equal(script.released(), false);
+  });
+});
+
+test('a stopped reply whose result never arrives still lets the process go', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await withRun(async ({ script }) => {
+    script.emit(init());
+    script.emit(toolUse('toolu_bg', 'Bash', { command: 'sleep 25', run_in_background: true }));
+    script.emit(taskStarted('b1', 'toolu_bg', 'local_bash'));
+    await script.drain();
+    assert.equal(await abortClaudeSDKSession(SESSION_ID), true);
+    assert.equal(script.released(), false);
+
+    t.mock.timers.tick(60_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(script.released(), true, 'a CLI that never ends the interrupted turn is not left running');
+  });
+});

@@ -67,6 +67,8 @@ type ChatComposerProps = {
   handleGrantToolPermission: (suggestion: { entry: string; toolName: string }) => { success: boolean };
   activity: SessionActivity | null;
   isLoading: boolean;
+  /** Whether Stop can act now; busy work nothing can stop (a ZCode agent past its turn) keeps the send button. */
+  canAbortSession: boolean;
   onAbortSession: () => void;
   onAbortBackgroundTasks: () => void;
   permissionMode: PermissionMode | string;
@@ -153,6 +155,7 @@ function ChatComposer({
   handleGrantToolPermission,
   activity,
   isLoading,
+  canAbortSession,
   onAbortSession,
   onAbortBackgroundTasks,
   permissionMode,
@@ -289,6 +292,9 @@ function ChatComposer({
 
   const hasQueuedDraft = Boolean(queuedDraft);
   const isBusy = isLoading || Boolean(hasActiveBackgroundTasks);
+  // The button is Stop only when stopping can do something. Otherwise it stays
+  // the send button: disabled while the input is empty, queueing once typed.
+  const offersStop = isLoading && canAbortSession;
   const canQueueDraft = isBusy && Boolean(input.trim() || attachedFiles.length > 0);
   const submitHint = canQueueDraft
     ? hasQueuedDraft
@@ -310,7 +316,7 @@ function ChatComposer({
     ? hasQueuedDraft
       ? t('input.queue.update', { defaultValue: 'Update queued message' })
       : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
-    : isLoading
+    : offersStop
       ? t('input.stop')
       : sendButtonLabel;
 
@@ -421,7 +427,7 @@ function ChatComposer({
 
         <PromptInput
           onSubmit={onSubmit as (event: FormEvent<HTMLFormElement>) => void}
-          status={isLoading ? 'streaming' : 'ready'}
+          status={offersStop ? 'streaming' : 'ready'}
           className={[
             isTextareaExpanded ? 'chat-input-expanded' : '',
             hasActivityIndicator ? 'rounded-t-none' : '',
@@ -568,7 +574,7 @@ function ChatComposer({
                       e.preventDefault();
                       onSubmit(e);
                     }
-                  : isLoading
+                  : offersStop
                     ? onAbortSession
                     : isRecording
                       ? (e: MouseEvent<HTMLButtonElement>) => {
@@ -580,7 +586,7 @@ function ChatComposer({
               disabled={
                 isSubmitting
                   ? true
-                  : isLoading
+                  : offersStop
                     ? false
                     : isRecording
                       ? false
