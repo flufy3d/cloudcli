@@ -1,6 +1,6 @@
 # Codex 会话标题
 
-> 状态：待实施。页面同步通道已在用；驻留已交付并默认开启。第一片要先补驻留管理模块缺的临时线程借用入口、按线程分流事件、受限连接句柄，并用真实账号验收临时线程隔离。待拍板：标题模型沿用会话模型，还是跟上游终端首选 `gpt-5.6-luna` 低档
+> 状态：待实施。页面同步通道已在用；驻留已交付并默认开启。第一片要先补驻留管理模块缺的临时线程借用入口、按线程分流事件、受限连接句柄，并用真实账号验收临时线程隔离
 > 基准：2.10.0 / 2026-10-20；源码核对点 `eb4cf953`，仓库依赖 `@openai/codex` 0.163.0，上游标签 `rust-v0.163.0`
 
 ## 目标与范围
@@ -100,7 +100,7 @@ flowchart TD
 
 标题用用户语言概括任务，单行、非空、无 Markdown。对提示词和模型输出设置大小上限，按 Unicode 字符边界截取。输出要求与上游同类的短任务标题，展示上限采用 36 个 Unicode 字符。输出必须经过结构校验，不能将整段回复或解析失败的原文当标题。
 
-标题模型有两个候选。候选一：使用原会话实际运行的模型和模型提供方，推理强度按模型目录选受支持的低档，目录不能确认支持时省略强度；不增加模型依赖，但用昂贵模型聊天的用户也按同样单价为标题付费，短输入不等于免费。候选二：跟上游终端的规则，账号模型目录里有 `gpt-5.6-luna` 就用它并把强度压到 `low`，否则退回候选一；每次标题成本最低、与官方终端行为一致，代价是多一次目录可用性判断，且标题模型与聊天模型不同。本机目录含 `gpt-5.6-luna`，候选二可以直接实测。拍板前按候选一实施。
+标题模型跟上游终端的规则：登录方式是 ChatGPT OAuth、且账号模型目录里有 `gpt-5.6-luna` 时，标题轮用 `gpt-5.6-luna` 并把推理强度压到 `low`；任一条件不成立就退回会话实际运行的模型，强度按模型目录选受支持的低档，目录不能确认支持时省略强度。目录判断用 `codex-models.provider.ts` 缓存的 `model/list`，登录方式用 `codex-auth.provider.ts` 的现有读数（OAuth 算 ChatGPT 账号，API Key 不算）。选它的理由：与官方终端行为一致、每次标题成本最低，且本机目录里另有只给 `gpt-5.6-luna` 的隐藏 `gpt-reserve` 保留额度桶（见"已核实的机制"），起名可能不占主额度。初版不开放模型配置项，规则固定；以后要改模型，再加明确的配置与可用性验证。
 
 同一应用会话与原生线程只保留一个待执行或运行中的任务。标题执行器在服务进程内串行处理任务，排队不占用聊天运行表，不阻止用户继续对话。标题生成不递归提交标题任务，也不登记为用户的后台工作。
 
@@ -146,7 +146,7 @@ Codex 原生名称使用 `thread/read` 和 `thread/name/set` 读写，不直接�
 | --- | --- | --- |
 | 驻留借用入口与真实协议验证 | `codex-session-manager.ts` 新增临时线程借用入口：不替换会话级回调、不暴露 `close()`、借用计入空闲回收与归档的活动判断、该线程的事件与请求只交给借用者；`--experimental` 协议导出；一次性探针 | 独立临时线程生成短标题；证明工具关闭（含 shell）、临时线程不入普通会话列表、原生名称保存后可读、改名是否触发 watcher；标题中断不影响正式聊天；失败时不改生产配置 |
 | 标题生成客户端 | 新增 `server/modules/providers/list/codex/codex-thread-title.ts`；复用驻留管理模块与 `codex-app-server.client.ts` | 借用归还、通知按 thread/turn 隔离、结构化输出、超时、取消和清理有测试；不复制 JSON-RPC 传输或会话进程表 |
-| 任务与条件落库 | 新增 `server/modules/providers/services/codex-session-title.service.ts`；`codex-runtime.provider.ts`；`server/modules/database/repositories/sessions.db.ts` | 只在符合条件的成功用户回合提交；去重、旧线程失效、手动改名保护和半完成恢复成立 |
+| 任务与条件落库 | 新增 `server/modules/providers/services/codex-session-title.service.ts`；`codex-runtime.provider.ts`；`server/modules/database/repositories/sessions.db.ts`；读 `codex-models.provider.ts` 的目录缓存与 `codex-auth.provider.ts` 的登录方式选标题模型 | 只在符合条件的成功用户回合提交；标题模型按规则选定并有回退；去重、旧线程失效、手动改名保护和半完成恢复成立 |
 | 元数据广播与页面同步接线 | 标题服务调用 `server/modules/websocket/services/session-upsert-broadcast.service.ts` 的 `metadataOnly` 路径；探针证明有必要时包含 `sessions-watcher.service.ts` 与 Codex 同步器 | 同时更新侧栏、顶部和浏览器标题；无历史刷新、未读提示、重复导航或搜索回跳；改名与新消息相邻时不漏历史变化 |
 | 同机制回归与文档 | providers/database/websocket/project-workspace 的对应 tests；`docs/requirements/Codex会话标题.md`；`docs/core/providers.md`、`docs/core/chat.md`、`docs/core/frontend.md` | 逐场景留下实测结果；活文档只写交付时已成立的机制 |
 
@@ -157,6 +157,9 @@ Codex 原生名称使用 `thread/read` 和 `thread/name/set` 读写，不直接�
 | 场景 | 必须观察到的结果 | 验证方式 |
 | --- | --- | --- |
 | 新 Codex 会话正常完成 | 首句占位最终成为概括标题；原生名称与本地名称一致 | 可控 app-server 测试和隔离真实 Codex 探针 |
+| ChatGPT 账号且目录含 `gpt-5.6-luna` | 标题轮用 `gpt-5.6-luna` + `low`；聊天回合的模型和强度不受影响 | 真实协议探针核对标题轮参数；runtime 测试 |
+| API Key 登录，或目录无 `gpt-5.6-luna` | 退回会话模型；不报失败、不改聊天 | 登录方式与模型目录 fixture |
+| `gpt-reserve` 保留额度桶 | 起名走 `gpt-5.6-luna` 后，配额快照显示它是否走保留桶、是否不占主额度；不成立就如实记录标题计入主额度 | 真实账号配额快照前后对比 |
 | 截图同类的既有会话 | 打开页面不发生成请求；下一次正常对话后补标题；有名称后不重复生成 | 历史 fixture 与任务服务测试 |
 | 同会话重复完成、多标签页 | 同一目标最多一个标题任务；页面不多出会话或聊天回合 | 调度与页面事件集成测试 |
 | 生成期间手动改名、删除、归档或编辑重发 | 自动结果不覆盖用户名称、不复活会话、不写到新原生线程 | 真实数据库条件写与可控时序测试 |
