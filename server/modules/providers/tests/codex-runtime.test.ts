@@ -295,6 +295,37 @@ test('stopping a running resident round interrupts the turn the engine started',
   }
 });
 
+test('an approval the engine asks for with no round in flight is answered', async (t) => {
+  const server = installFakeAppServer(t);
+  const published: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-approval-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: () => {} }, {
+      ...runtimeContext(false),
+      publishSessionEvent: (_appSessionId: string, message: any) => published.push(message),
+    } as never);
+
+    // The engine asks for an approval while no round waits: the request must
+    // not be answered as "not implemented".
+    const answer = server.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      itemId: 'item-1',
+      command: 'ls -la',
+    } as any);
+
+    assert.ok(answer !== undefined, 'the request must get an answer');
+    const card = published.find((message) => message.kind === 'permission_request');
+    assert.ok(card, 'the approval card must reach the session');
+    assert.equal(card.toolName, 'Bash');
+    void answer;
+  } finally {
+    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    closeCodexResidentSessions();
+  }
+});
+
 test('a turn the engine starts by itself is published to the session, not to the round', async (t) => {
   const server = installFakeAppServer(t);
   const messages: any[] = [];

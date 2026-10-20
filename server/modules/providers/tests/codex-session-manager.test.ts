@@ -679,3 +679,25 @@ test('a changed native thread replaces the resident process', async (t) => {
     closeCodexResidentSessions();
   }
 });
+
+test('the credential the process carried is revoked when the process is closed', async (t) => {
+  const server = installFakeAppServer(t);
+  const revoked: string[] = [];
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-credential',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      revokeCredential: () => revoked.push('tbc_probe'),
+    });
+
+    assert.deepEqual(revoked, [], 'the credential lives as long as the process');
+    closeCodexResidentSessions();
+    assert.deepEqual(revoked, ['tbc_probe'], 'the credential dies with the process');
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
