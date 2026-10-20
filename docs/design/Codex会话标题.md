@@ -1,6 +1,6 @@
 # Codex 会话标题
 
-> 状态：待实施。页面同步通道已在用；驻留已交付并默认开启。第一片要先补驻留管理模块缺的临时线程借用入口、按线程分流事件、受限连接句柄，并用真实账号验收临时线程隔离
+> 状态：待实施。页面同步通道已在用；驻留已交付并默认开启。第一片要先补驻留管理模块缺的临时线程借用入口、按线程分流事件、受限连接句柄，并用真实账号验收临时线程隔离。待拍板：标题模型沿用会话模型，还是跟上游终端首选 `gpt-5.6-luna` 低档
 > 基准：2.10.0 / 2026-10-20；源码核对点 `eb4cf953`，仓库依赖 `@openai/codex` 0.163.0，上游标签 `rust-v0.163.0`
 
 ## 目标与范围
@@ -25,7 +25,7 @@
 | ZCode | `server/modules/providers/list/zcode/zcode-session-synchronizer.provider.ts`，`deriveSessionName` | 读取引擎数据库标题，用 `title_source` 区分生成标题和原始首句 |
 | Antigravity | `server/modules/providers/list/antigravity/antigravity-session-synchronizer.provider.ts`，`deriveSessionName` | 读取引擎维护的会话摘要标题 |
 | Codex 索引 | `server/modules/providers/list/codex/codex-session-synchronizer.provider.ts`，`processSessionFile` | 读取 `session_index.jsonl` 的最新 `thread_name`；没有名称时保留已有占位标题 |
-| Codex 运行 | `server/modules/providers/list/codex/codex-runtime.provider.ts` | 通过驻留管理模块借用常驻进程，经引擎队列提交用户回合；没有标题生成任务；不读取 `thread/start`、`thread/resume` 应答里的 `name`；把非主线程的事件当作引擎自发活动发进会话频道 |
+| Codex 运行 | `server/modules/providers/list/codex/codex-runtime.provider.ts`，`handleCodexSessionEvent` | 通过驻留管理模块借用常驻进程，经引擎队列提交用户回合；没有标题生成任务；不读取 `thread/start`、`thread/resume` 应答里的 `name`；非主线程的事件交给会话级处理器，只有本会话已登记子代理线程的完成项会作为代理卡片行进聊天，其余外来线程的事件被丢弃——标题线程不另行路由的话，借用者收不到自己线程的任何事件 |
 | Codex 驻留管理 | `server/modules/providers/list/codex/codex-session-manager.ts`，`acquireCodexResidentSession` | 对外只有整会话借用与主线程回合提交，没有临时线程借用入口；对已存在的会话再次借用时，新借用者的会话级回调（引擎事件、审批请求、退出、忙判定）替换旧借用者的；借出的连接句柄带 `close()`，能关掉共享进程；非主线程事件不分线程，全部交给同一个 `onEngineEvent`；空闲回收只看前台回合、引擎自发回合、未答请求和 `isBusy`，没有辅助借用计数 |
 | 标题保护 | `server/modules/providers/shared/sessions/session-title-resolution.ts`，`resolveSessionTitle`；`server/modules/database/repositories/sessions.db.ts`，`applyEngineSessionName` | `name_locked` 保护用户命名；引擎名称可以替换未锁定的占位标题；`applyEngineSessionName` 只在未锁定时写名称，不核对 provider、原生线程映射与归档状态 |
 | 页面同步 | `src/modules/project-workspace/hooks/useProjectsState.ts`，`handleEvent` | `session_upserted` 更新侧栏；同 id 的名称更新合并进当前会话 |
@@ -40,6 +40,10 @@ Codex 引擎自己不生成名称。上游 `rust-v0.163.0` 里生成标题的是
 `thread/read` 返回的 `name` 只来自显式名称列（`thread_processor.rs`，`attach_thread_name`）。首句 `title` 不会被当成名称返回，所以"名称为空才生成"的判断成立。
 
 终端的临时线程隔离配方全部在 `temporary_structured_request.rs`。`thread/start` 带 `ephemeral: true` 和 `threadSource` 标记 `thread_title`，沙箱只读（用户有自定义权限档时沿用该档）。`config` 覆盖关闭约三十个能力开关，含 `features.shell_tool`、`features.unified_exec`、`features.hooks`、`features.memories`、`features.multi_agent`、`features.plugins`、`features.view_image`、`features.image_generation`、`cloud.skills.enabled`、`skills.include_instructions`、`tools.update_plan.enabled`、`tools.experimental_request_user_input.enabled`，并把 `web_search` 设为 `disabled`。它先读引擎有效配置，再把每个 MCP 服务器显式禁用；读不到有效配置就失败。`dynamicTools`、`environments`、`runtimeWorkspaceRoots`、`selectedCapabilityRoots` 置空。启动后核对应答里的 `sandbox` 确实是只读，不是就失败。回合超时 30 秒，拒绝一切交互请求。引擎核心对 `thread_title` 标记只改推理强度覆盖与缓存行为，源码注释写明不改权限（[`session.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/session/session.rs)，`title_request`）；隔离只能靠上述配置与沙箱，不能靠标记。
+
+`ephemeral: true` 时，引擎核心跳过线程持久化和状态库写入（`session.rs` 的 `thread_persistence_fut` 与 `state_db_fut` 在 ephemeral 下直接返回空）。所以临时线程不产生 `~/.codex/sessions` 下的聊天记录文件，不进 SQLite；只要不对它调 `thread/name/set`，`session_index.jsonl` 也不会有它。Codex 自己的线程列表读的是线程存储，看不到它；CloudCLI 的同步器只扫聊天记录文件，不会把它捞成侧栏会话。终端生成完只对临时线程调 `thread/unsubscribe` 停止接收通知，不另做删除。以上是源码推断，第一片探针要确认"临时线程不入普通会话列表"。
+
+终端起名的模型选择在 `thread_title.rs`：模型提供方是 `openai`、有 ChatGPT 账号、账号模型目录里有 `gpt-5.6-luna` 这三条都成立时，用 `gpt-5.6-luna` 并把推理强度压到 `low`；否则用当前聊天模型、不另设强度。提示词上限 960 字节，标题上限 36 个字符，续聊时取最近 8 条消息。本机账号目录里有 `gpt-5.6-luna`（目录描述"较老的快速高效模型"）和 `gpt-6-luna`（"快而便宜，适合简单任务"），两者都支持 `low` 档；模型按轮传，标题线程可以用与聊天不同的模型。本机目录另有隐藏的 `gpt-reserve` 配额分组，前端把它当作"只给 `gpt-5.6-luna` 的保留额度桶"处理（`src/modules/chat/utils/providerQuota.ts`）；起名用 `gpt-5.6-luna` 是否走这个单独的桶、是否不占主额度，要用真实账号的配额快照验证。
 
 本轮用仓库包内 CLI 导出公开协议核对了这套参数。`modelProvider`、`cwd`、`sandbox`、`config`、`ephemeral`、`threadSource` 在公开 `ThreadStartParams` 里；`model`、`permissions`、`runtimeWorkspaceRoots`、`environments`、`dynamicTools`、`selectedCapabilityRoots` 不在公开导出里，要用 `--experimental` 导出并在握手声明 `experimentalApi` 后验证（`codex-app-server.client.ts` 的握手已支持这个声明，驻留的队列方法正在用）。`model`、`effort`、`outputSchema` 在公开 `TurnStartParams` 里，模型、推理强度和结构化输出按轮传。`thread/read`、`thread/name/set`、`thread/name/updated`、`Thread.name` 均在公开协议。导出协议没有发起模型请求；临时线程的真实生成、工具隔离和写名称副作用仍需在实施时实测。
 
@@ -96,7 +100,7 @@ flowchart TD
 
 标题用用户语言概括任务，单行、非空、无 Markdown。对提示词和模型输出设置大小上限，按 Unicode 字符边界截取。输出要求与上游同类的短任务标题，展示上限采用 36 个 Unicode 字符。输出必须经过结构校验，不能将整段回复或解析失败的原文当标题。
 
-初版使用原会话实际运行的模型和模型提供方，不写死另一个小模型。推理强度按已有模型目录选择受支持的低档，目录不能确认支持时省略强度。这个选择减少额外模型依赖，但使用昂贵模型的用户也会为标题付出相应请求成本；短输入不等于免费。如果以后要单配便宜模型，需要增加明确的配置与可用性验证。
+标题模型有两个候选。候选一：使用原会话实际运行的模型和模型提供方，推理强度按模型目录选受支持的低档，目录不能确认支持时省略强度；不增加模型依赖，但用昂贵模型聊天的用户也按同样单价为标题付费，短输入不等于免费。候选二：跟上游终端的规则，账号模型目录里有 `gpt-5.6-luna` 就用它并把强度压到 `low`，否则退回候选一；每次标题成本最低、与官方终端行为一致，代价是多一次目录可用性判断，且标题模型与聊天模型不同。本机目录含 `gpt-5.6-luna`，候选二可以直接实测。拍板前按候选一实施。
 
 同一应用会话与原生线程只保留一个待执行或运行中的任务。标题执行器在服务进程内串行处理任务，排队不占用聊天运行表，不阻止用户继续对话。标题生成不递归提交标题任务，也不登记为用户的后台工作。
 
