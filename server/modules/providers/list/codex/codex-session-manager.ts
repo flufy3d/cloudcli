@@ -26,7 +26,9 @@
  * reported as engine work.
  *
  * Consumers: `codex-runtime.provider.ts` (the Codex chat runtime) borrows a
- * resident session per app session and submits its rounds through it.
+ * resident session per app session and submits its rounds through it;
+ * `codex-thread-title.ts` borrows an ephemeral thread of that session to
+ * name the conversation without entering it.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -116,6 +118,13 @@ type ResidentRound = {
   onRequest: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
 };
 
+/** What the manager keeps about one lent ephemeral thread: where its traffic goes. */
+type AuxiliaryBorrow = {
+  onNotification: (method: string, params: AnyRecord) => void;
+  onRequest?: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
+  onDisposed?: (reason: string) => void;
+};
+
 /**
  * One resident process and everything the host knows about it.
  *
@@ -140,6 +149,13 @@ type ResidentSession = {
   engineTurns: Set<string>;
   /** Unanswered engine requests keep their owning process alive. */
   pendingRequests: number;
+  /**
+   * The ephemeral threads lent to auxiliary borrowers, keyed by thread id.
+   *
+   * A lent thread's events and requests go to its borrower only; while any is
+   * lent the process has work and is not reclaimed.
+   */
+  auxThreads: Map<string, AuxiliaryBorrow>;
   /** Notification order is independent of asynchronous queue-read completion order. */
   latestPendingTurnKey: string | null;
   /**
@@ -339,9 +355,15 @@ function readEventTurnId(params: AnyRecord): string | null {
   return null;
 }
 
-/** Reads the thread id an event carries, whichever field it arrives in. */
+/**
+ * Reads the thread id an event carries, whichever field it arrives in.
+ *
+ * `thread/started` names its thread only inside the thread object, so that
+ * announcement of another thread must not be mistaken for the session's own.
+ */
 function readEventThreadId(params: AnyRecord): string | null {
-  const candidates = [params.threadId, params.thread_id];
+  const thread = params.thread && typeof params.thread === 'object' ? params.thread as AnyRecord : null;
+  const candidates = [params.threadId, params.thread_id, thread?.id];
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.length > 0) {
       return candidate;
@@ -369,6 +391,16 @@ function disposeResidentSession(session: ResidentSession, reason: string): void 
   if (residentSessions.get(session.appSessionId) === session) {
     residentSessions.delete(session.appSessionId);
   }
+  // A borrower of an ephemeral thread learns that the thread is gone with the
+  // process; its handle rejects from here on.
+  for (const borrow of session.auxThreads.values()) {
+    try {
+      borrow.onDisposed?.(reason);
+    } catch (error) {
+      console.warn(`[Codex] Telling an auxiliary borrower of ${session.appSessionId} about the closing failed:`, error);
+    }
+  }
+  session.auxThreads.clear();
   try {
     session.connection?.close();
   } catch (error) {
@@ -485,7 +517,7 @@ function deliverRoundEvent(round: ResidentRound, method: string, params: AnyReco
 /** One activity predicate shared by archive checks and both reclaim paths. */
 function hasResidentWork(session: ResidentSession): boolean {
   return session.lifetime === 'turn' || session.reservedForRound || Boolean(session.initializing || session.round)
-    || session.engineTurns.size > 0 || session.pendingTurns.size > 0
+    || session.engineTurns.size > 0 || session.pendingTurns.size > 0 || session.auxThreads.size > 0
     || session.pendingRequests > 0 || session.isBusy();
 }
 
@@ -639,8 +671,15 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
           return;
         }
         const eventThreadId = readEventThreadId(params);
+        const borrow = eventThreadId ? session.auxThreads.get(eventThreadId) : undefined;
+        if (borrow) {
+          // A lent thread's traffic is its borrower's alone: it is neither the
+          // round's nor engine work the conversation would show.
+          borrow.onNotification(method, params);
+          return;
+        }
         if (eventThreadId && eventThreadId !== session.threadId) {
-          // Subagents and auxiliary threads report on the same connection.
+          // Subagents report on the same connection.
           session.onEngineEvent(method, params, session.threadId);
           return;
         }
@@ -663,6 +702,12 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
         const round = session.round;
         const turnId = readEventTurnId(params);
         const threadId = readEventThreadId(params);
+        const borrow = threadId ? session.auxThreads.get(threadId) : undefined;
+        if (borrow) {
+          // Only the borrower may answer for its thread. Without a handler the
+          // request is refused, never shown to the user as the conversation's.
+          return await (borrow.onRequest ? borrow.onRequest(method, params) : undefined);
+        }
         if (round && turnId && !round.turnId) {
           await round.submitted;
           await session.pendingTurns.get(turnId)?.resolution;
@@ -842,6 +887,7 @@ export async function acquireCodexResidentSession(
     round: null,
     engineTurns: new Set<string>(),
     pendingRequests: 0,
+    auxThreads: new Map(),
     pendingTurns: new Map(),
     latestPendingTurnKey: null,
     initializing: null,
@@ -1262,6 +1308,153 @@ export function releaseCodexResidentSessionResources(appSessionId: string): void
  */
 export function openCodexResidentSessionAdmission(appSessionId: string): void {
   closedAdmission.delete(appSessionId);
+}
+
+/** The methods an auxiliary handle may never call: they open or take over threads. */
+const AUXILIARY_DENIED_METHODS = new Set(['initialize', 'thread/start', 'thread/resume', 'thread/fork']);
+
+/** The methods an auxiliary handle may call on a thread other than its own: reading and naming it. */
+const AUXILIARY_CROSS_THREAD_METHODS = new Set(['thread/read', 'thread/name/set']);
+
+/**
+ * What a caller supplies to borrow an ephemeral thread of a resident session.
+ *
+ * Consumer: `codex-thread-title.ts` (the Codex thread title client).
+ */
+export type CodexAuxiliaryThreadOptions = {
+  /** The app session whose resident process lends the thread. */
+  appSessionId: string;
+  /** The process generation the caller saw; a replaced process refuses the borrow. */
+  generation?: number;
+  /** The `thread/start` parameters of the lent thread. `ephemeral` must be true. */
+  start: AnyRecord;
+  /** Every notification of the lent thread. */
+  onNotification: (method: string, params: AnyRecord) => void;
+  /** Answers a request the engine makes for the lent thread; absent, the request is refused. */
+  onRequest?: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
+  /** Called when the process goes away under the borrow. */
+  onDisposed?: (reason: string) => void;
+};
+
+/**
+ * A borrowed ephemeral thread.
+ *
+ * The handle has no `close()`: the process is the conversation's, not the
+ * borrower's. `release()` only hands the thread back; interrupting its turn
+ * and unsubscribing from it are the borrower's job before that.
+ *
+ * Consumer: `codex-thread-title.ts` (the Codex thread title client).
+ */
+export type CodexAuxiliaryThread = {
+  appSessionId: string;
+  generation: number;
+  threadId: string;
+  /** Calls app-server for the lent thread; another thread may only be read or named. */
+  call(method: string, params: unknown, options?: { timeoutMs?: number }): Promise<unknown>;
+  /** Hands the thread back. Idempotent; a no-op once the process is gone. */
+  release(): void;
+};
+
+function auxiliaryUnavailable(message: string): AppError {
+  return new AppError(message, { code: 'CODEX_AUXILIARY_UNAVAILABLE', statusCode: 409 });
+}
+
+/**
+ * Lends an ephemeral thread of the resident process of an app session.
+ *
+ * The borrow does not touch the conversation: the session-level callbacks
+ * stay the runtime's, the lent thread's events and requests go to the
+ * borrower only, and while the thread is lent the process counts as busy, so
+ * it is neither reclaimed nor evicted nor archived under the borrower.
+ *
+ * Events that arrive before `thread/start` answers (the thread's own
+ * `thread/started`) are not held back: they take the path of any unknown
+ * thread. The borrower starts its turn only after this call returns, so
+ * every event of that turn reaches it.
+ *
+ * Consumer: `codex-thread-title.ts` (the Codex thread title client).
+ */
+export async function borrowCodexAuxiliaryThread(options: CodexAuxiliaryThreadOptions): Promise<CodexAuxiliaryThread> {
+  const session = residentSessions.get(options.appSessionId);
+  if (!session || session.disposed || session.initializing) {
+    throw auxiliaryUnavailable('No resident Codex conversation is open to lend a thread from.');
+  }
+  if (session.lifetime === 'turn') {
+    throw auxiliaryUnavailable('A one-shot Codex process is exclusive to its turn and lends no thread.');
+  }
+  if (typeof options.generation === 'number' && options.generation !== session.generation) {
+    throw auxiliaryUnavailable('The resident Codex process was replaced; borrow the thread again.');
+  }
+  if (closedAdmission.has(options.appSessionId)) {
+    throw auxiliaryUnavailable('The Codex conversation is being closed and lends no thread.');
+  }
+  if (options.start.ephemeral !== true) {
+    throw new AppError('An auxiliary thread must be started ephemeral.', {
+      code: 'CODEX_AUXILIARY_NOT_EPHEMERAL', statusCode: 400,
+    });
+  }
+
+  const started = await session.connection.call('thread/start', { ...options.start, ephemeral: true }) as AnyRecord | undefined;
+  if (session.disposed) {
+    throw auxiliaryUnavailable('The Codex conversation closed while the auxiliary thread was starting.');
+  }
+  const thread = started?.thread && typeof started.thread === 'object' ? started.thread as AnyRecord : null;
+  const threadId = typeof thread?.id === 'string' && thread.id.length > 0 ? thread.id : '';
+  if (!threadId) {
+    throw auxiliaryUnavailable('Codex app-server opened no auxiliary thread.');
+  }
+
+  session.auxThreads.set(threadId, {
+    onNotification: options.onNotification,
+    onRequest: options.onRequest,
+    onDisposed: options.onDisposed,
+  });
+  session.lastUsedAt = Date.now();
+  scheduleResidentReclaim(session);
+
+  return {
+    appSessionId: session.appSessionId,
+    generation: session.generation,
+    threadId,
+    call: (method, params, callOptions) => callForAuxiliaryThread(session, threadId, method, params, callOptions),
+    release: () => {
+      if (session.auxThreads.delete(threadId)) {
+        session.lastUsedAt = Date.now();
+        scheduleResidentReclaim(session);
+      }
+    },
+  };
+}
+
+/**
+ * The borrower's calls, kept to its own thread.
+ *
+ * Opening or taking over threads is refused outright; a call that names
+ * another thread passes only when it reads or names that thread, which is
+ * what a title borrower needs for the conversation's own thread.
+ */
+async function callForAuxiliaryThread(
+  session: ResidentSession,
+  threadId: string,
+  method: string,
+  params: unknown,
+  callOptions?: { timeoutMs?: number },
+): Promise<unknown> {
+  if (AUXILIARY_DENIED_METHODS.has(method)) {
+    throw new AppError(`An auxiliary thread cannot call ${method}.`, {
+      code: 'CODEX_AUXILIARY_THREAD_SCOPE', statusCode: 403,
+    });
+  }
+  const targetThreadId = params && typeof params === 'object' ? readEventThreadId(params as AnyRecord) : null;
+  if (targetThreadId && targetThreadId !== threadId && !AUXILIARY_CROSS_THREAD_METHODS.has(method)) {
+    throw new AppError(`An auxiliary thread cannot call ${method} on another thread.`, {
+      code: 'CODEX_AUXILIARY_THREAD_SCOPE', statusCode: 403,
+    });
+  }
+  if (session.disposed || !session.auxThreads.has(threadId)) {
+    throw auxiliaryUnavailable('The auxiliary thread is no longer lent.');
+  }
+  return session.connection.call(method, params, callOptions);
 }
 
 /** The resident sessions that are currently open, for diagnostics and tests. */

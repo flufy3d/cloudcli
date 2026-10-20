@@ -17,18 +17,22 @@ import {
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import {
   acquireCodexResidentSession,
+  borrowCodexAuxiliaryThread,
+  closeCodexResidentSessionAdmission,
   closeCodexResidentSessions,
   completeCodexResidentRound,
   isCodexResidentSessionBusy,
   readCodexResidentSessionActivity,
   listCodexResidentSessions,
   listCodexReportingOnlySessions,
+  openCodexResidentSessionAdmission,
   releaseCodexResidentSession,
   stopCodexResidentRound,
   submitCodexResidentRound,
 } from '@/modules/providers/list/codex/codex-session-manager.js';
 
 const THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5d9d';
+const AUX_THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5e11';
 
 type FakeServer = {
   /** Resolves when the fake process is gone. */
@@ -64,6 +68,11 @@ function installFakeAppServer(t: any): FakeServer {
     return {
       async call(method: string, params: any) {
         server.calls.push({ method, params });
+        if (method === 'thread/start' && params.ephemeral === true) {
+          // An auxiliary thread starts ephemeral on the same process; the
+          // engine persists nothing and hands back a fresh thread id.
+          return { thread: { id: AUX_THREAD_ID } };
+        }
         if (method === 'thread/start' || method === 'thread/resume') {
           // A thread takes the sandbox mode as a string; the policy object
           // belongs to a turn, and the engine ignores it here.
@@ -1361,6 +1370,272 @@ test('a report the engine runs on its own is reported as reporting', async (t) =
     } as any);
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.deepEqual(listCodexReportingOnlySessions(), []);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+// ----- Auxiliary (ephemeral) thread borrows -----
+
+const residentOptions = (appSessionId: string) => ({
+  appSessionId,
+  nativeThreadId: null,
+  workingDirectory: '/tmp',
+  approvalPolicy: 'never',
+  sandbox: 'workspace-write' as const,
+  sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+});
+
+/** What a title borrower asks for: an ephemeral, read-only thread on the same process. */
+const AUXILIARY_START = { ephemeral: true, cwd: '/tmp', sandbox: 'read-only' };
+
+test('an auxiliary borrow starts an ephemeral thread on the resident process and hands out no close', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    const resident = await acquireCodexResidentSession(residentOptions('app-aux'));
+    const handle = await borrowCodexAuxiliaryThread({
+      appSessionId: 'app-aux',
+      generation: resident.generation,
+      start: AUXILIARY_START,
+      onNotification: () => {},
+    });
+
+    assert.equal(handle.threadId, AUX_THREAD_ID);
+    assert.equal(handle.generation, resident.generation);
+    assert.equal('close' in handle, false);
+    // One process, two threads: the conversation's and the ephemeral one.
+    assert.equal(listCodexResidentSessions().length, 1);
+    const starts = server.calls.filter((call) => call.method === 'thread/start');
+    assert.equal(starts.length, 2);
+    assert.deepEqual(starts[1].params, AUXILIARY_START);
+
+    handle.release();
+    handle.release();
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('the events and requests of an auxiliary thread reach only its borrower', async (t) => {
+  const server = installFakeAppServer(t);
+  const engineEvents: Array<{ method: string; threadId: string }> = [];
+  const sessionRequests: string[] = [];
+  const borrowerEvents: string[] = [];
+  try {
+    await acquireCodexResidentSession({
+      ...residentOptions('app-aux-events'),
+      onEngineEvent: (method, _params, threadId) => { engineEvents.push({ method, threadId }); },
+      onSessionRequest: (method) => { sessionRequests.push(method); return { owner: 'session' }; },
+    });
+    await borrowCodexAuxiliaryThread({
+      appSessionId: 'app-aux-events',
+      start: AUXILIARY_START,
+      onNotification: (method) => { borrowerEvents.push(method); },
+      onRequest: () => ({ owner: 'borrower' }),
+    });
+
+    // The ephemeral thread's own announcement carries its id nested in the thread object.
+    notify(server, 'thread/started', { thread: { id: AUX_THREAD_ID } });
+    notify(server, 'turn/started', { threadId: AUX_THREAD_ID, turn: { id: 'aux-turn', status: 'inProgress' } });
+    notify(server, 'item/completed', { threadId: AUX_THREAD_ID, turnId: 'aux-turn', item: { type: 'agentMessage', text: '{"title":"x"}' } });
+    notify(server, 'turn/completed', { threadId: AUX_THREAD_ID, turn: { id: 'aux-turn', status: 'completed' } });
+    assert.deepEqual(borrowerEvents, ['thread/started', 'turn/started', 'item/completed', 'turn/completed']);
+    assert.deepEqual(engineEvents, []);
+    // The borrower's turn is not engine work: the page must not show the conversation busy.
+    assert.deepEqual(readCodexResidentSessionActivity('app-aux-events'), { queued: false, reporting: false });
+
+    // The conversation's own thread keeps its audience.
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'engine-turn', status: 'inProgress' } });
+    assert.deepEqual(engineEvents, [{ method: 'turn/started', threadId: THREAD_ID }]);
+    assert.equal(borrowerEvents.length, 4);
+
+    // A request from the ephemeral thread is answered by the borrower, never by the conversation.
+    assert.deepEqual(
+      await server.handlers.onRequest?.('item/commandExecution/requestApproval', { threadId: AUX_THREAD_ID } as any),
+      { owner: 'borrower' },
+    );
+    assert.deepEqual(
+      await server.handlers.onRequest?.('item/commandExecution/requestApproval', { threadId: THREAD_ID } as any),
+      { owner: 'session' },
+    );
+    assert.deepEqual(sessionRequests, ['item/commandExecution/requestApproval']);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a borrower without a request handler has the engine request refused, not forwarded', async (t) => {
+  const server = installFakeAppServer(t);
+  let sessionRequests = 0;
+  try {
+    await acquireCodexResidentSession({
+      ...residentOptions('app-aux-refuse'),
+      onSessionRequest: () => { sessionRequests += 1; return {}; },
+    });
+    await borrowCodexAuxiliaryThread({ appSessionId: 'app-aux-refuse', start: AUXILIARY_START, onNotification: () => {} });
+
+    // `undefined` is what the client turns into a "method not supported" refusal.
+    assert.equal(await server.handlers.onRequest?.('item/tool/requestUserInput', { threadId: AUX_THREAD_ID } as any), undefined);
+    assert.equal(sessionRequests, 0);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('an auxiliary borrow keeps the session alive and lets it idle out once released', async (t) => {
+  const server = installFakeAppServer(t);
+  process.env.CLOUDCLI_CODEX_RESIDENT_IDLE_MS = '30';
+  try {
+    await acquireCodexResidentSession(residentOptions('app-aux-idle'));
+    const handle = await borrowCodexAuxiliaryThread({ appSessionId: 'app-aux-idle', start: AUXILIARY_START, onNotification: () => {} });
+    assert.equal(isCodexResidentSessionBusy('app-aux-idle'), true);
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(listCodexResidentSessions().length, 1);
+    assert.equal(server.closed, false);
+
+    handle.release();
+    assert.equal(isCodexResidentSessionBusy('app-aux-idle'), false);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.deepEqual(listCodexResidentSessions(), []);
+    assert.equal(server.closed, true);
+  } finally {
+    delete process.env.CLOUDCLI_CODEX_RESIDENT_IDLE_MS;
+    closeCodexResidentSessions();
+  }
+});
+
+test('an auxiliary borrow is refused when no resident conversation can lend a thread', async (t) => {
+  const server = installFakeAppServer(t);
+  const borrow = (appSessionId: string, extra: Record<string, unknown> = {}) => borrowCodexAuxiliaryThread({
+    appSessionId,
+    start: AUXILIARY_START,
+    onNotification: () => {},
+    ...extra,
+  });
+  try {
+    await assert.rejects(borrow('app-aux-missing'), { code: 'CODEX_AUXILIARY_UNAVAILABLE' });
+
+    const resident = await acquireCodexResidentSession(residentOptions('app-aux-gate'));
+    await assert.rejects(borrow('app-aux-gate', { generation: resident.generation + 1 }), { code: 'CODEX_AUXILIARY_UNAVAILABLE' });
+
+    closeCodexResidentSessionAdmission('app-aux-gate');
+    await assert.rejects(borrow('app-aux-gate'), { code: 'CODEX_AUXILIARY_UNAVAILABLE' });
+    openCodexResidentSessionAdmission('app-aux-gate');
+
+    await assert.rejects(
+      borrow('app-aux-gate', { start: { ...AUXILIARY_START, ephemeral: false } }),
+      { code: 'CODEX_AUXILIARY_NOT_EPHEMERAL' },
+    );
+    // None of the refusals reached the engine.
+    assert.equal(server.calls.filter((call) => call.method === 'thread/start').length, 1);
+
+    // A one-shot tool-result process is exclusive to its turn.
+    closeCodexResidentSessions();
+    await acquireCodexResidentSession({ ...residentOptions('app-aux-oneshot'), lifetime: 'turn' });
+    await assert.rejects(borrow('app-aux-oneshot'), { code: 'CODEX_AUXILIARY_UNAVAILABLE' });
+  } finally {
+    openCodexResidentSessionAdmission('app-aux-gate');
+    closeCodexResidentSessions();
+  }
+});
+
+test('losing the process tells the auxiliary borrower and dead-ends its handle', async (t) => {
+  installFakeAppServer(t);
+  const disposed: string[] = [];
+  try {
+    await acquireCodexResidentSession(residentOptions('app-aux-dispose'));
+    const handle = await borrowCodexAuxiliaryThread({
+      appSessionId: 'app-aux-dispose',
+      start: AUXILIARY_START,
+      onNotification: () => {},
+      onDisposed: (reason) => { disposed.push(reason); },
+    });
+
+    closeCodexResidentSessions();
+
+    assert.deepEqual(disposed, ['host shutdown']);
+    await assert.rejects(handle.call('thread/read', { threadId: AUX_THREAD_ID }), { code: 'CODEX_AUXILIARY_UNAVAILABLE' });
+    handle.release();
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a borrower that fails on disposal does not keep the process from closing', async (t) => {
+  const server = installFakeAppServer(t);
+  const warnings: unknown[][] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args); });
+  try {
+    await acquireCodexResidentSession(residentOptions('app-aux-throw'));
+    await borrowCodexAuxiliaryThread({
+      appSessionId: 'app-aux-throw',
+      start: AUXILIARY_START,
+      onNotification: () => {},
+      onDisposed: () => { throw new Error('borrower broke'); },
+    });
+
+    closeCodexResidentSessions();
+
+    assert.equal(server.closed, true);
+    assert.deepEqual(listCodexResidentSessions(), []);
+    assert.ok(warnings.some((args) => String(args[0]).includes('auxiliary borrower')));
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('an auxiliary handle reaches its own thread, the name of another, and nothing else', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession(residentOptions('app-aux-scope'));
+    const handle = await borrowCodexAuxiliaryThread({ appSessionId: 'app-aux-scope', start: AUXILIARY_START, onNotification: () => {} });
+    const callsBefore = server.calls.length;
+
+    await handle.call('turn/start', { threadId: AUX_THREAD_ID, input: [] });
+    await handle.call('turn/interrupt', { threadId: AUX_THREAD_ID, turnId: 'aux-turn' });
+    await handle.call('thread/unsubscribe', { threadId: AUX_THREAD_ID });
+    await handle.call('model/list', {});
+    await handle.call('config/read', { includeLayers: false });
+    await handle.call('thread/read', { threadId: THREAD_ID });
+    await handle.call('thread/name/set', { threadId: THREAD_ID, name: 'Investigate duplicate replies' });
+    assert.equal(server.calls.length - callsBefore, 7);
+
+    for (const [method, params] of [
+      ['thread/start', { ephemeral: true }],
+      ['thread/resume', { threadId: THREAD_ID }],
+      ['thread/fork', { threadId: THREAD_ID }],
+      ['turn/start', { threadId: THREAD_ID, input: [] }],
+      ['turn/interrupt', { threadId: THREAD_ID, turnId: 'user-turn' }],
+      ['thread/queue/add', { threadId: THREAD_ID, input: [] }],
+      ['thread/queue/delete', { threadId: THREAD_ID, queuedSubmissionId: 'q1' }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      await assert.rejects(handle.call(method, params), { code: 'CODEX_AUXILIARY_THREAD_SCOPE' });
+    }
+    assert.equal(server.calls.length - callsBefore, 7);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('an auxiliary borrow does not replace the callbacks of the conversation', async (t) => {
+  const server = installFakeAppServer(t);
+  const engineEvents: string[] = [];
+  const exits: string[] = [];
+  try {
+    await acquireCodexResidentSession({
+      ...residentOptions('app-aux-callbacks'),
+      onEngineEvent: (method) => { engineEvents.push(method); },
+      onSessionExit: (reason) => { exits.push(reason); },
+    });
+    await borrowCodexAuxiliaryThread({ appSessionId: 'app-aux-callbacks', start: AUXILIARY_START, onNotification: () => {} });
+
+    // A thread this session never lent (a subagent) is still the conversation's engine work.
+    notify(server, 'item/completed', { threadId: 'subagent-thread', item: { type: 'agentMessage' } });
+    assert.deepEqual(engineEvents, ['item/completed']);
+
+    server.handlers.onExit?.('crashed');
+    assert.deepEqual(exits, ['crashed']);
   } finally {
     closeCodexResidentSessions();
   }
