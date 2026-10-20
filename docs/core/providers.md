@@ -13,6 +13,16 @@
 
 每家一个目录：`server/modules/providers/list/<name>/`，由 `<name>.provider.ts` 组装各切面。claude / cursor 的 runtime 是遗留 `.js` 适配器；opencode、codex、zcode / antigravity 是 TS（含协议客户端、运行生命周期等更多切面文件）。
 
+## Codex 会话驻留：一个应用会话一个 app-server 进程
+
+`codex-session-manager.ts` 按应用会话 id 持有驻留的 `codex app-server` 进程：同一会话的下一轮沿用同一个进程和同一个原生线程，不再每轮重启进程、重新加载历史。记录里还有进程代次，旧进程的迟到回调只能清理自己那一条。
+
+**提交路径是引擎的线程队列，不是 `turn/start`。** 活跃回合上的第二次 `turn/start` 不会新建回合，而是把输入并进正在跑的那一回合——引擎自发汇报时，用户消息就会被汇报回合吞掉。线程队列没有这个问题：`thread/queue/add` 写入输入，引擎忙时拒绝启动（`thread already has an active or pending turn`），闲时把队列排空，每条输入单独起一个回合。本轮设置先经 `thread/settings/update` 写进线程（模型、推理强度、工作目录、沙箱、审批策略），再写队列。这几个队列方法是 experimental 方法，连接必须声明 `experimentalApi` 能力。
+
+**回合归属靠队列消费判定。** 引擎消费排队输入**早于**它报出该输入产生的回合，并以 `thread/queue/changed` 通知。宿主因此在队列项消失时"武装"本轮，此后第一个 `turn/started` 就是本轮的回合；引擎自己起的回合不消费任何队列项，永远算引擎工作，不会结束用户这一轮。归属未定的事件先暂存，确认后再按序投递。
+
+**回收**：只有前台空闲、没有后台代理或汇报、没有审批、没有辅助借用时进程才进入空闲计时（10 分钟），到点回收；驻留上限 4 个会话（实测每个 app-server 进程组约 158 MB RSS），超限时先淘汰最久未使用且没有工作的那条，全部都在工作时明确报容量不足，不杀活跃会话来接另一条消息。驻留开关是 `CLOUDCLI_CODEX_RESIDENT=1`，完整验收前默认关闭——任务凭证、后台汇报投递和归档接线还没验收。关闭开关时运行时走短连接：每轮自己开连接、自己 `turn/start`、结束即关。
+
 ## Codex 异步任务结果续开（Task Continuation）
 
 Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结果续开。当长耗时后台任务在宿主完成且原聊天处于空闲时，`codex-runtime.provider.ts` 在新连接上执行 `thread/resume`，并在 `turn/start` 中直接传入：
@@ -401,7 +411,7 @@ id 必须字节相同。** 这条有两道闸门守着：
 - **常驻引擎的 stderr**：app-server 形态的引擎（zcode/codex）stderr 常驻嘈杂，别逐行转发日志——supervisor/客户端保留尾部环形缓冲（zcode 4000 字符），崩溃/crash-loop/session-lost 的错误全部附带尾部；engine 崩溃的真实死因只在 stderr 里。
 
 - **Codex 多代理下的事件流隔离与 mailbox 抢占**：
-  app-server 单连接在派生子代理时，子代理通知（含 `turn/completed`、`item/completed`）会混入父会话所在的同一事件流，但带自己的 `threadId`。若 `codex-runtime.provider.ts` 的 `onNotification` 未校验通知 `threadId`，子代理的 `turn/completed` 会提前触发主 turn 的 `settle()`，导致会话被误关中断。此外，子代理投递 mailbox 邮件时，引擎默认机制（`preempt_for_mailbox_mail`）会在 reasoning/commentary 边界抢占 sampling 导致中断。CloudCLI 在 `threadSettings.config` 中显式开启 `features.defer_mailbox_preemption = true` 将抢占推迟到安全边界，并在 runtime 强制丢弃非当前会话的通知，彻底实现多代理会话解耦。
+  app-server 单连接在派生子代理时，子代理通知（含 `turn/completed`、`item/completed`）会混入父会话所在的同一事件流，但带自己的 `threadId`。若 `codex-runtime.provider.ts` 的 `onNotification` 未校验通知 `threadId`，子代理的 `turn/completed` 会提前触发主 turn 的 `settle()`，导致会话被误关中断。此外，子代理投递 mailbox 邮件时，引擎默认机制（`preempt_for_mailbox_mail`）会在 reasoning/commentary 边界抢占 sampling 导致中断。CloudCLI 在 `threadSettings.config` 中显式开启 `features.defer_mailbox_preemption = true` 将抢占推迟到安全边界，并在 runtime 强制丢弃非当前会话的通知，彻底实现多代理会话解耦。驻留路径的隔离多一层：引擎自己起的汇报回合与用户这一轮分属两条通道，汇报回合的 `turn/completed` 不会兑现用户回合的等待。
 
 - **全仓散落的引擎清单**：除上述契约点外，历史上有过 6 处硬编码 6 家列表/能力表的地方（MCP scopes、公开 API 文档 `public/api-docs.html` 的 `PROVIDER_ORDER` 等）。新增引擎后 `grep -rn "antigravity" src server public --include='*.ts' --include='*.tsx' --include='*.html' -l` 扫一遍清单类常量，防止新引擎被隐藏。
 - `sessions`（运行时事件归一化/历史分页）与 `sessionSynchronizer`（落盘索引）是两个关注点，别混在一个类里。

@@ -554,6 +554,51 @@ async function scenarioResource() {
   });
 }
 
+/**
+ * Scenario: the exact interleaving of the queue drain and the turn events.
+ *
+ * The host can only tell its own round's turn apart from an engine report
+ * turn by when the queued item is consumed, so the order of
+ * `turn/started`, the item's removal and `thread/queue/changed` decides
+ * whether attribution is possible at all.
+ */
+async function scenarioDrainOrdering() {
+  return withServer({}, async ({ server, model }) => {
+    const threadId = await startThread(server);
+    const started = Date.now();
+    const timeline = [];
+    const note = (label) => timeline.push(`${label} @${Date.now() - started}`);
+
+    // Observe the queue state right after the add returns.
+    const added = await server.call('thread/queue/add', {
+      threadId,
+      input: [{ type: 'text', text: 'DRAIN-ORDER-PROBE-TEXT' }],
+      clientUserMessageId: 'client-msg-drain-order',
+    }).then((r) => ({ ok: true, result: r })).catch((e) => ({ ok: false, error: String(e) }));
+    note('queue/add returned');
+
+    const listAfterAdd = await server.call('thread/queue/list', { threadId })
+      .then((r) => ({ ok: true, result: r }))
+      .catch((e) => ({ ok: false, error: String(e) }));
+    note('queue/list right after add');
+
+    await sleep(1_200);
+    const listAfterDrain = await server.call('thread/queue/list', { threadId })
+      .then((r) => ({ ok: true, result: r }))
+      .catch((e) => ({ ok: false, error: String(e) }));
+    note('queue/list after drain');
+
+    report('queue drain ordering on an idle thread', {
+      queueAdd: added,
+      queueListRightAfterAdd: listAfterAdd,
+      queueListAfterDrain: listAfterDrain,
+      notifications: server.notifications.map((n) => n.method),
+      timeline,
+      deliveredTexts: model.requests.flatMap(textsOf),
+    });
+  });
+}
+
 /** ------------------------------------------------------------------ entry */
 
 const scenario = process.argv[2] ?? 'all';
@@ -575,6 +620,9 @@ const run = async () => {
   }
   if (scenario === 'all' || scenario === 'resource') {
     await scenarioResource();
+  }
+  if (scenario === 'all' || scenario === 'drain-ordering') {
+    await scenarioDrainOrdering();
   }
 };
 

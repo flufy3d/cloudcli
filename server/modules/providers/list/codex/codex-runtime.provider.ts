@@ -34,6 +34,13 @@ import {
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import { CODEX_BACKGROUND_TASK_TYPE, codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import {
+  acquireCodexResidentSession,
+  completeCodexResidentRound,
+  releaseCodexResidentSession,
+  stopCodexResidentRound,
+  submitCodexResidentRound,
+} from '@/modules/providers/list/codex/codex-session-manager.js';
+import {
   buildCodexSubagentAgentRow,
   codexThreadItemToRows,
   readCodexAppServerItem,
@@ -114,7 +121,11 @@ async function readEffectiveShellEnvironmentExcludes(
 }
 
 type ActiveCodexSession = {
-  connection: CodexAppServerConnection;
+  /**
+   * Ends the round: it interrupts a turn that already runs, or removes the
+   * input that is still waiting in the engine's queue.
+   */
+  stop: () => void;
   /** Set once the server reports the turn; `turn/interrupt` needs it. */
   threadId: string | null;
   turnId: string | null;
@@ -123,6 +134,15 @@ type ActiveCodexSession = {
 };
 
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
+
+/**
+ * Whether a Codex conversation keeps its process alive between rounds.
+ *
+ * The resident path is what lets the engine report in the background while
+ * the next message waits for its own turn, so it is off until the whole
+ * delivery — background reports, task credentials, reclaim — is accepted.
+ */
+const isResidentSessionsEnabled = (): boolean => process.env.CLOUDCLI_CODEX_RESIDENT === '1';
 
 const DETACHED_COMMAND_ENV_ALLOWLIST = [
   'PATH', 'HOME', 'CODEX_HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
@@ -689,191 +709,277 @@ async function queryCodex(
     }
   };
 
-  try {
-    connection = await codexAppServerTransport.open({
-      onExit: (reason) => {
-        if (currentSession()?.status !== 'aborted' && !terminalFailure) {
-          terminalFailure = { message: reason };
+  /** Set when the process of this round died, which kills its agents with it. */
+  let residentProcessExited = false;
+
+  /**
+   * Settles the agents of this round when nothing can be running any more.
+   *
+   * A resident process keeps the agents alive past the end of the round, so
+   * they are only settled when the process itself is gone.
+   */
+  const settleAgentsWhenProcessIsGone = (): void => {
+    if (!isResidentSessionsEnabled() || residentProcessExited) {
+      settleOutstandingAgents();
+    }
+  };
+
+  /**
+   * The process died, so the round can never reach a terminal state.
+   */
+  const handleProcessExit = (reason: string): void => {
+    residentProcessExited = true;
+    if (currentSession()?.status !== 'aborted' && !terminalFailure) {
+      terminalFailure = { message: reason };
+    }
+    settle();
+  };
+
+  /**
+   * Answers the server-to-client requests the round has to handle.
+   *
+   * An approval waits for the user, so the answer must reach the request
+   * that is still open.
+   */
+  const handleRoundRequest = async (method: string, params: AnyRecord) => {
+    if (method === TASK_MCP_ELICITATION_METHOD) {
+      if (!taskMcpOptions || params.serverName !== TASK_MCP_NAME) {
+        return undefined;
+      }
+      // CloudCLI's current permission card cannot collect form answers or complete URL handshakes.
+      return { action: 'decline', content: null };
+    }
+    if (!CODEX_APPROVAL_METHODS.has(method)) {
+      return undefined;
+    }
+    const decision = await requestApproval(method, params);
+    return toCodexApprovalResponse(method, params, decision);
+
+  };
+
+  /**
+   * The events of the round's own turn.
+   *
+   * The events of a turn the engine started on its own never reach this
+   * handler: a background report must not end the user's round.
+   */
+  const handleRoundEvent = (method: string, params: AnyRecord): void => {
+    const session = currentSession();
+    if (session?.status === 'aborted') {
+      return;
+    }
+
+    const notificationRecord = readObjectRecord(params);
+    const turnRecord = readObjectRecord(notificationRecord?.turn);
+    const itemRecord = readObjectRecord(notificationRecord?.item);
+    const eventThreadId =
+      readNonEmptyString(notificationRecord?.threadId) ??
+      readNonEmptyString(notificationRecord?.thread_id) ??
+      readNonEmptyString(turnRecord?.threadId) ??
+      readNonEmptyString(turnRecord?.thread_id) ??
+      readNonEmptyString(itemRecord?.threadId) ??
+      readNonEmptyString(itemRecord?.thread_id) ??
+      null;
+
+    // Subagents in multi-agent mode emit their own lifecycle events on the same
+    // app-server connection. Only events for the target thread (the parent session)
+    // drive this turn's terminal state, live transcript, and token updates.
+    if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
+      if (method === 'item/completed') {
+        emitAgentItem(eventThreadId, params.item, new Date().toISOString());
+      }
+      return;
+    }
+
+    switch (method) {
+      case 'turn/started': {
+        const turn = readObjectRecord(params.turn);
+        const turnId = typeof turn?.id === 'string' ? turn.id : null;
+        if (turnId) {
+          recordStartedTurn(turnId);
+        }
+        const active = currentSession();
+        if (active) {
+          active.turnId = turnId;
+        }
+        return;
+      }
+
+      case 'item/started': {
+        // Only work the user waits on is worth showing before it
+        // finishes. Text and reasoning items start empty — their content
+        // arrives as deltas — and a user message announced twice would be
+        // appended twice, because a transcript row is appended on arrival
+        // and only reconciled against *history* by id.
+        const startedType = readObjectRecord(params.item)?.type;
+        if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
+          emitItem(params.item, new Date().toISOString(), 'started');
+        }
+        return;
+      }
+
+      case 'item/completed':
+        emitItem(params.item, new Date().toISOString(), 'completed');
+        return;
+
+      case 'item/agentMessage/delta': {
+        // Streamed prose has its own protocol frame: the client grows one
+        // placeholder from the fragments and the completed item's row
+        // then takes its place. Re-sending the whole text as a `text` row
+        // per delta instead appends one row per fragment.
+        if (typeof params.delta === 'string' && params.delta) {
+          sendMessage(ws, createNormalizedMessage({
+            kind: 'stream_delta',
+            role: 'assistant',
+            content: params.delta,
+            sessionId: capturedSessionId || sessionId || null,
+            provider: 'codex',
+          }));
+        }
+        return;
+      }
+
+      case 'thread/tokenUsage/updated': {
+        const tokenBudget = readCodexTokenBudget(params);
+        if (tokenBudget) {
+          sendMessage(ws, createNormalizedMessage({
+            kind: 'status',
+            text: 'token_budget',
+            tokenBudget,
+            sessionId: capturedSessionId || sessionId || null,
+            provider: 'codex',
+          }));
+        }
+        return;
+      }
+
+      case 'error': {
+        const error = readObjectRecord(params.error);
+        const message = readNonEmptyString(error?.message)?.trim()
+          || readNonEmptyString(params.message)?.trim()
+          || 'Codex reported an error.';
+        // A recoverable stream error is progress, not a failed turn. Keep
+        // its cause in logs without adding a permanent chat error row.
+        if (params.willRetry === true) {
+          console.warn('[Codex] Retrying turn:', message);
+          return;
+        }
+        surfaceFailure(message);
+        return;
+      }
+
+      case 'turn/completed': {
+        const turn = readObjectRecord(params.turn);
+        if (typeof turn?.id === 'string') engineTurnId = turn.id;
+        terminalStatus = turn?.status === 'completed'
+          ? 'completed'
+          : turn?.status === 'failed'
+            ? 'failed'
+            : turn?.status === 'interrupted'
+              ? 'interrupted'
+              : 'unknown';
+        if (turn?.status === 'failed') {
+          const error = readObjectRecord(turn.error);
+          const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
+          surfaceFailure(message);
+          notifyRunFailed({
+            userId: normalizedUserId,
+            provider: 'codex',
+            sessionId: appSessionId || capturedSessionId || null,
+            sessionName: sessionSummary,
+            error: terminalFailure,
+          });
+        }
+        if (turn?.status === 'interrupted' && currentSession()?.status !== 'aborted') {
+          // Codex ends a usage-limit, shutdown, or engine-internal interrupt
+          // here rather than at `failed` — on codex 0.155 a spawned agent
+          // finishing mid-turn aborted the whole agent tree as `interrupted`
+          // (fixed upstream in 0.156/#45549 and 0.157/#47340). Treating the
+          // status as a normal completion sent the client a clean `complete`
+          // while the rollout recorded `turn_aborted`, so the abort was
+          // invisible until history re-read it and diagnostics logged the run
+          // as a success. A stop the user asked for (`abort` already flagged
+          // the session) arrives as the same status and must stay silent.
+          const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
+          surfaceFailure(message);
+          notifyRunFailed({
+            userId: normalizedUserId,
+            provider: 'codex',
+            sessionId: appSessionId || capturedSessionId || null,
+            sessionName: sessionSummary,
+            error: terminalFailure,
+          });
         }
         settle();
-      },
-      onRequest: async (method, params) => {
-        if (method === TASK_MCP_ELICITATION_METHOD) {
-          if (!taskMcpOptions || params.serverName !== TASK_MCP_NAME) {
-            return undefined;
-          }
-          // CloudCLI's current permission card cannot collect form answers or complete URL handshakes.
-          return { action: 'decline', content: null };
-        }
-        if (!CODEX_APPROVAL_METHODS.has(method)) {
-          return undefined;
-        }
-        const decision = await requestApproval(method, params);
-        return toCodexApprovalResponse(method, params, decision);
-      },
-      onNotification: (method, params) => {
-        const session = currentSession();
-        if (session?.status === 'aborted') {
-          return;
-        }
+        return;
+      }
 
-        const notificationRecord = readObjectRecord(params);
-        const turnRecord = readObjectRecord(notificationRecord?.turn);
-        const itemRecord = readObjectRecord(notificationRecord?.item);
-        const eventThreadId =
-          readNonEmptyString(notificationRecord?.threadId) ??
-          readNonEmptyString(notificationRecord?.thread_id) ??
-          readNonEmptyString(turnRecord?.threadId) ??
-          readNonEmptyString(turnRecord?.thread_id) ??
-          readNonEmptyString(itemRecord?.threadId) ??
-          readNonEmptyString(itemRecord?.thread_id) ??
-          null;
+      default:
+        return;
+    }
 
-        // Subagents in multi-agent mode emit their own lifecycle events on the same
-        // app-server connection. Only events for the target thread (the parent session)
-        // drive this turn's terminal state, live transcript, and token updates.
-        if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
-          if (method === 'item/completed') {
-            emitAgentItem(eventThreadId, params.item, new Date().toISOString());
-          }
-          return;
-        }
+  };
 
-        switch (method) {
-          case 'turn/started': {
-            const turn = readObjectRecord(params.turn);
-            const turnId = typeof turn?.id === 'string' ? turn.id : null;
-            if (turnId) {
-              recordStartedTurn(turnId);
-            }
-            const active = currentSession();
-            if (active) {
-              active.turnId = turnId;
-            }
-            return;
-          }
+  /**
+   * The events of a turn the engine started on its own.
+   *
+   * A background report belongs to the session rather than to the round the
+   * user is waiting for, so it must never end that round. The session-level
+   * channel that delivers it to the browser comes with the gateway work; until
+   * then a report is only announced in the log.
+   */
+  const handleEngineEvent = (method: string, params: AnyRecord): void => {
+    const eventThreadId = readNonEmptyString(params.threadId) ?? readNonEmptyString(params.thread_id);
+    if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
+      // A subagent reports on the same connection, and its card still belongs
+      // to the conversation the user is looking at.
+      if (method === 'item/completed') {
+        emitAgentItem(eventThreadId, params.item, new Date().toISOString());
+      }
+      return;
+    }
+    if (method === 'turn/started') {
+      console.log(`[Codex] The engine started a turn of its own on thread ${capturedSessionId ?? 'unknown'}.`);
+    }
+  };
 
-          case 'item/started': {
-            // Only work the user waits on is worth showing before it
-            // finishes. Text and reasoning items start empty — their content
-            // arrives as deltas — and a user message announced twice would be
-            // appended twice, because a transcript row is appended on arrival
-            // and only reconciled against *history* by id.
-            const startedType = readObjectRecord(params.item)?.type;
-            if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
-              emitItem(params.item, new Date().toISOString(), 'started');
-            }
-            return;
-          }
+  /**
+   * The resident key is the app session id, so the next round of the same
+   * conversation finds the process that is already running.
+   */
+  const residentKey = appSessionId ?? `codex-unbound-${randomUUID()}`;
 
-          case 'item/completed':
-            emitItem(params.item, new Date().toISOString(), 'completed');
-            return;
-
-          case 'item/agentMessage/delta': {
-            // Streamed prose has its own protocol frame: the client grows one
-            // placeholder from the fragments and the completed item's row
-            // then takes its place. Re-sending the whole text as a `text` row
-            // per delta instead appends one row per fragment.
-            if (typeof params.delta === 'string' && params.delta) {
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'stream_delta',
-                role: 'assistant',
-                content: params.delta,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
-            }
-            return;
-          }
-
-          case 'thread/tokenUsage/updated': {
-            const tokenBudget = readCodexTokenBudget(params);
-            if (tokenBudget) {
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'status',
-                text: 'token_budget',
-                tokenBudget,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
-            }
-            return;
-          }
-
-          case 'error': {
-            const error = readObjectRecord(params.error);
-            const message = readNonEmptyString(error?.message)?.trim()
-              || readNonEmptyString(params.message)?.trim()
-              || 'Codex reported an error.';
-            // A recoverable stream error is progress, not a failed turn. Keep
-            // its cause in logs without adding a permanent chat error row.
-            if (params.willRetry === true) {
-              console.warn('[Codex] Retrying turn:', message);
-              return;
-            }
-            surfaceFailure(message);
-            return;
-          }
-
-          case 'turn/completed': {
-            const turn = readObjectRecord(params.turn);
-            if (typeof turn?.id === 'string') engineTurnId = turn.id;
-            terminalStatus = turn?.status === 'completed'
-              ? 'completed'
-              : turn?.status === 'failed'
-                ? 'failed'
-                : turn?.status === 'interrupted'
-                  ? 'interrupted'
-                  : 'unknown';
-            if (turn?.status === 'failed') {
-              const error = readObjectRecord(turn.error);
-              const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
-              surfaceFailure(message);
-              notifyRunFailed({
-                userId: normalizedUserId,
-                provider: 'codex',
-                sessionId: appSessionId || capturedSessionId || null,
-                sessionName: sessionSummary,
-                error: terminalFailure,
-              });
-            }
-            if (turn?.status === 'interrupted' && currentSession()?.status !== 'aborted') {
-              // Codex ends a usage-limit, shutdown, or engine-internal interrupt
-              // here rather than at `failed` — on codex 0.155 a spawned agent
-              // finishing mid-turn aborted the whole agent tree as `interrupted`
-              // (fixed upstream in 0.156/#45549 and 0.157/#47340). Treating the
-              // status as a normal completion sent the client a clean `complete`
-              // while the rollout recorded `turn_aborted`, so the abort was
-              // invisible until history re-read it and diagnostics logged the run
-              // as a success. A stop the user asked for (`abort` already flagged
-              // the session) arrives as the same status and must stay silent.
-              const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
-              surfaceFailure(message);
-              notifyRunFailed({
-                userId: normalizedUserId,
-                provider: 'codex',
-                sessionId: appSessionId || capturedSessionId || null,
-                sessionName: sessionSummary,
-                error: terminalFailure,
-              });
-            }
-            settle();
-            return;
-          }
-
-          default:
-            return;
-        }
-      },
-    }, taskMcpOptions ? { env: taskMcpOptions.env } : undefined);
+  try {
+    /**
+     * Ends the round.
+     *
+     * A resident session interrupts the turn it started, or removes the input
+     * that is still waiting in the engine's queue. A short connection is torn
+     * down behind the interrupt.
+     */
+    const stopRound = () => {
+      if (isResidentSessionsEnabled()) {
+        void stopCodexResidentRound(residentKey);
+        return;
+      }
+      const session = currentSession();
+      if (session?.threadId && session.turnId) {
+        connection?.call('turn/interrupt', { threadId: session.threadId, turnId: session.turnId })
+          .catch((error: unknown) => {
+            console.warn(`[Codex] Interrupt for session ${residentKey} was not accepted:`, error);
+          });
+      }
+      // The connection is torn down on the next tick so the interrupt has a
+      // chance to leave the process before its pipes close.
+      setTimeout(() => connection?.close(), 250).unref?.();
+    };
 
     const registerSession = (id: string | null) => {
-      if (!id || !connection) {
+      if (!id) {
         return;
       }
       runSession = {
-        connection,
+        stop: stopRound,
         threadId: capturedSessionId,
         turnId: null,
         status: 'running',
@@ -882,43 +988,8 @@ async function queryCodex(
       activeCodexSessions.set(id, runSession);
     };
 
-    if (sessionKey()) {
-      registerSession(sessionKey());
-    }
-
-    const effectiveShellExcludes = taskMcpOptions
-      ? await readEffectiveShellEnvironmentExcludes(connection, workingDirectory)
-      : [];
-
-    // `config` carries the settings the protocol has no field of its own for.
-    const threadSettings: AnyRecord = {
-      cwd: workingDirectory,
-      sandbox,
-      approvalPolicy,
-      config: {
-        'features.defer_mailbox_preemption': true,
-        ...(taskMcpOptions?.config ?? {}),
-        ...(taskMcpOptions ? {
-          'shell_environment_policy.exclude': [...new Set([
-            ...effectiveShellExcludes,
-            TASK_API_KEY_ENV,
-            TASK_RUN_CONTEXT_ENV,
-          ])],
-        } : {}),
-      },
-      ...(resolvedModel ? { model: resolvedModel } : {}),
-    };
-    const thread = readObjectRecord(providerSessionId
-      ? await connection.call('thread/resume', {
-        threadId: providerSessionId,
-        excludeTurns: true,
-        ...threadSettings,
-      })
-      : await connection.call('thread/start', threadSettings));
-
-    const threadRecord = readObjectRecord(thread?.thread);
-    const discoveredSessionId = typeof threadRecord?.id === 'string' ? threadRecord.id : null;
-    if (discoveredSessionId) {
+    /** Records the native thread the conversation runs in. */
+    const adoptNativeThread = (discoveredSessionId: string) => {
       onNativeThreadResolved?.(discoveredSessionId);
       const isNewThread = !capturedSessionId;
       capturedSessionId = discoveredSessionId;
@@ -940,6 +1011,84 @@ async function queryCodex(
           sessionId: capturedSessionId,
           provider: 'codex',
         }));
+      }
+    };
+
+    if (sessionKey()) {
+      registerSession(sessionKey());
+    }
+
+    if (isResidentSessionsEnabled()) {
+      const resident = await acquireCodexResidentSession({
+        appSessionId: residentKey,
+        nativeThreadId: providerSessionId,
+        workingDirectory,
+        env: taskMcpOptions?.env,
+        config: async (openConnection) => {
+          const excludes = taskMcpOptions
+            ? await readEffectiveShellEnvironmentExcludes(openConnection, workingDirectory)
+            : [];
+          return {
+            'features.defer_mailbox_preemption': true,
+            ...(taskMcpOptions?.config ?? {}),
+            ...(taskMcpOptions ? {
+              'shell_environment_policy.exclude': [...new Set([
+                ...excludes,
+                TASK_API_KEY_ENV,
+                TASK_RUN_CONTEXT_ENV,
+              ])],
+            } : {}),
+          };
+        },
+        approvalPolicy,
+        sandboxMode: sandbox,
+        onEngineEvent: handleEngineEvent,
+        onSessionExit: handleProcessExit,
+        isBusy: () => codexBackgroundWork.hasSession(residentKey),
+      });
+      connection = resident.connection;
+      adoptNativeThread(resident.threadId);
+    } else {
+      connection = await codexAppServerTransport.open({
+        onExit: handleProcessExit,
+        onRequest: handleRoundRequest,
+        onNotification: handleRoundEvent,
+      }, taskMcpOptions ? { env: taskMcpOptions.env } : undefined);
+
+      const effectiveShellExcludes = taskMcpOptions
+        ? await readEffectiveShellEnvironmentExcludes(connection, workingDirectory)
+        : [];
+
+      // `config` carries the settings the protocol has no field of its own for.
+      const threadSettings: AnyRecord = {
+        cwd: workingDirectory,
+        sandbox,
+        approvalPolicy,
+        config: {
+          'features.defer_mailbox_preemption': true,
+          ...(taskMcpOptions?.config ?? {}),
+          ...(taskMcpOptions ? {
+            'shell_environment_policy.exclude': [...new Set([
+              ...effectiveShellExcludes,
+              TASK_API_KEY_ENV,
+              TASK_RUN_CONTEXT_ENV,
+            ])],
+          } : {}),
+        },
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+      };
+      const thread = readObjectRecord(providerSessionId
+        ? await connection.call('thread/resume', {
+          threadId: providerSessionId,
+          excludeTurns: true,
+          ...threadSettings,
+        })
+        : await connection.call('thread/start', threadSettings));
+
+      const threadRecord = readObjectRecord(thread?.thread);
+      const discoveredSessionId = typeof threadRecord?.id === 'string' ? threadRecord.id : null;
+      if (discoveredSessionId) {
+        adoptNativeThread(discoveredSessionId);
       }
     }
 
@@ -967,17 +1116,33 @@ async function queryCodex(
         : JSON.stringify(options.taskContinuation),
     } : null);
 
-    const startResult = readObjectRecord(await connection.call('turn/start', {
-      threadId: capturedSessionId,
-      input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
-      ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
-      ...(resolvedEffort ? { effort: resolvedEffort } : {}),
-    }));
-    const startedTurn = readObjectRecord(startResult?.turn);
-    recordStartedTurn(typeof startedTurn?.id === 'string' ? startedTurn.id : null);
+    if (isResidentSessionsEnabled() && !toolOutputParam) {
+      // The engine's queue is the admission gate: the input waits while the
+      // thread is busy and becomes a turn of its own once it is idle.
+      await submitCodexResidentRound({
+        appSessionId: residentKey,
+        input: toAppServerInput(inputItems as AnyRecord[]),
+        model: resolvedModel ?? undefined,
+        effort: resolvedEffort ?? undefined,
+        workingDirectory,
+        approvalPolicy,
+        sandboxMode: sandbox,
+        onEvent: handleRoundEvent,
+        onRequest: handleRoundRequest,
+      });
+    } else {
+      const startResult = readObjectRecord(await connection.call('turn/start', {
+        threadId: capturedSessionId,
+        input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
+        ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
+        ...(resolvedEffort ? { effort: resolvedEffort } : {}),
+      }));
+      const startedTurn = readObjectRecord(startResult?.turn);
+      recordStartedTurn(typeof startedTurn?.id === 'string' ? startedTurn.id : null);
+    }
 
     await turnSettled;
-    settleOutstandingAgents();
+    settleAgentsWhenProcessIsGone();
 
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session.
@@ -1005,7 +1170,7 @@ async function queryCodex(
 
   } catch (error) {
     const runError = error instanceof Error ? error : new Error(String(error));
-    settleOutstandingAgents();
+    settleAgentsWhenProcessIsGone();
     const wasAborted =
       currentSession()?.status === 'aborted' ||
       runError.name === 'AbortError' ||
@@ -1048,11 +1213,21 @@ async function queryCodex(
 
   } finally {
     cancelOpenApprovals('The run ended before this was answered.');
-    settleOutstandingAgents();
-    connection?.close();
+    settleAgentsWhenProcessIsGone();
     const session = currentSession();
     if (session) {
       session.status = session.status === 'aborted' ? 'aborted' : 'completed';
+    }
+    if (isResidentSessionsEnabled()) {
+      // The process stays alive: the next round continues in the same thread.
+      completeCodexResidentRound(residentKey);
+      if (!appSessionId) {
+        // A run without an app session has no conversation to stay resident
+        // for, so its process is closed with the round.
+        releaseCodexResidentSession(residentKey, { dispose: true });
+      }
+    } else {
+      connection?.close();
     }
   }
 
@@ -1081,16 +1256,7 @@ function abortCodexSession(sessionId: string) {
     `[Codex] Aborting session ${sessionId} (thread ${session.threadId ?? 'unknown'}, `
     + `turn ${session.turnId ?? 'none'}) — started ${session.startedAt}`,
   );
-  if (session.threadId && session.turnId) {
-    session.connection
-      .call('turn/interrupt', { threadId: session.threadId, turnId: session.turnId })
-      .catch((error: unknown) => {
-        console.warn(`[Codex] Interrupt for session ${sessionId} was not accepted:`, error);
-      });
-  }
-  // The connection is torn down on the next tick so the interrupt has a
-  // chance to leave the process before its pipes close.
-  setTimeout(() => session.connection.close(), 250).unref?.();
+  session.stop();
 
   return true;
 }

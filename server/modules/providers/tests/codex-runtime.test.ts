@@ -20,6 +20,7 @@ import {
   codexRuntime,
   executeCodexSandboxCommand,
 } from '@/modules/providers/list/codex/codex-runtime.provider.js';
+import { closeCodexResidentSessions } from '@/modules/providers/list/codex/codex-session-manager.js';
 import type { ProviderRuntimeContext } from '@/shared/index.js';
 
 const THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5d9d';
@@ -31,6 +32,8 @@ type FakeServer = {
   openOptions?: { env?: NodeJS.ProcessEnv; inheritEnv?: boolean };
   /** Whether the run closed the connection, which kills the real app-server process. */
   closed?: boolean;
+  /** The inputs the fake engine holds in its queue, keyed by client message id. */
+  queue: Map<string, { id: string; clientUserMessageId: string }>;
 };
 
 /**
@@ -41,7 +44,7 @@ function installFakeAppServer(
   t: any,
   script: (server: FakeServer) => void = replayOneTurn,
 ): FakeServer {
-  const server: FakeServer = { calls: [], handlers: {} };
+  const server: FakeServer = { calls: [], handlers: {}, closed: false, queue: new Map() };
 
   t.mock.method(codexAppServerTransport, 'open', async (
     handlers: CodexAppServerHandlers,
@@ -50,7 +53,7 @@ function installFakeAppServer(
     server.handlers = handlers;
     server.openOptions = openOptions;
     return {
-      async call(method: string, params: unknown, options?: unknown) {
+      async call(method: string, params: any, options?: unknown) {
         server.calls.push({ method, params, options });
         if (method === 'thread/start' || method === 'thread/resume') {
           return { thread: { id: THREAD_ID } };
@@ -66,6 +69,29 @@ function installFakeAppServer(
           // through notifications.
           queueMicrotask(() => script(server));
           return { turn: { id: TURN_ID, status: 'inProgress' } };
+        }
+        if (method === 'thread/queue/add') {
+          // The engine takes the input and, when the thread is idle, starts it
+          // as a turn of its own: the consumption is reported before the turn.
+          const id = `queued-${server.queue.size + 1}`;
+          server.queue.set(params.clientUserMessageId, { id, clientUserMessageId: params.clientUserMessageId });
+          queueMicrotask(() => {
+            server.queue.delete(params.clientUserMessageId);
+            server.handlers.onNotification?.('thread/queue/changed', { threadId: THREAD_ID } as any);
+            script(server);
+          });
+          return { queuedSubmission: { id, input: params.input, clientUserMessageId: params.clientUserMessageId } };
+        }
+        if (method === 'thread/queue/list') {
+          return { data: [...server.queue.values()], nextCursor: null };
+        }
+        if (method === 'thread/queue/delete') {
+          for (const [key, item] of server.queue) {
+            if (item.id === params.queuedSubmissionId) {
+              server.queue.delete(key);
+            }
+          }
+          return {};
         }
         return {};
       },
@@ -152,6 +178,54 @@ for (const resumed of [false, true]) {
     });
   }
 }
+
+test('a resident round is written to the engine queue instead of starting a turn', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+
+    assert.ok(!server.calls.some((call) => call.method === 'turn/start'));
+    const added = server.calls.find((call) => call.method === 'thread/queue/add');
+    assert.ok(added, 'the round must be queued');
+    assert.deepEqual(added.params.input, [{ type: 'text', text: 'hey there', text_elements: [] }]);
+
+    assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 0));
+    assert.ok(!messages.some((message) => message.kind === 'error'));
+  } finally {
+    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    closeCodexResidentSessions();
+  }
+});
+
+test('a resident conversation keeps its process and reuses it for the next round', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    for (const command of ['first message', 'second message']) {
+      await codexRuntime.run(command, {
+        sessionId: 'resident-session',
+        cwd: process.cwd(),
+      }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+    }
+
+    assert.equal(server.calls.filter((call) => call.method === 'thread/start').length, 1);
+    assert.equal(server.closed, false, 'the process must stay alive between rounds');
+    const queued = server.calls.filter((call) => call.method === 'thread/queue/add');
+    assert.equal(queued.length, 2);
+    assert.equal(queued[0].params.input[0].text, 'first message');
+    assert.equal(queued[1].params.input[0].text, 'second message');
+    assert.equal(messages.filter((message) => message.kind === 'complete').length, 2);
+  } finally {
+    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    closeCodexResidentSessions();
+  }
+});
 
 test('an image-only turn sends a fallback prompt with the attachment', async (t) => {
   const server = installFakeAppServer(t);
