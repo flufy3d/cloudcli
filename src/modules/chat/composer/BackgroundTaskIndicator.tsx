@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { TerminalIcon, Square } from 'lucide-react';
+
 import type { ActiveBackgroundTask } from '@/shared/types';
 
 type BackgroundTaskIndicatorProps = {
@@ -45,7 +46,7 @@ export default function BackgroundTaskIndicator({ tasks, onAbort, queuesInput = 
       role="status"
       aria-live="polite"
     >
-      <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-sky-500/15">
+      <div className="flex items-center justify-between gap-2 border-b border-sky-500/15 pb-1.5">
         <div className="flex items-center gap-2">
           <span className="relative flex h-2 w-2">
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
@@ -81,7 +82,7 @@ export default function BackgroundTaskIndicator({ tasks, onAbort, queuesInput = 
               onClick={onAbort}
               aria-label={t('composer.backgroundTasks.abort', { defaultValue: '中止后台任务' })}
               title={t('composer.backgroundTasks.abort', { defaultValue: '中止后台任务' })}
-              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-destructive hover:bg-destructive/10 transition-colors"
+              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-medium text-destructive transition-colors hover:bg-destructive/10"
             >
               <Square className="h-2.5 w-2.5 fill-current" />
               <span>{t('composer.backgroundTasks.abortButton', { defaultValue: '中止' })}</span>
@@ -90,7 +91,7 @@ export default function BackgroundTaskIndicator({ tasks, onAbort, queuesInput = 
         </div>
       </div>
 
-      <div className="mt-1.5 space-y-1 max-h-36 overflow-y-auto">
+      <div className="mt-1.5 max-h-36 space-y-1 overflow-y-auto">
         {tasks.map((task) => {
           const elapsedSeconds = Math.max(
             0,
@@ -103,7 +104,7 @@ export default function BackgroundTaskIndicator({ tasks, onAbort, queuesInput = 
               key={task.id}
               className="flex items-center justify-between gap-2 rounded-md bg-background/50 px-2 py-1 text-[11px]"
             >
-              <div className="flex items-center gap-1.5 min-w-0 flex-1">
+              <div className="flex min-w-0 flex-1 items-center gap-1.5">
                 <TerminalIcon className="h-3 w-3 shrink-0 text-sky-500/80" />
                 <span className="shrink-0 font-medium text-sky-600 dark:text-sky-400">
                   {task.toolName}:
