@@ -75,6 +75,7 @@ export {
 } from '@/modules/task-continuations/task-continuations.routes.js';
 
 export {
+  handleTaskRegisterForRun,
   readTaskOutputForScope,
   registerAndStartTaskFromRun,
 } from '@/modules/task-continuations/services/task-continuation-worker-manager.service.js';

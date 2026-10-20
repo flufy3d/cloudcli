@@ -18,8 +18,8 @@ import {
   setTaskContinuationsEnabled,
 } from '@/modules/task-continuations/task-continuations.config.js';
 import {
+  handleTaskRegisterForRun,
   readTaskOutputForScope,
-  registerAndStartTaskFromRun,
 } from '@/modules/task-continuations/services/task-continuation-worker-manager.service.js';
 import { getTaskContinuationStatusHint } from '@/modules/task-continuations/services/task-continuation-status.service.js';
 import type { TaskContinuationStatusHint } from '@/modules/task-continuations/services/task-continuation-status.service.js';
@@ -226,20 +226,16 @@ taskBridgeRouter.post(
       const title = typeof toolArguments.title === 'string' ? toolArguments.title.trim() : '';
       const command = typeof toolArguments.command === 'string' ? toolArguments.command : '';
       const commandArgs = toolArguments.args === undefined ? [] : toolArguments.args;
-      const requestId = typeof body.requestId === 'string' ? body.requestId : '';
-      if (!title || title.length > 200 || !command.trim() || command.length > 4096 || command.includes('\0')
-        || !Array.isArray(commandArgs) || commandArgs.length > 128
-        || commandArgs.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0'))
-        || !requestId || requestId.length > 256) {
-        throw new AppError('Task registration request is invalid.', {
+      if (!Array.isArray(commandArgs)) {
+        throw new AppError('Task command arguments are invalid.', {
           code: 'INVALID_TASK_REGISTRATION',
           statusCode: 400,
         });
       }
-      const result = await registerAndStartTaskFromRun({
+      const result = await handleTaskRegisterForRun({
         context: runContext,
         capabilityToken: observed.runToken,
-        requestId,
+        requestId: typeof body.requestId === 'string' ? body.requestId : '',
         title,
         command: [command, ...(commandArgs as string[])],
         autoNotify: toolArguments.notify === true,
@@ -305,22 +301,17 @@ taskContinuationsRouter.post(
     const { context, token } = readTaskRunCapability(req);
     const body = (req.body ?? {}) as Record<string, unknown>;
     const title = readString(body.title, 'title');
-    const requestId = typeof body.requestId === 'string' ? body.requestId : '';
     const command = body.command;
-    if (title.length > 200 || !requestId || requestId.length > 256
-      || !Array.isArray(command) || command.length < 1 || command.length > 129
-      || command.some((argument) => typeof argument !== 'string' || argument.length > 4096 || argument.includes('\0'))
-      || typeof command[0] !== 'string' || !command[0].trim()
-      || (body.autoNotify !== undefined && typeof body.autoNotify !== 'boolean')) {
+    if (!Array.isArray(command) || (body.autoNotify !== undefined && typeof body.autoNotify !== 'boolean')) {
       throw new AppError('Task registration request is invalid.', {
         code: 'INVALID_TASK_REGISTRATION',
         statusCode: 400,
       });
     }
-    const result = await registerAndStartTaskFromRun({
+    const result = await handleTaskRegisterForRun({
       context,
       capabilityToken: token,
-      requestId,
+      requestId: typeof body.requestId === 'string' ? body.requestId : '',
       title,
       command: command as string[],
       autoNotify: body.autoNotify === true,
