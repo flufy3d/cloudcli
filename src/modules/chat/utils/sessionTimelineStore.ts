@@ -22,7 +22,9 @@
  * Ordering contracts that live INSIDE this module (each was a past bug):
  * - `applyServerEvent` flushes the buffered stream segment before applying any
  *   content-bearing frame (the routing table owns the gate), or a whole
- *   turn's text landed in one streaming bubble.
+ *   turn's text landed in one streaming bubble. A subagent's step
+ *   (`parentToolUseId`) passes without flushing, or the parent's reply was
+ *   cut into one fragment per step.
  * - `pruneRealtimeSupersededByServer` runs before the content-level bail-out
  *   of a latest refresh, or a delayed ws replay row survives forever.
  * - A drifting tail-relative offset during an older-page fetch is realigned
@@ -297,6 +299,11 @@ function enqueueHistoryMutation<T>(
  */
 function buildStreamedTextPlaceholderId(sessionId: string, segment: number): string {
   return `__streamed_${sessionId}_${segment}`;
+}
+
+/** Whether a frame is a subagent's step, shown inside its `Agent` card. */
+function isSubagentStep(message: NormalizedMessage | null): boolean {
+  return Boolean(message?.parentToolUseId);
 }
 
 /** Whether a row is streamed text still waiting for the engine's own row. */
@@ -1049,13 +1056,20 @@ export class SessionTimelineStore {
     // a provider message; narrowing once here is what lets those branches read
     // message fields at all.
     const message = isNormalizedMessageEvent(msg) ? msg : null;
-    if (sid && route.flushesStream) {
+    if (sid && route.flushesStream && !isSubagentStep(message)) {
       // Any content-bearing frame ends the current text segment: once the
       // model moves from prose to a tool call or its next thinking block, the
       // buffered text must finalize as its own message instead of absorbing
       // whatever comes after it. zcode's engine never emits text-boundary
       // events, so without this flush a whole turn's text landed in one
       // streaming bubble.
+      //
+      // A subagent's step is not the parent model moving on: it is another
+      // agent's work, drawn inside its card, arriving on the same stream while
+      // the parent may still be writing. Every engine forwards those steps
+      // live, so letting them flush cut one reply into a fragment per step —
+      // and the reply's own row could adopt only the last fragment, leaving
+      // the rest beside it as a duplicate.
       this.flushStream(sid);
     }
 
@@ -1589,7 +1603,9 @@ export class SessionTimelineStore {
     slot: SessionSlot,
     message: NormalizedMessage,
   ): NormalizedMessage[] | null {
-    if (message.kind !== 'text') {
+    // Both stand-ins hold the parent session's rows; a subagent's row is drawn
+    // in its card and stands in for neither.
+    if (message.kind !== 'text' || isSubagentStep(message)) {
       return null;
     }
 

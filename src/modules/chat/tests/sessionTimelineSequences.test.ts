@@ -263,6 +263,64 @@ test('a content frame finalizes the buffered text segment before entering the st
   timeline.cleanup();
 });
 
+test('a subagent step arriving mid-reply leaves the reply as one row', async () => {
+  const timeline = mountTimeline();
+  const replyId = 'msg_parent_text_0';
+  const delta = (content: string) =>
+    timeline.emit({ kind: 'stream_delta', id: replyId, sessionId: SESSION_ID, provider: 'opencode', content } as unknown as ServerEvent);
+  const childStep = (frame: Record<string, unknown>) =>
+    timeline.emit({ sessionId: SESSION_ID, provider: 'opencode', parentToolUseId: 'agent-call-1', ...frame } as unknown as ServerEvent);
+
+  // The frame order a running subagent produced while the parent replied:
+  // its tool calls, results and thinking land between the reply's deltas.
+  delta('Code ');
+  childStep({ kind: 'tool_use', id: 'child-call', toolId: 'child-call', toolName: 'Bash', toolInput: {} });
+  delta('and docs ');
+  await tickThrottle();
+  childStep({ kind: 'tool_result', id: 'child-call_result', toolId: 'child-call', content: 'ok' });
+  delta('are done');
+  childStep({ kind: 'thinking', id: 'child-reasoning', content: 'checking' });
+  delta('.');
+  timeline.emit({ kind: 'text', id: replyId, sessionId: SESSION_ID, provider: 'opencode', role: 'assistant', content: 'Code and docs are done.' } as unknown as ServerEvent);
+  timeline.emit({ kind: 'stream_end', id: `${replyId}_end`, sessionId: SESSION_ID, provider: 'opencode' } as unknown as ServerEvent);
+
+  const replyRows = timeline.sessionStore.getMessages(SESSION_ID)
+    .filter((row) => row.kind === 'text' && row.role === 'assistant' && !row.parentToolUseId);
+  assert.deepEqual(
+    replyRows.map((row) => ({ id: row.id, content: row.content })),
+    [{ id: replyId, content: 'Code and docs are done.' }],
+    'the reply must be one engine-named row, not fragments beside it',
+  );
+  assert.deepEqual(
+    timeline.sessionStore.getMessages(SESSION_ID).filter((row) => row.parentToolUseId).map((row) => row.id),
+    ['child-call', 'child-call_result', 'child-reasoning'],
+    'the subagent steps stay in the timeline for their card',
+  );
+
+  timeline.cleanup();
+});
+
+test('a subagent text row does not take the place of the parent reply streamed before it', () => {
+  const timeline = mountTimeline();
+  const replyId = 'msg_parent_text_0';
+
+  timeline.emit({ kind: 'stream_delta', id: replyId, sessionId: SESSION_ID, provider: 'opencode', content: 'Parent reply' } as unknown as ServerEvent);
+  // The parent's own tool call ends the segment, leaving it under a placeholder.
+  timeline.emit({ kind: 'tool_use', id: 'parent-call', sessionId: SESSION_ID, provider: 'opencode', toolId: 'parent-call', toolName: 'Agent', toolInput: {} } as unknown as ServerEvent);
+  timeline.emit({ kind: 'text', id: 'child-text', sessionId: SESSION_ID, provider: 'opencode', role: 'assistant', parentToolUseId: 'parent-call', content: 'Child finding' } as unknown as ServerEvent);
+  timeline.emit({ kind: 'text', id: replyId, sessionId: SESSION_ID, provider: 'opencode', role: 'assistant', content: 'Parent reply' } as unknown as ServerEvent);
+
+  const textRows = timeline.sessionStore.getMessages(SESSION_ID)
+    .filter((row) => row.kind === 'text')
+    .map((row) => ({ id: row.id, content: row.content, parentToolUseId: row.parentToolUseId }));
+  assert.deepEqual(textRows, [
+    { id: replyId, content: 'Parent reply', parentToolUseId: undefined },
+    { id: 'child-text', content: 'Child finding', parentToolUseId: 'parent-call' },
+  ]);
+
+  timeline.cleanup();
+});
+
 // ─── streaming row: anchored timestamp, in-place finalize ────────────────────
 
 test('every sequenced frame advances the per-session resume seq, sessionless frames count toward the viewed session', () => {
