@@ -173,6 +173,19 @@ export function createProviderRuntimeService(
     },
 
     /**
+     * What the engines report about the session's round.
+     */
+    getSessionActivity(sessionId: string): { queued: boolean; reporting: boolean } | null {
+      for (const provider of dependencies.listProviders()) {
+        const activity = provider.runtime.getSessionActivity?.(sessionId);
+        if (activity) {
+          return activity;
+        }
+      }
+      return null;
+    },
+
+    /**
      * Whether any engine still has work in the session.
      */
     hasSessionWork(sessionId: string): boolean {

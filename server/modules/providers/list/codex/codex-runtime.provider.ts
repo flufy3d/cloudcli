@@ -39,6 +39,7 @@ import {
   completeCodexResidentRound,
   isCodexResidentSessionAdmissionClosed,
   isCodexResidentSessionBusy,
+  readCodexResidentSessionActivity,
   openCodexResidentSessionAdmission,
   releaseCodexResidentSession,
   releaseCodexResidentSessionResources,
@@ -163,7 +164,7 @@ const activeCodexSessions = new Map<string, ActiveCodexSession>();
  * the next message waits for its own turn, so it is off until the whole
  * delivery — background reports, task credentials, reclaim — is accepted.
  */
-const isResidentSessionsEnabled = (): boolean => process.env.CLOUDCLI_CODEX_RESIDENT === '1';
+const isResidentSessionsEnabled = (): boolean => process.env.CLOUDCLI_CODEX_RESIDENT !== '0';
 
 const DETACHED_COMMAND_ENV_ALLOWLIST = [
   'PATH', 'HOME', 'CODEX_HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
@@ -1680,6 +1681,15 @@ export const codexRuntime = {
    */
   listBackgroundWork(): SessionBackgroundWork[] {
     return codexBackgroundWork.list();
+  },
+  /**
+   * What the engine is doing with the conversation's round.
+   *
+   * The engine is the only one that knows whether it picked the queued input
+   * up, so the page asks the engine instead of guessing.
+   */
+  getSessionActivity(sessionId: string): { queued: boolean; reporting: boolean } | null {
+    return readCodexResidentSessionActivity(sessionId);
   },
   /**
    * Whether the conversation still has work that must not be reclaimed.

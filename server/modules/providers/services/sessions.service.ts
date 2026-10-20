@@ -46,6 +46,13 @@ type RunningSessionEntry = {
   canInterrupt?: false;
   statusText?: string;
   tasks?: BackgroundTaskSummary[];
+  /**
+   * The round was submitted and the engine has not started its turn yet, so
+   * the conversation is waiting for the engine rather than working.
+   */
+  queued?: boolean;
+  /** The engine is running a turn of its own, such as a background report. */
+  reporting?: boolean;
 };
 
 type CreateAppSessionResult = {
@@ -380,7 +387,16 @@ export const sessionsService = {
       runningById.set(session.session_id, entries[entries.length - 1]);
     }
 
-    return entries;
+    // The engine is the only one that knows whether it picked a queued input
+    // up, so the entry says whether the conversation is waiting for the engine
+    // or working on the round.
+    return entries.map((entry) => {
+      const activity = providerRuntimeService.getSessionActivity(entry.sessionId);
+      if (!activity) {
+        return entry;
+      }
+      return { ...entry, queued: activity.queued, reporting: activity.reporting };
+    });
   },
 
   /**

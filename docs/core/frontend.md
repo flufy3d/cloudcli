@@ -26,6 +26,8 @@ React 18 + TypeScript + Vite 7（`vite.config.js`，别名 `@` → `src/`，`@sh
 
 `SessionProtectionContext` 的活动表区分主轮和后台等待两个阶段。后台等待包括任务执行和后续汇报，卡片消失不等于活动结束；后台结束事件只清后台阶段，新主轮会建立自己的活动。阶段交接不依赖毫秒时间比较。消息排队、中止资格和提示音按后台等待状态判断，具体链路见 [chat.md](./chat.md)。
 
+活动项还带一个"在等引擎"的标志：常驻引擎把已提交的回合握在原生线程空闲之前，这段时间活动药丸显示"排队中——等引擎空闲"，按钮说明它取消的是排队中的消息，而不是停止正在跑的回合。
+
 前后端共用的 `NormalizedMessage` 是聊天时间线的 wire contract；provider 给出的跨路行身份和历史正文完整度必须由 WebSocket 与历史接口原样传入 `SessionTimelineStore`，不能在视图模型层重新生成。身份的分段与对账规则见 [chat.md](./chat.md)。本地 Markdown 图片经授权端点转换为 Blob URL 后，组件换图或卸载必须中止请求并恰好释放一次 URL。
 
 `WebSocketContext` 只分发当前 socket 的回调，已被替换连接的迟到正文、打开和错误回调不能改变新连接。连接建立后，聊天接收器主动订阅已有会话，先通过确认建立网关代次，再让带代次的事件进入时间线。`SessionTimelineStore` 的连续应用游标与确认水位分开；有界缺口缓存、逐事件状态和指令执行、历史恢复基线见 [chat.md](./chat.md)。接收器不另建去重账。历史恢复失败提示使用 `chat.replay.recoveryFailed` 文案，简体、繁体和英文登记在各语言的 `chat.json`，其他语言沿现有英文回退。提示复用错误卡，不增加持久化消息；恢复成功后移除。

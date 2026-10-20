@@ -429,6 +429,33 @@ test('running sessions carry their tasks on a chat run that is still going', { c
   });
 });
 
+test('a running session says whether its round waits for the engine', { concurrency: false }, async () => {
+  await withIsolatedDatabase(async () => {
+    sessionsDb.createAppSession('queued-session', 'codex', '/tmp/running-project');
+    const run = chatRunRegistry.startRun({
+      appSessionId: 'queued-session', provider: 'codex', providerSessionId: null, connection: null, userId: null,
+    });
+    assert.ok(run);
+
+    await withClaudeCliRegistry([], async () => await withProviders(
+      {
+        codex: {
+          run: async () => undefined,
+          abort: () => false,
+          // The engine has the round but has not started its turn.
+          getSessionActivity: () => ({ queued: true, reporting: false }),
+        },
+      },
+      async () => {
+        const sessions = await sessionsService.listRunningSessions();
+        assert.equal(sessions.length, 1);
+        assert.equal(sessions[0].queued, true);
+        assert.equal(sessions[0].reporting, false);
+      },
+    ));
+  });
+});
+
 test('running sessions with no background work are the chat runs alone', { concurrency: false }, async () => {
   await withIsolatedDatabase(async () => {
     sessionsDb.createAppSession('plain-session', 'codex', '/tmp/running-project');

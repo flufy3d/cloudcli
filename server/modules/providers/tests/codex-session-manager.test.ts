@@ -20,6 +20,7 @@ import {
   closeCodexResidentSessions,
   completeCodexResidentRound,
   isCodexResidentSessionBusy,
+  readCodexResidentSessionActivity,
   listCodexResidentSessions,
   releaseCodexResidentSession,
   stopCodexResidentRound,
@@ -1284,6 +1285,71 @@ test('a process that held the thread is gone before the next one resumes it', as
     release();
     await handover;
     assert.equal(resumed, true);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('the session says whether its round waits for the engine', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-activity',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+
+    // The session is resident but has no round, so nothing waits for the
+    // engine.
+    let activity = readCodexResidentSessionActivity('app-activity');
+    assert.equal(activity?.queued, false);
+    assert.equal(activity?.reporting, false);
+
+    await submitCodexResidentRound({
+      appSessionId: 'app-activity',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: () => {},
+      onRequest: () => undefined,
+    });
+
+    // The input is in the engine's queue; the engine has not started a turn
+    // for it yet.
+    activity = readCodexResidentSessionActivity('app-activity');
+    assert.equal(activity?.queued, true);
+    assert.equal(activity?.reporting, false);
+
+    // The engine starts the round's turn: the round is no longer waiting.
+    drainQueue(server, 'activity-turn');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    activity = readCodexResidentSessionActivity('app-activity');
+    assert.equal(activity?.queued, false);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a report the engine runs on its own is reported as reporting', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-report-activity',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: 'report-turn', status: 'inProgress' },
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.equal(readCodexResidentSessionActivity('app-report-activity')?.reporting, true);
   } finally {
     closeCodexResidentSessions();
   }

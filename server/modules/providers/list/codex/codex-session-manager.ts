@@ -1158,6 +1158,31 @@ export function releaseCodexResidentSession(appSessionId: string, options?: { di
 }
 
 /**
+ * What the engine is doing with the session's round.
+ *
+ * Only the engine knows whether it has picked the queued input up, so the
+ * host asks here instead of guessing from the round's existence. A round that
+ * exists but has no turn yet is waiting in the engine's queue; a turn the
+ * engine started on its own is a background report.
+ */
+export function readCodexResidentSessionActivity(appSessionId: string): {
+  /** The round was submitted and the engine has not started its turn yet. */
+  queued: boolean;
+  /** The engine is running a turn of its own, such as a background report. */
+  reporting: boolean;
+} | null {
+  const session = residentSessions.get(appSessionId);
+  if (!session || session.disposed) {
+    return null;
+  }
+  const round = session.round;
+  return {
+    queued: round ? !round.turnId && !round.terminalSeen : false,
+    reporting: session.engineTurns.size > 0,
+  };
+}
+
+/**
  * Whether the session still has work that must not be reclaimed.
  *
  * A round in flight, a report the engine started on its own, or an agent

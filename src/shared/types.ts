@@ -306,6 +306,11 @@ export type SessionActivity = {
   background?: boolean;
   /** The background tasks the session still has running, with or without a response in flight. */
   tasks?: BackgroundTaskSummary[];
+  /**
+   * The round was submitted and the engine has not started its turn yet, so
+   * the conversation waits for the engine instead of working on the round.
+   */
+  queued?: boolean;
 };
 
 /** Every busy session, keyed by session id. Read it to tell whether a session is busy; check `background` to tell how. */

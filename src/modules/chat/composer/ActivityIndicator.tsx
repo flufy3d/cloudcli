@@ -81,11 +81,17 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
   if (!renderedActivity) return null;
 
   const isBackground = Boolean(renderedActivity.background);
+  // A resident engine holds the round until the thread is idle, so the page
+  // has to say that the conversation waits for the engine instead of
+  // pretending it is being worked on.
+  const isQueued = Boolean(renderedActivity.queued) && !isBackground;
   const actionWords = ACTION_KEYS.map((key, i) => t(key, { defaultValue: DEFAULT_ACTION_WORDS[i] }));
   const label = isBackground
     ? t('claudeStatus.backgroundWork', 'Background work')
-    : (renderedActivity.statusText || actionWords[Math.floor(elapsedSeconds / 4) % actionWords.length])
-      .replace(/\.+$/, '');
+    : isQueued
+      ? t('claudeStatus.queuedInEngine', 'Queued — waiting for the engine')
+      : (renderedActivity.statusText || actionWords[Math.floor(elapsedSeconds / 4) % actionWords.length])
+        .replace(/\.+$/, '');
   const detail = isBackground ? describeBackgroundTasks(renderedActivity.tasks ?? [], t) : '';
 
   const minutes = Math.floor(elapsedSeconds / 60);
@@ -126,12 +132,16 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
             type="button"
             onClick={onAbort}
             className={`${tabSurfaceClassName} pointer-events-auto shrink-0 gap-1.5 whitespace-nowrap text-muted-foreground hover:bg-card hover:text-destructive`}
-            aria-label={t('claudeStatus.stop', { defaultValue: 'Stop' })}
+            aria-label={isQueued
+              ? t('claudeStatus.cancelQueued', { defaultValue: 'Cancel the queued message' })
+              : t('claudeStatus.stop', { defaultValue: 'Stop' })}
           >
             <svg className="h-2.5 w-2.5 fill-current" viewBox="0 0 24 24" aria-hidden>
               <rect x="5" y="5" width="14" height="14" rx="2" />
             </svg>
-            <span>{t('claudeStatus.stop', { defaultValue: 'Stop' })}</span>
+            <span>{isQueued
+              ? t('claudeStatus.cancelQueuedShort', { defaultValue: 'Cancel' })
+              : t('claudeStatus.stop', { defaultValue: 'Stop' })}</span>
             <kbd className="hidden rounded border border-border/60 px-1 text-[10px] text-muted-foreground/70 sm:inline-block">
               esc
             </kbd>

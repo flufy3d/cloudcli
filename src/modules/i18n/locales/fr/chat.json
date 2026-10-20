@@ -200,7 +200,10 @@
     },
     "providers": {
       "assistant": "Assistant"
-    }
+    },
+    "queuedInEngine": "Queued — waiting for the engine",
+    "cancelQueued": "Cancel the queued message",
+    "cancelQueuedShort": "Cancel"
   },
   "projectSelection": {
     "startChatWithProvider": "Sélectionnez un projet pour commencer à chatter avec {{provider}}"

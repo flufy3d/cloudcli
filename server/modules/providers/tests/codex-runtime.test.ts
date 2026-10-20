@@ -24,6 +24,11 @@ import { closeCodexResidentSessions, listCodexResidentSessions } from '@/modules
 import type { ProviderRuntimeContext } from '@/shared/index.js';
 
 const THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5d9d';
+
+// The tests below cover the short connection path, the one a conversation
+// falls back to when the resident path is turned off. The resident path has
+// its own tests, which turn it on for the duration of one test.
+process.env.CLOUDCLI_CODEX_RESIDENT = '0';
 const TURN_ID = '01a0c4d2-a3fe-7330-bb87-5a99871777d0';
 
 type FakeServer = {
@@ -212,7 +217,7 @@ test('a resident round is written to the engine queue instead of starting a turn
     assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 0));
     assert.ok(!messages.some((message) => message.kind === 'error'));
   } finally {
-    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     closeCodexResidentSessions();
   }
 });
@@ -237,7 +242,7 @@ test('a resident conversation keeps its process and reuses it for the next round
     assert.equal(queued[1].params.input[0].text, 'second message');
     assert.equal(messages.filter((message) => message.kind === 'complete').length, 2);
   } finally {
-    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     closeCodexResidentSessions();
   }
 });
@@ -253,7 +258,7 @@ test('stopping a finished round reports that there is nothing to stop', async (t
 
     assert.equal(codexRuntime.abort('resident-stop-session'), false);
   } finally {
-    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     closeCodexResidentSessions();
   }
 });
@@ -290,7 +295,7 @@ test('stopping a running resident round interrupts the turn the engine started',
     } as any);
     await run;
   } finally {
-    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     closeCodexResidentSessions();
   }
 });
@@ -322,7 +327,7 @@ test('an approval the engine asks for with no round in flight is answered', asyn
     codexRuntime.permissions.resolve(card.requestId, { allow: true });
     assert.deepEqual(await answer, { decision: 'accept' });
   } finally {
-    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     closeCodexResidentSessions();
   }
 });
@@ -359,7 +364,7 @@ test('a turn the engine starts by itself is published to the session, not to the
     // The round's own events stay in the round.
     assert.ok(!messages.some((message) => message.content === 'the background report'));
   } finally {
-    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     closeCodexResidentSessions();
   }
 });
@@ -1377,7 +1382,7 @@ for (const payload of ['taskContinuation', 'toolOutput'] as const) {
       assert.equal(listCodexResidentSessions().length, 0);
       assert.equal(messages.filter((message) => message.kind === 'complete' && message.exitCode === 0).length, 1);
     } finally {
-      if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+      if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
       else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
       closeCodexResidentSessions();
     }
@@ -1400,7 +1405,7 @@ test('an unconfirmed withdrawal remains unknown after a user stop', async (t) =>
     assert.match(error?.content ?? '', /background agents/i);
     assert.equal(server.closed, true);
   } finally {
-    if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
     closeCodexResidentSessions();
   }
@@ -1425,7 +1430,7 @@ test('a session approval survives the next round and is retracted when its proce
     assert.ok(published.some((message) => message.kind === 'permission_cancelled'));
   } finally {
     closeCodexResidentSessions();
-    if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
   }
 });
@@ -1448,7 +1453,7 @@ test('a reporting conversation defers a task result without touching the process
     assert.equal(messages.some((message) => message.kind === 'error'), false);
   } finally {
     closeCodexResidentSessions();
-    if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
   }
 });

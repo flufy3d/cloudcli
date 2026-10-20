@@ -236,7 +236,10 @@
     },
     "providers": {
       "assistant": "Assistant"
-    }
+    },
+    "queuedInEngine": "排队中——等引擎空闲",
+    "cancelQueued": "取消排队中的消息",
+    "cancelQueuedShort": "取消"
   },
   "projectSelection": {
     "startChatWithProvider": "选择一个项目以开始与 {{provider}} 聊天"

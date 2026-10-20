@@ -47,6 +47,14 @@ export interface IProviderRuntime {
   ): Promise<unknown>;
   abort(sessionId: string): boolean | Promise<boolean>;
   /**
+   * What the engine is doing with the session's round.
+   *
+   * A resident engine knows whether the queued input has been picked up; the
+   * caller needs that to tell "waiting for the engine" from "the engine is
+   * working on this round".
+   */
+  getSessionActivity?(sessionId: string): { queued: boolean; reporting: boolean } | null;
+  /**
    * Whether the session still has work that must not be reclaimed.
    *
    * A conversation with a turn in flight, with a report the engine started on

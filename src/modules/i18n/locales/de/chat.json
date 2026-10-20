@@ -198,7 +198,10 @@
     },
     "providers": {
       "assistant": "Assistent"
-    }
+    },
+    "queuedInEngine": "Queued — waiting for the engine",
+    "cancelQueued": "Cancel the queued message",
+    "cancelQueuedShort": "Cancel"
   },
   "projectSelection": {
     "startChatWithProvider": "Wähl ein Projekt, um mit {{provider}} zu chatten"

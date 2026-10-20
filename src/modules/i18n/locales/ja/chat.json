@@ -192,7 +192,10 @@
     },
     "providers": {
       "assistant": "Assistant"
-    }
+    },
+    "queuedInEngine": "Queued — waiting for the engine",
+    "cancelQueued": "Cancel the queued message",
+    "cancelQueuedShort": "Cancel"
   },
   "message": {
     "editAndResend": "編集して再送信",

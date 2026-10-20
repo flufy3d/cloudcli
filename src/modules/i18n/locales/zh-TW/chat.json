@@ -259,7 +259,10 @@
     },
     "providers": {
       "assistant": "助理"
-    }
+    },
+    "queuedInEngine": "排隊中——等引擎空閒",
+    "cancelQueued": "取消排隊中的訊息",
+    "cancelQueuedShort": "取消"
   },
   "projectSelection": {
     "startChatWithProvider": "選擇一個專案以開始與 {{provider}} 聊天"
