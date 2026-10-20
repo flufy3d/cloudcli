@@ -39,8 +39,48 @@ test('gateway stamps one epoch across runs and replay declares its complete lowe
     next.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'next' });
     const nextReplay = chatRunRegistry.replayEvents('epoch-session', 2);
     assert.equal((nextReplay as any).streamEpoch, (replay as any).streamEpoch);
-    assert.equal((nextReplay as any).replayFromSeq, 3);
+    // The replay buffer belongs to the session, so the previous round's events
+    // are still replayable and the lower bound stays at the session's start.
+    assert.equal((nextReplay as any).replayFromSeq, 1);
     assert.equal(nextReplay.events[0].seq, 3);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('an event published outside a run reaches the session and is replayable', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const connection = new FakeConnection();
+    const run = chatRunRegistry.startRun({ appSessionId: 'session-events', provider: 'codex', providerSessionId: null, connection, userId: null });
+    assert.ok(run);
+    run.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'from the round' });
+    chatRunRegistry.publishSessionEvent('session-events', { kind: 'stream_delta', provider: 'codex', content: 'from the engine' } as any);
+
+    const replay = chatRunRegistry.replayEvents('session-events', 0);
+    assert.equal(replay.events.length, 2);
+    assert.equal(replay.events[0].seq, 1);
+    assert.equal(replay.events[1].seq, 2);
+    assert.equal(connection.frames.length, 2);
+    assert.equal((connection.frames[1] as any).content, 'from the engine');
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('a session event without a run does not make the session look busy', () => {
+  chatRunRegistry.clearAll();
+  try {
+    chatRunRegistry.publishSessionEvent('idle-session', { kind: 'stream_delta', provider: 'codex', content: 'late report' } as any);
+    assert.equal(chatRunRegistry.isProcessing('idle-session'), false);
+    assert.equal(chatRunRegistry.replayEvents('idle-session', 0).events.length, 1);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('a published terminal event is dropped, so no round is ended by it', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'published-complete', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    chatRunRegistry.publishSessionEvent('published-complete', { kind: 'complete', provider: 'codex', exitCode: 0 } as any);
+    assert.equal(chatRunRegistry.isProcessing('published-complete'), true);
+    assert.equal(chatRunRegistry.replayEvents('published-complete', 0).events.length, 0);
   } finally { chatRunRegistry.clearAll(); }
 });
 

@@ -123,6 +123,13 @@ const agentRoutes = createAgentModule({
 // (agents, workflows, backgrounded commands) is still reporting through it.
 chatRunRegistry.setRetentionGuard((sessionId) => providerRuntimeService.hasBackgroundWork(sessionId));
 
+// A resident provider can report after its round ended. The gateway owns the
+// session's sequence numbers, audience and replay buffer, so the runtime
+// hands the event over instead of numbering it itself.
+providerRuntimeService.setSessionEventPublisher((appSessionId, message) => {
+    chatRunRegistry.publishSessionEvent(appSessionId, message);
+});
+
 createWebSocketServer(server, {
     verifyClient: {
         isPlatform: IS_PLATFORM,

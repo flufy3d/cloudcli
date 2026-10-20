@@ -125,7 +125,7 @@ type ResidentSession = {
   /** Whether the session still has work that must not be reclaimed. */
   isBusy: () => boolean;
   /** Events of turns the engine started on its own. */
-  onEngineEvent: (method: string, params: AnyRecord) => void;
+  onEngineEvent: (method: string, params: AnyRecord, threadId: string) => void;
   /** Called when the process of the session dies. */
   onSessionExit: (reason: string) => void;
 };
@@ -161,8 +161,14 @@ export type CodexResidentSessionOptions = {
   approvalPolicy: string;
   /** The sandbox mode the rounds use. */
   sandboxMode: string;
-  /** Events of turns the engine started on its own. */
-  onEngineEvent?: (method: string, params: AnyRecord) => void;
+  /**
+   * Events of turns the engine started on its own.
+   *
+   * The handler belongs to the session, not to a round: a resident process
+   * reports after the round that started it is gone, so the handler must not
+   * depend on a round's writer.
+   */
+  onEngineEvent?: (method: string, params: AnyRecord, threadId: string) => void;
   /** Called when the process of the session dies. */
   onSessionExit?: (reason: string) => void;
   /** Whether the session still has work that must not be reclaimed. */
@@ -295,7 +301,7 @@ function routeResidentNotification(session: ResidentSession, method: string, par
     if (turnId) {
       session.engineTurns.add(turnId);
     }
-    session.onEngineEvent(method, params);
+    session.onEngineEvent(method, params, session.threadId);
     return;
   }
 
@@ -309,20 +315,20 @@ function routeResidentNotification(session: ResidentSession, method: string, par
     return;
   }
   if (turnId && session.engineTurns.has(turnId)) {
-    session.onEngineEvent(method, params);
+    session.onEngineEvent(method, params, session.threadId);
     return;
   }
   if (turnId) {
     // An event of a turn this session never saw start. It belongs to neither
     // the round nor a known engine turn, so it must not end the round.
-    session.onEngineEvent(method, params);
+    session.onEngineEvent(method, params, session.threadId);
     return;
   }
   if (round) {
     round.onEvent(method, params);
     return;
   }
-  session.onEngineEvent(method, params);
+  session.onEngineEvent(method, params, session.threadId);
 }
 
 /**
@@ -352,7 +358,7 @@ async function resolvePendingTurn(session: ResidentSession): Promise<void> {
     session.engineTurns.add(pending.turnId);
   }
   for (const event of pending.events) {
-    session.onEngineEvent(event.method, event.params);
+    session.onEngineEvent(event.method, event.params, session.threadId);
   }
 }
 
@@ -366,7 +372,7 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
       const eventThreadId = readEventThreadId(params);
       if (eventThreadId && eventThreadId !== session.threadId) {
         // Subagents and auxiliary threads report on the same connection.
-        session.onEngineEvent(method, params);
+        session.onEngineEvent(method, params, session.threadId);
         return;
       }
       if (method === 'thread/queue/changed') {

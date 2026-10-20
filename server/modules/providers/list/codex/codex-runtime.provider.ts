@@ -320,6 +320,300 @@ function sendMessage(ws: ProviderRuntimeWriter, data: unknown) {
 }
 
 /**
+ * Where one set of Codex events goes.
+ *
+ * A foreground round delivers through the run's writer, so the gateway stamps
+ * the run's sequence numbers and ends the run on its terminal event. A turn
+ * the engine started by itself delivers through the session's publish entry:
+ * that event belongs to the session, and it must not end a round nobody
+ * started.
+ */
+type CodexEventTarget = {
+  /** The app session the events belong to. */
+  appSessionId: string | null;
+  /** The native thread the conversation runs in. */
+  threadId: () => string | null;
+  /** Normalizes one provider row into the app's rows. */
+  normalize: (raw: unknown, sessionId: string | null) => NormalizedMessage[];
+  /** Delivers one row to the client. */
+  deliver: (message: NormalizedMessage) => void;
+  /** The tool each announced item needs, so an approval card can name it. */
+  approvalSubjects: Map<string, { toolName: string; input: unknown }>;
+};
+
+/** One `task_status` frame for a collab agent, folded by the client onto the card of `toolUseId`. */
+function codexTaskStatus(
+  messageSessionId: string | null,
+  taskId: string,
+  toolUseId: string,
+  fields: Parameters<typeof createTaskStatusMessage>[1],
+) {
+  return createTaskStatusMessage(
+    { provider: 'codex', sessionId: messageSessionId, taskId, toolUseId, taskType: CODEX_BACKGROUND_TASK_TYPE },
+    fields,
+  );
+}
+
+/**
+ * Re-sends the composer strip's list for a session; called after every change
+ * to the agents tracked under `backgroundWorkKey`. The turn is in flight for
+ * as long as an agent is tracked, so the work is always stoppable through the
+ * turn.
+ */
+function broadcastCodexBackgroundTasks(target: CodexEventTarget, backgroundWorkKey: string): void {
+  target.deliver(createBackgroundTasksStatusMessage(
+    { provider: 'codex', sessionId: target.threadId() || target.appSessionId || null },
+    codexBackgroundWork.listStripTasks(backgroundWorkKey),
+    true,
+  ));
+}
+
+/**
+ * Draws and settles the Agent card of an agent announced only through its
+ * activity record (the shape real engines use; see
+ * `buildCodexSubagentAgentRow`). `started` opens the card, marks it running
+ * and tracks the agent as background work under its thread id; `completed`
+ * and `interrupted` settle the card they started — found through that
+ * thread id, since the item id differs between the two — and retire the
+ * entry. An end with no tracked start (the server restarted while the
+ * agent ran) has no card to settle and is dropped. `interacted` is the
+ * agents talking among themselves and draws nothing.
+ */
+function emitCodexSubagentActivity(
+  target: CodexEventTarget,
+  item: Extract<CodexThreadItem, { kind: 'subagent_activity' }>,
+  timestamp: string,
+  backgroundWorkKey: string | null | undefined,
+): void {
+  const messageSessionId = target.threadId() || target.appSessionId || null;
+  if (item.activity === 'started') {
+    const taskId = item.agentThreadId ?? item.id;
+    if (backgroundWorkKey && codexBackgroundWork.get(backgroundWorkKey, taskId)) {
+      return;
+    }
+    for (const message of target.normalize(buildCodexSubagentAgentRow(item, timestamp), messageSessionId)) {
+      target.deliver(message);
+    }
+    const description = readCodexSubagentLabel(item);
+    if (backgroundWorkKey) {
+      codexBackgroundWork.start(backgroundWorkKey, {
+        taskId,
+        toolUseId: item.id,
+        taskType: CODEX_BACKGROUND_TASK_TYPE,
+        description,
+      });
+      broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+    }
+    target.deliver(codexTaskStatus(messageSessionId, taskId, item.id, { event: 'started', description }));
+    return;
+  }
+
+  if (item.activity !== 'completed' && item.activity !== 'interrupted') {
+    return;
+  }
+  const tracked = backgroundWorkKey && item.agentThreadId
+    ? codexBackgroundWork.end(backgroundWorkKey, item.agentThreadId)
+    : undefined;
+  if (!backgroundWorkKey || !tracked) {
+    return;
+  }
+  broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+  target.deliver(codexTaskStatus(messageSessionId, tracked.taskId, tracked.toolUseId, {
+    event: 'notification',
+    status: item.activity === 'completed' ? 'completed' : 'stopped',
+  }));
+}
+
+/**
+ * Announces one engine item as the app's rows.
+ *
+ * A collab agent's lifecycle feeds the background-work tracker, so the
+ * running-sessions poll and the composer's strip name the agents the turn
+ * in flight is waiting on. Which event announced the item — not the item's
+ * own status field, which `started` events may omit — decides between tracked
+ * and retired: an unrecognized status parses as `completed`, and trusting it
+ * on `started` would drop the agent before its first tick.
+ */
+function emitCodexItem(
+  target: CodexEventTarget,
+  rawItem: unknown,
+  timestamp: string,
+  source: 'started' | 'completed',
+  backgroundWorkKey: string | null | undefined,
+): void {
+  const item = readCodexAppServerItem(rawItem);
+  if (!item) {
+    return;
+  }
+  if (item.kind === 'collab_spawn' && backgroundWorkKey) {
+    if (source === 'started') {
+      codexBackgroundWork.start(backgroundWorkKey, {
+        taskId: item.id,
+        toolUseId: item.id,
+        taskType: CODEX_BACKGROUND_TASK_TYPE,
+        description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
+      });
+      broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+    } else if (codexBackgroundWork.end(backgroundWorkKey, item.id)) {
+      broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+    }
+  }
+  if (item.kind === 'subagent_activity') {
+    emitCodexSubagentActivity(target, item, timestamp, backgroundWorkKey);
+    return;
+  }
+  for (const row of codexThreadItemToRows(item, timestamp)) {
+    if (row.type === 'tool_use' && !target.approvalSubjects.has(item.id)) {
+      target.approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
+    }
+    for (const message of target.normalize(row, target.threadId() || target.appSessionId || null)) {
+      target.deliver(message);
+    }
+  }
+}
+
+/**
+ * A running agent's own finished item, as a row tied to its card. Agents
+ * work on their own thread of this connection; the thread id is how the
+ * registry finds the card. The agent's prompt (the card's task) and its
+ * lifecycle items are left out, the same as when history rebuilds the
+ * timeline from the agent's rollout, so the card reads alike either way.
+ * Threads this session did not spawn are ignored.
+ */
+function emitCodexAgentItem(
+  target: CodexEventTarget,
+  agentThreadId: string,
+  rawItem: unknown,
+  timestamp: string,
+  backgroundWorkKey: string | null | undefined,
+): void {
+  const owner = codexBackgroundWork.find(agentThreadId);
+  const item = readCodexAppServerItem(rawItem);
+  if (!owner || owner.sessionKey !== backgroundWorkKey || !item || item.kind === 'user_message' || item.kind === 'subagent_activity') {
+    return;
+  }
+  for (const row of codexThreadItemToRows(item, timestamp)) {
+    for (const message of target.normalize(row, target.threadId() || target.appSessionId || null)) {
+      target.deliver({ ...message, parentToolUseId: owner.task.toolUseId });
+    }
+  }
+}
+
+/**
+ * The events of a turn the engine started on its own.
+ *
+ * The engine starts a turn to deliver a background result, and that turn
+ * belongs to the session rather than to the round the user is waiting for.
+ * Its events are published to the session, so they reach the tabs watching
+ * the conversation without ending a round.
+ *
+ * The handler is bound to the session, not to a round: a resident process
+ * reports after the round that started it is gone, so nothing here may
+ * depend on that round's writer.
+ */
+function handleCodexSessionEvent(
+  target: CodexEventTarget,
+  method: string,
+  params: AnyRecord,
+): void {
+  const backgroundWorkKey = target.appSessionId;
+  const eventThreadId = readNonEmptyString(params.threadId) ?? readNonEmptyString(params.thread_id);
+  if (eventThreadId && target.threadId() && eventThreadId !== target.threadId()) {
+    // A subagent reports on the same connection, and its card still belongs
+    // to the conversation the user is looking at.
+    if (method === 'item/completed') {
+      emitCodexAgentItem(target, eventThreadId, params.item, new Date().toISOString(), backgroundWorkKey);
+    }
+    return;
+  }
+
+  const sessionId = target.threadId() || target.appSessionId || null;
+  switch (method) {
+    case 'turn/started': {
+      console.log(`[Codex] The engine started a turn of its own on thread ${target.threadId() ?? 'unknown'}.`);
+      return;
+    }
+
+    case 'item/started': {
+      const startedType = readObjectRecord(params.item)?.type;
+      if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
+        emitCodexItem(target, params.item, new Date().toISOString(), 'started', backgroundWorkKey);
+      }
+      return;
+    }
+
+    case 'item/completed': {
+      emitCodexItem(target, params.item, new Date().toISOString(), 'completed', backgroundWorkKey);
+      return;
+    }
+
+    case 'item/agentMessage/delta': {
+      if (typeof params.delta === 'string' && params.delta) {
+        target.deliver(createNormalizedMessage({
+          kind: 'stream_delta',
+          role: 'assistant',
+          content: params.delta,
+          sessionId,
+          provider: 'codex',
+        }));
+      }
+      return;
+    }
+
+    case 'thread/tokenUsage/updated': {
+      const tokenBudget = readCodexTokenBudget(params);
+      if (tokenBudget) {
+        target.deliver(createNormalizedMessage({
+          kind: 'status',
+          text: 'token_budget',
+          tokenBudget,
+          sessionId,
+          provider: 'codex',
+        }));
+      }
+      return;
+    }
+
+    case 'error': {
+      const error = readObjectRecord(params.error);
+      const message = readNonEmptyString(error?.message)?.trim() || readNonEmptyString(params.message)?.trim();
+      if (message) {
+        target.deliver(createNormalizedMessage({
+          kind: 'error',
+          content: message,
+          sessionId,
+          provider: 'codex',
+        }));
+      }
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+/**
+ * The tool each announced item needs, per session.
+ *
+ * A resident session can be asked for an approval while no round is in
+ * flight, and the card has to name the tool that waits.
+ */
+const sessionApprovalSubjects = new Map<string, Map<string, { toolName: string; input: unknown }>>();
+
+/** The approval subjects of a session, created on first use. */
+function readSessionApprovalSubjects(appSessionId: string | null): Map<string, { toolName: string; input: unknown }> {
+  const key = appSessionId ?? '';
+  const existing = sessionApprovalSubjects.get(key);
+  if (existing) {
+    return existing;
+  }
+  const created = new Map<string, { toolName: string; input: unknown }>();
+  sessionApprovalSubjects.set(key, created);
+  return created;
+}
+
+/**
  * Executes one Codex turn and streams it to the client.
  */
 async function queryCodex(
@@ -443,16 +737,20 @@ async function queryCodex(
    */
   const approvalSubjects = new Map<string, { toolName: string; input: unknown }>();
 
-  /** One `task_status` frame for a collab agent, folded by the client onto the card of `toolUseId`. */
-  const codexTaskStatus = (
-    messageSessionId: string | null,
-    taskId: string,
-    toolUseId: string,
-    fields: Parameters<typeof createTaskStatusMessage>[1],
-  ) => createTaskStatusMessage(
-    { provider: 'codex', sessionId: messageSessionId, taskId, toolUseId, taskType: CODEX_BACKGROUND_TASK_TYPE },
-    fields,
-  );
+  /**
+   * The events of this round, delivered through the run's writer.
+   *
+   * The gateway stamps the round's sequence numbers and ends the round on its
+   * terminal event, so a round's own events never travel the session's
+   * publish entry.
+   */
+  const roundTarget: CodexEventTarget = {
+    appSessionId: sessionId || null,
+    threadId: () => capturedSessionId,
+    normalize: (raw, nativeSessionId) => context.normalizeMessage(raw, nativeSessionId),
+    deliver: (message) => sendMessage(ws, message),
+    approvalSubjects,
+  };
 
   /**
    * Re-sends the composer strip's list for this run's session; called after
@@ -461,66 +759,7 @@ async function queryCodex(
    * rest), so the work is always stoppable through the turn.
    */
   const broadcastBackgroundTasks = (backgroundWorkKey: string): void => {
-    sendMessage(ws, createBackgroundTasksStatusMessage(
-      { provider: 'codex', sessionId: capturedSessionId || sessionId || null },
-      codexBackgroundWork.listStripTasks(backgroundWorkKey),
-      true,
-    ));
-  };
-
-  /**
-   * Draws and settles the Agent card of an agent announced only through its
-   * activity record (the shape real engines use; see
-   * `buildCodexSubagentAgentRow`). `started` opens the card, marks it running
-   * and tracks the agent as background work under its thread id; `completed`
-   * and `interrupted` settle the card they started — found through that
-   * thread id, since the item id differs between the two — and retire the
-   * entry. An end with no tracked start (the server restarted while the
-   * agent ran) has no card to settle and is dropped. `interacted` is the
-   * agents talking among themselves and draws nothing.
-   */
-  const emitSubagentActivity = (
-    item: Extract<CodexThreadItem, { kind: 'subagent_activity' }>,
-    timestamp: string,
-    backgroundWorkKey: string | null | undefined,
-  ): void => {
-    const messageSessionId = capturedSessionId || sessionId || null;
-    if (item.activity === 'started') {
-      const taskId = item.agentThreadId ?? item.id;
-      if (backgroundWorkKey && codexBackgroundWork.get(backgroundWorkKey, taskId)) {
-        return;
-      }
-      for (const message of context.normalizeMessage(buildCodexSubagentAgentRow(item, timestamp), messageSessionId)) {
-        sendMessage(ws, message);
-      }
-      const description = readCodexSubagentLabel(item);
-      if (backgroundWorkKey) {
-        codexBackgroundWork.start(backgroundWorkKey, {
-          taskId,
-          toolUseId: item.id,
-          taskType: CODEX_BACKGROUND_TASK_TYPE,
-          description,
-        });
-        broadcastBackgroundTasks(backgroundWorkKey);
-      }
-      sendMessage(ws, codexTaskStatus(messageSessionId, taskId, item.id, { event: 'started', description }));
-      return;
-    }
-
-    if (item.activity !== 'completed' && item.activity !== 'interrupted') {
-      return;
-    }
-    const tracked = backgroundWorkKey && item.agentThreadId
-      ? codexBackgroundWork.end(backgroundWorkKey, item.agentThreadId)
-      : undefined;
-    if (!backgroundWorkKey || !tracked) {
-      return;
-    }
-    broadcastBackgroundTasks(backgroundWorkKey);
-    sendMessage(ws, codexTaskStatus(messageSessionId, tracked.taskId, tracked.toolUseId, {
-      event: 'notification',
-      status: item.activity === 'completed' ? 'completed' : 'stopped',
-    }));
+    broadcastCodexBackgroundTasks(roundTarget, backgroundWorkKey);
   };
 
   /**
@@ -550,46 +789,7 @@ async function queryCodex(
   };
 
   const emitItem = (rawItem: unknown, timestamp: string, source: 'started' | 'completed'): void => {
-    const item = readCodexAppServerItem(rawItem);
-    if (!item) {
-      return;
-    }
-    // A collab agent's lifecycle feeds the background-work tracker, so the
-    // running-sessions poll and the composer's strip name the agents the turn
-    // in flight is waiting on. Keyed like Claude's tracker: the app session
-    // id when the run knows one, the native thread id as the fallback for a
-    // brand-new session's first turn. The turn's end settles whatever is
-    // still tracked (`settleOutstandingAgents`). Which event
-    // announced the item — not the item's own status field, which `started`
-    // events may omit — decides between tracked and retired: an unrecognized
-    // status parses as `completed`, and trusting it on `started` would drop
-    // the agent before its first tick.
-    const backgroundWorkKey = sessionId || capturedSessionId;
-    if (item.kind === 'collab_spawn' && backgroundWorkKey) {
-      if (source === 'started') {
-        codexBackgroundWork.start(backgroundWorkKey, {
-          taskId: item.id,
-          toolUseId: item.id,
-          taskType: CODEX_BACKGROUND_TASK_TYPE,
-          description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
-        });
-        broadcastBackgroundTasks(backgroundWorkKey);
-      } else if (codexBackgroundWork.end(backgroundWorkKey, item.id)) {
-        broadcastBackgroundTasks(backgroundWorkKey);
-      }
-    }
-    if (item.kind === 'subagent_activity') {
-      emitSubagentActivity(item, timestamp, backgroundWorkKey);
-      return;
-    }
-    for (const row of codexThreadItemToRows(item, timestamp)) {
-      if (row.type === 'tool_use' && !approvalSubjects.has(item.id)) {
-        approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
-      }
-      for (const message of context.normalizeMessage(row, capturedSessionId || sessionId || null)) {
-        sendMessage(ws, message);
-      }
-    }
+    emitCodexItem(roundTarget, rawItem, timestamp, source, sessionId || capturedSessionId);
   };
 
   /**
@@ -601,17 +801,7 @@ async function queryCodex(
    * Threads this run did not spawn are ignored.
    */
   const emitAgentItem = (agentThreadId: string, rawItem: unknown, timestamp: string): void => {
-    const owner = codexBackgroundWork.find(agentThreadId);
-    const runKey = sessionId || capturedSessionId;
-    const item = readCodexAppServerItem(rawItem);
-    if (!owner || owner.sessionKey !== runKey || !item || item.kind === 'user_message' || item.kind === 'subagent_activity') {
-      return;
-    }
-    for (const row of codexThreadItemToRows(item, timestamp)) {
-      for (const message of context.normalizeMessage(row, capturedSessionId || sessionId || null)) {
-        sendMessage(ws, { ...message, parentToolUseId: owner.task.toolUseId });
-      }
-    }
+    emitCodexAgentItem(roundTarget, agentThreadId, rawItem, timestamp, sessionId || capturedSessionId);
   };
 
   /** Approvals this run opened, so the run's end can retract them. */
@@ -921,29 +1111,6 @@ async function queryCodex(
   };
 
   /**
-   * The events of a turn the engine started on its own.
-   *
-   * A background report belongs to the session rather than to the round the
-   * user is waiting for, so it must never end that round. The session-level
-   * channel that delivers it to the browser comes with the gateway work; until
-   * then a report is only announced in the log.
-   */
-  const handleEngineEvent = (method: string, params: AnyRecord): void => {
-    const eventThreadId = readNonEmptyString(params.threadId) ?? readNonEmptyString(params.thread_id);
-    if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
-      // A subagent reports on the same connection, and its card still belongs
-      // to the conversation the user is looking at.
-      if (method === 'item/completed') {
-        emitAgentItem(eventThreadId, params.item, new Date().toISOString());
-      }
-      return;
-    }
-    if (method === 'turn/started') {
-      console.log(`[Codex] The engine started a turn of its own on thread ${capturedSessionId ?? 'unknown'}.`);
-    }
-  };
-
-  /**
    * The resident key is the app session id, so the next round of the same
    * conversation finds the process that is already running.
    */
@@ -1042,7 +1209,15 @@ async function queryCodex(
         },
         approvalPolicy,
         sandboxMode: sandbox,
-        onEngineEvent: handleEngineEvent,
+        onEngineEvent: (method, params, threadId) => handleCodexSessionEvent({
+          appSessionId: residentKey,
+          threadId: () => threadId,
+          normalize: (raw, nativeSessionId) => context.normalizeMessage(raw, nativeSessionId),
+          deliver: (message) => {
+            context.publishSessionEvent?.(residentKey, message);
+          },
+          approvalSubjects: readSessionApprovalSubjects(residentKey),
+        }, method, params),
         onSessionExit: handleProcessExit,
         isBusy: () => codexBackgroundWork.hasSession(residentKey),
       });

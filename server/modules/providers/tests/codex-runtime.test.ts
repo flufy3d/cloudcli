@@ -227,6 +227,43 @@ test('a resident conversation keeps its process and reuses it for the next round
   }
 });
 
+test('a turn the engine starts by itself is published to the session, not to the round', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  const published: Array<{ appSessionId: string; message: any }> = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-engine-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, {
+      ...runtimeContext(false),
+      publishSessionEvent: (appSessionId, message) => published.push({ appSessionId, message }),
+    });
+
+    // The engine reports in the background, after the round is over.
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: 'engine-turn', status: 'inProgress' },
+    } as any);
+    server.handlers.onNotification?.('item/agentMessage/delta', {
+      threadId: THREAD_ID,
+      turnId: 'engine-turn',
+      delta: 'the background report',
+    } as any);
+
+    assert.ok(published.length > 0, 'the report must reach the session');
+    assert.equal(published[0].appSessionId, 'resident-engine-session');
+    assert.equal(published[0].message.kind, 'stream_delta');
+    assert.equal(published[0].message.content, 'the background report');
+    // The round's own events stay in the round.
+    assert.ok(!messages.some((message) => message.content === 'the background report'));
+  } finally {
+    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    closeCodexResidentSessions();
+  }
+});
+
 test('an image-only turn sends a fallback prompt with the attachment', async (t) => {
   const server = installFakeAppServer(t);
   const messages: any[] = [];

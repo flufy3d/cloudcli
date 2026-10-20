@@ -13,6 +13,14 @@ import {
 
 type ChatSessionWriterOptions = {
   connection: RealtimeClientConnection | null;
+  /**
+   * The audience to deliver to, when the session's channel owns it.
+   *
+   * The channel keeps one audience per session, so a run's writer and the
+   * session's publish entry reach the same sockets. A writer without one keeps
+   * a private audience, which is what the tests use.
+   */
+  audience?: Set<RealtimeClientConnection>;
   userId: string | number | null;
   provider: LLMProvider;
   /** Provider-native id when resuming an existing session, otherwise null. */
@@ -84,7 +92,7 @@ export class ChatSessionWriter {
    * stream away from everyone before it, so a second tab silently froze
    * mid-run and only caught up on the next REST history refresh.
    */
-  private readonly connections = new Set<RealtimeClientConnection>();
+  private readonly connections: Set<RealtimeClientConnection>;
   /**
    * The provider-native session id as the runtime knows it. Kept locally
    * (besides the registry) because runtimes read it back via `getSessionId()`
@@ -95,6 +103,7 @@ export class ChatSessionWriter {
 
   constructor(options: ChatSessionWriterOptions) {
     this.options = options;
+    this.connections = options.audience ?? new Set<RealtimeClientConnection>();
     // A run started by a timer has no audience yet. Everything still goes
     // through `decorateOutboundEvent` into the run's replay buffer, so a
     // client that subscribes mid-run catches up from the beginning.

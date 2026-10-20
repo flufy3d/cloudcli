@@ -387,6 +387,15 @@ export type ProviderRuntimeContext = {
   ): Promise<string | undefined>;
   getProviderModels(): Promise<ProviderModelsDefinition>;
   normalizeMessage(raw: unknown, sessionId: string | null): NormalizedMessage[];
+  /**
+   * Publishes one event to a session outside any run.
+   *
+   * A provider that stays resident keeps working after its round ended — the
+   * engine starts a turn of its own to report a background result. The
+   * gateway owns the session's sequence numbers, audience and replay buffer,
+   * so the runtime only supplies the event; the gateway decides where it goes.
+   */
+  publishSessionEvent?(appSessionId: string, message: NormalizedMessage): void;
   /** Optional provider hook for clearing incomplete real-time state at a terminal run outcome. */
   resetLiveMessageState?(sessionId: string): void;
   isProviderInstalled(): Promise<boolean>;

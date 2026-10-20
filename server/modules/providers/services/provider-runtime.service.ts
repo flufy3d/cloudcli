@@ -6,6 +6,7 @@ import type {
   ActiveBackgroundTask,
   AnyRecord,
   LLMProvider,
+  NormalizedMessage,
   ProviderPermissionDecision,
   ProviderRunFunction,
   ProviderRuntimeContext,
@@ -34,6 +35,15 @@ const defaultDependencies: ProviderRuntimeServiceDependencies = {
 };
 
 /**
+ * The entry that publishes an event to a session outside any run.
+ *
+ * The gateway owns it, and the composition root installs it after both
+ * modules exist. Until it is installed a runtime has no way to reach a
+ * session that has no round in flight.
+ */
+let sessionEventPublisher: ((appSessionId: string, message: NormalizedMessage) => void) | undefined;
+
+/**
  * Creates the application-facing provider runtime dispatcher.
  *
  * The provider registry owns each concrete runtime. This service supplies the
@@ -53,6 +63,9 @@ export function createProviderRuntimeService(
       dependencies.resolveResumeModel(provider.id, sessionId, requestedModel),
     getProviderModels: async () => dependencies.getProviderModels(provider.id),
     normalizeMessage: (raw, sessionId) => provider.sessions.normalizeMessage(raw, sessionId),
+    publishSessionEvent: (appSessionId, message) => {
+      sessionEventPublisher?.(appSessionId, message);
+    },
     resetLiveMessageState: provider.sessions.resetLiveMessageState
       ? (sessionId) => provider.sessions.resetLiveMessageState?.(sessionId)
       : undefined,
@@ -83,6 +96,15 @@ export function createProviderRuntimeService(
 
   return {
     run,
+
+    /**
+     * Installs the entry that publishes an event to a session outside any
+     * run. The composition root calls it with the gateway's publisher, so the
+     * providers module never imports the websocket module.
+     */
+    setSessionEventPublisher(publisher: (appSessionId: string, message: NormalizedMessage) => void): void {
+      sessionEventPublisher = publisher;
+    },
 
     hasRuntime(providerName: string): boolean {
       try {
