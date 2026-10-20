@@ -917,6 +917,7 @@ test('detached Codex command execution keeps the original sandbox and strips tas
       env: {
         API_KEY: null,
         CLOUDCLI_TASK_API_KEY: null,
+        CLOUDCLI_TASK_BRIDGE: null,
         CLOUDCLI_TASK_RUN_CONTEXT: null,
         CLOUDCLI_REGISTRATION_TOKEN: null,
         CLOUDCLI_TASK_TOKEN: null,

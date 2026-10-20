@@ -65,7 +65,10 @@ import {
 import { initializeDatabase, sessionsDb } from './modules/database/index.js';
 import { configureWebPush } from './modules/notifications/index.js';
 import {
+    createTaskBridgeCredential,
+    registerTaskBridgeCall,
     startTaskContinuationRuntime,
+    taskBridgeRouter,
     taskContinuationsRouter,
 } from './modules/task-continuations/index.js';
 
@@ -130,6 +133,17 @@ providerRuntimeService.setSessionEventPublisher((appSessionId, message) => {
     chatRunRegistry.publishSessionEvent(appSessionId, message);
 });
 
+// A resident process outlives the round that started it, so the host takes
+// the authority for a task call from the engine call it observed, and the
+// process carries a narrow bridge credential instead of the round's own.
+providerRuntimeService.setBridgeCredentialIssuer((input) => {
+    const credential = createTaskBridgeCredential(input);
+    return { token: credential.token };
+});
+providerRuntimeService.setEngineToolCallRegistrar((call) => {
+    registerTaskBridgeCall(call);
+});
+
 createWebSocketServer(server, {
     verifyClient: {
         isPlatform: IS_PLATFORM,
@@ -178,6 +192,12 @@ app.get('/health', (req, res) => {
         version: RUNNING_VERSION
     });
 });
+
+// The bridge entry a resident Codex process calls authenticates itself with
+// a narrow credential and with the engine's own call identity, so it is
+// mounted before the API-wide key check. Every other path keeps the usual
+// authentication.
+app.use('/api/tasks', taskBridgeRouter);
 
 // Optional API key validation (if configured)
 app.use('/api', validateApiKey);

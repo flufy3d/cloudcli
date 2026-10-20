@@ -25,6 +25,18 @@ export { normalizeTaskResult } from '@/modules/task-continuations/services/task-
 export type { NormalizedTaskResult } from '@/modules/task-continuations/services/task-result.service.js';
 
 export {
+  createTaskBridgeCredential,
+  registerTaskBridgeCall,
+  resolveTaskBridgeCall,
+  resolveTaskBridgeCredential,
+  revokeTaskBridgeCredential,
+  waitForTaskBridgeCall,
+} from '@/modules/task-continuations/services/task-bridge.service.js';
+export type {
+  TaskBridgeCredentialContext,
+} from '@/modules/task-continuations/services/task-bridge.service.js';
+
+export {
   createTaskRunCapability,
   resolveTaskRunCapability,
   revokeTaskRunCapability,
@@ -57,7 +69,10 @@ export {
   setTaskContinuationsEnabled,
   TASK_CONTINUATIONS_ENABLED_CONFIG_KEY,
 } from '@/modules/task-continuations/task-continuations.config.js';
-export { taskContinuationsRouter } from '@/modules/task-continuations/task-continuations.routes.js';
+export {
+  taskBridgeRouter,
+  taskContinuationsRouter,
+} from '@/modules/task-continuations/task-continuations.routes.js';
 
 export {
   readTaskOutputForScope,

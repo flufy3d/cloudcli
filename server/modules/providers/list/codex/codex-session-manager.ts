@@ -148,8 +148,13 @@ export type CodexResidentSessionOptions = {
   nativeThreadId: string | null;
   /** The working directory the rounds run in. */
   workingDirectory: string;
-  /** Extra environment for the child process. */
-  env?: NodeJS.ProcessEnv;
+  /**
+   * The environment the child process starts with.
+   *
+   * It is built from the process generation, because the narrow credential a
+   * resident process carries is bound to it.
+   */
+  env?: (generation: number) => NodeJS.ProcessEnv | undefined;
   /**
    * The thread configuration the engine applies.
    *
@@ -503,9 +508,10 @@ export async function acquireCodexResidentSession(
   };
 
   const initialization = (async () => {
+    const processEnv = options.env?.(session.generation);
     const connection = await codexAppServerTransport.open(
       buildResidentHandlers(session),
-      { experimentalApi: true, ...(options.env ? { env: options.env } : {}) },
+      { experimentalApi: true, ...(processEnv ? { env: processEnv } : {}) },
     );
     session.connection = connection;
     const threadConfig = options.config ? await options.config(connection) : {};

@@ -9,6 +9,7 @@ const PROTOCOL_VERSION = '2025-03-26';
 const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
 const TASK_API_KEY_ENV = 'CLOUDCLI_TASK_API_KEY';
 const TASK_RUN_CONTEXT_ENV = 'CLOUDCLI_TASK_RUN_CONTEXT';
+const TASK_BRIDGE_ENV = 'CLOUDCLI_TASK_BRIDGE';
 const MAX_LINE_BYTES = 64 * 1024;
 
 type RpcMessage = {
@@ -75,6 +76,101 @@ function readTaskCapability(env: NodeJS.ProcessEnv): { apiUrl: string; token: st
   return { apiUrl: parsedUrl.toString().replace(/\/$/, ''), token };
 }
 
+/**
+ * The engine's own identity for a tool call.
+ *
+ * The engine puts it into the request's metadata: `callId` names the call,
+ * `threadId` the native thread, and the turn metadata carries the native turn.
+ * It is the only thing that tells the host which round made the call, because
+ * a resident process outlives the round that started it.
+ */
+type BridgeCallIdentity = {
+  callId: string;
+  threadId: string;
+  turnId: string | null;
+};
+
+function readBridgeCallIdentity(params: Record<string, unknown>): BridgeCallIdentity | null {
+  const meta = readObjectRecord(params._meta);
+  if (!meta) {
+    return null;
+  }
+  const callId = typeof meta.callId === 'string' ? meta.callId.trim() : '';
+  const threadId = typeof meta.threadId === 'string' ? meta.threadId.trim() : '';
+  const turnMetadata = readObjectRecord(meta['x-codex-turn-metadata']);
+  const turnId = typeof turnMetadata?.turn_id === 'string' && turnMetadata.turn_id.trim()
+    ? turnMetadata.turn_id.trim()
+    : null;
+  if (!callId || !threadId) {
+    return null;
+  }
+  return { callId, threadId, turnId };
+}
+
+/**
+ * Calls the host's bridge entry with the engine's call identity.
+ *
+ * The bridge credential replaces the global API key here: a resident process
+ * authenticates with its own narrow credential, and the host matches the call
+ * against the engine call it observed.
+ */
+async function requestHostViaBridge(
+  env: NodeJS.ProcessEnv,
+  tool: string,
+  toolArguments: Record<string, unknown>,
+  requestId: string | undefined,
+  identity: BridgeCallIdentity | null,
+): Promise<Record<string, unknown>> {
+  const apiUrl = env[TASK_API_URL_ENV]?.trim();
+  const token = env[TASK_BRIDGE_ENV]?.trim();
+  if (!apiUrl || !token) {
+    throw new AppError('Task continuation tools are not available for this run.', {
+      code: 'TASK_RUN_CONTEXT_UNAVAILABLE',
+      statusCode: 401,
+    });
+  }
+  if (!identity) {
+    throw new AppError('The engine did not identify this call.', {
+      code: 'TASK_BRIDGE_CALL_UNKNOWN',
+      statusCode: 403,
+    });
+  }
+
+  let result: unknown;
+  try {
+    const response = await fetch(`${apiUrl.replace(/\/$/, '')}/api/tasks/mcp/invoke`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ tool, arguments: toolArguments, requestId, identity }),
+      signal: AbortSignal.timeout(40_000),
+    });
+    result = await response.json().catch(() => null);
+    if (!response.ok) {
+      const responseRecord = readObjectRecord(result);
+      const code = typeof responseRecord?.code === 'string' ? ` (${responseRecord.code})` : '';
+      throw new AppError(`Task host rejected the request with HTTP ${response.status}${code}.`, {
+        code: 'TASK_HOST_REQUEST_FAILED',
+        statusCode: response.status,
+      });
+    }
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw error;
+    }
+    throw new AppError('Task host request failed.', { code: 'TASK_HOST_UNAVAILABLE', statusCode: 503 });
+  }
+
+  const envelope = readObjectRecord(result);
+  const data = readObjectRecord(envelope?.data);
+  if (envelope?.success !== true || !data) {
+    throw new AppError('Task host returned an invalid response.', { code: 'INVALID_TASK_HOST_RESPONSE', statusCode: 502 });
+  }
+  return data;
+}
+
 async function requestHost(
   env: NodeJS.ProcessEnv,
   request: { method: string; path: string; body?: Record<string, unknown> },
@@ -126,8 +222,26 @@ async function callTaskTool(
   rawArguments: unknown,
   env: NodeJS.ProcessEnv,
   requestId?: string,
+  identity: BridgeCallIdentity | null = null,
 ): Promise<Record<string, unknown>> {
   const args = readArguments(rawArguments);
+  if (env[TASK_BRIDGE_ENV]?.trim()) {
+    // A resident process authenticates with the bridge credential, and the
+    // host matches the call against the engine call it observed.
+    const data = await requestHostViaBridge(env, name, args, requestId, identity);
+    if (name === 'cloudcli_task_run') {
+      const taskId = readTaskId(data.taskId);
+      return textResult({
+        taskId,
+        title: typeof data.title === 'string' ? data.title : String(args.title ?? ''),
+        status: ['uncertain', 'completed', 'failed', 'cancelled'].includes(String(data.status))
+          ? data.status
+          : 'accepted',
+        duplicate: data.duplicate === true,
+      });
+    }
+    return textResult(data);
+  }
   if (name === 'cloudcli_task_run') {
     const title = typeof args.title === 'string' ? args.title.trim() : '';
     const command = typeof args.command === 'string' ? args.command : '';
@@ -265,7 +379,13 @@ async function handleMessage(message: RpcMessage, env: NodeJS.ProcessEnv): Promi
     }
     try {
       const requestId = typeof id === 'string' || typeof id === 'number' ? String(id) : undefined;
-      return response(id, await callTaskTool(params.name, params.arguments, env, requestId));
+      return response(id, await callTaskTool(
+        params.name,
+        params.arguments,
+        env,
+        requestId,
+        readBridgeCallIdentity(params),
+      ));
     } catch (error) {
       const messageText = error instanceof Error ? error.message : 'Task tool failed.';
       return response(id, { isError: true, content: [{ type: 'text', text: messageText }] });

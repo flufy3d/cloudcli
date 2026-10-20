@@ -44,6 +44,28 @@ const defaultDependencies: ProviderRuntimeServiceDependencies = {
 let sessionEventPublisher: ((appSessionId: string, message: NormalizedMessage) => void) | undefined;
 
 /**
+ * The entry that records an MCP tool call the engine made.
+ *
+ * The composition root installs it with the task bridge's registry, so the
+ * providers module never imports the task-continuations module.
+ */
+let bridgeCredentialIssuer: ((input: {
+  userId: string;
+  appSessionId: string;
+  generation: number;
+}) => { token: string } | null) | undefined;
+
+let engineToolCallRegistrar: ((call: {
+  appSessionId: string;
+  threadId: string;
+  turnId: string | null;
+  callId: string;
+  server: string;
+  tool: string;
+  runToken: string;
+}) => void) | undefined;
+
+/**
  * Creates the application-facing provider runtime dispatcher.
  *
  * The provider registry owns each concrete runtime. This service supplies the
@@ -65,6 +87,10 @@ export function createProviderRuntimeService(
     normalizeMessage: (raw, sessionId) => provider.sessions.normalizeMessage(raw, sessionId),
     publishSessionEvent: (appSessionId, message) => {
       sessionEventPublisher?.(appSessionId, message);
+    },
+    createBridgeCredential: (input) => bridgeCredentialIssuer?.(input) ?? null,
+    registerEngineToolCall: (call) => {
+      engineToolCallRegistrar?.(call);
     },
     resetLiveMessageState: provider.sessions.resetLiveMessageState
       ? (sessionId) => provider.sessions.resetLiveMessageState?.(sessionId)
@@ -104,6 +130,30 @@ export function createProviderRuntimeService(
      */
     setSessionEventPublisher(publisher: (appSessionId: string, message: NormalizedMessage) => void): void {
       sessionEventPublisher = publisher;
+    },
+
+    /**
+     * Installs the entry that records an MCP tool call the engine made. The
+     * composition root calls it with the task bridge's registry.
+     */
+    setBridgeCredentialIssuer(issuer: (input: {
+      userId: string;
+      appSessionId: string;
+      generation: number;
+    }) => { token: string } | null): void {
+      bridgeCredentialIssuer = issuer;
+    },
+
+    setEngineToolCallRegistrar(registrar: (call: {
+      appSessionId: string;
+      threadId: string;
+      turnId: string | null;
+      callId: string;
+      server: string;
+      tool: string;
+      runToken: string;
+    }) => void): void {
+      engineToolCallRegistrar = registrar;
     },
 
     hasRuntime(providerName: string): boolean {

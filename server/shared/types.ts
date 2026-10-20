@@ -396,6 +396,34 @@ export type ProviderRuntimeContext = {
    * so the runtime only supplies the event; the gateway decides where it goes.
    */
   publishSessionEvent?(appSessionId: string, message: NormalizedMessage): void;
+  /**
+   * Registers one MCP tool call the engine made.
+   *
+   * A resident process outlives the round that started it, so the host
+   * cannot take the round's authority from the process. It takes it from the
+   * engine call it observed, and this is how that call reaches the host.
+   */
+  /**
+   * Issues the narrow credential a resident process carries.
+   *
+   * A resident process outlives the round that started it, so it cannot
+   * carry the round's capability; it carries a bridge credential instead,
+   * and the host matches every call against the engine call it observed.
+   */
+  createBridgeCredential?(input: {
+    userId: string;
+    appSessionId: string;
+    generation: number;
+  }): { token: string } | null;
+  registerEngineToolCall?(call: {
+    appSessionId: string;
+    threadId: string;
+    turnId: string | null;
+    callId: string;
+    server: string;
+    tool: string;
+    runToken: string;
+  }): void;
   /** Optional provider hook for clearing incomplete real-time state at a terminal run outcome. */
   resetLiveMessageState?(sessionId: string): void;
   isProviderInstalled(): Promise<boolean>;

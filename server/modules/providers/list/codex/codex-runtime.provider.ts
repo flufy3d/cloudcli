@@ -72,6 +72,7 @@ const TASK_MCP_NAME = 'cloudcli_task_continuations';
 const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
 const TASK_API_KEY_ENV = 'CLOUDCLI_TASK_API_KEY';
 const TASK_RUN_CONTEXT_ENV = 'CLOUDCLI_TASK_RUN_CONTEXT';
+const TASK_BRIDGE_ENV = 'CLOUDCLI_TASK_BRIDGE';
 
 function getTaskMcpCommand(): { command: string; args: string[] } {
   const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -88,23 +89,38 @@ function getTaskMcpCommand(): { command: string; args: string[] } {
   };
 }
 
+/**
+ * The task MCP server's configuration and environment.
+ *
+ * A short-lived process carries the round's own capability and the global API
+ * key. A resident process cannot: it outlives the round that started it, so
+ * it carries a narrow bridge credential instead, and the host matches every
+ * call against the engine call it observed.
+ */
 function getTaskMcpRuntimeOptions(input: {
-  token: string;
+  token?: string;
+  bridgeToken?: string;
 }): { config: Record<string, unknown>; env: NodeJS.ProcessEnv } {
   const apiUrl = process.env.CLOUDCLI_API_URL
     || `http://127.0.0.1:${process.env.SERVER_PORT || process.env.PORT || '3001'}`;
+  const env: NodeJS.ProcessEnv = { [TASK_API_URL_ENV]: apiUrl.replace(/\/$/, '') };
+  const envVars = [TASK_API_URL_ENV];
+  if (input.bridgeToken) {
+    env[TASK_BRIDGE_ENV] = input.bridgeToken;
+    envVars.push(TASK_BRIDGE_ENV);
+  } else {
+    env[TASK_API_KEY_ENV] = process.env.API_KEY ?? '';
+    env[TASK_RUN_CONTEXT_ENV] = input.token ?? '';
+    envVars.push(TASK_API_KEY_ENV, TASK_RUN_CONTEXT_ENV);
+  }
   return {
     config: {
       [`mcp_servers.${TASK_MCP_NAME}`]: {
         ...getTaskMcpCommand(),
-        env_vars: [TASK_API_URL_ENV, TASK_API_KEY_ENV, TASK_RUN_CONTEXT_ENV],
+        env_vars: envVars,
       },
     },
-    env: {
-      [TASK_API_URL_ENV]: apiUrl.replace(/\/$/, ''),
-      [TASK_API_KEY_ENV]: process.env.API_KEY ?? '',
-      [TASK_RUN_CONTEXT_ENV]: input.token,
-    },
+    env,
   };
 }
 
@@ -152,6 +168,7 @@ const TASK_CREDENTIAL_ENV_NAMES = [
   'API_KEY',
   'CLOUDCLI_TASK_API_KEY',
   'CLOUDCLI_TASK_RUN_CONTEXT',
+  'CLOUDCLI_TASK_BRIDGE',
   'CLOUDCLI_REGISTRATION_TOKEN',
   'CLOUDCLI_TASK_TOKEN',
   'JWT_SECRET',
@@ -339,6 +356,14 @@ type CodexEventTarget = {
   deliver: (message: NormalizedMessage) => void;
   /** The tool each announced item needs, so an approval card can name it. */
   approvalSubjects: Map<string, { toolName: string; input: unknown }>;
+  /**
+   * Records one MCP tool call the engine made.
+   *
+   * A resident process outlives the round that started it, so the host takes
+   * the authority for a call from the engine call it observed rather than
+   * from a secret the process carries.
+   */
+  registerToolCall?: (call: { callId: string; server: string; tool: string }) => void;
 };
 
 /** One `task_status` frame for a collab agent, folded by the client onto the card of `toolUseId`. */
@@ -457,6 +482,9 @@ function emitCodexItem(
     } else if (codexBackgroundWork.end(backgroundWorkKey, item.id)) {
       broadcastCodexBackgroundTasks(target, backgroundWorkKey);
     }
+  }
+  if (item.kind === 'mcp_tool_call') {
+    target.registerToolCall?.({ callId: item.id, server: item.server, tool: item.tool });
   }
   if (item.kind === 'subagent_activity') {
     emitCodexSubagentActivity(target, item, timestamp, backgroundWorkKey);
@@ -669,6 +697,27 @@ async function queryCodex(
   const taskMcpOptions = taskRunToken
     ? getTaskMcpRuntimeOptions({ token: taskRunToken })
     : null;
+  /**
+   * The task MCP options of a resident process.
+   *
+   * A resident process carries a narrow bridge credential instead of the
+   * round's capability, because it outlives the round that started it. The
+   * credential is bound to the process generation, so it is created when the
+   * manager starts the process.
+   */
+  let residentTaskMcpOptions: { config: Record<string, unknown>; env: NodeJS.ProcessEnv } | null = null;
+  const createResidentTaskMcpOptions = (generation: number) => {
+    const bridge = context.createBridgeCredential?.({
+      userId: normalizedUserId ?? '',
+      appSessionId: residentKey,
+      generation,
+    });
+    if (!bridge) {
+      return null;
+    }
+    residentTaskMcpOptions = getTaskMcpRuntimeOptions({ bridgeToken: bridge.token });
+    return residentTaskMcpOptions;
+  };
   const catalog = await context.getProviderModels();
   const resolvedEffort = resolveModelEffort(resolvedModel, effort, catalog);
 
@@ -750,6 +799,20 @@ async function queryCodex(
     normalize: (raw, nativeSessionId) => context.normalizeMessage(raw, nativeSessionId),
     deliver: (message) => sendMessage(ws, message),
     approvalSubjects,
+    registerToolCall: (call) => {
+      if (!taskRunToken || !capturedSessionId) {
+        return;
+      }
+      context.registerEngineToolCall?.({
+        appSessionId: sessionId || capturedSessionId,
+        threadId: capturedSessionId,
+        turnId: engineTurnId,
+        callId: call.callId,
+        server: call.server,
+        tool: call.tool,
+        runToken: taskRunToken,
+      });
+    },
   };
 
   /**
@@ -1190,19 +1253,18 @@ async function queryCodex(
         appSessionId: residentKey,
         nativeThreadId: providerSessionId,
         workingDirectory,
-        env: taskMcpOptions?.env,
+        env: (generation) => createResidentTaskMcpOptions(generation)?.env,
         config: async (openConnection) => {
-          const excludes = taskMcpOptions
+          const excludes = residentTaskMcpOptions
             ? await readEffectiveShellEnvironmentExcludes(openConnection, workingDirectory)
             : [];
           return {
             'features.defer_mailbox_preemption': true,
-            ...(taskMcpOptions?.config ?? {}),
-            ...(taskMcpOptions ? {
+            ...(residentTaskMcpOptions?.config ?? {}),
+            ...(residentTaskMcpOptions ? {
               'shell_environment_policy.exclude': [...new Set([
                 ...excludes,
-                TASK_API_KEY_ENV,
-                TASK_RUN_CONTEXT_ENV,
+                TASK_BRIDGE_ENV,
               ])],
             } : {}),
           };

@@ -24,8 +24,12 @@ import {
 import { getTaskContinuationStatusHint } from '@/modules/task-continuations/services/task-continuation-status.service.js';
 import type { TaskContinuationStatusHint } from '@/modules/task-continuations/services/task-continuation-status.service.js';
 import { resolveTaskRunCapability } from '@/modules/task-continuations/services/task-run-context.service.js';
+import {
+  resolveTaskBridgeCredential,
+  waitForTaskBridgeCall,
+} from '@/modules/task-continuations/services/task-bridge.service.js';
 import type { AsyncTaskRecord, TaskContinuationEventRecord } from '@/shared/types.js';
-import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils.js';
+import { AppError, asyncHandler, createApiSuccessResponse, readObjectRecord } from '@/shared/utils.js';
 
 type AuthenticatedRequest = Request & { user?: { id?: number | string } };
 
@@ -129,6 +133,135 @@ function buildTaskStatusResponse(
   });
   return toPublicTaskStatus(task, continuationEvent, capabilityScoped, hint);
 }
+
+/**
+ * The bridge entry a resident Codex process calls.
+ *
+ * It is mounted before the API-wide key check, because the process
+ * authenticates with its own narrow credential and with the engine's own
+ * call identity — it never receives the global API key, and every other
+ * path keeps the usual authentication.
+ */
+export const taskBridgeRouter = express.Router();
+
+/** The narrow credential a resident process carries. */
+function readTaskBridgeCredential(request: Request) {
+  const authorization = request.headers.authorization;
+  const match = typeof authorization === 'string' ? /^Bearer\s+(tbc_[A-Za-z0-9_-]+)$/.exec(authorization) : null;
+  const context = match ? resolveTaskBridgeCredential(match[1]) : null;
+  if (!context) {
+    throw new AppError('Task bridge credential is invalid or expired.', {
+      code: 'TASK_BRIDGE_CREDENTIAL_INVALID',
+      statusCode: 401,
+    });
+  }
+  return { context, token: match![1] };
+}
+
+/** The engine's own identity for the call, taken from the request body. */
+function readBridgeCallIdentity(body: Record<string, unknown>): {
+  callId: string;
+  threadId: string;
+  turnId: string | null;
+} {
+  const identity = readObjectRecord(body.identity);
+  const callId = readString(identity?.callId, 'callId');
+  const threadId = readString(identity?.threadId, 'threadId');
+  const turnId = typeof identity?.turnId === 'string' && identity.turnId.trim() ? identity.turnId.trim() : null;
+  return { callId, threadId, turnId };
+}
+
+taskBridgeRouter.post(
+  '/mcp/invoke',
+  asyncHandler(async (req: Request, res: Response) => {
+    const { context: credential } = readTaskBridgeCredential(req);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const tool = readString(body.tool, 'tool');
+    const toolArguments = readObjectRecord(body.arguments) ?? {};
+    const identity = readBridgeCallIdentity(body);
+
+    // The credential names the session; the engine's own record of the call
+    // names the round that made it. A call the engine never announced has no
+    // authority at all.
+    const observed = await waitForTaskBridgeCall(credential.appSessionId, identity.callId);
+    if (!observed) {
+      throw new AppError('The engine did not announce this call.', {
+        code: 'TASK_BRIDGE_CALL_UNKNOWN',
+        statusCode: 403,
+      });
+    }
+    if (observed.threadId !== identity.threadId
+      || (identity.turnId !== null && observed.turnId !== null && identity.turnId !== observed.turnId)) {
+      throw new AppError('The call does not match the engine call that was announced.', {
+        code: 'TASK_BRIDGE_CALL_MISMATCH',
+        statusCode: 403,
+      });
+    }
+    const runContext = resolveTaskRunCapability(observed.runToken);
+    if (!runContext) {
+      throw new AppError('The run that made this call is over.', {
+        code: 'TASK_RUN_CONTEXT_INVALID',
+        statusCode: 401,
+      });
+    }
+    if (String(runContext.userId) !== String(credential.userId)
+      || runContext.sessionId !== credential.appSessionId) {
+      throw new AppError('The call does not belong to this session.', {
+        code: 'TASK_BRIDGE_CALL_MISMATCH',
+        statusCode: 403,
+      });
+    }
+
+    if (tool === 'cloudcli_task_run') {
+      const title = typeof toolArguments.title === 'string' ? toolArguments.title.trim() : '';
+      const command = typeof toolArguments.command === 'string' ? toolArguments.command : '';
+      const commandArgs = toolArguments.args === undefined ? [] : toolArguments.args;
+      const requestId = typeof body.requestId === 'string' ? body.requestId : '';
+      if (!title || title.length > 200 || !command.trim() || command.length > 4096 || command.includes('\0')
+        || !Array.isArray(commandArgs) || commandArgs.length > 128
+        || commandArgs.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0'))
+        || !requestId || requestId.length > 256) {
+        throw new AppError('Task registration request is invalid.', {
+          code: 'INVALID_TASK_REGISTRATION',
+          statusCode: 400,
+        });
+      }
+      const result = await registerAndStartTaskFromRun({
+        context: runContext,
+        capabilityToken: observed.runToken,
+        requestId,
+        title,
+        command: [command, ...(commandArgs as string[])],
+        autoNotify: toolArguments.notify === true,
+      });
+      res.status(result.duplicate ? 200 : 202).json(createApiSuccessResponse(result));
+      return;
+    }
+
+    if (tool === 'cloudcli_task_status') {
+      const taskId = readString(toolArguments.taskId, 'taskId');
+      const result = await handleGetTaskStatus(taskId, {
+        userId: runContext.userId,
+        sessionId: runContext.sessionId,
+      });
+      res.json(createApiSuccessResponse(buildTaskStatusResponse(result.task, result.continuationEvent, true)));
+      return;
+    }
+
+    if (tool === 'cloudcli_task_cancel_notification') {
+      const taskId = readString(toolArguments.taskId, 'taskId');
+      const reason = typeof toolArguments.reason === 'string' ? toolArguments.reason.slice(0, 500) : undefined;
+      const success = await handleCancelTaskNotification(taskId, {
+        userId: runContext.userId,
+        sessionId: runContext.sessionId,
+      }, reason);
+      res.json(createApiSuccessResponse({ success }));
+      return;
+    }
+
+    throw new AppError(`Unknown task tool: ${tool}`, { code: 'UNKNOWN_TASK_TOOL', statusCode: 404 });
+  }),
+);
 
 export const taskContinuationsRouter = express.Router();
 
