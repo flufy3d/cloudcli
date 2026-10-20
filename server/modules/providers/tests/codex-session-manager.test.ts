@@ -511,7 +511,7 @@ test('an engine turn that starts while the round waits does not take the round o
     } as any);
     await new Promise((resolve) => setTimeout(resolve, 30));
 
-    assert.deepEqual(roundEvents, [], 'the engine turn must not become the round');
+    assert.equal(roundEvents.length, 0, 'the engine turn must not become the round');
     assert.ok(engineEvents.includes('turn/started'));
 
     // The input is consumed afterwards, and the turn that follows is the
