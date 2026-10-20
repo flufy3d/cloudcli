@@ -34,6 +34,8 @@ test('the bridge entry needs the engine call it names, not just the credential',
     createTaskBridgeCredential,
     createTaskRunCapability,
     registerTaskBridgeCall,
+    setTaskContinuationsEnabled,
+    handleGetTaskStatus,
   } = await import('@/modules/task-continuations/index.js');
   const { taskBridgeRouter } = await import('@/modules/task-continuations/task-continuations.routes.js');
 
@@ -63,12 +65,12 @@ test('the bridge entry needs the engine call it names, not just the credential',
   await once(server, 'listening');
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
-  const invoke = (identity: Record<string, unknown>) => fetch(`${baseUrl}/api/tasks/mcp/invoke`, {
+  const invoke = (identity: Record<string, unknown>, args = { taskId: 'task_unknown' }) => fetch(`${baseUrl}/api/tasks/mcp/invoke`, {
     method: 'POST',
     headers: { authorization: `Bearer ${credential.token}`, 'content-type': 'application/json' },
     body: JSON.stringify({
       tool: 'cloudcli_task_status',
-      arguments: { taskId: 'task_unknown' },
+      arguments: args,
       identity,
     }),
   });
@@ -88,6 +90,8 @@ test('the bridge entry needs the engine call it names, not just the credential',
       server: 'cloudcli_task_continuations',
       tool: 'cloudcli_task_status',
       runToken: capability.token,
+      generation: 1,
+      arguments: { taskId: 'task_unknown' },
     });
 
     // The announced call passes the gate; the task itself does not exist,
@@ -96,10 +100,62 @@ test('the bridge entry needs the engine call it names, not just the credential',
     assert.equal(announced.status, 404);
     assert.equal((await announced.json() as { code?: string }).code, 'TASK_NOT_FOUND');
 
+    const tampered = await invoke({ callId: 'call-1', threadId: 'native-thread-1', turnId: 'native-turn-1' }, { taskId: 'another-task' });
+    assert.equal(tampered.status, 403);
+    assert.equal((await tampered.json() as { code?: string }).code, 'TASK_BRIDGE_CALL_MISMATCH');
+
     // A call that names another thread is not the call the engine made.
     const mismatched = await invoke({ callId: 'call-1', threadId: 'native-thread-other', turnId: 'native-turn-1' });
     assert.equal(mismatched.status, 403);
     assert.equal((await mismatched.json() as { code?: string }).code, 'TASK_BRIDGE_CALL_MISMATCH');
+
+    // Native identity, rather than a restarted stdio counter, owns registration.
+    const previousTasksRoot = process.env.CLOUDCLI_TASKS_DIR;
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CLOUDCLI_TASKS_DIR = path.join(temporaryDirectory, 'tasks');
+    process.env.CODEX_HOME = path.join(temporaryDirectory, 'codex');
+    await fs.mkdir(process.env.CODEX_HOME);
+    setTaskContinuationsEnabled(true);
+    const taskArguments = { title: 'isolated bridge identity', command: process.execPath, args: ['-e', 'process.exit(0)'], notify: false };
+    const taskIds = new Set<string>();
+    const register = async (callId: string, requestId: string) => {
+      registerTaskBridgeCall({
+        appSessionId: 'bridge-session', generation: 1, threadId: 'native-thread-1', turnId: 'native-turn-1',
+        callId, server: 'cloudcli_task_continuations', tool: 'cloudcli_task_run', arguments: taskArguments, runToken: capability.token,
+      });
+      const response = await fetch(`${baseUrl}/api/tasks/mcp/invoke`, {
+        method: 'POST', headers: { authorization: `Bearer ${credential.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ tool: 'cloudcli_task_run', arguments: taskArguments, requestId,
+          identity: { callId, threadId: 'native-thread-1', turnId: 'native-turn-1' } }),
+      });
+      const payload = await response.json() as { data?: { taskId: string; duplicate: boolean }; code?: string };
+      assert.ok(response.ok, JSON.stringify(payload));
+      taskIds.add(payload.data!.taskId);
+      return payload.data!;
+    };
+    try {
+      const first = await register('native-register-1', 'stdio-1');
+      const retry = await register('native-register-1', 'stdio-2');
+      assert.equal(retry.taskId, first.taskId);
+      assert.equal(retry.duplicate, true);
+      const afterRestart = await register('native-register-2', 'stdio-1');
+      assert.notEqual(afterRestart.taskId, first.taskId);
+    } finally {
+      // The detached worker only runs node's immediate exit in this test. Wait
+      // for its real result before closing the isolated database and directory.
+      const until = Date.now() + 15_000;
+      for (const taskId of taskIds) {
+        while (Date.now() < until) {
+          const { task } = await handleGetTaskStatus(taskId, { userId: 1, sessionId: 'bridge-session' });
+          if (['completed', 'failed', 'cancelled'].includes(task.status)) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      if (previousTasksRoot === undefined) delete process.env.CLOUDCLI_TASKS_DIR;
+      else process.env.CLOUDCLI_TASKS_DIR = previousTasksRoot;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+    }
 
     // A call without a credential is refused outright.
     const anonymous = await fetch(`${baseUrl}/api/tasks/mcp/invoke`, {

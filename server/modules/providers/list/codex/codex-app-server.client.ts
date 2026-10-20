@@ -74,6 +74,13 @@ export type CodexAppServerConnection = {
   call(method: string, params: unknown, options?: { timeoutMs?: number }): Promise<unknown>;
   /** Kills the child. Safe to call more than once. */
   close(): void;
+  /**
+   * Resolves when the child process is gone.
+   *
+   * A thread can only be resumed by one process at a time, so a caller that
+   * replaces the process has to wait for this one to release the thread.
+   */
+  waitForExit?: () => Promise<void>;
 };
 
 /** What a caller must supply to receive the server's own traffic. */
@@ -205,8 +212,11 @@ export async function openCodexAppServer(
     handlers.onExit?.(stderr.trim() ? `${reason} — ${stderr.trim().split('\n').slice(-1)[0]}` : reason);
   };
 
+  let markExited!: () => void;
+  const exited = new Promise<void>((resolve) => { markExited = resolve; });
   child.on('error', (error) => failPending(error.message));
   child.on('exit', (code, signal) => {
+    markExited();
     console.log(
       `[Codex] app-server exited (code ${code ?? 'null'}, signal ${signal ?? 'null'}, `
       + `closedByCloudCLI=${closedByClient})`,
@@ -281,7 +291,7 @@ export async function openCodexAppServer(
     throw error;
   }
 
-  return { call, close };
+  return { call, close, waitForExit: () => exited };
 }
 
 /**
@@ -294,6 +304,16 @@ export async function openCodexAppServer(
  */
 export const codexAppServerTransport = { open: openCodexAppServer };
 
+/**
+ * Whether the engine refused the thread because another process holds it.
+ *
+ * The message is the engine's own; the rpc code is too general to tell this
+ * refusal from any other invalid request.
+ */
+function isThreadHeldByAnotherProcess(error: unknown): boolean {
+  return error instanceof AppError && error.message.includes('already has an active writer');
+}
+
 /** Reads every persisted turn for one Codex thread using the paginated app-server API. */
 export async function listCodexThreadTurns(threadId: string): Promise<unknown[]> {
   if (!threadId.trim()) {
@@ -304,14 +324,23 @@ export async function listCodexThreadTurns(threadId: string): Promise<unknown[]>
   }
   const connection = await codexAppServerTransport.open({}, { experimentalApi: true });
   try {
-    const resumed = await connection.call('thread/resume', { threadId, excludeTurns: true }) as {
-      thread?: { id?: unknown };
-    } | undefined;
-    if (resumed?.thread?.id !== threadId) {
-      throw new AppError('Codex resumed a different thread while checking task history.', {
-        code: 'CODEX_HISTORY_THREAD_MISMATCH',
-        statusCode: 502,
-      });
+    // A resident conversation holds its own thread, and the engine allows one
+    // writer per thread. The listing does not need the thread loaded, so a
+    // thread another process holds is read without taking it over.
+    try {
+      const resumed = await connection.call('thread/resume', { threadId, excludeTurns: true }) as {
+        thread?: { id?: unknown };
+      } | undefined;
+      if (resumed?.thread?.id !== threadId) {
+        throw new AppError('Codex resumed a different thread while checking task history.', {
+          code: 'CODEX_HISTORY_THREAD_MISMATCH',
+          statusCode: 502,
+        });
+      }
+    } catch (error) {
+      if (!isThreadHeldByAnotherProcess(error)) {
+        throw error;
+      }
     }
 
     const turns: unknown[] = [];

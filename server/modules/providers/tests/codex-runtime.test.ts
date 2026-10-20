@@ -20,7 +20,7 @@ import {
   codexRuntime,
   executeCodexSandboxCommand,
 } from '@/modules/providers/list/codex/codex-runtime.provider.js';
-import { closeCodexResidentSessions } from '@/modules/providers/list/codex/codex-session-manager.js';
+import { closeCodexResidentSessions, listCodexResidentSessions } from '@/modules/providers/list/codex/codex-session-manager.js';
 import type { ProviderRuntimeContext } from '@/shared/index.js';
 
 const THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5d9d';
@@ -319,7 +319,8 @@ test('an approval the engine asks for with no round in flight is answered', asyn
     const card = published.find((message) => message.kind === 'permission_request');
     assert.ok(card, 'the approval card must reach the session');
     assert.equal(card.toolName, 'Bash');
-    void answer;
+    codexRuntime.permissions.resolve(card.requestId, { allow: true });
+    assert.deepEqual(await answer, { decision: 'accept' });
   } finally {
     delete process.env.CLOUDCLI_CODEX_RESIDENT;
     closeCodexResidentSessions();
@@ -1353,4 +1354,101 @@ test('an interrupted agent settles its card as stopped', async (t) => {
   const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'stopped');
   assert.equal(stopped?.toolUseId, 'call_spawn_1');
   assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+for (const payload of ['taskContinuation', 'toolOutput'] as const) {
+  test(`a resident ${payload} receives its own terminal event`, async (t) => {
+    installFakeAppServer(t);
+    const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+    const messages: any[] = [];
+    try {
+      const running = codexRuntime.run('', {
+        sessionId: `resident-${payload}`,
+        [payload]: payload === 'taskContinuation'
+          ? { taskId: 'task-test', eventId: 'event-test', summary: 'done' }
+          : { name: 'cloudcli_task_result', output: '{"summary":"done"}' },
+      }, { send: (message) => messages.push(message) }, runtimeContext(false));
+      const result = await Promise.race([
+        running.then(() => 'finished'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 100)),
+      ]);
+      assert.equal(result, 'finished');
+      assert.equal(listCodexResidentSessions().length, 0);
+      assert.equal(messages.filter((message) => message.kind === 'complete' && message.exitCode === 0).length, 1);
+    } finally {
+      if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+      else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+      closeCodexResidentSessions();
+    }
+  });
+}
+
+test('an unconfirmed withdrawal remains unknown after a user stop', async (t) => {
+  const server = installFakeAppServer(t, () => {});
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  const messages: any[] = [];
+  try {
+    const running = codexRuntime.run('do work', { sessionId: 'stop-unknown' }, { send: (message) => messages.push(message) }, runtimeContext(false));
+    await waitFor(() => server.calls.find((call) => call.method === 'thread/queue/add'));
+    assert.equal(codexRuntime.abort('stop-unknown'), true);
+    const result = await running;
+    assert.equal(result.terminalStatus, 'unknown');
+    const error = messages.find((message) => message.kind === 'error');
+    assert.match(error?.content ?? '', /could not confirm.*queued message/i);
+    assert.match(error?.content ?? '', /background agents/i);
+    assert.equal(server.closed, true);
+  } finally {
+    if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+    closeCodexResidentSessions();
+  }
+});
+
+test('a session approval survives the next round and is retracted when its process closes', async (t) => {
+  const server = installFakeAppServer(t);
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  const published: any[] = [];
+  const context = { ...runtimeContext(false), publishSessionEvent: (_sessionId: string, message: any) => published.push(message) };
+  try {
+    const run = () => codexRuntime.run('hey', { sessionId: 'session-approval-lifetime' }, { send() {} }, context);
+    await run();
+    const answer = server.handlers.onRequest?.('item/commandExecution/requestApproval', { command: 'pwd', itemId: 'background-command' });
+    assert.equal(codexRuntime.permissions.listPending('session-approval-lifetime').length, 1);
+    await run();
+    assert.equal(codexRuntime.permissions.listPending('session-approval-lifetime').length, 1);
+    closeCodexResidentSessions();
+    assert.deepEqual(await answer, { decision: 'decline' });
+    assert.equal(codexRuntime.permissions.listPending('session-approval-lifetime').length, 0);
+    assert.ok(published.some((message) => message.kind === 'permission_cancelled'));
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
+});
+
+test('a reporting conversation defers a task result without touching the process or emitting an error', async (t) => {
+  const server = installFakeAppServer(t);
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  const messages: any[] = [];
+  try {
+    await codexRuntime.run('normal', { sessionId: 'deferred-result' }, { send() {} }, runtimeContext(false));
+    server.handlers.onNotification?.('turn/started', { threadId: THREAD_ID, turn: { id: 'active-report' } });
+    const result = await codexRuntime.run('', {
+      sessionId: 'deferred-result', taskContinuation: { taskId: 'task-ready', summary: 'done' },
+    }, { send: (message) => messages.push(message) }, runtimeContext(false));
+    assert.equal((result as { busy?: boolean }).busy, true);
+    assert.equal(result.engineTurnId, null);
+    assert.equal(server.closed, false);
+    assert.equal(server.calls.filter((call) => call.method === 'thread/start' || call.method === 'thread/resume').length, 1);
+    assert.equal(messages.some((message) => message.kind === 'error'), false);
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
 });

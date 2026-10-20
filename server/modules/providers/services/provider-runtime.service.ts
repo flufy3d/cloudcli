@@ -4,6 +4,7 @@ import { sessionsService } from '@/modules/providers/services/sessions.service.j
 import type { IProvider } from '@/shared/interfaces.js';
 import type {
   ActiveBackgroundTask,
+  TaskBridgeEngineCall,
   AnyRecord,
   LLMProvider,
   NormalizedMessage,
@@ -74,15 +75,7 @@ export function createProviderRuntimeService(
    *
    * The composition root installs it with the task bridge's registry.
    */
-  let engineToolCallRegistrar: ((call: {
-    appSessionId: string;
-    threadId: string;
-    turnId: string | null;
-    callId: string;
-    server: string;
-    tool: string;
-    runToken: string;
-  }) => void) | undefined;
+  let engineToolCallRegistrar: ((call: TaskBridgeEngineCall) => void) | undefined;
 
   const createRuntimeContext = (
     provider: IProvider,
@@ -162,15 +155,8 @@ export function createProviderRuntimeService(
       bridgeCredentialRevoker = revoker;
     },
 
-    setEngineToolCallRegistrar(registrar: (call: {
-      appSessionId: string;
-      threadId: string;
-      turnId: string | null;
-      callId: string;
-      server: string;
-      tool: string;
-      runToken: string;
-    }) => void): void {
+    /** Used by server composition to connect observed native calls to task authorization. */
+    setEngineToolCallRegistrar(registrar: (call: TaskBridgeEngineCall) => void): void {
       engineToolCallRegistrar = registrar;
     },
 

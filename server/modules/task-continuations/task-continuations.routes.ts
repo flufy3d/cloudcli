@@ -26,15 +26,12 @@ import type { TaskContinuationStatusHint } from '@/modules/task-continuations/se
 import { resolveTaskRunCapability } from '@/modules/task-continuations/services/task-run-context.service.js';
 import {
   resolveTaskBridgeCredential,
-  waitForTaskBridgeCall,
+  authorizeTaskBridgeCall,
 } from '@/modules/task-continuations/services/task-bridge.service.js';
 import type { AsyncTaskRecord, TaskContinuationEventRecord } from '@/shared/types.js';
 import { AppError, asyncHandler, createApiSuccessResponse, readObjectRecord } from '@/shared/utils.js';
 
 type AuthenticatedRequest = Request & { user?: { id?: number | string } };
-
-/** The MCP server the engine calls for the task tools. */
-const TASK_MCP_SERVER_NAME = 'cloudcli_task_continuations';
 
 function readUserId(request: Request): number {
   const userId = Number((request as AuthenticatedRequest).user?.id);
@@ -188,39 +185,9 @@ taskBridgeRouter.post(
     const toolArguments = readObjectRecord(body.arguments) ?? {};
     const identity = readBridgeCallIdentity(body);
 
-    // The credential names the session; the engine's own record of the call
-    // names the round that made it. A call the engine never announced has no
-    // authority at all.
-    const observed = await waitForTaskBridgeCall(credential.appSessionId, identity.callId);
-    if (!observed) {
-      throw new AppError('The engine did not announce this call.', {
-        code: 'TASK_BRIDGE_CALL_UNKNOWN',
-        statusCode: 403,
-      });
-    }
-    if (observed.threadId !== identity.threadId
-      || observed.turnId !== identity.turnId
-      || observed.tool !== tool
-      || observed.server !== TASK_MCP_SERVER_NAME) {
-      throw new AppError('The call does not match the engine call that was announced.', {
-        code: 'TASK_BRIDGE_CALL_MISMATCH',
-        statusCode: 403,
-      });
-    }
-    const runContext = resolveTaskRunCapability(observed.runToken);
-    if (!runContext) {
-      throw new AppError('The run that made this call is over.', {
-        code: 'TASK_RUN_CONTEXT_INVALID',
-        statusCode: 401,
-      });
-    }
-    if (String(runContext.userId) !== String(credential.userId)
-      || runContext.sessionId !== credential.appSessionId) {
-      throw new AppError('The call does not belong to this session.', {
-        code: 'TASK_BRIDGE_CALL_MISMATCH',
-        statusCode: 403,
-      });
-    }
+    const { context: runContext, capabilityToken, requestId } = await authorizeTaskBridgeCall({
+      credential, identity, tool, arguments: toolArguments,
+    });
 
     if (tool === 'cloudcli_task_run') {
       const title = typeof toolArguments.title === 'string' ? toolArguments.title.trim() : '';
@@ -234,8 +201,8 @@ taskBridgeRouter.post(
       }
       const result = await handleTaskRegisterForRun({
         context: runContext,
-        capabilityToken: observed.runToken,
-        requestId: typeof body.requestId === 'string' ? body.requestId : '',
+        capabilityToken,
+        requestId,
         title,
         command: [command, ...(commandArgs as string[])],
         autoNotify: toolArguments.notify === true,

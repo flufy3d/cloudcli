@@ -21,6 +21,7 @@ import {
   completeCodexResidentRound,
   isCodexResidentSessionBusy,
   listCodexResidentSessions,
+  releaseCodexResidentSession,
   stopCodexResidentRound,
   submitCodexResidentRound,
 } from '@/modules/providers/list/codex/codex-session-manager.js';
@@ -28,6 +29,8 @@ import {
 const THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5d9d';
 
 type FakeServer = {
+  /** Resolves when the fake process is gone. */
+  exited: Promise<void>;
   calls: Array<{ method: string; params: any }>;
   handlers: CodexAppServerHandlers;
   closed: boolean;
@@ -42,7 +45,13 @@ const notify = (server: FakeServer, method: string, params: unknown): void => {
 
 /** Installs a fake app-server and returns what it was asked to do. */
 function installFakeAppServer(t: any): FakeServer {
-  const server: FakeServer = { calls: [], handlers: {}, closed: false, queue: new Map() };
+  const server: FakeServer = {
+    calls: [],
+    handlers: {},
+    closed: false,
+    queue: new Map(),
+    exited: Promise.resolve(),
+  };
 
   t.mock.method(codexAppServerTransport, 'open', async (
     handlers: CodexAppServerHandlers,
@@ -83,13 +92,15 @@ function installFakeAppServer(t: any): FakeServer {
           for (const [key, item] of server.queue) {
             if (item.id === params.queuedSubmissionId) {
               server.queue.delete(key);
+              return { deleted: true };
             }
           }
-          return {};
+          return { deleted: false };
         }
         return {};
       },
       close() { server.closed = true; },
+      waitForExit: () => server.exited,
     };
   });
 
@@ -733,6 +744,546 @@ test('the credential the process carried is revoked when the process is closed',
     assert.deepEqual(revoked, [], 'the credential lives as long as the process');
     closeCodexResidentSessions();
     assert.deepEqual(revoked, ['tbc_probe'], 'the credential dies with the process');
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+for (const failureAt of ['open', 'config', 'thread'] as const) {
+  test(`initialization failure at ${failureAt} releases the process and its credential`, async (t) => {
+    let closed = 0;
+    const revoked: string[] = [];
+    t.mock.method(codexAppServerTransport, 'open', async () => {
+      if (failureAt === 'open') throw new Error('initialization rejected');
+      return {
+        call: async () => { throw new Error('initialization rejected'); },
+        close: () => { closed += 1; },
+      };
+    });
+    await assert.rejects(acquireCodexResidentSession({
+      appSessionId: `failed-${failureAt}`, nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      env: () => ({ env: {}, credentialToken: 'credential-to-revoke' }),
+      config: async () => {
+        if (failureAt === 'config') throw new Error('initialization rejected');
+        return {};
+      },
+      revokeCredential: (token) => revoked.push(token),
+    }), /initialization rejected/);
+    closeCodexResidentSessions();
+    assert.deepEqual(revoked, ['credential-to-revoke']);
+    assert.equal(closed, failureAt === 'open' ? 0 : 1);
+    assert.deepEqual(listCodexResidentSessions(), []);
+  });
+}
+
+for (const blockedAt of ['open', 'thread'] as const) {
+  test(`closing a session during ${blockedAt} cannot resurrect its process`, async (t) => {
+    let resume!: () => void;
+    const blocked = new Promise<void>((resolve) => { resume = resolve; });
+    let reached!: () => void;
+    const waiting = new Promise<void>((resolve) => { reached = resolve; });
+    let closed = 0;
+    t.mock.method(codexAppServerTransport, 'open', async () => {
+      if (blockedAt === 'open') { reached(); await blocked; }
+      return {
+        call: async () => {
+          if (blockedAt === 'thread') { reached(); await blocked; }
+          return { thread: { id: THREAD_ID } };
+        },
+        close: () => { closed += 1; },
+      };
+    });
+    const opening = acquireCodexResidentSession({
+      appSessionId: 'closing-initialization', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+    await waiting;
+    const busyWhileOpening = isCodexResidentSessionBusy('closing-initialization');
+    closeCodexResidentSessions();
+    resume();
+    await assert.rejects(opening, /closed/);
+    assert.equal(busyWhileOpening, true);
+    assert.equal(closed, 1);
+    assert.deepEqual(listCodexResidentSessions(), []);
+  });
+}
+
+for (const reclaim of ['capacity', 'idle'] as const) {
+  test(`an engine report is protected from ${reclaim} reclamation`, async (t) => {
+    const server = installFakeAppServer(t);
+    const previousEnv = { ...process.env };
+    t.after(() => { process.env = previousEnv; });
+    process.env.CLOUDCLI_CODEX_RESIDENT_MAX = '1';
+    process.env.CLOUDCLI_CODEX_RESIDENT_IDLE_MS = '20';
+    const options = {
+      appSessionId: 'report-reclamation', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write' as const,
+      sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+    };
+    try {
+      await acquireCodexResidentSession(options);
+      notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'report-active' } });
+      if (reclaim === 'capacity') {
+        await assert.rejects(acquireCodexResidentSession({ ...options, appSessionId: 'another-session' }), /already keeping/);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      assert.equal(server.closed, false);
+      assert.equal(isCodexResidentSessionBusy(options.appSessionId), true);
+      notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'report-active', status: 'completed' } });
+      assert.equal(isCodexResidentSessionBusy(options.appSessionId), false);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.equal(server.closed, true);
+    } finally { closeCodexResidentSessions(); }
+  });
+}
+
+test('a buffered report terminal event releases its activity registration', async (t) => {
+  const server = installFakeAppServer(t);
+  const events: string[] = [];
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'buffered-report', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: (method) => events.push(method),
+    });
+    await submitCodexResidentRound({ appSessionId: 'buffered-report', input: [], onEvent: () => {}, onRequest: () => {} });
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'buffered-engine' } });
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'buffered-engine', status: 'completed' } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    completeCodexResidentRound('buffered-report');
+    assert.deepEqual(events, ['turn/started', 'turn/completed']);
+    assert.equal(isCodexResidentSessionBusy('buffered-report'), false);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('an unanswered session approval prevents reclamation until it is answered', async (t) => {
+  const server = installFakeAppServer(t);
+  const previousEnv = { ...process.env };
+  t.after(() => { process.env = previousEnv; });
+  process.env.CLOUDCLI_CODEX_RESIDENT_IDLE_MS = '20';
+  let answer!: (value: unknown) => void;
+  const approval = new Promise((resolve) => { answer = resolve; });
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'pending-session-approval', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'on-request', sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onSessionRequest: () => approval,
+    });
+    const request = server.handlers.onRequest?.('item/commandExecution/requestApproval', { threadId: THREAD_ID });
+    const busy = isCodexResidentSessionBusy('pending-session-approval');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const closedWhileWaiting = server.closed;
+    answer({ decision: 'decline' });
+    await request;
+    assert.equal(busy, true);
+    assert.equal(closedWhileWaiting, false);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(server.closed, true);
+  } finally { answer?.({ decision: 'decline' }); closeCodexResidentSessions(); }
+});
+
+test('a rejected queue withdrawal is unknown and force-closes its process', async (t) => {
+  const server = installFakeAppServer(t);
+  let ended: string | null = null;
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'failed-withdrawal', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onRoundEnded: (reason) => { ended = reason; },
+    });
+    await submitCodexResidentRound({ appSessionId: 'failed-withdrawal', input: [], onEvent: () => {}, onRequest: () => {} });
+    const call = resident.connection.call.bind(resident.connection);
+    t.mock.method(resident.connection, 'call', async (method: string, params: unknown) => {
+      if (method === 'thread/queue/delete') throw new Error('withdrawal rejected');
+      return call(method, params);
+    });
+    assert.equal(await stopCodexResidentRound('failed-withdrawal'), 'unknown');
+    assert.equal(ended, 'unknown');
+    assert.equal(server.closed, true);
+    assert.equal(listCodexResidentSessions().length, 0);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('stopping during queue submission waits for the queue item before withdrawing it', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'stop-submitting', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const originalCall = resident.connection.call.bind(resident.connection);
+    t.mock.method(resident.connection, 'call', async (method: string, params: unknown) => {
+      if (method === 'thread/queue/add') await gate;
+      return originalCall(method, params);
+    });
+    const submitting = submitCodexResidentRound({ appSessionId: 'stop-submitting', input: [], onEvent: () => {}, onRequest: () => {} });
+    const stopping = stopCodexResidentRound('stop-submitting');
+    release();
+    await submitting;
+    assert.equal(await stopping, 'cancelled');
+    assert.equal(server.queue.size, 0);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('recreating a disposed conversation never reuses its process generation', async (t) => {
+  installFakeAppServer(t);
+  const options = {
+    appSessionId: 'generation-after-disposal', nativeThreadId: null, workingDirectory: '/tmp',
+    approvalPolicy: 'never', sandbox: 'workspace-write' as const,
+    sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+  };
+  try {
+    const first = await acquireCodexResidentSession(options);
+    closeCodexResidentSessions();
+    const next = await acquireCodexResidentSession(options);
+    assert.notEqual(next.generation, first.generation);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('a queue item already consumed by the engine is not reported as withdrawn', async (t) => {
+  const server = installFakeAppServer(t);
+  let ended: string | null = null;
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'consumed-withdrawal', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onRoundEnded: (reason) => { ended = reason; },
+    });
+    await submitCodexResidentRound({ appSessionId: 'consumed-withdrawal', input: [], onEvent: () => {}, onRequest: () => {} });
+    const original = resident.connection.call.bind(resident.connection);
+    t.mock.method(resident.connection, 'call', async (method: string, params: unknown) => {
+      if (method === 'thread/queue/delete') { server.queue.clear(); return { deleted: false }; }
+      return original(method, params);
+    });
+    assert.equal(await stopCodexResidentRound('consumed-withdrawal'), 'unknown');
+    assert.equal(ended, 'unknown');
+    assert.equal(server.closed, true);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('a native event callback failure only closes its owning conversation', async (t) => {
+  const server = installFakeAppServer(t);
+  const exits: string[] = [];
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'invalid-engine-call', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: () => { throw new Error('engine call snapshot conflicts'); },
+      onSessionExit: (reason) => exits.push(reason),
+    });
+    assert.doesNotThrow(() => notify(server, 'item/started', { threadId: THREAD_ID, turnId: 'engine-turn' }));
+    assert.equal(server.closed, true);
+    assert.match(exits[0], /snapshot conflicts/);
+    assert.equal(listCodexResidentSessions().length, 0);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('out-of-order queue reads cannot give an older report the user turn', async (t) => {
+  const server = installFakeAppServer(t);
+  const owned: string[] = [];
+  const reports: string[] = [];
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'reordered-reads', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: (_method, params) => reports.push(params.turn?.id),
+    });
+    await submitCodexResidentRound({ appSessionId: 'reordered-reads', input: [], onEvent: (_method, params) => owned.push(params.turn?.id), onRequest: () => {} });
+    const original = resident.connection.call.bind(resident.connection);
+    const reads: Array<(value: unknown) => void> = [];
+    t.mock.method(resident.connection, 'call', (method: string, params: unknown) => {
+      if (method === 'thread/queue/list') return new Promise((resolve) => reads.push(resolve));
+      return original(method, params);
+    });
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'older-report' } });
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'older-report' } });
+    server.queue.clear();
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'actual-user-turn' } });
+    reads[1]({ data: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    reads[0]({ data: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(owned, ['actual-user-turn']);
+    assert.deepEqual(reports, ['older-report', 'older-report']);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('an old process completion cannot release a replacement round', async (t) => {
+  installFakeAppServer(t);
+  const options = {
+    appSessionId: 'stale-completion', nativeThreadId: null, workingDirectory: '/tmp',
+    approvalPolicy: 'never', sandbox: 'workspace-write' as const, sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+  };
+  try {
+    const old = await acquireCodexResidentSession(options);
+    closeCodexResidentSessions();
+    await acquireCodexResidentSession(options);
+    await submitCodexResidentRound({ appSessionId: options.appSessionId, input: [], onEvent: () => {}, onRequest: () => {} });
+    completeCodexResidentRound(options.appSessionId, { generation: old.generation, clientUserMessageId: 'old-round' });
+    assert.equal(isCodexResidentSessionBusy(options.appSessionId), true);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('a tool-result borrow replaces an idle process and resumes its native thread', async (t) => {
+  const server = installFakeAppServer(t);
+  const options = {
+    appSessionId: 'one-shot-result', nativeThreadId: null, workingDirectory: '/tmp',
+    approvalPolicy: 'never', sandbox: 'workspace-write' as const,
+    sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+  };
+  try {
+    const first = await acquireCodexResidentSession(options);
+    const continuation = await acquireCodexResidentSession({ ...options, lifetime: 'turn' });
+    assert.notEqual(continuation.generation, first.generation);
+    assert.equal(continuation.threadId, first.threadId);
+    assert.equal(server.closed, true, 'the idle process must be closed before the continuation opens');
+    assert.ok(server.calls.some((call) => call.method === 'thread/resume' && call.params.threadId === first.threadId));
+    assert.equal(isCodexResidentSessionBusy(options.appSessionId), true, 'the one-shot process is reserved until release');
+    await assert.rejects(acquireCodexResidentSession(options), { code: 'CODEX_SESSION_BUSY' });
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('a tool-result borrow leaves a reporting process alive and returns busy', async (t) => {
+  const server = installFakeAppServer(t);
+  const options = {
+    appSessionId: 'busy-result', nativeThreadId: null, workingDirectory: '/tmp',
+    approvalPolicy: 'never', sandbox: 'workspace-write' as const,
+    sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+  };
+  try {
+    await acquireCodexResidentSession(options);
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'report-busy' } });
+    await assert.rejects(acquireCodexResidentSession({ ...options, lifetime: 'turn' }), { code: 'CODEX_SESSION_BUSY' });
+    assert.equal(server.closed, false);
+    assert.equal(server.calls.filter((call) => call.method === 'thread/start' || call.method === 'thread/resume').length, 1);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('a runtime round reservation protects input preparation from a tool-result borrow', async (t) => {
+  const server = installFakeAppServer(t);
+  const options = {
+    appSessionId: 'preparing-round', nativeThreadId: null, workingDirectory: '/tmp',
+    approvalPolicy: 'never', sandbox: 'workspace-write' as const, sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+  };
+  try {
+    const resident = await acquireCodexResidentSession({ ...options, reserveForRound: true });
+    await assert.rejects(acquireCodexResidentSession({ ...options, lifetime: 'turn' }), { code: 'CODEX_SESSION_BUSY' });
+    assert.equal(server.closed, false);
+    assert.equal(listCodexResidentSessions()[0].generation, resident.generation);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('a stale borrowed generation cannot submit into a replacement process', async (t) => {
+  installFakeAppServer(t);
+  const options = {
+    appSessionId: 'stale-submit', nativeThreadId: null, workingDirectory: '/tmp',
+    approvalPolicy: 'never', sandbox: 'workspace-write' as const, sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+  };
+  try {
+    const old = await acquireCodexResidentSession(options);
+    closeCodexResidentSessions();
+    const next = await acquireCodexResidentSession(options);
+    await assert.rejects(submitCodexResidentRound({
+      appSessionId: options.appSessionId, generation: old.generation, input: [], onEvent() {}, onRequest() {},
+    }), /generation|replaced/i);
+    assert.equal(listCodexResidentSessions()[0].generation, next.generation);
+  } finally { closeCodexResidentSessions(); }
+});
+
+for (const failure of ['rejected', 'no-terminal'] as const) {
+  test(`a running stop ${failure} cannot leave its process working indefinitely`, async (t) => {
+    const server = installFakeAppServer(t);
+    let ended: string | null = null;
+    try {
+      const resident = await acquireCodexResidentSession({
+        appSessionId: `running-stop-${failure}`, nativeThreadId: null, workingDirectory: '/tmp',
+        approvalPolicy: 'never', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+        onRoundEnded: (reason) => { ended = reason; },
+      });
+      await submitCodexResidentRound({ appSessionId: resident.appSessionId, input: [], onEvent() {}, onRequest() {} });
+      drainQueue(server, 'turn-to-stop');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (failure === 'rejected') {
+        const original = resident.connection.call.bind(resident.connection);
+        t.mock.method(resident.connection, 'call', async (method: string, params: unknown) => {
+          if (method === 'turn/interrupt') throw new Error('interrupt rejected');
+          return original(method, params);
+        });
+        assert.equal(await stopCodexResidentRound(resident.appSessionId), 'unknown');
+      } else {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        assert.equal(await stopCodexResidentRound(resident.appSessionId), 'interrupted');
+        t.mock.timers.tick(3_001);
+      }
+      assert.equal(ended, 'unknown');
+      assert.equal(server.closed, true);
+    } finally { closeCodexResidentSessions(); }
+  });
+}
+
+test('withdrawing queued input preserves a report buffered while its ownership was checked', async (t) => {
+  const server = installFakeAppServer(t);
+  const reports: string[] = [];
+  let releaseRead!: (value: unknown) => void;
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'withdraw-with-report', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: (method) => reports.push(method),
+    });
+    await submitCodexResidentRound({ appSessionId: resident.appSessionId, input: [], onEvent() {}, onRequest() {} });
+    const original = resident.connection.call.bind(resident.connection);
+    t.mock.method(resident.connection, 'call', (method: string, params: unknown) => {
+      if (method === 'thread/queue/list') return new Promise((resolve) => { releaseRead = resolve; });
+      return original(method, params);
+    });
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'report-during-withdrawal' } });
+    assert.equal(await stopCodexResidentRound(resident.appSessionId), 'cancelled');
+    assert.deepEqual(reports, ['turn/started']);
+    assert.equal(isCodexResidentSessionBusy(resident.appSessionId), true);
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'report-during-withdrawal' } });
+    assert.equal(isCodexResidentSessionBusy(resident.appSessionId), false);
+  } finally {
+    releaseRead?.({ data: [] });
+    closeCodexResidentSessions();
+  }
+});
+
+test('a confirmed stop cancels its shared watchdog before a later round', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'stop-watchdog-scope', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'never', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+    const submit = () => submitCodexResidentRound({ appSessionId: resident.appSessionId, input: [], onEvent() {}, onRequest() {} });
+    await submit();
+    drainQueue(server, 'first-watchdog-turn');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const firstStop = stopCodexResidentRound(resident.appSessionId);
+    const repeatedStop = stopCodexResidentRound(resident.appSessionId);
+    assert.equal(firstStop, repeatedStop);
+    await firstStop;
+    assert.equal(server.calls.filter((call) => call.method === 'turn/interrupt').length, 1);
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'first-watchdog-turn' } });
+    completeCodexResidentRound(resident.appSessionId);
+    await submit();
+    t.mock.timers.tick(10_000);
+    assert.equal(server.closed, false);
+    assert.equal(isCodexResidentSessionBusy(resident.appSessionId), true);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('an approval of a report does not belong to the user round waiting in the queue', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'approval-owner', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'on-request', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onSessionRequest: () => ({ owner: 'session' }),
+    });
+    await submitCodexResidentRound({ appSessionId: resident.appSessionId, input: [], onEvent() {}, onRequest: () => ({ owner: 'round' }) });
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'asking-report' } });
+    assert.deepEqual(await server.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      threadId: THREAD_ID, turnId: 'asking-report', itemId: 'report-command',
+    }), { owner: 'session' });
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'asking-report' } });
+    drainQueue(server, 'asking-user-turn');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(await server.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      threadId: THREAD_ID, turnId: 'asking-user-turn', itemId: 'user-command',
+    }), { owner: 'round' });
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('a second runtime reservation cannot replace an active user round callbacks', async (t) => {
+  installFakeAppServer(t);
+  const options = {
+    appSessionId: 'duplicate-runtime-borrow', nativeThreadId: null, workingDirectory: '/tmp', reserveForRound: true,
+    approvalPolicy: 'never', sandbox: 'workspace-write' as const, sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+  };
+  try {
+    const resident = await acquireCodexResidentSession(options);
+    await submitCodexResidentRound({ appSessionId: resident.appSessionId, input: [], onEvent() {}, onRequest() {} });
+    await assert.rejects(acquireCodexResidentSession(options), { code: 'CODEX_SESSION_BUSY' });
+    assert.equal(isCodexResidentSessionBusy(resident.appSessionId), true);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('an approval waits for its pending turn ownership before choosing the audience', async (t) => {
+  const server = installFakeAppServer(t);
+  let releaseRead!: (value: unknown) => void;
+  try {
+    const resident = await acquireCodexResidentSession({
+      appSessionId: 'pending-approval-owner', nativeThreadId: null, workingDirectory: '/tmp',
+      approvalPolicy: 'on-request', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onSessionRequest: () => ({ owner: 'session' }),
+    });
+    await submitCodexResidentRound({ appSessionId: resident.appSessionId, input: [], onEvent() {}, onRequest: () => ({ owner: 'round' }) });
+    const original = resident.connection.call.bind(resident.connection);
+    t.mock.method(resident.connection, 'call', (method: string, params: unknown) => {
+      if (method === 'thread/queue/list') return new Promise((resolve) => { releaseRead = resolve; });
+      return original(method, params);
+    });
+    server.queue.clear();
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'pending-own-turn' } });
+    let settled = false;
+    const request = Promise.resolve(server.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      threadId: THREAD_ID, turnId: 'pending-own-turn', itemId: 'pending-own-command',
+    })).then((result) => { settled = true; return result; });
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    const prematurelySettled = settled;
+    releaseRead({ data: [] });
+    assert.deepEqual(await request, { owner: 'round' });
+    assert.equal(prematurelySettled, false);
+  } finally { releaseRead?.({ data: [] }); closeCodexResidentSessions(); }
+});
+
+test('a process that held the thread is gone before the next one resumes it', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-handover',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+
+    // The engine allows one writer per thread, so the next process has to wait
+    // for this one to release it.
+    let release = () => {};
+    server.exited = new Promise<void>((resolve) => { release = resolve; });
+    releaseCodexResidentSession('app-handover', { dispose: true });
+
+    let resumed = false;
+    const handover = acquireCodexResidentSession({
+      appSessionId: 'app-handover',
+      nativeThreadId: 'thread-after-release',
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    }).then(() => { resumed = true; });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(resumed, false, 'the new process must wait for the old one');
+
+    release();
+    await handover;
+    assert.equal(resumed, true);
   } finally {
     closeCodexResidentSessions();
   }

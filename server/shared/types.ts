@@ -373,6 +373,32 @@ export type ProviderRuntimePermissionGateway = {
   listPending(sessionId: string): unknown[];
 };
 
+//----------------- RESIDENT TASK BRIDGE ------------
+/** Trusted process identity issued by providers and verified by task-continuations. */
+export type TaskBridgeCredentialContext = {
+  userId: string | number;
+  appSessionId: string;
+  generation: number;
+};
+
+/**
+ * A tool invocation observed on the owning resident connection, never supplied
+ * by the HTTP caller. Providers attach the current run capability only after
+ * binding its native turn; task-continuations compares arguments and generation.
+ */
+export type TaskBridgeEngineCall = {
+  appSessionId: string;
+  generation: number;
+  threadId: string;
+  turnId: string | null;
+  callId: string;
+  server: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  runToken: string;
+};
+
+// ---------------------------
 /**
  * Provider-scoped application capabilities supplied to a runtime for one run.
  *
@@ -420,15 +446,7 @@ export type ProviderRuntimeContext = {
    * cannot take the round's authority from the process. It takes it from the
    * engine call it observed, and this is how that call reaches the host.
    */
-  registerEngineToolCall?(call: {
-    appSessionId: string;
-    threadId: string;
-    turnId: string | null;
-    callId: string;
-    server: string;
-    tool: string;
-    runToken: string;
-  }): void;
+  registerEngineToolCall?(call: TaskBridgeEngineCall): void;
   /** Optional provider hook for clearing incomplete real-time state at a terminal run outcome. */
   resetLiveMessageState?(sessionId: string): void;
   isProviderInstalled(): Promise<boolean>;

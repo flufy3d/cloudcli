@@ -71,16 +71,27 @@ test('an observed engine call is matched by the session and the call id', async 
       server: 'cloudcli_task_continuations',
       tool: 'cloudcli_task_run',
       runToken: 'trc_round_1',
+      generation: 3,
+      arguments: {},
     });
 
-    const found = resolveTaskBridgeCall('session-resident', 'call-1');
+    const found = resolveTaskBridgeCall('session-resident', 'call-1', 3);
     assert.equal(found?.threadId, 'native-thread-1');
     assert.equal(found?.turnId, 'native-turn-1');
     assert.equal(found?.runToken, 'trc_round_1');
 
+    assert.equal(resolveTaskBridgeCall('session-resident', 'call-1', 4), null);
+    registerTaskBridgeCall({
+      appSessionId: 'session-resident', generation: 4, threadId: 'new-native-thread', turnId: 'new-native-turn',
+      callId: 'call-1', server: 'cloudcli_task_continuations', tool: 'cloudcli_task_run',
+      arguments: {}, runToken: 'trc_round_2',
+    });
+    assert.equal(resolveTaskBridgeCall('session-resident', 'call-1', 3)?.runToken, 'trc_round_1');
+    assert.equal(resolveTaskBridgeCall('session-resident', 'call-1', 4)?.runToken, 'trc_round_2');
+
     // A call of another session is not this call.
-    assert.equal(resolveTaskBridgeCall('session-other', 'call-1'), null);
-    assert.equal(resolveTaskBridgeCall('session-resident', 'call-unknown'), null);
+    assert.equal(resolveTaskBridgeCall('session-other', 'call-1', 3), null);
+    assert.equal(resolveTaskBridgeCall('session-resident', 'call-unknown', 3), null);
   } finally {
     process.env.DATABASE_PATH = previousDatabasePath;
     process.env.JWT_SECRET = previousJwtSecret;
@@ -103,7 +114,7 @@ test('a bridge call waits for the engine call and gives up when it never comes',
   try {
     // The engine's record arrives after the call does: the two travel on
     // different channels.
-    const pending = waitForTaskBridgeCall('session-resident', 'call-late', 2_000);
+    const pending = waitForTaskBridgeCall('session-resident', 'call-late', 3, 2_000);
     setTimeout(() => {
       registerTaskBridgeCall({
         appSessionId: 'session-resident',
@@ -113,13 +124,15 @@ test('a bridge call waits for the engine call and gives up when it never comes',
         server: 'cloudcli_task_continuations',
         tool: 'cloudcli_task_run',
         runToken: 'trc_round_1',
+      generation: 3,
+      arguments: {},
       });
     }, 60);
 
     const found = await pending;
     assert.equal(found?.callId, 'call-late');
 
-    const never = await waitForTaskBridgeCall('session-resident', 'call-never', 100);
+    const never = await waitForTaskBridgeCall('session-resident', 'call-never', 3, 100);
     assert.equal(never, null);
   } finally {
     process.env.DATABASE_PATH = previousDatabasePath;

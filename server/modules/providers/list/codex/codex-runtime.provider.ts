@@ -71,7 +71,7 @@ import type {
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
 import type { NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
-import { readObjectRecord } from '@/shared/utils.js';
+import { AppError, readObjectRecord } from '@/shared/utils.js';
 
 const TASK_MCP_NAME = 'cloudcli_task_continuations';
 const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
@@ -350,7 +350,7 @@ type CodexEventTarget = {
    * the authority for a call from the engine call it observed rather than
    * from a secret the process carries.
    */
-  registerToolCall?: (call: { callId: string; server: string; tool: string }) => void;
+  registerToolCall?: (call: { callId: string; server: string; tool: string; arguments: Record<string, unknown> }) => void;
 };
 
 /** One `task_status` frame for a collab agent, folded by the client onto the card of `toolUseId`. */
@@ -471,7 +471,8 @@ function emitCodexItem(
     }
   }
   if (item.kind === 'mcp_tool_call') {
-    target.registerToolCall?.({ callId: item.id, server: item.server, tool: item.tool });
+    const args = readObjectRecord(item.toolArguments);
+    if (args) target.registerToolCall?.({ callId: item.id, server: item.server, tool: item.tool, arguments: args });
   }
   if (item.kind === 'subagent_activity') {
     emitCodexSubagentActivity(target, item, timestamp, backgroundWorkKey);
@@ -642,6 +643,8 @@ function settleCodexSessionAgents(
  * flight, and the card has to name the tool that waits.
  */
 const sessionApprovalSubjects = new Map<string, Map<string, { toolName: string; input: unknown }>>();
+/** Session approvals outlive any one borrower's round and are retracted on disposal. */
+const sessionApprovalIds = new Map<string, Set<string>>();
 
 /** The approval subjects of a session, created on first use. */
 function readSessionApprovalSubjects(appSessionId: string | null): Map<string, { toolName: string; input: unknown }> {
@@ -697,6 +700,12 @@ async function queryCodex(
     ? 'bypassPermissions'
     : taskApprovalPolicy === 'never' ? 'acceptEdits' : permissionMode;
   const { sandbox, approvalPolicy, sandboxPolicy } = resolveCodexExecutionPolicy(targetPermissionMode);
+  const toolOutputParam = options.toolOutput ?? (options.taskContinuation ? {
+      name: 'cloudcli_task_result',
+      output: typeof options.taskContinuation === 'string'
+        ? options.taskContinuation
+        : JSON.stringify(options.taskContinuation),
+    } : null);
   const taskExecutionContext = readObjectRecord(options.taskExecutionContext);
   const taskContinuationLifecycle = readObjectRecord(options.taskContinuationLifecycle);
   const onEngineTurnStarted = typeof taskContinuationLifecycle?.onEngineTurnStarted === 'function'
@@ -756,6 +765,7 @@ async function queryCodex(
   let connection: CodexAppServerConnection | null = null;
   let engineTurnId: string | null = null;
   let terminalStatus: 'completed' | 'failed' | 'interrupted' | 'unknown' = 'unknown';
+  let acceptanceUnknown = false;
   let acceptedTurnCallbackSent = false;
 
   const recordStartedTurn = (turnId: string | null): void => {
@@ -820,6 +830,8 @@ async function queryCodex(
    * terminal event, so a round's own events never travel the session's
    * publish entry.
    */
+  let residentGeneration: number | null = null;
+  let residentRoundId: string | null = null;
   const roundTarget: CodexEventTarget = {
     appSessionId: sessionId || null,
     threadId: () => capturedSessionId,
@@ -827,11 +839,13 @@ async function queryCodex(
     deliver: (message) => sendMessage(ws, message),
     approvalSubjects,
     registerToolCall: (call) => {
-      if (!taskRunToken || !capturedSessionId) {
+      if (!taskRunToken || !capturedSessionId || residentGeneration === null) {
         return;
       }
       context.registerEngineToolCall?.({
         appSessionId: sessionId || capturedSessionId,
+        generation: residentGeneration,
+        arguments: call.arguments,
         threadId: capturedSessionId,
         turnId: engineTurnId,
         callId: call.callId,
@@ -898,15 +912,6 @@ async function queryCodex(
   const openApprovalIds = new Set<string>();
 
   /**
-   * The approvals a session opened for the requests the engine made with no
-   * round in flight.
-   *
-   * They belong to the session rather than to a round: a round that ends must
-   * not retract the approval the engine is still waiting for.
-   */
-  const sessionApprovalIds = new Map<string, Set<string>>();
-
-  /**
    * Puts one approval in front of the user and waits for the answer.
    *
    * Codex is blocked on the JSON-RPC request until this resolves, so the wait
@@ -918,6 +923,7 @@ async function queryCodex(
     params: AnyRecord,
     deliver: (message: NormalizedMessage) => void = (message) => sendMessage(ws, message),
     subjects: Map<string, { toolName: string; input: unknown }> = approvalSubjects,
+    ownedApprovalIds: Set<string> = openApprovalIds,
   ): Promise<ProviderPermissionDecision | null> => {
     const itemId = readNonEmptyString(params.itemId) ?? randomUUID();
     const requestId = randomUUID();
@@ -944,7 +950,7 @@ async function queryCodex(
         }
         settled = true;
         pendingCodexApprovals.delete(requestId);
-        openApprovalIds.delete(requestId);
+        ownedApprovalIds.delete(requestId);
         resolve(decision);
       };
 
@@ -956,7 +962,7 @@ async function queryCodex(
         input: subject?.input,
         receivedAt: new Date(),
       });
-      openApprovalIds.add(requestId);
+      ownedApprovalIds.add(requestId);
 
       deliver(createNormalizedMessage({
         kind: 'permission_request',
@@ -1327,6 +1333,8 @@ async function queryCodex(
     if (isResidentSessionsEnabled()) {
       const resident = await acquireCodexResidentSession({
         appSessionId: residentKey,
+        lifetime: toolOutputParam ? 'turn' : 'session',
+        reserveForRound: true,
         userId: normalizedUserId,
         nativeThreadId: providerSessionId,
         workingDirectory,
@@ -1359,20 +1367,30 @@ async function queryCodex(
           approvalSubjects: readSessionApprovalSubjects(residentKey),
         }, method, params),
         onSessionExit: handleProcessExit,
-        onSessionRequest: (method, params) => requestApproval(
-          method,
-          params,
-          publishSessionMessage,
-          readSessionApprovalSubjects(residentKey),
-        ),
-        onRoundEnded: (reason) => {
+        onSessionRequest: async (method, params) => {
+          if (!CODEX_APPROVAL_METHODS.has(method)) return undefined;
+          let ids = sessionApprovalIds.get(residentKey);
+          if (!ids) {
+            ids = new Set<string>();
+            sessionApprovalIds.set(residentKey, ids);
+          }
+          const decision = await requestApproval(method, params, publishSessionMessage,
+            readSessionApprovalSubjects(residentKey), ids);
+          return toCodexApprovalResponse(method, params, decision);
+        },
+        onRoundEnded: (reason, cause) => {
           // The round cannot wait for an event that will never come: the
           // input was withdrawn, or the turn could not be identified.
           if (reason === 'cancelled') {
             terminalStatus = 'interrupted';
           } else {
             terminalStatus = 'unknown';
-            surfaceFailure('Codex could not tell which turn answered this message.');
+            acceptanceUnknown = true;
+            surfaceFailure(cause === 'interrupt'
+              ? 'Codex could not confirm that this turn stopped. Its conversation process and background agents were force-stopped. Check the results before retrying; independent tasks may still be running.'
+              : cause === 'stop'
+              ? 'Codex could not confirm whether the queued message ran. Its conversation process and background agents were force-stopped. Check the results before retrying; independent tasks may still be running.'
+              : 'Codex could not tell which turn answered this message.');
           }
           settle();
         },
@@ -1383,10 +1401,13 @@ async function queryCodex(
           // The agents of a closed process cannot report any more, so their
           // cards are settled.
           settleCodexSessionAgents(residentKey, publishSessionMessage);
+          cancelSessionApprovals(residentKey, 'The conversation process closed before this was answered.');
+          sessionApprovalSubjects.delete(residentKey);
         },
         isBusy: () => codexBackgroundWork.hasSession(residentKey),
       });
       connection = resident.connection;
+      residentGeneration = resident.generation;
       adoptNativeThread(resident.threadId);
     } else {
       connection = await codexAppServerTransport.open({
@@ -1449,19 +1470,16 @@ async function queryCodex(
       throw new Error('Codex app-server opened no thread to run the turn in.');
     }
 
-    const toolOutputParam = options.toolOutput ?? (options.taskContinuation ? {
-      name: 'cloudcli_task_result',
-      output: typeof options.taskContinuation === 'string'
-        ? options.taskContinuation
-        : JSON.stringify(options.taskContinuation),
-    } : null);
 
-    if (isResidentSessionsEnabled() && !toolOutputParam) {
+
+    if (isResidentSessionsEnabled()) {
       // The engine's queue is the admission gate: the input waits while the
       // thread is busy and becomes a turn of its own once it is idle.
-      await submitCodexResidentRound({
+      const submitted = await submitCodexResidentRound({
         appSessionId: residentKey,
-        input: toAppServerInput(inputItems as AnyRecord[]),
+        generation: residentGeneration ?? undefined,
+        input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
+        ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
         model: resolvedModel ?? undefined,
         effort: resolvedEffort ?? undefined,
         workingDirectory,
@@ -1471,6 +1489,7 @@ async function queryCodex(
         onEvent: handleRoundEvent,
         onRequest: handleRoundRequest,
       });
+      residentRoundId = submitted.clientUserMessageId;
     } else {
       const startResult = readObjectRecord(await connection.call('turn/start', {
         threadId: capturedSessionId,
@@ -1483,12 +1502,15 @@ async function queryCodex(
     }
 
     await turnSettled;
+    if (toolOutputParam && residentGeneration !== null) {
+      releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
+    }
     settleAgentsWhenProcessIsGone();
 
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session.
     const runAborted = currentSession()?.status === 'aborted';
-    if (runAborted) {
+    if (runAborted && !acceptanceUnknown) {
       terminalStatus = 'interrupted';
     }
     if (!runAborted) {
@@ -1511,6 +1533,9 @@ async function queryCodex(
 
   } catch (error) {
     const runError = error instanceof Error ? error : new Error(String(error));
+    if (toolOutputParam && error instanceof AppError && error.code === 'CODEX_SESSION_BUSY') {
+      return { engineTurnId: null, terminalStatus: 'unknown' as const, busy: true };
+    }
     settleAgentsWhenProcessIsGone();
     const wasAborted =
       currentSession()?.status === 'aborted' ||
@@ -1518,7 +1543,7 @@ async function queryCodex(
       runError.message.toLowerCase().includes('aborted');
 
     if (!wasAborted) {
-      terminalStatus = 'failed';
+      if (!acceptanceUnknown) terminalStatus = 'failed';
       console.error('[Codex] Error:', error);
 
       if (!errorSurfaced) {
@@ -1548,7 +1573,7 @@ async function queryCodex(
           error,
         });
       }
-    } else {
+    } else if (!acceptanceUnknown) {
       terminalStatus = 'interrupted';
     }
 
@@ -1561,11 +1586,17 @@ async function queryCodex(
     }
     if (isResidentSessionsEnabled()) {
       // The process stays alive: the next round continues in the same thread.
-      completeCodexResidentRound(residentKey);
-      if (!appSessionId) {
+      if (residentGeneration !== null && residentRoundId) {
+        completeCodexResidentRound(residentKey, { generation: residentGeneration, clientUserMessageId: residentRoundId });
+      }
+      if (toolOutputParam && residentGeneration !== null) {
+        releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
+      } else if (!appSessionId && residentGeneration !== null) {
         // A run without an app session has no conversation to stay resident
         // for, so its process is closed with the round.
-        releaseCodexResidentSession(residentKey, { dispose: true });
+        releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
+      } else if (residentGeneration !== null) {
+        releaseCodexResidentSession(residentKey, { generation: residentGeneration });
       }
     } else {
       connection?.close();

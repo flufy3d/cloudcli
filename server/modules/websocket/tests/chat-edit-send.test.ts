@@ -435,3 +435,29 @@ test('detached Codex continuation preserves engine acceptance callback beside na
     await runPromise;
   }, CODEX_TRANSCRIPT_ROWS);
 });
+
+test('a task continuation preserves the runtime busy result before engine acceptance', async () => {
+  await withGateway('codex', async ({ dependencies }) => {
+    const runtime = dependencies.runtime as { run: () => Promise<unknown> };
+    runtime.run = async () => ({ busy: true, engineTurnId: null, terminalStatus: 'unknown' });
+    const result = await runDetachedChatTurn({
+      sessionId: SESSION_ID, userId: 1, content: '', taskContinuation: { taskId: 'deferred-task', summary: 'done' },
+    }, dependencies as never);
+    assert.equal(result.started, false);
+    assert.equal(result.busy, true);
+    assert.equal(result.engineTurnId, undefined);
+    assert.equal(chatRunRegistry.isProcessing(SESSION_ID), false);
+  }, CODEX_TRANSCRIPT_ROWS);
+});
+
+test('a known reporting session defers task delivery without creating a gateway run', async () => {
+  await withGateway('codex', async ({ dependencies, runs }) => {
+    (dependencies.runtime as { hasSessionWork?: (id: string) => boolean }).hasSessionWork = () => true;
+    const result = await runDetachedChatTurn({
+      sessionId: SESSION_ID, userId: 1, content: '', taskContinuation: { taskId: 'report-blocked', summary: 'done' },
+    }, dependencies as never);
+    assert.equal(result.busy, true);
+    assert.equal(runs.length, 0);
+    assert.equal(chatRunRegistry.getRun(SESSION_ID), undefined);
+  }, CODEX_TRANSCRIPT_ROWS);
+});

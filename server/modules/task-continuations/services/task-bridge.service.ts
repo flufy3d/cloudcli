@@ -16,7 +16,9 @@
 import crypto from 'node:crypto';
 
 import { hashToken } from '@/modules/task-continuations/services/task-token.service.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError, canonicalizeJson, readObjectRecord, sha256Hex } from '@/shared/utils.js';
+import type { TaskBridgeCredentialContext, TaskBridgeEngineCall } from '@/shared/types.js';
+import { resolveTaskRunCapability } from '@/modules/task-continuations/services/task-run-context.service.js';
 
 /** How long a bridge credential stays valid. */
 const TASK_BRIDGE_CREDENTIAL_TTL_MS = 12 * 60 * 60 * 1000;
@@ -33,30 +35,9 @@ const OBSERVED_TASK_BRIDGE_CALL_TTL_MS = 60 * 60 * 1000;
 /** How long a bridge call waits for the engine's own event to arrive. */
 const BRIDGE_CALL_MATCH_TIMEOUT_MS = 5_000;
 
-/** The session a bridge credential belongs to. */
-export type TaskBridgeCredentialContext = {
-  /** The trusted user the session belongs to. */
-  userId: string | number;
-  appSessionId: string;
-  /** The process generation the credential was issued for. */
-  generation: number;
-};
-
-/** One MCP tool call the engine made, as the host observed it. */
-export type ObservedTaskBridgeCall = {
-  appSessionId: string;
-  /** The native thread the call happened in. */
-  threadId: string;
-  /** The native turn the call happened in. */
-  turnId: string | null;
-  /** The engine's own id for the call. */
-  callId: string;
-  /** The MCP server the call went to. */
-  server: string;
-  /** The tool the engine asked for. */
-  tool: string;
-  /** The round that made the call, and the authority that comes with it. */
-  runToken: string;
+/** Private snapshot: retain a digest rather than caller-mutable arguments. */
+type ObservedTaskBridgeCall = Omit<TaskBridgeEngineCall, 'arguments'> & {
+  argumentsDigest: string;
   observedAt: number;
 };
 
@@ -69,10 +50,8 @@ const activeCredentials = new Map<string, ActiveTaskBridgeCredential>();
 const observedCalls = new Map<string, ObservedTaskBridgeCall>();
 
 /** The key an observed call is stored under. */
-function callKey(appSessionId: string, callId: string): string {
-  // A separator that cannot appear in an id keeps the key unambiguous, and a
-  // printable one keeps the file readable for a human reviewing a diff.
-  return `${appSessionId}::${callId}`;
+function callKey(appSessionId: string, callId: string, generation: number): string {
+  return JSON.stringify([appSessionId, generation, callId]);
 }
 
 function pruneExpiredCredentials(now = Date.now()): void {
@@ -149,29 +128,46 @@ export function revokeTaskBridgeCredential(token: string): boolean {
  * carries the call's id. A bridge call that arrives before this record does
  * waits for it, because the two travel on different channels.
  */
-export function registerTaskBridgeCall(call: Omit<ObservedTaskBridgeCall, 'observedAt'>): void {
+export function registerTaskBridgeCall(call: TaskBridgeEngineCall): void {
   if (!call.appSessionId.trim() || !call.threadId.trim() || !call.callId.trim()
     || !call.server.trim() || !call.tool.trim() || !call.runToken.trim()) {
-    return;
+    throw new AppError('Engine call identity is invalid.', { code: 'INVALID_TASK_BRIDGE_CALL', statusCode: 400 });
+  }
+  if (!Number.isSafeInteger(call.generation) || call.generation < 1 || !readObjectRecord(call.arguments)) {
+    throw new AppError('Engine call snapshot is invalid.', { code: 'INVALID_TASK_BRIDGE_CALL', statusCode: 400 });
   }
   pruneExpiredCalls();
-  if (!observedCalls.has(callKey(call.appSessionId, call.callId))
+  if (!observedCalls.has(callKey(call.appSessionId, call.callId, call.generation))
     && observedCalls.size >= MAX_OBSERVED_TASK_BRIDGE_CALLS) {
     const oldest = [...observedCalls.entries()].sort((a, b) => a[1].observedAt - b[1].observedAt)[0];
     if (oldest) {
       observedCalls.delete(oldest[0]);
     }
   }
-  observedCalls.set(callKey(call.appSessionId, call.callId), { ...call, observedAt: Date.now() });
+  const { arguments: args, ...identity } = call;
+  const key = callKey(call.appSessionId, call.callId, call.generation);
+  const snapshot = { ...identity, argumentsDigest: sha256Hex(JSON.stringify(canonicalizeJson(args))), observedAt: Date.now() };
+  const previous = observedCalls.get(key);
+  if (previous) {
+    if (previous.generation !== snapshot.generation || previous.threadId !== snapshot.threadId
+      || previous.turnId !== snapshot.turnId || previous.server !== snapshot.server
+      || previous.tool !== snapshot.tool || previous.runToken !== snapshot.runToken
+      || previous.argumentsDigest !== snapshot.argumentsDigest) {
+      throw new AppError('Engine call identity was reused with a different snapshot.', { code: 'TASK_BRIDGE_CALL_MISMATCH', statusCode: 403 });
+    }
+    return;
+  }
+  observedCalls.set(key, snapshot);
 }
 
 /** The observed call a bridge call names, when the engine made it. */
 export function resolveTaskBridgeCall(
   appSessionId: string,
   callId: string,
+  generation: number,
 ): ObservedTaskBridgeCall | null {
   pruneExpiredCalls();
-  return observedCalls.get(callKey(appSessionId, callId)) ?? null;
+  return observedCalls.get(callKey(appSessionId, callId, generation)) ?? null;
 }
 
 /**
@@ -184,11 +180,12 @@ export function resolveTaskBridgeCall(
 export async function waitForTaskBridgeCall(
   appSessionId: string,
   callId: string,
+  generation: number,
   timeoutMs = BRIDGE_CALL_MATCH_TIMEOUT_MS,
 ): Promise<ObservedTaskBridgeCall | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const call = resolveTaskBridgeCall(appSessionId, callId);
+    const call = resolveTaskBridgeCall(appSessionId, callId, generation);
     if (call) {
       return call;
     }
@@ -206,4 +203,32 @@ export function clearTaskBridgeCalls(appSessionId: string): void {
       observedCalls.delete(key);
     }
   }
+}
+
+/** Used by the bridge route to verify the native snapshot before any task operation. */
+export async function authorizeTaskBridgeCall(input: {
+  credential: TaskBridgeCredentialContext;
+  identity: { callId: string; threadId: string; turnId: string };
+  tool: string;
+  arguments: Record<string, unknown>;
+}) {
+  const { credential, identity } = input;
+  const observed = await waitForTaskBridgeCall(credential.appSessionId, identity.callId, credential.generation);
+  if (!observed) throw new AppError('The engine did not announce this call.', { code: 'TASK_BRIDGE_CALL_UNKNOWN', statusCode: 403 });
+  if (observed.generation !== credential.generation || observed.threadId !== identity.threadId
+    || observed.turnId !== identity.turnId || observed.tool !== input.tool
+    || observed.server !== 'cloudcli_task_continuations'
+    || observed.argumentsDigest !== sha256Hex(JSON.stringify(canonicalizeJson(input.arguments)))) {
+    throw new AppError('The call does not match the engine call that was announced.', { code: 'TASK_BRIDGE_CALL_MISMATCH', statusCode: 403 });
+  }
+  const context = resolveTaskRunCapability(observed.runToken);
+  if (!context) throw new AppError('The run that made this call is over.', { code: 'TASK_RUN_CONTEXT_INVALID', statusCode: 401 });
+  if (String(context.userId) !== String(credential.userId) || context.sessionId !== credential.appSessionId
+    || context.providerThreadId !== observed.threadId) {
+    throw new AppError('The call does not belong to this session.', { code: 'TASK_BRIDGE_CALL_MISMATCH', statusCode: 403 });
+  }
+  const requestId = `bridge:${sha256Hex(JSON.stringify([
+    credential.appSessionId, observed.generation, observed.threadId, observed.turnId, observed.callId,
+  ]))}`;
+  return { context, capabilityToken: observed.runToken, requestId };
 }

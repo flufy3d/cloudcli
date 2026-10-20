@@ -37,6 +37,7 @@ import {
   type CodexAppServerHandlers,
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import type { AnyRecord } from '@/shared/index.js';
+import { AppError } from '@/shared/utils.js';
 
 /** How long a resident process may sit idle before it is reclaimed. */
 const RESIDENT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -46,6 +47,13 @@ const RESIDENT_MAX_SESSIONS = 4;
 
 /** How often the queue is read again when the read failed. */
 const QUEUE_READ_ATTEMPTS = 3;
+
+/** Maximum time to confirm an interrupt or submission-window stop. */
+const STOP_CONFIRMATION_MS = 3_000;
+
+/** Maximum time to wait for a replaced process to release the thread. */
+const PROCESS_EXIT_WAIT_MS = 5_000;
+type ResidentStopResult = 'interrupted' | 'cancelled' | 'not-found' | 'unknown';
 
 /** How long the host waits before it reads the queue again. */
 const QUEUE_READ_RETRY_MS = 50;
@@ -90,6 +98,14 @@ type ResidentRound = {
   clientUserMessageId: string;
   /** The engine's queue item id, empty until the submission lands. */
   queuedItemId: string | null;
+  /** A stop waits until submission can be identified or has failed. */
+  submitted: Promise<void>;
+  /** Tool results are submitted by turn/start and bound to its returned turn id. */
+  directSubmission: boolean;
+  /** Repeated stop requests share one operation and one deadline. */
+  stopping: Promise<ResidentStopResult> | null;
+  stopTimer: NodeJS.Timeout | null;
+  terminalSeen: boolean;
   /** Set once the engine consumed the queued input. */
   armed: boolean;
   /** The engine turn this round owns, once the engine started it. */
@@ -111,6 +127,10 @@ type ResidentSession = {
   /** The trusted user the conversation belongs to. */
   userId: string | null;
   generation: number;
+  /** A one-shot process is never reused or reclaimed before its owning turn releases it. */
+  lifetime: 'session' | 'turn';
+  /** The runtime owns the preparation window before its round is registered. */
+  reservedForRound: boolean;
   connection: CodexAppServerConnection;
   /** The native thread the rounds run in. */
   threadId: string;
@@ -118,6 +138,10 @@ type ResidentSession = {
   round: ResidentRound | null;
   /** Turns the engine started on its own, so their events stay out of the round. */
   engineTurns: Set<string>;
+  /** Unanswered engine requests keep their owning process alive. */
+  pendingRequests: number;
+  /** Notification order is independent of asynchronous queue-read completion order. */
+  latestPendingTurnKey: string | null;
   /**
    * The turns whose owner is not decided yet, keyed by turn id.
    *
@@ -131,6 +155,7 @@ type ResidentSession = {
   pendingTurns: Map<string, {
     turnId: string | null;
     events: Array<{ method: string; params: AnyRecord }>;
+    resolution: Promise<void> | null;
   }>;
   /** The shared initialization, so concurrent borrows open one process. */
   initializing: Promise<ResidentSession> | null;
@@ -149,7 +174,7 @@ type ResidentSession = {
   /** Answers a request the engine makes when no round is in flight. */
   onSessionRequest: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
   /** Called when the round ends without the engine reporting a terminal state. */
-  onRoundEnded: (reason: 'cancelled' | 'unknown') => void;
+  onRoundEnded: (reason: 'cancelled' | 'unknown', cause?: 'stop' | 'interrupt') => void;
   /** The credential the process carried, revoked when the process is gone. */
   credentialToken: string | null;
   /** Revokes the credential the process carried. */
@@ -170,6 +195,10 @@ export type CodexResidentSession = {
 
 /** What a caller needs to open or reuse a resident session. */
 export type CodexResidentSessionOptions = {
+  /** Tool-result callers request an exclusive fresh process that lives for one turn. */
+  lifetime?: 'session' | 'turn';
+  /** Chat runtime reserves input preparation; diagnostics may share an unreserved connection. */
+  reserveForRound?: boolean;
   /** The app session the process belongs to. */
   appSessionId: string;
   /**
@@ -240,7 +269,7 @@ export type CodexResidentSessionOptions = {
    * round's turn could not be identified. Either way the round must not wait
    * for an event that will never come.
    */
-  onRoundEnded?: (reason: 'cancelled' | 'unknown') => void;
+  onRoundEnded?: (reason: 'cancelled' | 'unknown', cause?: 'stop' | 'interrupt') => void;
   /** Revokes the credential the process carried, when the process is gone. */
   revokeCredential?: (token: string) => void;
   /** Called when the process of the session is closed. */
@@ -252,8 +281,12 @@ export type CodexResidentSessionOptions = {
 /** What a caller needs to submit a round. */
 export type CodexResidentRoundOptions = {
   appSessionId: string;
+  /** Chat runtime binds submission to the connection it acquired. */
+  generation?: number;
   /** The user input, in the shape app-server's queue accepts. */
   input: AnyRecord[];
+  /** Native tool result input; the engine queue only accepts user input. */
+  toolOutput?: AnyRecord;
   /** The model the round runs with. */
   model?: string;
   /** The reasoning effort the round runs with. */
@@ -273,6 +306,17 @@ export type CodexResidentRoundOptions = {
 };
 
 const residentSessions = new Map<string, ResidentSession>();
+
+/**
+ * The exit of a process that was released, per app session.
+ *
+ * A thread can only be resumed by one process at a time, so the process that
+ * held it has to be gone before the next one takes it over. The exit is
+ * remembered here because the release itself is synchronous.
+ */
+const releasedProcessExits = new Map<string, Promise<void>>();
+// Monotonic across removal/recreation; old credentials never name a new process.
+let nextProcessGeneration = 0;
 
 /**
  * The sessions whose admission is closed.
@@ -317,6 +361,7 @@ function disposeResidentSession(session: ResidentSession, reason: string): void 
     return;
   }
   session.disposed = true;
+  if (session.round?.stopTimer) clearTimeout(session.round.stopTimer);
   if (session.idleTimer) {
     clearTimeout(session.idleTimer);
     session.idleTimer = null;
@@ -325,9 +370,14 @@ function disposeResidentSession(session: ResidentSession, reason: string): void 
     residentSessions.delete(session.appSessionId);
   }
   try {
-    session.connection.close();
+    session.connection?.close();
   } catch (error) {
     console.warn(`[Codex] Closing the resident session ${session.appSessionId} failed:`, error);
+  }
+  // The thread this process held is only free once it is gone.
+  const exited = session.connection?.waitForExit?.() ?? null;
+  if (exited) {
+    releasedProcessExits.set(session.appSessionId, exited);
   }
   // The credential the process carried only ever authorized that process.
   if (session.credentialToken) {
@@ -422,6 +472,33 @@ async function refreshRoundArmedState(session: ResidentSession): Promise<QueueAr
   return 'unreadable';
 }
 
+/** Live and buffered own-turn events acknowledge the same stop deadline. */
+function deliverRoundEvent(round: ResidentRound, method: string, params: AnyRecord): void {
+  if (method === 'turn/completed') {
+    round.terminalSeen = true;
+    if (round.stopTimer) clearTimeout(round.stopTimer);
+    round.stopTimer = null;
+  }
+  round.onEvent(method, params);
+}
+
+/** One activity predicate shared by archive checks and both reclaim paths. */
+function hasResidentWork(session: ResidentSession): boolean {
+  return session.lifetime === 'turn' || session.reservedForRound || Boolean(session.initializing || session.round)
+    || session.engineTurns.size > 0 || session.pendingTurns.size > 0
+    || session.pendingRequests > 0 || session.isBusy();
+}
+
+/** Engine turns use the same lifecycle accounting for live and buffered events. */
+function deliverEngineEvent(session: ResidentSession, method: string, params: AnyRecord): void {
+  const turnId = readEventTurnId(params);
+  if (method === 'turn/started' && turnId) session.engineTurns.add(turnId);
+  if (method === 'turn/completed' && turnId) session.engineTurns.delete(turnId);
+  session.lastUsedAt = Date.now();
+  session.onEngineEvent(method, params, session.threadId);
+  scheduleResidentReclaim(session);
+}
+
 /**
  * Routes one notification to the round it belongs to.
  *
@@ -433,24 +510,29 @@ function routeResidentNotification(session: ResidentSession, method: string, par
   const round = session.round;
 
   if (method === 'turn/started') {
+    if (round?.turnId && round.turnId === turnId) {
+      deliverRoundEvent(round, method, params);
+      return;
+    }
     if (round && !round.turnId) {
       if (round.armed) {
         round.turnId = turnId;
-        round.onEvent(method, params);
+        deliverRoundEvent(round, method, params);
         return;
       }
       // The engine may have consumed the queued input right before this turn
       // started, but the host has not seen the consumption yet. The turn is
       // held until the queue says who owns it.
       const key = turnId ?? `turn-without-id-${randomUUID()}`;
-      session.pendingTurns.set(key, { turnId, events: [{ method, params }] });
-      void resolvePendingTurn(session, key);
+      session.latestPendingTurnKey = key;
+      const pending = { turnId, events: [{ method, params }], resolution: null as Promise<void> | null };
+      session.pendingTurns.set(key, pending);
+      if (!round.directSubmission) {
+        pending.resolution = resolvePendingTurn(session, key).catch((error: unknown) => failResidentEvent(session, error));
+      }
       return;
     }
-    if (turnId) {
-      session.engineTurns.add(turnId);
-    }
-    session.onEngineEvent(method, params, session.threadId);
+    deliverEngineEvent(session, method, params);
     return;
   }
 
@@ -465,24 +547,24 @@ function routeResidentNotification(session: ResidentSession, method: string, par
     session.engineTurns.delete(turnId);
   }
   if (turnId && round?.turnId === turnId) {
-    round.onEvent(method, params);
+    deliverRoundEvent(round, method, params);
     return;
   }
   if (turnId && session.engineTurns.has(turnId)) {
-    session.onEngineEvent(method, params, session.threadId);
+    deliverEngineEvent(session, method, params);
     return;
   }
   if (turnId) {
     // An event of a turn this session never saw start. It belongs to neither
     // the round nor a known engine turn, so it must not end the round.
-    session.onEngineEvent(method, params, session.threadId);
+    deliverEngineEvent(session, method, params);
     return;
   }
   if (round) {
-    round.onEvent(method, params);
+    deliverRoundEvent(round, method, params);
     return;
   }
-  session.onEngineEvent(method, params, session.threadId);
+  deliverEngineEvent(session, method, params);
 }
 
 /**
@@ -511,19 +593,40 @@ async function resolvePendingTurn(session: ResidentSession, key: string): Promis
   // The engine starts the turns of a thread in order, so the last waiting
   // turn is the one the round's own input produced; an earlier one is the
   // engine reporting on its own.
-  const isLatestWaitingTurn = session.pendingTurns.size === 0;
+  const isLatestWaitingTurn = session.latestPendingTurnKey === key;
   if (armed === 'armed' && round && !round.turnId && isLatestWaitingTurn) {
     round.turnId = pending.turnId;
     for (const event of pending.events) {
-      round.onEvent(event.method, event.params);
+      deliverRoundEvent(round, event.method, event.params);
     }
     return;
   }
-  if (pending.turnId) {
-    session.engineTurns.add(pending.turnId);
-  }
   for (const event of pending.events) {
-    session.onEngineEvent(event.method, event.params, session.threadId);
+    deliverEngineEvent(session, event.method, event.params);
+  }
+}
+
+/** Native stream handlers must not let one malformed call crash other sessions. */
+function failResidentEvent(session: ResidentSession, error: unknown): void {
+  const reason = error instanceof Error ? error.message : String(error);
+  console.error(`[Codex] Native event handling failed for ${session.appSessionId}:`, error);
+  disposeResidentSession(session, 'native event handling failed');
+  session.onSessionExit(reason);
+}
+
+/** A cancelled host input must not discard the engine's concurrent report. */
+function publishPendingEngineTurns(session: ResidentSession): boolean {
+  const waiting = [...session.pendingTurns.values()];
+  session.pendingTurns.clear();
+  if (session.disposed) return false;
+  try {
+    for (const pending of waiting) {
+      for (const event of pending.events) deliverEngineEvent(session, event.method, event.params);
+    }
+    return true;
+  } catch (error) {
+    failResidentEvent(session, error);
+    return false;
   }
 }
 
@@ -531,31 +634,48 @@ async function resolvePendingTurn(session: ResidentSession, key: string): Promis
 function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers {
   return {
     onNotification: (method, params) => {
-      if (session.disposed) {
-        return;
+      try {
+        if (session.disposed) {
+          return;
+        }
+        const eventThreadId = readEventThreadId(params);
+        if (eventThreadId && eventThreadId !== session.threadId) {
+          // Subagents and auxiliary threads report on the same connection.
+          session.onEngineEvent(method, params, session.threadId);
+          return;
+        }
+        if (method === 'thread/queue/changed') {
+          // The manager consumes this one: it says the engine took a queued
+          // input, which is what arms the round that submitted it.
+          void refreshRoundArmedState(session);
+          return;
+        }
+        routeResidentNotification(session, method, params);
+      } catch (error) {
+        failResidentEvent(session, error);
       }
-      const eventThreadId = readEventThreadId(params);
-      if (eventThreadId && eventThreadId !== session.threadId) {
-        // Subagents and auxiliary threads report on the same connection.
-        session.onEngineEvent(method, params, session.threadId);
-        return;
-      }
-      if (method === 'thread/queue/changed') {
-        // The manager consumes this one: it says the engine took a queued
-        // input, which is what arms the round that submitted it.
-        void refreshRoundArmedState(session);
-        return;
-      }
-      routeResidentNotification(session, method, params);
     },
     onRequest: async (method, params) => {
-      const round = session.round;
-      if (!round) {
-        // The engine blocks on the answer, so a request without a round still
-        // gets one: it belongs to the session, not to a round.
-        return session.onSessionRequest(method, params);
+      if (session.disposed) throw new Error('The Codex conversation is closed.');
+      session.pendingRequests += 1;
+      scheduleResidentReclaim(session);
+      try {
+        const round = session.round;
+        const turnId = readEventTurnId(params);
+        const threadId = readEventThreadId(params);
+        if (round && turnId && !round.turnId) {
+          await round.submitted;
+          await session.pendingTurns.get(turnId)?.resolution;
+        }
+        if (session.disposed) throw new Error('The Codex conversation is closed.');
+        const belongsToRound = round && session.round === round && turnId
+          && round.turnId === turnId && (!threadId || threadId === session.threadId);
+        return await (belongsToRound ? round.onRequest(method, params) : session.onSessionRequest(method, params));
+      } finally {
+        session.pendingRequests -= 1;
+        session.lastUsedAt = Date.now();
+        scheduleResidentReclaim(session);
       }
-      return round.onRequest(method, params);
     },
     onExit: (reason) => {
       disposeResidentSession(session, `process exited: ${reason}`);
@@ -575,12 +695,12 @@ function scheduleResidentReclaim(session: ResidentSession): void {
     clearTimeout(session.idleTimer);
     session.idleTimer = null;
   }
-  if (session.disposed || session.round) {
+  if (session.disposed || hasResidentWork(session)) {
     return;
   }
   session.idleTimer = setTimeout(() => {
     session.idleTimer = null;
-    if (session.disposed || session.round || session.isBusy()) {
+    if (session.disposed || hasResidentWork(session)) {
       return;
     }
     disposeResidentSession(session, 'idle');
@@ -601,7 +721,7 @@ function evictResidentSessionIfNeeded(): void {
     return;
   }
   const candidates = [...residentSessions.values()]
-    .filter((session) => !session.round && !session.isBusy())
+    .filter((session) => !session.disposed && !hasResidentWork(session))
     .sort((left, right) => left.lastUsedAt - right.lastUsedAt);
   const evicted = candidates[0];
   if (evicted) {
@@ -623,8 +743,34 @@ function evictResidentSessionIfNeeded(): void {
 export async function acquireCodexResidentSession(
   options: CodexResidentSessionOptions,
 ): Promise<CodexResidentSession> {
+  if (closedAdmission.has(options.appSessionId)) {
+    throw new Error('The Codex conversation is being closed and cannot take another message.');
+  }
   const existing = residentSessions.get(options.appSessionId);
+  if (existing && !existing.disposed && (existing.lifetime === 'turn'
+    || (options.reserveForRound && (existing.reservedForRound || existing.round))
+    || (options.lifetime === 'turn' && hasResidentWork(existing)))) {
+    throw new AppError('The Codex conversation is busy; the tool result has not been submitted.', {
+      code: 'CODEX_SESSION_BUSY', statusCode: 409,
+    });
+  }
+  if (existing && !existing.disposed && options.lifetime === 'turn') {
+    options = { ...options, nativeThreadId: options.nativeThreadId ?? existing.threadId };
+    // A thread can only be resumed by one process at a time, so the process
+    // that holds it has to be gone before the new one takes it over.
+    const released = existing.connection?.waitForExit?.() ?? null;
+    disposeResidentSession(existing, 'idle process replaced for a tool-result turn');
+    if (released) {
+      const gone = await Promise.race([released.then(() => true), sleep(PROCESS_EXIT_WAIT_MS).then(() => false)]);
+      if (!gone) {
+        console.warn(
+          `[Codex] The replaced process of ${options.appSessionId} did not exit in time; the thread may stay locked.`,
+        );
+      }
+    }
+  }
   if (existing && !existing.disposed) {
+    if (options.reserveForRound) existing.reservedForRound = true;
     existing.lastUsedAt = Date.now();
     // The latest borrower's callbacks describe the current state of the
     // conversation, so they replace the ones of the previous borrower.
@@ -634,7 +780,6 @@ export async function acquireCodexResidentSession(
     existing.onRoundEnded = options.onRoundEnded ?? existing.onRoundEnded;
     existing.onSessionDisposed = options.onSessionDisposed ?? existing.onSessionDisposed;
     existing.isBusy = options.isBusy ?? existing.isBusy;
-    const wasInitializing = Boolean(existing.initializing);
     if (existing.initializing) {
       await existing.initializing;
     }
@@ -647,6 +792,7 @@ export async function acquireCodexResidentSession(
         && settled.threadId !== options.nativeThreadId;
       const userChanged = Boolean(options.userId) && settled.userId !== options.userId;
       if (!threadChanged && !userChanged) {
+        if (options.reserveForRound) settled.reservedForRound = true;
         settled.lastUsedAt = Date.now();
         if (settled.idleTimer) {
           clearTimeout(settled.idleTimer);
@@ -666,17 +812,37 @@ export async function acquireCodexResidentSession(
     }
   }
 
+  // The process that held this thread before must be gone before the new one
+  // resumes it.
+  const previousExit = releasedProcessExits.get(options.appSessionId);
+  if (previousExit) {
+    releasedProcessExits.delete(options.appSessionId);
+    const gone = await Promise.race([
+      previousExit.then(() => true),
+      sleep(PROCESS_EXIT_WAIT_MS).then(() => false),
+    ]);
+    if (!gone) {
+      console.warn(
+        `[Codex] The previous process of ${options.appSessionId} did not exit in time; the thread may stay locked.`,
+      );
+    }
+  }
+
   evictResidentSessionIfNeeded();
 
   const session: ResidentSession = {
     appSessionId: options.appSessionId,
     userId: options.userId ?? null,
-    generation: (existing?.generation ?? 0) + 1,
+    generation: ++nextProcessGeneration,
+    lifetime: options.lifetime ?? 'session',
+    reservedForRound: options.reserveForRound ?? false,
     connection: undefined as unknown as CodexAppServerConnection,
     threadId: '',
     round: null,
     engineTurns: new Set<string>(),
+    pendingRequests: 0,
     pendingTurns: new Map(),
+    latestPendingTurnKey: null,
     initializing: null,
     lastUsedAt: Date.now(),
     idleTimer: null,
@@ -700,8 +866,15 @@ export async function acquireCodexResidentSession(
       buildResidentHandlers(session),
       { experimentalApi: true, ...(processSetup ? { env: processSetup.env } : {}) },
     );
+    if (session.disposed) {
+      connection.close();
+      throw new Error('The Codex conversation was closed during initialization.');
+    }
     session.connection = connection;
     const threadConfig = options.config ? await options.config(connection) : {};
+    if (session.disposed) {
+      throw new Error('The Codex conversation was closed during initialization.');
+    }
     const thread = await connection.call(
       options.nativeThreadId ? 'thread/resume' : 'thread/start',
       {
@@ -712,9 +885,11 @@ export async function acquireCodexResidentSession(
         config: threadConfig,
       },
     ) as { thread?: { id?: unknown } } | undefined;
+    if (session.disposed) {
+      throw new Error('The Codex conversation was closed during initialization.');
+    }
     const threadId = typeof thread?.thread?.id === 'string' ? thread.thread.id : '';
     if (!threadId) {
-      connection.close();
       throw new Error('Codex app-server opened no thread to run the session in.');
     }
     session.threadId = threadId;
@@ -739,9 +914,7 @@ export async function acquireCodexResidentSession(
       connection: settled.connection,
     };
   } catch (error) {
-    if (residentSessions.get(options.appSessionId) === session) {
-      residentSessions.delete(options.appSessionId);
-    }
+    disposeResidentSession(session, 'initialization failed');
     throw error;
   }
 }
@@ -760,8 +933,14 @@ export async function submitCodexResidentRound(
   if (!session || session.disposed) {
     throw new Error('The Codex conversation is no longer resident. Send the message again.');
   }
+  if (options.generation !== undefined && session.generation !== options.generation) {
+    throw new Error('The Codex process generation was replaced before submission.');
+  }
   if (session.round) {
     throw new Error('The Codex conversation is already answering.');
+  }
+  if (options.toolOutput && session.lifetime !== 'turn') {
+    throw new Error('Tool results require an exclusive one-shot Codex process.');
   }
   if (closedAdmission.has(options.appSessionId)) {
     throw new Error('The Codex conversation is being closed and cannot take another message.');
@@ -769,17 +948,28 @@ export async function submitCodexResidentRound(
   if (session.initializing) {
     await session.initializing;
   }
+  if (session.disposed || residentSessions.get(options.appSessionId) !== session) {
+    throw new Error('The Codex process generation was replaced before submission.');
+  }
 
   const clientUserMessageId = randomUUID();
+  let finishSubmission!: () => void;
+  const submitted = new Promise<void>((resolve) => { finishSubmission = resolve; });
   const round: ResidentRound = {
     clientUserMessageId,
     queuedItemId: null,
+    submitted,
+    directSubmission: Boolean(options.toolOutput),
+    stopping: null,
+    stopTimer: null,
+    terminalSeen: false,
     armed: false,
     turnId: null,
     onEvent: options.onEvent,
     onRequest: options.onRequest,
   };
   session.round = round;
+  session.reservedForRound = false;
   session.lastUsedAt = Date.now();
 
   try {
@@ -792,6 +982,35 @@ export async function submitCodexResidentRound(
         ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
         ...(options.sandboxPolicy ? { sandboxPolicy: options.sandboxPolicy } : {}),
       });
+    }
+
+    if (options.toolOutput) {
+      // This protocol only queues user input. Refuse known engine work before
+      // injecting a native tool result, and bind only the returned turn id.
+      if (session.engineTurns.size > 0 || session.pendingTurns.size > 0 || session.pendingRequests > 0 || session.isBusy()) {
+        throw new AppError('The Codex thread is busy reporting; the tool result was not submitted.', {
+          code: 'CODEX_SESSION_BUSY', statusCode: 409,
+        });
+      }
+      const started = await session.connection.call('turn/start', {
+        threadId: session.threadId, input: [], toolOutput: options.toolOutput,
+      }) as { turn?: { id?: unknown } } | undefined;
+      if (session.disposed || session.round !== round) throw new Error('The Codex conversation is closed.');
+      const turnId = typeof started?.turn?.id === 'string' ? started.turn.id : null;
+      if (!turnId || session.engineTurns.has(turnId)) {
+        session.onRoundEnded('unknown');
+        throw new Error('Codex could not identify an independent tool-result turn.');
+      }
+      round.turnId = turnId;
+      const waiting = [...session.pendingTurns.values()];
+      session.pendingTurns.clear();
+      for (const pending of waiting) {
+        for (const event of pending.events) {
+          if (pending.turnId === turnId) deliverRoundEvent(round, event.method, event.params);
+          else deliverEngineEvent(session, event.method, event.params);
+        }
+      }
+      return { clientUserMessageId };
     }
 
     const added = await session.connection.call('thread/queue/add', {
@@ -808,6 +1027,8 @@ export async function submitCodexResidentRound(
     session.round = null;
     scheduleResidentReclaim(session);
     throw error;
+  } finally {
+    finishSubmission();
   }
 }
 
@@ -817,36 +1038,75 @@ export async function submitCodexResidentRound(
  * A round that already started is interrupted; a round that is still queued is
  * removed from the queue, which is the only way to cancel it.
  */
-export async function stopCodexResidentRound(
-  appSessionId: string,
-): Promise<'interrupted' | 'cancelled' | 'not-found'> {
+export function stopCodexResidentRound(appSessionId: string): Promise<ResidentStopResult> {
   const session = residentSessions.get(appSessionId);
-  if (!session || session.disposed) {
-    return 'not-found';
+  const round = session?.round;
+  if (!session || session.disposed || !round) return Promise.resolve('not-found');
+  round.stopping ??= stopResidentRound(session, round);
+  return round.stopping;
+}
+
+/** Only the captured round may be failed by its own stop timeout. */
+function forceUnknownStop(session: ResidentSession, round: ResidentRound, error: unknown, cause: 'stop' | 'interrupt'): void {
+  if (session.disposed || session.round !== round || round.terminalSeen) return;
+  console.warn(`[Codex] Stop of ${session.appSessionId} is unknown; forcing process exit:`, error);
+  session.onRoundEnded('unknown', cause);
+  disposeResidentSession(session, 'stop could not be confirmed');
+}
+
+async function interruptResidentRound(session: ResidentSession, round: ResidentRound): Promise<ResidentStopResult> {
+  if (!round.stopTimer) {
+    round.stopTimer = setTimeout(() => forceUnknownStop(session, round,
+      new Error('No terminal event arrived after the interrupt.'), 'interrupt'), STOP_CONFIRMATION_MS);
+    round.stopTimer.unref?.();
   }
-  const round = session.round;
-  if (!round) {
-    return 'not-found';
-  }
-  if (round.turnId) {
-    await session.connection.call('turn/interrupt', {
-      threadId: session.threadId,
-      turnId: round.turnId,
-    }).catch((error: unknown) => {
-      console.warn(`[Codex] Interrupt for ${appSessionId} was not accepted:`, error);
-    });
+  try {
+    await session.connection.call('turn/interrupt', { threadId: session.threadId, turnId: round.turnId }, { timeoutMs: STOP_CONFIRMATION_MS });
     return 'interrupted';
+  } catch (error) {
+    forceUnknownStop(session, round, error, 'interrupt');
+    return round.terminalSeen ? 'not-found' : 'unknown';
   }
+}
+
+async function stopResidentRound(session: ResidentSession, round: ResidentRound): Promise<ResidentStopResult> {
+  const appSessionId = session.appSessionId;
+  let deadline: NodeJS.Timeout | undefined;
+  try {
+    if (!round.turnId && !round.queuedItemId) await Promise.race([
+      round.submitted,
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error('Submission did not settle before stopping.')), STOP_CONFIRMATION_MS);
+      }),
+    ]);
+  } catch (error) {
+    forceUnknownStop(session, round, error, 'stop');
+    return 'unknown';
+  } finally {
+    clearTimeout(deadline);
+  }
+  if (session.disposed || session.round !== round) return 'not-found';
+  if (round.turnId) return interruptResidentRound(session, round);
   if (round.queuedItemId) {
-    await session.connection.call('thread/queue/delete', {
-      threadId: session.threadId,
-      queuedSubmissionId: round.queuedItemId,
-    }).catch((error: unknown) => {
-      console.warn(`[Codex] Removing the queued message of ${appSessionId} failed:`, error);
-    });
+    try {
+      const withdrawal = await session.connection.call('thread/queue/delete', {
+        threadId: session.threadId,
+        queuedSubmissionId: round.queuedItemId,
+      }, { timeoutMs: STOP_CONFIRMATION_MS }) as { deleted?: unknown } | undefined;
+      if (session.disposed || session.round !== round) return 'not-found';
+      if (withdrawal?.deleted !== true) {
+        if (round.turnId) {
+          return interruptResidentRound(session, round);
+        }
+        throw new Error('The engine did not confirm removal of the queued input.');
+      }
+    } catch (error) {
+      forceUnknownStop(session, round, error, 'stop');
+      return 'unknown';
+    }
   }
   session.round = null;
-  session.pendingTurns.clear();
+  if (!publishPendingEngineTurns(session)) return 'unknown';
   // The engine will report no turn for an input that was withdrawn, so the
   // round ends here instead of waiting for a terminal event that never comes.
   session.onRoundEnded('cancelled');
@@ -859,13 +1119,18 @@ export async function stopCodexResidentRound(
  *
  * The process stays alive: the next round continues in the same thread.
  */
-export function completeCodexResidentRound(appSessionId: string): void {
+export function completeCodexResidentRound(
+  appSessionId: string,
+  expected?: { generation: number; clientUserMessageId: string },
+): void {
   const session = residentSessions.get(appSessionId);
-  if (!session) {
+  if (!session || (expected && (session.generation !== expected.generation
+    || session.round?.clientUserMessageId !== expected.clientUserMessageId))) {
     return;
   }
+  if (session.round?.stopTimer) clearTimeout(session.round.stopTimer);
   session.round = null;
-  session.pendingTurns.clear();
+  publishPendingEngineTurns(session);
   // The engine's own turns are not cleared here: a report the engine started
   // is still running, and the session must not look idle while it does.
   session.lastUsedAt = Date.now();
@@ -878,15 +1143,16 @@ export function completeCodexResidentRound(appSessionId: string): void {
  * `dispose` ends the process right away, which is what a deleted or archived
  * conversation needs.
  */
-export function releaseCodexResidentSession(appSessionId: string, options?: { dispose?: boolean }): void {
+export function releaseCodexResidentSession(appSessionId: string, options?: { dispose?: boolean; generation?: number }): void {
   const session = residentSessions.get(appSessionId);
-  if (!session) {
+  if (!session || (options?.generation !== undefined && session.generation !== options.generation)) {
     return;
   }
   if (options?.dispose) {
     disposeResidentSession(session, 'released');
     return;
   }
+  session.reservedForRound = false;
   session.lastUsedAt = Date.now();
   scheduleResidentReclaim(session);
 }
@@ -903,7 +1169,7 @@ export function isCodexResidentSessionBusy(appSessionId: string): boolean {
   if (!session || session.disposed) {
     return false;
   }
-  return Boolean(session.round) || session.engineTurns.size > 0 || session.isBusy();
+  return hasResidentWork(session);
 }
 
 /**

@@ -2083,3 +2083,16 @@ export function resolveCodexExecutionPolicy(permissionMode: string): {
     sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
   };
 }
+
+//----------------- CANONICAL JSON ------------
+/**
+ * Recursively sorts object keys without changing arrays or JSON scalar values.
+ * Task result digests and bridge argument digests use this on parsed JSON so
+ * property insertion order cannot change equality. This is not a JSON validator.
+ */
+export function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeJson);
+  if (typeof value !== 'object' || value === null) return value;
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(Object.keys(record).sort().map((key) => [key, canonicalizeJson(record[key])]));
+}

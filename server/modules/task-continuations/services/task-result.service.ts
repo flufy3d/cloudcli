@@ -2,7 +2,7 @@ import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import { calculateResultDigest } from '@/modules/task-continuations/services/task-continuation-state.service.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError, canonicalizeJson } from '@/shared/utils.js';
 
 const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 export const MAX_TASK_RESULT_BYTES = 1_000_000;
@@ -94,18 +94,6 @@ export async function readAndNormalizeTaskResultFromDisk(input: {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function canonicalizeJson(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(canonicalizeJson);
-  }
-  if (!isRecord(value)) {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.keys(value).sort().map((key) => [key, canonicalizeJson(value[key])]),
-  );
 }
 
 function invalidTaskResult(message: string): never {

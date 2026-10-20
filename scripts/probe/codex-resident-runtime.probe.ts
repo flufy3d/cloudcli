@@ -10,52 +10,12 @@
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import http from 'node:http';
+import assert from 'node:assert/strict';
+import { startFakeModel } from './resident-fake-model.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-
-/** The fake model: one assistant message per request, then the turn ends. */
-function startFakeModel() {
-  const requests: string[] = [];
-  const server = http.createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk) => chunks.push(chunk as Buffer));
-    req.on('end', () => {
-      requests.push(Buffer.concat(chunks).toString('utf8'));
-      const item = {
-        id: 'msg_probe',
-        type: 'message',
-        status: 'completed',
-        role: 'assistant',
-        content: [{ type: 'output_text', text: 'probe-ok' }],
-      };
-      const response = {
-        id: 'resp_probe',
-        object: 'response',
-        created_at: 0,
-        status: 'completed',
-        model: 'probe-model',
-        output: [item],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-      };
-      const events = [
-        ['response.created', { type: 'response.created', response: { ...response, status: 'in_progress', output: [] } }],
-        ['response.output_item.added', { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } }],
-        ['response.output_text.delta', { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'probe-ok' }],
-        ['response.output_item.done', { type: 'response.output_item.done', output_index: 0, item }],
-        ['response.completed', { type: 'response.completed', response }],
-      ];
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      res.end(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(''));
-    });
-  });
-  const listening = new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
-  return { requests, listening, port: () => (server.address() as { port: number }).port };
-}
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
   const model = startFakeModel();
@@ -82,15 +42,18 @@ wire_api = "responses"
   process.env.CLOUDCLI_CODEX_RESIDENT = '1';
 
   const { codexRuntime } = await import('@/modules/providers/list/codex/codex-runtime.provider.js');
-  const { closeCodexResidentSessions } = await import('@/modules/providers/list/codex/codex-session-manager.js');
+  const { closeCodexResidentSessions, listCodexResidentSessions } = await import('@/modules/providers/list/codex/codex-session-manager.js');
 
   const firstMessages: any[] = [];
   const secondMessages: any[] = [];
+  const { CodexSessionsProvider } = await import('@/modules/providers/list/codex/codex-sessions.provider.js');
+  const sessions = new CodexSessionsProvider();
+  let resolvedThreadId: string | null = null;
   const context = {
-    resolveProviderSessionId: () => null,
+    resolveProviderSessionId: () => resolvedThreadId,
     resolveResumeModel: async () => 'probe-model',
     getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'probe-model' }),
-    normalizeMessage: (row: any) => [row],
+    normalizeMessage: (row: unknown, sessionId: string | null) => sessions.normalizeMessage(row, sessionId),
     isProviderInstalled: async () => true,
   };
 
@@ -101,6 +64,7 @@ wire_api = "responses"
       model: 'probe-model',
     }, { isWebSocketWriter: true, send: (message: any) => firstMessages.push(message) }, context as never);
 
+    const firstResident = listCodexResidentSessions()[0];
     const second = await codexRuntime.run('SECOND-RUNTIME-PROBE-TEXT', {
       sessionId: 'probe-runtime-session',
       cwd: REPO_ROOT,
@@ -111,6 +75,51 @@ wire_api = "responses"
     const secondReply = secondMessages.find((message) => message.kind === 'assistant' || message.kind === 'text');
     const firstComplete = firstMessages.find((message) => message.kind === 'complete');
     const secondComplete = secondMessages.find((message) => message.kind === 'complete');
+
+    const secondResident = listCodexResidentSessions()[0];
+    assert.ok(firstReply && secondReply, 'both rounds must deliver normalized assistant replies');
+    assert.equal(firstComplete?.exitCode, 0);
+    assert.equal(secondComplete?.exitCode, 0);
+    assert.equal(firstResident.generation, secondResident.generation);
+    assert.equal(firstResident.threadId, secondResident.threadId);
+    assert.ok(model.requests.some((body) => body.includes('FIRST-RUNTIME-PROBE-TEXT')));
+    assert.ok(model.requests.some((body) => body.includes('SECOND-RUNTIME-PROBE-TEXT')));
+
+    resolvedThreadId = secondResident.threadId;
+    const taskMessages: any[] = [];
+    let taskGeneration: number | undefined;
+    const taskResult = await codexRuntime.run('', {
+      sessionId: 'probe-runtime-session', cwd: REPO_ROOT, model: 'probe-model',
+      taskContinuation: { eventId: 'RESIDENT-TASK-RESULT-PROBE', taskId: 'probe-task', summary: 'probe completed' },
+    }, {
+      isWebSocketWriter: true,
+      send: (message: any) => {
+        taskMessages.push(message);
+        taskGeneration ??= listCodexResidentSessions()[0]?.generation;
+      },
+    }, context as never);
+    assert.equal(taskResult.terminalStatus, 'completed');
+    assert.equal(taskMessages.find((message) => message.kind === 'complete')?.exitCode, 0);
+    assert.ok(taskGeneration !== undefined && taskGeneration !== secondResident.generation);
+    assert.equal(listCodexResidentSessions().length, 0, 'the tool-result process must be released');
+    assert.ok(model.requests.some((body) => body.includes('RESIDENT-TASK-RESULT-PROBE')));
+
+    const resumedMessages: any[] = [];
+    const resumed = await codexRuntime.run('AFTER-TASK-RUNTIME-PROBE', {
+      sessionId: 'probe-runtime-session', cwd: REPO_ROOT, model: 'probe-model',
+    }, { isWebSocketWriter: true, send: (message: any) => resumedMessages.push(message) }, context as never);
+    assert.equal(resumed.terminalStatus, 'completed');
+    assert.equal(resumedMessages.find((message) => message.kind === 'complete')?.exitCode, 0);
+    const resumedResident = listCodexResidentSessions()[0];
+    assert.equal(resumedResident.threadId, firstResident.threadId);
+    assert.notEqual(resumedResident.generation, taskGeneration);
+
+    const { listCodexThreadTurns } = await import('@/modules/providers/list/codex/codex-app-server.client.js');
+    const history = await listCodexThreadTurns(resumedResident.threadId) as Array<{ id: string; items: any[] }>;
+    const resultTurns = history.filter((turn) => turn.items.some((item) => item.type === 'functionCallOutput'
+      && item.name === 'cloudcli_task_result' && JSON.stringify(item.output).includes('RESIDENT-TASK-RESULT-PROBE')));
+    assert.equal(resultTurns.length, 1, 'one persisted native tool result must identify the continuation');
+    assert.equal(resultTurns[0].id, taskResult.engineTurnId);
 
     console.log('\n### the resident path through the real engine');
     console.log(JSON.stringify({
@@ -127,7 +136,16 @@ wire_api = "responses"
         sawReply: Boolean(secondReply),
         sawComplete: Boolean(secondComplete),
       },
-      sameThread: (first as { engineTurnId?: string } | null)?.engineTurnId !== undefined,
+      toolResult: {
+        terminalStatus: taskResult.terminalStatus,
+        usedFreshProcess: taskGeneration !== secondResident.generation,
+        processReleased: true,
+        persistedInOwnNativeTurn: resultTurns[0].id === taskResult.engineTurnId,
+        reachedModel: model.requests.some((body) => body.includes('RESIDENT-TASK-RESULT-PROBE')),
+      },
+      afterToolResult: { terminalStatus: resumed.terminalStatus, sameNativeThread: resumedResident.threadId === firstResident.threadId },
+      sameThread: firstResident.threadId === secondResident.threadId,
+      sameProcessGeneration: firstResident.generation === secondResident.generation,
       firstMessageKinds: firstMessages.map((message) => message.kind),
       secondMessageKinds: secondMessages.map((message) => message.kind),
       errors: [...firstMessages, ...secondMessages]
@@ -140,8 +158,9 @@ wire_api = "responses"
     }, null, 2));
   } finally {
     closeCodexResidentSessions();
-    rmSync(home, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
+    await model.close();
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(codexHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 

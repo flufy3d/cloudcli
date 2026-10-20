@@ -10,52 +10,13 @@
  * Run: npx tsx --tsconfig server/tsconfig.json scripts/probe/codex-resident-round.probe.ts
  */
 
-import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import http from 'node:http';
+import assert from 'node:assert/strict';
+import { startFakeModel } from './resident-fake-model.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-
-/** The fake model: one assistant message, then the turn ends. */
-function startFakeModel() {
-  const requests: string[] = [];
-  const server = http.createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk) => chunks.push(chunk as Buffer));
-    req.on('end', () => {
-      requests.push(Buffer.concat(chunks).toString('utf8'));
-      const item = {
-        id: 'msg_probe',
-        type: 'message',
-        status: 'completed',
-        role: 'assistant',
-        content: [{ type: 'output_text', text: 'probe-ok' }],
-      };
-      const response = {
-        id: 'resp_probe',
-        object: 'response',
-        created_at: 0,
-        status: 'completed',
-        model: 'probe-model',
-        output: [item],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-      };
-      const events = [
-        ['response.created', { type: 'response.created', response: { ...response, status: 'in_progress', output: [] } }],
-        ['response.output_item.added', { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } }],
-        ['response.output_text.delta', { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'probe-ok' }],
-        ['response.output_item.done', { type: 'response.output_item.done', output_index: 0, item }],
-        ['response.completed', { type: 'response.completed', response }],
-      ];
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      res.end(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(''));
-    });
-  });
-  const listening = new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
-  return { requests, listening, port: () => (server.address() as { port: number }).port };
-}
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -149,6 +110,10 @@ wire_api = "responses"
     }
     const secondDelivered = model.requests.some((body) => body.includes('SECOND-RESIDENT-PROBE-TEXT'));
 
+    assert.ok(delivered && secondDelivered, 'both inputs must reach the model');
+    assert.ok(events.includes('round:turn/started') && events.includes('round:turn/completed'));
+    assert.ok(secondEvents.includes('turn/started') && secondEvents.includes('turn/completed'));
+
     console.log('\n### the round through the real engine');
     console.log(JSON.stringify({
       threadId: session.threadId,
@@ -161,8 +126,9 @@ wire_api = "responses"
     }, null, 2));
   } finally {
     closeCodexResidentSessions();
-    rmSync(home, { recursive: true, force: true });
-    rmSync(codexHome, { recursive: true, force: true });
+    await model.close();
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(codexHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 

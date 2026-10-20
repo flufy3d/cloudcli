@@ -34,7 +34,7 @@ export {
 } from '@/modules/task-continuations/services/task-bridge.service.js';
 export type {
   TaskBridgeCredentialContext,
-} from '@/modules/task-continuations/services/task-bridge.service.js';
+} from '@/shared/types.js';
 
 export {
   createTaskRunCapability,
