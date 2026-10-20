@@ -283,7 +283,8 @@
     },
     "queuedInEngine": "Queued — waiting for the engine",
     "cancelQueued": "Cancel the queued message",
-    "cancelQueuedShort": "Cancel"
+    "cancelQueuedShort": "Cancel",
+    "queuedReporting": "Queued — the engine is reporting, this starts after it"
   },
   "projectSelection": {
     "startChatWithProvider": "Select a project to start chatting with {{provider}}"

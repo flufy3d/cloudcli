@@ -262,7 +262,8 @@
     },
     "queuedInEngine": "排隊中——等引擎空閒",
     "cancelQueued": "取消排隊中的訊息",
-    "cancelQueuedShort": "取消"
+    "cancelQueuedShort": "取消",
+    "queuedReporting": "排隊中——引擎正在回報，它結束後這一輪自動開始"
   },
   "projectSelection": {
     "startChatWithProvider": "選擇一個專案以開始與 {{provider}} 聊天"

@@ -278,10 +278,7 @@
     },
     "providers": {
       "assistant": "Asistent"
-    },
-    "queuedInEngine": "Queued — waiting for the engine",
-    "cancelQueued": "Cancel the queued message",
-    "cancelQueuedShort": "Cancel"
+    }
   },
   "projectSelection": {
     "startChatWithProvider": "Vyberte projekt a zahajte konverzaci ({{provider}})"

@@ -253,10 +253,7 @@
     },
     "providers": {
       "assistant": "Asisten"
-    },
-    "queuedInEngine": "Queued — waiting for the engine",
-    "cancelQueued": "Cancel the queued message",
-    "cancelQueuedShort": "Cancel"
+    }
   },
   "projectSelection": {
     "startChatWithProvider": "Pilih proyek untuk mulai chat dengan {{provider}}"

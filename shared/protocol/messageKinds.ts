@@ -124,6 +124,12 @@ export type MessageFieldsByKind = {
     tokenBudget?: unknown;
     backgroundTasks?: ActiveBackgroundTask[];
     backgroundWorkPending?: boolean;
+    /**
+     * What the engine is doing with the round: `queued` means the engine holds
+     * it and has not started its turn, `reporting` means the engine runs a
+     * turn of its own, which is why it waits.
+     */
+    activityState?: { queued?: boolean; reporting?: boolean };
   };
   permission_request: {
     requestId?: string;

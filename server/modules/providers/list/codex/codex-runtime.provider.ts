@@ -45,6 +45,7 @@ import {
   releaseCodexResidentSessionResources,
   stopCodexResidentRound,
   submitCodexResidentRound,
+  type CodexResidentSession,
 } from '@/modules/providers/list/codex/codex-session-manager.js';
 import {
   buildCodexSubagentAgentRow,
@@ -147,7 +148,8 @@ type ActiveCodexSession = {
    * Ends the round: it interrupts a turn that already runs, or removes the
    * input that is still waiting in the engine's queue.
    */
-  stop: () => void;
+  /** Ends the round. Resolves once the engine confirmed what it did. */
+  stop: () => Promise<unknown>;
   /** Set once the server reports the turn; `turn/interrupt` needs it. */
   threadId: string | null;
   turnId: string | null;
@@ -1089,6 +1091,26 @@ async function queryCodex(
    * The events of a turn the engine started on its own never reach this
    * handler: a background report must not end the user's round.
    */
+  /**
+   * Announces what the engine is doing with the round.
+   *
+   * The page learns it from this frame instead of waiting for the next poll,
+   * so a round that waits for the engine says so at once.
+   */
+  const announceActivityState = (): void => {
+    const activity = readCodexResidentSessionActivity(residentKey);
+    if (!activity) {
+      return;
+    }
+    sendMessage(ws, createNormalizedMessage({
+      kind: 'status',
+      text: 'activity_state',
+      activityState: { queued: activity.queued, reporting: activity.reporting },
+      sessionId: capturedSessionId || sessionId || null,
+      provider: 'codex',
+    }));
+  };
+
   const handleRoundEvent = (method: string, params: AnyRecord): void => {
     const session = currentSession();
     // A stop the user asked for silences the events that follow it, but the
@@ -1132,6 +1154,8 @@ async function queryCodex(
         if (active) {
           active.turnId = turnId;
         }
+        // The engine took the round; it is not waiting any more.
+        announceActivityState();
         return;
       }
 
@@ -1270,10 +1294,11 @@ async function queryCodex(
      * that is still waiting in the engine's queue. A short connection is torn
      * down behind the interrupt.
      */
-    const stopRound = () => {
+    const stopRound = (): Promise<unknown> => {
       if (isResidentSessionsEnabled()) {
-        void stopCodexResidentRound(residentKey);
-        return;
+        // The confirmation matters: the engine may already have run the input,
+        // and the user must not see a success before that is known.
+        return stopCodexResidentRound(residentKey);
       }
       const session = currentSession();
       if (session?.threadId && session.turnId) {
@@ -1285,6 +1310,7 @@ async function queryCodex(
       // The connection is torn down on the next tick so the interrupt has a
       // chance to leave the process before its pipes close.
       setTimeout(() => connection?.close(), 250).unref?.();
+      return Promise.resolve('interrupted');
     };
 
     const registerSession = (id: string | null) => {
@@ -1331,8 +1357,10 @@ async function queryCodex(
       registerSession(sessionKey());
     }
 
+    let resident: CodexResidentSession | null = null;
     if (isResidentSessionsEnabled()) {
-      const resident = await acquireCodexResidentSession({
+      try {
+        resident = await acquireCodexResidentSession({
         appSessionId: residentKey,
         lifetime: toolOutputParam ? 'turn' : 'session',
         reserveForRound: true,
@@ -1407,6 +1435,18 @@ async function queryCodex(
         },
         isBusy: () => codexBackgroundWork.hasSession(residentKey),
       });
+      } catch (error) {
+        // Every resident process is busy. The short connection still works, so
+        // the message goes out instead of failing to send.
+        if (!(error instanceof AppError) || error.code !== 'CODEX_RESIDENT_CAPACITY') {
+          throw error;
+        }
+        console.warn(`[Codex] ${error.message} This round runs on a short connection.`);
+        resident = null;
+      }
+    }
+
+    if (resident) {
       connection = resident.connection;
       residentGeneration = resident.generation;
       adoptNativeThread(resident.threadId);
@@ -1491,6 +1531,8 @@ async function queryCodex(
         onRequest: handleRoundRequest,
       });
       residentRoundId = submitted.clientUserMessageId;
+      // The engine has the input but has not started its turn yet.
+      announceActivityState();
     } else {
       const startResult = readObjectRecord(await connection.call('turn/start', {
         threadId: capturedSessionId,
@@ -1617,7 +1659,7 @@ async function queryCodex(
  * out in the rollout — and the connection is closed behind it so a server
  * that ignores the interrupt cannot keep the run alive.
  */
-function abortCodexSession(sessionId: string) {
+async function abortCodexSession(sessionId: string): Promise<boolean> {
   const session = activeCodexSessions.get(sessionId);
 
   // A session whose round is over has nothing to stop: the entry stays for
@@ -1632,7 +1674,10 @@ function abortCodexSession(sessionId: string) {
     `[Codex] Aborting session ${sessionId} (thread ${session.threadId ?? 'unknown'}, `
     + `turn ${session.turnId ?? 'none'}) — started ${session.startedAt}`,
   );
-  session.stop();
+  // The stop waits for the engine's confirmation. A queued input the engine
+  // already ran cannot be taken back, and the user must not see a success
+  // before that is known; the manager reports the unknown case itself.
+  await session.stop();
 
   return true;
 }

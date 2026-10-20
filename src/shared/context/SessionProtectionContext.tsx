@@ -21,6 +21,7 @@ type RunningSessionApiItem = {
   background?: unknown;
   tasks?: unknown;
   queued?: unknown;
+  reporting?: unknown;
 };
 
 type RunningSessionsApiPayload = {
@@ -157,6 +158,7 @@ export function SessionProtectionProvider({ children }: { children: ReactNode })
               canInterrupt: typeof session.canInterrupt === 'boolean' ? session.canInterrupt : undefined,
               background: session.background === true,
               queued: session.queued === true,
+              reporting: session.reporting === true,
               tasks: parseBackgroundTasks(session.tasks),
             };
           })

@@ -39,6 +39,8 @@ type FakeServer = {
   closed?: boolean;
   /** The inputs the fake engine holds in its queue, keyed by client message id. */
   queue: Map<string, { id: string; clientUserMessageId: string }>;
+  /** Set when the engine is busy and keeps the input queued. */
+  holdQueue?: boolean;
 };
 
 /**
@@ -95,6 +97,10 @@ function installFakeAppServer(
           // as a turn of its own: the consumption is reported before the turn.
           const id = `queued-${server.queue.size + 1}`;
           server.queue.set(params.clientUserMessageId, { id, clientUserMessageId: params.clientUserMessageId });
+          if (server.holdQueue) {
+            // A busy engine keeps the input queued.
+            return { queuedSubmission: { id, input: params.input, clientUserMessageId: params.clientUserMessageId } };
+          }
           queueMicrotask(() => {
             server.queue.delete(params.clientUserMessageId);
             server.handlers.onNotification?.('thread/queue/changed', { threadId: THREAD_ID } as any);
@@ -222,6 +228,53 @@ test('a resident round is written to the engine queue instead of starting a turn
   }
 });
 
+test('a resident round announces that it waits for the engine and that it started', async (t) => {
+  const server = installFakeAppServer(t);
+  // The engine is busy with something else, so it holds the input.
+  server.holdQueue = true;
+  const messages: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    const run = codexRuntime.run('hey there', {
+      sessionId: 'resident-activity-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+
+    // The announcement follows the submission, so it arrives with the round.
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (messages.some((message) => message.kind === 'status' && message.text === 'activity_state')) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const queued = messages
+      .filter((message) => message.kind === 'status' && message.text === 'activity_state')
+      .map((message) => message.activityState);
+    assert.equal(queued[0].queued, true, 'the engine holds the round before its turn');
+
+    // The engine takes the input and starts the round's turn.
+    server.queue.clear();
+    server.handlers.onNotification?.('thread/queue/changed', { threadId: THREAD_ID } as any);
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'inProgress' },
+    } as any);
+    server.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'completed', error: null },
+    } as any);
+    await run;
+
+    const states = messages
+      .filter((message) => message.kind === 'status' && message.text === 'activity_state')
+      .map((message) => message.activityState);
+    assert.equal(states.at(-1).queued, false, 'the engine took the round');
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
 test('a resident conversation keeps its process and reuses it for the next round', async (t) => {
   const server = installFakeAppServer(t);
   const messages: any[] = [];
@@ -256,7 +309,7 @@ test('stopping a finished round reports that there is nothing to stop', async (t
       cwd: process.cwd(),
     }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(false));
 
-    assert.equal(codexRuntime.abort('resident-stop-session'), false);
+    assert.equal(await codexRuntime.abort('resident-stop-session'), false);
   } finally {
     process.env.CLOUDCLI_CODEX_RESIDENT = '0';
     closeCodexResidentSessions();
@@ -281,7 +334,7 @@ test('stopping a running resident round interrupts the turn the engine started',
     await waitFor(() => server.calls.some((call) => call.method === 'thread/queue/add'));
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    assert.equal(codexRuntime.abort('resident-running-session'), true);
+    assert.equal(await codexRuntime.abort('resident-running-session'), true);
     await waitFor(() => server.calls.some((call) => call.method === 'turn/interrupt'));
     assert.equal(
       server.calls.find((call) => call.method === 'turn/interrupt')?.params.turnId,
@@ -673,7 +726,7 @@ test('a delayed aborted run does not read or complete over its successor session
   }, { isWebSocketWriter: true, send: (message) => firstMessages.push(message) }, runtimeContext(true));
   await firstStartedPromise;
 
-  assert.equal(codexRuntime.abort('app-session-successor'), true);
+  assert.equal(await codexRuntime.abort('app-session-successor'), true);
   const secondMessages: any[] = [];
   const secondRun = codexRuntime.run('second', {
     sessionId: 'app-session-successor', cwd: process.cwd(),
@@ -684,7 +737,7 @@ test('a delayed aborted run does not read or complete over its successor session
   assert.equal(firstResult.terminalStatus, 'interrupted');
   assert.ok(!firstMessages.some((message) => message.kind === 'complete'), 'aborted predecessor must not send a second completion');
 
-  assert.equal(codexRuntime.abort('app-session-successor'), true);
+  assert.equal(await codexRuntime.abort('app-session-successor'), true);
   const secondResult = await secondRun;
   assert.equal(secondResult.terminalStatus, 'interrupted');
   assert.ok(!secondMessages.some((message) => message.kind === 'complete'));
@@ -1397,7 +1450,7 @@ test('an unconfirmed withdrawal remains unknown after a user stop', async (t) =>
   try {
     const running = codexRuntime.run('do work', { sessionId: 'stop-unknown' }, { send: (message) => messages.push(message) }, runtimeContext(false));
     await waitFor(() => server.calls.find((call) => call.method === 'thread/queue/add'));
-    assert.equal(codexRuntime.abort('stop-unknown'), true);
+    assert.equal(await codexRuntime.abort('stop-unknown'), true);
     const result = await running;
     assert.equal(result.terminalStatus, 'unknown');
     const error = messages.find((message) => message.kind === 'error');

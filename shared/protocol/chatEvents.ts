@@ -496,6 +496,12 @@ export type NormalizedMessage = {
    */
   summaryKey?: string;
   tokenBudget?: unknown;
+  /**
+   * What the engine is doing with the round: `queued` means the engine holds
+   * it and has not started its turn, `reporting` means the engine runs a
+   * turn of its own, which is why it waits.
+   */
+  activityState?: { queued?: boolean; reporting?: boolean };
   backgroundTasks?: ActiveBackgroundTask[];
   /** True while background execution or its follow-up reply still blocks queued messages. */
   backgroundWorkPending?: boolean;

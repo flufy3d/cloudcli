@@ -835,6 +835,7 @@ export type ServerEventDirective =
       canInterrupt: boolean;
       tokenBudget: unknown;
       backgroundTasks?: ActiveBackgroundTask[];
+      activityState?: { queued?: boolean; reporting?: boolean };
     }
   | {
       effect: 'permission_request';
@@ -1185,6 +1186,9 @@ export class SessionTimelineStore {
           canInterrupt: message?.canInterrupt !== false,
           tokenBudget: message?.tokenBudget,
           backgroundTasks: statusBgTasks,
+          // What the engine is doing with the round, so the caller can tell
+          // "waiting for the engine" from "the engine is working on it".
+          activityState: message?.activityState,
         };
       }
 

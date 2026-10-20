@@ -89,7 +89,10 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
   const label = isBackground
     ? t('claudeStatus.backgroundWork', 'Background work')
     : isQueued
-      ? t('claudeStatus.queuedInEngine', 'Queued — waiting for the engine')
+      ? (renderedActivity.reporting
+        // The engine is making a report of its own; this round starts after it.
+        ? t('claudeStatus.queuedReporting', 'Queued — the engine is reporting, this starts after it')
+        : t('claudeStatus.queuedInEngine', 'Queued — waiting for the engine'))
       : (renderedActivity.statusText || actionWords[Math.floor(elapsedSeconds / 4) % actionWords.length])
         .replace(/\.+$/, '');
   const detail = isBackground ? describeBackgroundTasks(renderedActivity.tasks ?? [], t) : '';

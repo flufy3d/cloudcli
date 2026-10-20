@@ -728,9 +728,10 @@ function evictResidentSessionIfNeeded(): void {
     disposeResidentSession(evicted, 'evicted for capacity');
     return;
   }
-  throw new Error(
+  throw new AppError(
     `Codex is already keeping ${limit} conversations alive. `
     + 'Wait for one of them to finish, or close the conversations you do not need.',
+    { code: 'CODEX_RESIDENT_CAPACITY', statusCode: 409 },
   );
 }
 
@@ -1176,8 +1177,14 @@ export function readCodexResidentSessionActivity(appSessionId: string): {
     return null;
   }
   const round = session.round;
+  if (!round) {
+    return { queued: false, reporting: session.engineTurns.size > 0 };
+  }
   return {
-    queued: round ? !round.turnId && !round.terminalSeen : false,
+    // The round waits while its input is still in the engine's queue. A round
+    // that went in through `turn/start` was never queued, and a round the
+    // engine has already picked up is running.
+    queued: !round.directSubmission && !round.armed && !round.turnId && !round.terminalSeen,
     reporting: session.engineTurns.size > 0,
   };
 }

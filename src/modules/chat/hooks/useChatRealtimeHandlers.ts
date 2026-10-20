@@ -312,7 +312,15 @@ export function useChatRealtimeHandlers({
         }
 
         case 'status': {
-          if (directive.text === 'token_budget' && directive.tokenBudget) {
+          if (directive.text === 'activity_state' && directive.sessionId && directive.activityState) {
+            // The engine says what it is doing with the round, so the pill can
+            // tell "waiting for the engine" from "the engine is working on it"
+            // without waiting for the next poll.
+            onSessionProcessing?.(directive.sessionId, {
+              queued: directive.activityState.queued === true,
+              reporting: directive.activityState.reporting === true,
+            });
+          } else if (directive.text === 'token_budget' && directive.tokenBudget) {
             setTokenBudget(directive.tokenBudget as Record<string, unknown>);
           } else if (directive.text === 'background_tasks' && directive.sessionId) {
             // Agents launched and settled mid-turn (Codex, ZCode) are the

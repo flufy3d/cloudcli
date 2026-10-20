@@ -911,10 +911,11 @@ export const sessionsService = {
     let keepAdmissionClosed = false;
     try {
       if (providerRuntimeService.hasSessionWork(resolvedSessionId)) {
-        throw new AppError('This conversation is still working. Stop it before archiving it.', {
-          code: 'SESSION_HAS_ACTIVE_WORK',
-          statusCode: 409,
-        });
+        throw new AppError(
+          'This conversation still has work running — a background task or a report the engine is still making. '
+          + 'Wait for it to finish, or stop it, before archiving the conversation.',
+          { code: 'SESSION_HAS_ACTIVE_WORK', statusCode: 409 },
+        );
       }
       // An idle resident process is closed with the conversation, so the
       // engine does not keep working for a session that is gone. The

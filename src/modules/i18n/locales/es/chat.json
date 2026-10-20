@@ -232,10 +232,7 @@
     },
     "providers": {
       "assistant": "Asistente"
-    },
-    "queuedInEngine": "Queued — waiting for the engine",
-    "cancelQueued": "Cancel the queued message",
-    "cancelQueuedShort": "Cancel"
+    }
   },
   "projectSelection": {
     "startChatWithProvider": "Selecciona un proyecto para empezar a chatear con {{provider}}"

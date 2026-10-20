@@ -239,7 +239,8 @@
     },
     "queuedInEngine": "排队中——等引擎空闲",
     "cancelQueued": "取消排队中的消息",
-    "cancelQueuedShort": "取消"
+    "cancelQueuedShort": "取消",
+    "queuedReporting": "排队中——引擎正在汇报，它结束后这一轮自动开始"
   },
   "projectSelection": {
     "startChatWithProvider": "选择一个项目以开始与 {{provider}} 聊天"
