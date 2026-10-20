@@ -120,6 +120,7 @@ type ResidentRound = {
 
 /** What the manager keeps about one lent ephemeral thread: where its traffic goes. */
 type AuxiliaryBorrow = {
+  failed: boolean;
   onNotification: (method: string, params: AnyRecord) => void;
   onRequest?: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
   onDisposed?: (reason: string) => void;
@@ -156,6 +157,12 @@ type ResidentSession = {
    * lent the process has work and is not reclaimed.
    */
   auxThreads: Map<string, AuxiliaryBorrow>;
+  /** Starts in flight also prevent reclaim, eviction and archive. */
+  auxiliaryStarting: number;
+  /** Source markers used by auxiliary starts on this process, including timed-out starts. */
+  auxiliarySources: Set<string>;
+  /** Unclaimed startup announcements, retained until registration or bounded detach. */
+  auxiliaryAnnouncements: Map<string, 'waiting' | 'detaching'>;
   /** Notification order is independent of asynchronous queue-read completion order. */
   latestPendingTurnKey: string | null;
   /**
@@ -395,7 +402,7 @@ function disposeResidentSession(session: ResidentSession, reason: string): void 
   // process; its handle rejects from here on.
   for (const borrow of session.auxThreads.values()) {
     try {
-      borrow.onDisposed?.(reason);
+      if (!borrow.failed) borrow.onDisposed?.(reason);
     } catch (error) {
       console.warn(`[Codex] Telling an auxiliary borrower of ${session.appSessionId} about the closing failed:`, error);
     }
@@ -517,7 +524,7 @@ function deliverRoundEvent(round: ResidentRound, method: string, params: AnyReco
 /** One activity predicate shared by archive checks and both reclaim paths. */
 function hasResidentWork(session: ResidentSession): boolean {
   return session.lifetime === 'turn' || session.reservedForRound || Boolean(session.initializing || session.round)
-    || session.engineTurns.size > 0 || session.pendingTurns.size > 0 || session.auxThreads.size > 0
+    || session.engineTurns.size > 0 || session.pendingTurns.size > 0 || session.auxThreads.size > 0 || session.auxiliaryStarting > 0 || session.auxiliaryAnnouncements.size > 0
     || session.pendingRequests > 0 || session.isBusy();
 }
 
@@ -662,6 +669,36 @@ function publishPendingEngineTurns(session: ResidentSession): boolean {
   }
 }
 
+/**
+ * thread/started also arrives after a transport timeout discarded the reply.
+ * Once every start has settled, announcements with no returned owner are
+ * detached. Waiting for all starts prevents a concurrent successful borrower
+ * from losing its thread before its own response registers ownership.
+ */
+function detachUnclaimedAuxiliaryThreads(session: ResidentSession): void {
+  if (session.disposed || session.auxiliaryStarting > 0) return;
+  for (const [threadId, state] of session.auxiliaryAnnouncements) {
+    if (state === 'detaching') continue;
+    session.auxiliaryAnnouncements.set(threadId, 'detaching');
+    scheduleResidentReclaim(session);
+    void session.connection.call('thread/unsubscribe', { threadId }, { timeoutMs: 3000 })
+      .catch((error) => { console.warn(`[Codex] Detaching unclaimed auxiliary thread ${threadId} failed:`, error); })
+      .finally(() => {
+        session.auxiliaryAnnouncements.delete(threadId);
+        scheduleResidentReclaim(session);
+      });
+  }
+}
+
+/** Auxiliary failures stay on their thread; the caller retains cleanup access. */
+function failAuxiliaryBorrow(session: ResidentSession, borrow: AuxiliaryBorrow, error: unknown): void {
+  if (borrow.failed) return;
+  borrow.failed = true;
+  console.warn(`[Codex] Auxiliary handler failed for ${session.appSessionId}:`, error);
+  try { borrow.onDisposed?.('auxiliary handler failed'); }
+  catch (failure) { console.warn(`[Codex] Auxiliary failure callback failed for ${session.appSessionId}:`, failure); }
+}
+
 /** Builds the handlers a resident connection reports through. */
 function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers {
   return {
@@ -675,9 +712,21 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
         if (borrow) {
           // A lent thread's traffic is its borrower's alone: it is neither the
           // round's nor engine work the conversation would show.
-          borrow.onNotification(method, params);
+          if (!borrow.failed) {
+            try { borrow.onNotification(method, params); }
+            catch (error) { failAuxiliaryBorrow(session, borrow, error); }
+          }
           return;
         }
+        const announced = method === 'thread/started' && params.thread && typeof params.thread === 'object'
+          ? params.thread as AnyRecord : null;
+        if (eventThreadId && announced?.ephemeral === true
+          && typeof announced.threadSource === 'string' && session.auxiliarySources.has(announced.threadSource)) {
+          session.auxiliaryAnnouncements.set(eventThreadId, 'waiting');
+          detachUnclaimedAuxiliaryThreads(session);
+          return;
+        }
+        if (eventThreadId && session.auxiliaryAnnouncements.has(eventThreadId)) return;
         if (eventThreadId && eventThreadId !== session.threadId) {
           // Subagents report on the same connection.
           session.onEngineEvent(method, params, session.threadId);
@@ -706,7 +755,9 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
         if (borrow) {
           // Only the borrower may answer for its thread. Without a handler the
           // request is refused, never shown to the user as the conversation's.
-          return await (borrow.onRequest ? borrow.onRequest(method, params) : undefined);
+          if (borrow.failed) return undefined;
+          try { return await borrow.onRequest?.(method, params); }
+          catch (error) { failAuxiliaryBorrow(session, borrow, error); return undefined; }
         }
         if (round && turnId && !round.turnId) {
           await round.submitted;
@@ -888,6 +939,9 @@ export async function acquireCodexResidentSession(
     engineTurns: new Set<string>(),
     pendingRequests: 0,
     auxThreads: new Map(),
+    auxiliaryStarting: 0,
+    auxiliarySources: new Set(),
+    auxiliaryAnnouncements: new Map(),
     pendingTurns: new Map(),
     latestPendingTurnKey: null,
     initializing: null,
@@ -1310,8 +1364,9 @@ export function openCodexResidentSessionAdmission(appSessionId: string): void {
   closedAdmission.delete(appSessionId);
 }
 
-/** The methods an auxiliary handle may never call: they open or take over threads. */
-const AUXILIARY_DENIED_METHODS = new Set(['initialize', 'thread/start', 'thread/resume', 'thread/fork']);
+/** The only global RPCs exposed to auxiliary borrowers are configuration/catalog reads. */
+const AUXILIARY_GLOBAL_READS = new Set(['model/list', 'config/read']);
+const AUXILIARY_THREAD_METHODS = new Set(['turn/start', 'turn/interrupt', 'thread/unsubscribe', 'thread/read', 'thread/name/set']);
 
 /** The methods an auxiliary handle may call on a thread other than its own: reading and naming it. */
 const AUXILIARY_CROSS_THREAD_METHODS = new Set(['thread/read', 'thread/name/set']);
@@ -1328,6 +1383,8 @@ export type CodexAuxiliaryThreadOptions = {
   generation?: number;
   /** The `thread/start` parameters of the lent thread. `ephemeral` must be true. */
   start: AnyRecord;
+  /** Deadline left for thread/start; the title client owns the overall deadline. */
+  timeoutMs?: number;
   /** Every notification of the lent thread. */
   onNotification: (method: string, params: AnyRecord) => void;
   /** Answers a request the engine makes for the lent thread; absent, the request is refused. */
@@ -1346,6 +1403,8 @@ export type CodexAuxiliaryThreadOptions = {
  * Consumer: `codex-thread-title.ts` (the Codex thread title client).
  */
 export type CodexAuxiliaryThread = {
+  /** Actual engine startup result, used to validate sandbox/profile before inference. */
+  startResult: AnyRecord;
   appSessionId: string;
   generation: number;
   threadId: string;
@@ -1367,10 +1426,10 @@ function auxiliaryUnavailable(message: string): AppError {
  * borrower only, and while the thread is lent the process counts as busy, so
  * it is neither reclaimed nor evicted nor archived under the borrower.
  *
- * Events that arrive before `thread/start` answers (the thread's own
- * `thread/started`) are not held back: they take the path of any unknown
- * thread. The borrower starts its turn only after this call returns, so
- * every event of that turn reaches it.
+ * Startup announcements identify unclaimed threads even when the start RPC
+ * times out. Their source marker keeps auxiliary announcements off the chat
+ * path; unclaimed threads are unsubscribed once all starts have settled.
+ * The borrower starts its turn after this call returns.
  *
  * Consumer: `codex-thread-title.ts` (the Codex thread title client).
  */
@@ -1394,36 +1453,54 @@ export async function borrowCodexAuxiliaryThread(options: CodexAuxiliaryThreadOp
     });
   }
 
-  const started = await session.connection.call('thread/start', { ...options.start, ephemeral: true }) as AnyRecord | undefined;
-  if (session.disposed) {
-    throw auxiliaryUnavailable('The Codex conversation closed while the auxiliary thread was starting.');
-  }
-  const thread = started?.thread && typeof started.thread === 'object' ? started.thread as AnyRecord : null;
-  const threadId = typeof thread?.id === 'string' && thread.id.length > 0 ? thread.id : '';
-  if (!threadId) {
-    throw auxiliaryUnavailable('Codex app-server opened no auxiliary thread.');
-  }
-
-  session.auxThreads.set(threadId, {
-    onNotification: options.onNotification,
-    onRequest: options.onRequest,
-    onDisposed: options.onDisposed,
-  });
-  session.lastUsedAt = Date.now();
+  const source = typeof options.start.threadSource === 'string' && options.start.threadSource.length > 0
+    ? options.start.threadSource : 'cloudcli_auxiliary';
+  session.auxiliarySources.add(source);
+  session.auxiliaryStarting += 1;
   scheduleResidentReclaim(session);
+  try {
+    const started = await session.connection.call(
+      'thread/start',
+      { ...options.start, ephemeral: true, threadSource: source },
+      { timeoutMs: options.timeoutMs },
+    ) as AnyRecord | undefined;
+    if (session.disposed) {
+      throw auxiliaryUnavailable('The Codex conversation closed while the auxiliary thread was starting.');
+    }
+    const thread = started?.thread && typeof started.thread === 'object' ? started.thread as AnyRecord : null;
+    const threadId = typeof thread?.id === 'string' && thread.id.length > 0 ? thread.id : '';
+    if (!threadId) {
+      throw auxiliaryUnavailable('Codex app-server opened no auxiliary thread.');
+    }
 
-  return {
-    appSessionId: session.appSessionId,
-    generation: session.generation,
-    threadId,
-    call: (method, params, callOptions) => callForAuxiliaryThread(session, threadId, method, params, callOptions),
-    release: () => {
-      if (session.auxThreads.delete(threadId)) {
-        session.lastUsedAt = Date.now();
-        scheduleResidentReclaim(session);
-      }
-    },
-  };
+    session.auxiliaryAnnouncements.delete(threadId);
+    session.auxThreads.set(threadId, {
+      failed: false,
+      onNotification: options.onNotification,
+      onRequest: options.onRequest,
+      onDisposed: options.onDisposed,
+    });
+    session.lastUsedAt = Date.now();
+    scheduleResidentReclaim(session);
+
+    return {
+      startResult: started!,
+      appSessionId: session.appSessionId,
+      generation: session.generation,
+      threadId,
+      call: (method, params, callOptions) => callForAuxiliaryThread(session, threadId, method, params, callOptions),
+      release: () => {
+        if (session.auxThreads.delete(threadId)) {
+          session.lastUsedAt = Date.now();
+          scheduleResidentReclaim(session);
+        }
+      },
+    };
+  } finally {
+    session.auxiliaryStarting -= 1;
+    detachUnclaimedAuxiliaryThreads(session);
+    scheduleResidentReclaim(session);
+  }
 }
 
 /**
@@ -1440,14 +1517,14 @@ async function callForAuxiliaryThread(
   params: unknown,
   callOptions?: { timeoutMs?: number },
 ): Promise<unknown> {
-  if (AUXILIARY_DENIED_METHODS.has(method)) {
-    throw new AppError(`An auxiliary thread cannot call ${method}.`, {
-      code: 'CODEX_AUXILIARY_THREAD_SCOPE', statusCode: 403,
-    });
-  }
-  const targetThreadId = params && typeof params === 'object' ? readEventThreadId(params as AnyRecord) : null;
-  if (targetThreadId && targetThreadId !== threadId && !AUXILIARY_CROSS_THREAD_METHODS.has(method)) {
-    throw new AppError(`An auxiliary thread cannot call ${method} on another thread.`, {
+  const record = params && typeof params === 'object' ? params as AnyRecord : {};
+  const target = record.threadId;
+  const globalRead = AUXILIARY_GLOBAL_READS.has(method);
+  const validTarget = typeof target === 'string' && target.length > 0
+    && (target === threadId || (target === session.threadId && AUXILIARY_CROSS_THREAD_METHODS.has(method)));
+  if ((!globalRead && (!AUXILIARY_THREAD_METHODS.has(method) || !validTarget))
+    || 'thread_id' in record || 'thread' in record) {
+    throw new AppError(`An auxiliary thread cannot call ${method} outside its scope.`, {
       code: 'CODEX_AUXILIARY_THREAD_SCOPE', statusCode: 403,
     });
   }

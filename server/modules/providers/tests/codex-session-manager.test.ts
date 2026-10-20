@@ -37,10 +37,11 @@ const AUX_THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5e11';
 type FakeServer = {
   /** Resolves when the fake process is gone. */
   exited: Promise<void>;
-  calls: Array<{ method: string; params: any }>;
+  calls: Array<{ method: string; params: any; options?: { timeoutMs?: number } }>;
   handlers: CodexAppServerHandlers;
   closed: boolean;
   openOptions?: unknown;
+  auxStart?: () => Promise<unknown>;
   /** The queued items the fake engine holds, keyed by the client message id. */
   queue: Map<string, { id: string; clientUserMessageId: string }>;
 };
@@ -66,12 +67,13 @@ function installFakeAppServer(t: any): FakeServer {
     server.handlers = handlers;
     server.openOptions = openOptions;
     return {
-      async call(method: string, params: any) {
-        server.calls.push({ method, params });
+      async call(method: string, params: any, options?: { timeoutMs?: number }) {
+        server.calls.push({ method, params, options });
         if (method === 'thread/start' && params.ephemeral === true) {
+          if (server.auxStart) return server.auxStart();
           // An auxiliary thread starts ephemeral on the same process; the
           // engine persists nothing and hands back a fresh thread id.
-          return { thread: { id: AUX_THREAD_ID } };
+          return { thread: { id: AUX_THREAD_ID }, sandbox: { type: 'readOnly' }, activePermissionProfile: { id: ':read-only' } };
         }
         if (method === 'thread/start' || method === 'thread/resume') {
           // A thread takes the sandbox mode as a string; the policy object
@@ -1387,7 +1389,7 @@ const residentOptions = (appSessionId: string) => ({
 });
 
 /** What a title borrower asks for: an ephemeral, read-only thread on the same process. */
-const AUXILIARY_START = { ephemeral: true, cwd: '/tmp', sandbox: 'read-only' };
+const AUXILIARY_START = { ephemeral: true, cwd: '/tmp', sandbox: 'read-only', threadSource: 'thread_title' };
 
 test('an auxiliary borrow starts an ephemeral thread on the resident process and hands out no close', async (t) => {
   const server = installFakeAppServer(t);
@@ -1639,4 +1641,185 @@ test('an auxiliary borrow does not replace the callbacks of the conversation', a
   } finally {
     closeCodexResidentSessions();
   }
+});
+
+
+test('a starting auxiliary thread keeps its resident process busy until startup settles', async (t) => {
+  const server = installFakeAppServer(t);
+  let finish!: (result: unknown) => void;
+  server.auxStart = () => new Promise((resolve) => { finish = resolve; });
+  try {
+    await acquireCodexResidentSession(residentOptions('aux-starting'));
+    const pending = borrowCodexAuxiliaryThread({ appSessionId: 'aux-starting', start: AUXILIARY_START, onNotification: () => {} });
+    assert.equal(isCodexResidentSessionBusy('aux-starting'), true);
+    finish({ thread: { id: AUX_THREAD_ID } });
+    const handle = await pending;
+    assert.equal(isCodexResidentSessionBusy('aux-starting'), true);
+    handle.release();
+    assert.equal(isCodexResidentSessionBusy('aux-starting'), false);
+  } finally {
+    finish?.({ thread: { id: AUX_THREAD_ID } });
+    closeCodexResidentSessions();
+  }
+});
+
+test('a failing auxiliary notification cannot close or replace the conversation', async (t) => {
+  const server = installFakeAppServer(t);
+  const disposed: string[] = [];
+  const chat: string[] = [];
+  const warnings: unknown[][] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args); });
+  try {
+    await acquireCodexResidentSession({ ...residentOptions('aux-callback-failure'), onEngineEvent: (method) => chat.push(method) });
+    const handle = await borrowCodexAuxiliaryThread({
+      appSessionId: 'aux-callback-failure', start: AUXILIARY_START,
+      onNotification: () => { throw new Error('invalid title response'); },
+      onDisposed: (reason) => disposed.push(reason),
+    });
+    notify(server, 'item/completed', { threadId: AUX_THREAD_ID, item: {} });
+    assert.equal(server.closed, false);
+    assert.equal(listCodexResidentSessions().length, 1);
+    assert.equal(disposed.length, 1);
+    assert.ok(warnings.length > 0);
+    notify(server, 'turn/completed', { threadId: AUX_THREAD_ID, turn: { id: 'aux-turn' } });
+    assert.equal(disposed.length, 1);
+    assert.deepEqual(chat, []);
+    await handle.call('turn/interrupt', { threadId: AUX_THREAD_ID, turnId: 'aux-turn' });
+    handle.release();
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('auxiliary calls refuse global mutations and missing or ambiguous thread targets', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession(residentOptions('aux-global-scope'));
+    const handle = await borrowCodexAuxiliaryThread({ appSessionId: 'aux-global-scope', start: AUXILIARY_START, onNotification: () => {} });
+    const before = server.calls.length;
+    for (const [method, params] of [
+      ['command/exec', { command: ['touch', '/tmp/forbidden'] }],
+      ['config/value/write', { keyPath: 'sandbox_mode', value: 'danger-full-access' }],
+      ['thread/archive', { threadId: AUX_THREAD_ID }],
+      ['turn/start', {}],
+      ['thread/name/set', { thread_id: THREAD_ID, name: 'bypass' }],
+      ['turn/start', { threadId: AUX_THREAD_ID, thread_id: THREAD_ID }],
+    ] as const) await assert.rejects(handle.call(method, params), { code: 'CODEX_AUXILIARY_THREAD_SCOPE' });
+    assert.equal(server.calls.length, before);
+    handle.release();
+  } finally { closeCodexResidentSessions(); }
+});
+
+
+test('an auxiliary borrower receives the actual sandbox and permission profile', async (t) => {
+  installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession(residentOptions('aux-permissions'));
+    const handle = await borrowCodexAuxiliaryThread({ appSessionId: 'aux-permissions', start: AUXILIARY_START, onNotification: () => {} });
+    assert.deepEqual(handle.startResult?.sandbox, { type: 'readOnly' });
+    assert.deepEqual(handle.startResult?.activePermissionProfile, { id: ':read-only' });
+    handle.release();
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('failed auxiliary startup releases its activity without releasing a concurrent startup', async (t) => {
+  const server = installFakeAppServer(t);
+  const pending: Array<{ resolve: (value: unknown) => void; reject: (reason: Error) => void }> = [];
+  server.auxStart = () => new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  try {
+    await acquireCodexResidentSession(residentOptions('aux-concurrent-start'));
+    const first = borrowCodexAuxiliaryThread({ appSessionId: 'aux-concurrent-start', start: AUXILIARY_START, onNotification: () => {} });
+    const second = borrowCodexAuxiliaryThread({ appSessionId: 'aux-concurrent-start', start: AUXILIARY_START, onNotification: () => {} });
+    const rejected = assert.rejects(first, /start refused/);
+    pending[0].reject(new Error('start refused'));
+    await rejected;
+    assert.equal(isCodexResidentSessionBusy('aux-concurrent-start'), true);
+    pending[1].resolve({ thread: { id: AUX_THREAD_ID } });
+    const handle = await second;
+    handle.release();
+    assert.equal(isCodexResidentSessionBusy('aux-concurrent-start'), false);
+    assert.equal(server.closed, false);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('an auxiliary request handler failure is refused without terminating the conversation', async (t) => {
+  const server = installFakeAppServer(t);
+  const disposed: string[] = [];
+  t.mock.method(console, 'warn', () => {});
+  try {
+    await acquireCodexResidentSession(residentOptions('aux-request-failure'));
+    const handle = await borrowCodexAuxiliaryThread({
+      appSessionId: 'aux-request-failure', start: AUXILIARY_START,
+      onNotification: () => {}, onRequest: async () => { throw new Error('request failed'); },
+      onDisposed: (reason) => disposed.push(reason),
+    });
+    const result = await server.handlers.onRequest?.('item/tool/requestUserInput', { threadId: AUX_THREAD_ID });
+    assert.equal(result, undefined);
+    assert.equal(server.closed, false);
+    assert.deepEqual(disposed, ['auxiliary handler failed']);
+    await handle.call('thread/unsubscribe', { threadId: AUX_THREAD_ID });
+    handle.release();
+    assert.equal(isCodexResidentSessionBusy('aux-request-failure'), false);
+  } finally { closeCodexResidentSessions(); }
+});
+
+
+test('auxiliary startup forwards its deadline and invalid startup releases activity', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession(residentOptions('aux-invalid-start'));
+    server.auxStart = async () => ({ thread: {} });
+    await assert.rejects(borrowCodexAuxiliaryThread({
+      appSessionId: 'aux-invalid-start', start: AUXILIARY_START, timeoutMs: 42, onNotification: () => {},
+    }), { code: 'CODEX_AUXILIARY_UNAVAILABLE' });
+    assert.equal(server.calls.at(-1)?.options?.timeoutMs, 42);
+    assert.equal(isCodexResidentSessionBusy('aux-invalid-start'), false);
+    server.auxStart = async () => ({ thread: { id: AUX_THREAD_ID } });
+    const handle = await borrowCodexAuxiliaryThread({ appSessionId: 'aux-invalid-start', start: AUXILIARY_START, onNotification: () => {} });
+    for (const params of [null, undefined, { threadId: 'unrelated' }, { threadId: '' }]) {
+      await assert.rejects(handle.call('thread/read', params), { code: 'CODEX_AUXILIARY_THREAD_SCOPE' });
+    }
+    handle.release();
+  } finally { closeCodexResidentSessions(); }
+});
+
+
+test('a late thread started after startup timeout is detached without touching the conversation', async (t) => {
+  const server = installFakeAppServer(t);
+  const chat: string[] = [];
+  try {
+    await acquireCodexResidentSession({ ...residentOptions('aux-late-start'), onEngineEvent: (method) => chat.push(method) });
+    server.auxStart = async () => { throw new Error('startup timed out'); };
+    await assert.rejects(borrowCodexAuxiliaryThread({
+      appSessionId: 'aux-late-start', start: AUXILIARY_START, onNotification: () => {},
+    }), /startup timed out/);
+    notify(server, 'thread/started', { thread: { id: AUX_THREAD_ID, ephemeral: true, threadSource: 'thread_title' } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(server.calls.some((call) => call.method === 'thread/unsubscribe' && call.params.threadId === AUX_THREAD_ID));
+    assert.equal(server.closed, false);
+    assert.equal(isCodexResidentSessionBusy('aux-late-start'), false);
+    assert.deepEqual(chat, []);
+  } finally { closeCodexResidentSessions(); }
+});
+
+test('startup announcements wait for concurrent ownership and never detach a successful borrower', async (t) => {
+  const server = installFakeAppServer(t);
+  const pending: Array<{ resolve: (value: unknown) => void; reject: (reason: Error) => void }> = [];
+  server.auxStart = () => new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  try {
+    await acquireCodexResidentSession(residentOptions('aux-announcements'));
+    const failed = borrowCodexAuxiliaryThread({ appSessionId: 'aux-announcements', start: AUXILIARY_START, onNotification: () => {} });
+    const success = borrowCodexAuxiliaryThread({ appSessionId: 'aux-announcements', start: AUXILIARY_START, onNotification: () => {} });
+    const failure = assert.rejects(failed, /timeout/);
+    notify(server, 'thread/started', { thread: { id: 'orphan', ephemeral: true, threadSource: 'thread_title' } });
+    notify(server, 'thread/started', { thread: { id: AUX_THREAD_ID, ephemeral: true, threadSource: 'thread_title' } });
+    pending[0].reject(new Error('timeout'));
+    await failure;
+    assert.equal(server.calls.some((call) => call.method === 'thread/unsubscribe'), false);
+    pending[1].resolve({ thread: { id: AUX_THREAD_ID } });
+    const handle = await success;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(server.calls.filter((call) => call.method === 'thread/unsubscribe').map((call) => call.params.threadId), ['orphan']);
+    assert.equal(isCodexResidentSessionBusy('aux-announcements'), true);
+    handle.release();
+    assert.equal(isCodexResidentSessionBusy('aux-announcements'), false);
+  } finally { closeCodexResidentSessions(); }
 });
