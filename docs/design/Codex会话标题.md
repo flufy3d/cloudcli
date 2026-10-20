@@ -1,17 +1,17 @@
 # Codex 会话标题
 
-> 状态：待实施（公共前置：仅元数据通知与名称合并已随 [OpenCode 会话标题](OpenCode会话标题.md) 落地）
-> 基准：2.10.0 / 2026-10-19；源码核对点 `692ce960`，仓库依赖 `@openai/codex` 0.163.0
+> 状态：待实施。页面同步通道已在用；驻留已交付并默认开启。第一片要先补驻留管理模块缺的临时线程借用入口、按线程分流事件、受限连接句柄，并用真实账号验收临时线程隔离
+> 基准：2.10.0 / 2026-10-20；源码核对点 `eb4cf953`，仓库依赖 `@openai/codex` 0.163.0，上游标签 `rust-v0.163.0`
 
 ## 目标与范围
 
 用户发起“我发现最近的版本很容易出现这种重复文字的情况……”的 Codex 会话后，CloudCLI 先用首句显示标题。正常回复结束后，后台生成例如“排查多引擎重复消息”的短标题，侧栏、聊天顶部和浏览器标题一起更新。这个示例说明预期含义，不要求模型逐字生成指定文案。
 
-本方案实现 Codex 的自动命名，以及会话名称从服务端同步到当前页面的通用路径。Claude、ZCode、Antigravity 继续使用各自引擎提供的标题。OpenCode 的标题诊断和 Cursor 的自动命名不在本次实施范围。
+本方案实现 Codex 的自动命名。会话名称从服务端同步到当前页面的通用路径已经在用，由 [OpenCode 会话标题](OpenCode会话标题.md) 交付，本方案直接复用。Claude、ZCode、Antigravity 继续使用各自引擎提供的标题；OpenCode 的标题由引擎自己生成，CloudCLI 只监听。Cursor 的自动命名不在本次实施范围。
 
 标题用于辨认会话。标题生成不占用聊天运行状态，不延迟发送下一条消息，不增加聊天消息、后台任务卡片或未读提示。用户手动命名优先。
 
-实施依赖[Codex 会话驻留](Codex会话驻留.md)的连接管理、线程路由与辅助借用入口。先交付驻留，再接标题。保持连接本身不生成标题，仍需一次独立的命名请求。
+实施依赖[Codex 会话驻留](Codex会话驻留.md)的连接管理与线程路由；驻留已交付并默认开启。驻留管理模块目前只提供整会话借用和主线程回合提交两种入口，没有临时线程借用入口；这个入口由本方案第一片实现，不能拿现有的整会话借用入口凑合（原因见"已核实的机制"）。保持连接本身不生成标题，仍需一次独立的命名请求。
 
 ## 已核实的机制
 
@@ -25,22 +25,29 @@
 | ZCode | `server/modules/providers/list/zcode/zcode-session-synchronizer.provider.ts`，`deriveSessionName` | 读取引擎数据库标题，用 `title_source` 区分生成标题和原始首句 |
 | Antigravity | `server/modules/providers/list/antigravity/antigravity-session-synchronizer.provider.ts`，`deriveSessionName` | 读取引擎维护的会话摘要标题 |
 | Codex 索引 | `server/modules/providers/list/codex/codex-session-synchronizer.provider.ts`，`processSessionFile` | 读取 `session_index.jsonl` 的最新 `thread_name`；没有名称时保留已有占位标题 |
-| Codex 运行 | `server/modules/providers/list/codex/codex-runtime.provider.ts` | 运行用户回合，没有标题生成任务；回合退出时关闭 app-server 连接 |
-| 标题保护 | `server/modules/providers/shared/sessions/session-title-resolution.ts`，`resolveSessionTitle` | `name_locked` 保护用户命名；引擎名称可以替换未锁定的占位标题 |
-| 页面同步 | `src/modules/project-workspace/hooks/useProjectsState.ts`，`handleEvent` | `session_upserted` 更新侧栏；同 id 的名称更新会合并进当前会话（该合并已随 OpenCode 方案落地） |
+| Codex 运行 | `server/modules/providers/list/codex/codex-runtime.provider.ts` | 通过驻留管理模块借用常驻进程，经引擎队列提交用户回合；没有标题生成任务；不读取 `thread/start`、`thread/resume` 应答里的 `name`；把非主线程的事件当作引擎自发活动发进会话频道 |
+| Codex 驻留管理 | `server/modules/providers/list/codex/codex-session-manager.ts`，`acquireCodexResidentSession` | 对外只有整会话借用与主线程回合提交，没有临时线程借用入口；对已存在的会话再次借用时，新借用者的会话级回调（引擎事件、审批请求、退出、忙判定）替换旧借用者的；借出的连接句柄带 `close()`，能关掉共享进程；非主线程事件不分线程，全部交给同一个 `onEngineEvent`；空闲回收只看前台回合、引擎自发回合、未答请求和 `isBusy`，没有辅助借用计数 |
+| 标题保护 | `server/modules/providers/shared/sessions/session-title-resolution.ts`，`resolveSessionTitle`；`server/modules/database/repositories/sessions.db.ts`，`applyEngineSessionName` | `name_locked` 保护用户命名；引擎名称可以替换未锁定的占位标题；`applyEngineSessionName` 只在未锁定时写名称，不核对 provider、原生线程映射与归档状态 |
+| 页面同步 | `src/modules/project-workspace/hooks/useProjectsState.ts`，`handleEvent` | `session_upserted` 更新侧栏；同 id 的名称更新合并进当前会话 |
 | 页面副作用 | 同上 | 普通 `session_upserted` 落到空闲的当前会话仍会触发历史刷新，后台会话仍会被标记需要关注；带 `metadataOnly` 的增量两者都不触发 |
 
-Codex 自带终端界面在客户端组织标题生成。上游 `rust-v0.163.0` 的 [`app/thread_title.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/app/thread_title.rs) 调用临时线程生成结构化标题；[`temporary_structured_request.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/temporary_structured_request.rs) 负责临时线程、工具隔离、超时和清理。这段客户端逻辑不会因为 CloudCLI 调用了 `thread/start` 就自动执行。
+Codex 引擎自己不生成名称。上游 `rust-v0.163.0` 里生成标题的是终端客户端：[`app/thread_title.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/app/thread_title.rs) 调用临时线程生成结构化标题，[`temporary_structured_request.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/temporary_structured_request.rs) 负责临时线程、工具隔离、超时和清理。这段客户端逻辑不会因为 CloudCLI 调用了 `thread/start` 就自动执行。
 
-[官方 app-server 文档](https://developers.openai.com/codex/app-server) 提供 `thread/name/set` 和 `thread/name/updated`，并通过 `thread/read` 等接口返回 `thread.name`。这些接口负责存取名称。CloudCLI 需要自己组织生成请求。
+[官方 app-server 文档](https://developers.openai.com/codex/app-server) 提供 `thread/name/set` 和 `thread/name/updated`，并通过 `thread/read` 等接口返回 `thread.name`。`thread/name/updated` 只由 `thread/name/set` 的处理函数在写入成功后发出（[`thread_processor.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server/src/request_processors/thread_processor.rs)，`thread_set_name`），引擎没有别的路径发它。这一点和 OpenCode 不同：OpenCode 的服务端自己生成标题并推送更新事件，CloudCLI 只监听就能拿到名称；Codex 由 CloudCLI 驱动时，这个通知只会回显 CloudCLI 自己的改名。所以 CloudCLI 必须自己组织生成请求。`thread/name/updated` 可以当作自己那次 `thread/name/set` 已落盘的确认信号，不能当作标题来源。
 
-本轮还用仓库包内 CLI 导出公开协议，确认包含临时线程、结构化输出、读名称和写名称所需的字段。导出协议没有发起模型请求；临时线程的真实生成、工具隔离和写名称副作用仍需在实施时实测。
+`thread/name/set` 写 SQLite 的 `threads.name`，并向 `session_index.jsonl` 追加一条记录（[`update_thread_metadata.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/thread-store/src/local/update_thread_metadata.rs) 调 `append_thread_name`，实现在 [`session_index.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/rollout/src/session_index.rs)），不改聊天记录 JSONL。CloudCLI 的 Codex 同步器只监听 `~/.codex/sessions` 下的 `.jsonl`，`session_index.jsonl` 只在扫描时查表（`codex-session-synchronizer.provider.ts`，`getSessionWatchTarget`）。按源码推断，仅改名不会触发现有 watcher，名称要靠本方案主动广播才能即时到页面；这一条以第一片真实探针为准。
+
+`thread/read` 返回的 `name` 只来自显式名称列（`thread_processor.rs`，`attach_thread_name`）。首句 `title` 不会被当成名称返回，所以"名称为空才生成"的判断成立。
+
+终端的临时线程隔离配方全部在 `temporary_structured_request.rs`。`thread/start` 带 `ephemeral: true` 和 `threadSource` 标记 `thread_title`，沙箱只读（用户有自定义权限档时沿用该档）。`config` 覆盖关闭约三十个能力开关，含 `features.shell_tool`、`features.unified_exec`、`features.hooks`、`features.memories`、`features.multi_agent`、`features.plugins`、`features.view_image`、`features.image_generation`、`cloud.skills.enabled`、`skills.include_instructions`、`tools.update_plan.enabled`、`tools.experimental_request_user_input.enabled`，并把 `web_search` 设为 `disabled`。它先读引擎有效配置，再把每个 MCP 服务器显式禁用；读不到有效配置就失败。`dynamicTools`、`environments`、`runtimeWorkspaceRoots`、`selectedCapabilityRoots` 置空。启动后核对应答里的 `sandbox` 确实是只读，不是就失败。回合超时 30 秒，拒绝一切交互请求。引擎核心对 `thread_title` 标记只改推理强度覆盖与缓存行为，源码注释写明不改权限（[`session.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/session/session.rs)，`title_request`）；隔离只能靠上述配置与沙箱，不能靠标记。
+
+本轮用仓库包内 CLI 导出公开协议核对了这套参数。`modelProvider`、`cwd`、`sandbox`、`config`、`ephemeral`、`threadSource` 在公开 `ThreadStartParams` 里；`model`、`permissions`、`runtimeWorkspaceRoots`、`environments`、`dynamicTools`、`selectedCapabilityRoots` 不在公开导出里，要用 `--experimental` 导出并在握手声明 `experimentalApi` 后验证（`codex-app-server.client.ts` 的握手已支持这个声明，驻留的队列方法正在用）。`model`、`effort`、`outputSchema` 在公开 `TurnStartParams` 里，模型、推理强度和结构化输出按轮传。`thread/read`、`thread/name/set`、`thread/name/updated`、`Thread.name` 均在公开协议。导出协议没有发起模型请求；临时线程的真实生成、工具隔离和写名称副作用仍需在实施时实测。
 
 ```sh
 node node_modules/@openai/codex/bin/codex.js app-server generate-ts --out /tmp/cloudcli-codex-title-protocol
 ```
 
-重点核对导出目录的 `v2/ThreadStartParams.ts`、`v2/TurnStartParams.ts`、`v2/ThreadReadParams.ts`、`v2/ThreadSetNameParams.ts`、`v2/ThreadNameUpdatedNotification.ts`。上游终端实现还使用部分内部或实验字段，实施不能照抄 Rust 请求后就假定公开接口接受；需要实验字段时单独导出 `--experimental` 协议并验证握手。
+重点核对导出目录的 `v2/ThreadStartParams.ts`、`v2/TurnStartParams.ts`、`v2/ThreadReadParams.ts`、`v2/ThreadSetNameParams.ts`、`v2/ThreadNameUpdatedNotification.ts`。实施不能照抄 Rust 请求后就假定公开接口接受。
 
 ## 选择的方案
 
@@ -54,7 +61,7 @@ CloudCLI 在用户回合成功结束后，提交一个独立的 Codex 标题任�
 | --- | --- | --- |
 | 驻留连接上用独立临时线程生成，保存原生名称 | 每个尚未命名的会话多一次小请求；复用进程，需要管理模块提供线程路由和隔离 | 本方案采用 |
 | 受控专用短连接上的临时线程 | 增加进程启动，但可以隔离与正式聊天不兼容的启动配置 | 仅作验证后确有必要的兼容分支 |
-| 等待 Codex 自动生成，只补标题监听 | 没有新增模型请求；需要所接客户端本来就生成名称 | 当前 CloudCLI 没有生成方，不能解决截图问题 |
+| 等待 Codex 自动生成，只补标题监听 | 没有新增模型请求；需要引擎或所接客户端本来就生成名称 | 引擎不生成名称，`thread/name/updated` 只回显 `thread/name/set`；CloudCLI 不发生成请求就永远没有名称，不能解决截图问题 |
 | 在正式聊天里追加“生成标题”指令 | 名称任务进入用户上下文，可能产生可见回复、工具调用或额外回合 | 不采用 |
 | CloudCLI 单独接模型 HTTP API | 需要另管认证、模型路由和返回协议，用户配置也可能与 Codex 不同 | 当前不值得建立第二套请求路径 |
 
@@ -97,13 +104,13 @@ flowchart TD
 
 失败后本次任务结束，不定时循环重试。下次成功的正常用户回合重新检查资格。进程重启后内存中的任务丢失，也按下次用户回合恢复。成功的原生名称充当已命名依据；本方案不增加持久任务队列，不承诺跨崩溃只调用一次模型。
 
-临时线程需要关闭 shell、文件修改、外部工具、MCP、hooks、skills、记忆和子代理等任务能力，只开放结构化文本生成。具体配置取自所用版本的有效配置与上游隔离机制，不能仅靠提示词要求模型不用工具。不能确认隔离配置或实际权限时，任务失败并保留原标题。临时线程不得落成普通侧栏会话，也不得继承 CloudCLI 宿主任务专用凭证。
+临时线程需要关闭 shell、文件修改、外部工具、MCP、hooks、skills、记忆和子代理等任务能力，只开放结构化文本生成。配置照终端的隔离配方（见"已核实的机制"）：只读沙箱、`config` 覆盖关闭能力开关、读有效配置后逐个禁用 MCP 服务器、启动后核对应答里的沙箱。不能仅靠提示词要求模型不用工具，也不能靠 `thread_title` 标记。不能确认隔离配置或实际权限时，任务失败并保留原标题。临时线程不得落成普通侧栏会话，也不得继承 CloudCLI 宿主任务专用凭证。
 
 ## 名称保存与竞争处理
 
 Codex 原生名称使用 `thread/read` 和 `thread/name/set` 读写，不直接写 `state_*.sqlite`，也不由 CloudCLI 手工拼接 `session_index.jsonl`。名称已存在时只同步，不重新生成。这样，原生保存成功、本地保存失败的情况，可以在下一次资格检查中补齐本地数据，而不再调用模型。
 
-本地自动写入必须是名称专用的条件更新。已有 `sessionsDb.updateSessionCustomName` 不检查锁，不能直接用它落自动标题。数据库更新同时要求应用会话、provider、原生线程映射仍匹配，名称未锁定且会话未归档。条件不成立时放弃结果，不创建会话、不解除归档、不改会话活跃时间和项目归属。
+本地自动写入必须是名称专用的条件更新。已有 `sessionsDb.updateSessionCustomName` 不检查锁；`applyEngineSessionName` 只检查锁。两者都不核对 provider、原生线程映射和归档状态，不能直接用来落自动标题。数据库更新同时要求应用会话、provider、原生线程映射仍匹配，名称未锁定且会话未归档。条件不成立时放弃结果，不创建会话、不解除归档、不改会话活跃时间和项目归属。
 
 生成前、写原生名称前、写本地名称时都检查目标。用户在等待期间手动改名，本地的 `name_locked` 必须使自动结果失效。用户编辑早期消息导致同一个应用会话换到另一个原生线程时，旧任务只能丢弃，不能把旧主题写到新线程。
 
@@ -111,13 +118,13 @@ Codex 原生名称使用 `thread/read` 和 `thread/name/set` 读写，不直接�
 
 另一 Codex 客户端可能在最后一次读取与 `thread/name/set` 之间改名。当前原生接口没有条件写参数，无法保证这两个请求之间的跨客户端原子性。实施需要二次读取以缩小窗口，并如实保留这个限制；CloudCLI 自己的用户命名始终由数据库条件更新保护。
 
-同步器仍负责已有 `thread_name` 的正常同步。必须通过真实协议探针确认 `thread/name/set` 写入哪些原生记录、是否触发当前 watcher，不能假设标题索引与聊天 JSONL 会同时变化。自动标题提交后主动广播，不依赖文件监听恰好触发。
+同步器仍负责已有 `thread_name` 的正常同步。按源码，`thread/name/set` 只写 SQLite 与 `session_index.jsonl`，不碰被监听的聊天 JSONL，所以仅改名不会触发现有 watcher。名称要靠自动标题提交后主动广播才能即时到页面，不能依赖文件监听。另一个 Codex 客户端改的名，CloudCLI 要等该会话的聊天 JSONL 下次变化、同步器重新查表时才会看到。第一片探针要实测确认这两点。
 
-如果原生改名同时触发 watcher，必须让仅改名产生的更新也走仅元数据分支；真实聊天记录变化仍走原分支。不能把“发过一次标题更新”当作忽略随后文件事件的依据，否则会漏掉用户接着发的一轮。当前 watcher 不区分变化原因，这部分接线以第一片真实协议探针的结果为准。
+如果实测发现改名也触发了 watcher，必须让仅改名产生的更新走仅元数据分支；真实聊天记录变化仍走原分支。不能把"发过一次标题更新"当作忽略随后文件事件的依据，否则会漏掉用户接着发的一轮。当前 watcher 不区分变化原因，这部分接线以第一片真实协议探针的结果为准。
 
 ## 页面更新
 
-复用 `broadcastSessionUpserted` 的唯一事件构造路径，给 `SessionUpsertedEvent` 增加可选的 `metadataOnly` 标记。标题任务发送 true；缺省保持现有含义。字段在共享协议定义，前端复用共享类型，移除触及位置重复定义的事件形状。
+`broadcastSessionUpserted` 是唯一的事件构造路径，`SessionUpsertedEvent` 带可选的 `metadataOnly` 标记。标题任务发送 true；缺省保持原有含义。字段在共享协议定义，前端复用共享类型。
 
 前端收到仅元数据更新时，合并侧栏名称和当前会话名称，既支持应用 id，也支持 provider id 归并。当前会话 id 没变时不重新导航。标题相同则保留原对象，避免重复更新。
 
@@ -125,7 +132,7 @@ Codex 原生名称使用 `thread/read` 和 `thread/name/set` 读写，不直接�
 
 `WorkspaceTitle` 和浏览器标题继续从当前会话状态派生，不增加第二套标题缓存。这个同步修复适用于所有引擎的同 id 名称更新；其他引擎的普通会话文件更新仍保留原有历史刷新行为。
 
-上面这套机制已随 [OpenCode 会话标题](OpenCode会话标题.md) 落地，Codex 侧直接复用。落地时补了一条约束：仅元数据更新要换掉当前会话的对象才能带上新名字，重读消息的副作用因此只能挂在会话 id 上（`useChatSessionState` 的刷新 effect 依赖 `selectedSession` 对象时，标题到达会被当成「对话变了」而重读一遍）。
+这套机制是 OpenCode 自动标题正在用的路径（见 [OpenCode 会话标题](OpenCode会话标题.md)），Codex 侧直接复用。现行约束：仅元数据更新要换掉当前会话的对象才能带上新名字，重读消息的副作用因此只能挂在会话 id 上（`useChatSessionState` 的刷新 effect 若依赖 `selectedSession` 对象，标题到达会被当成「对话变了」而重读一遍）。
 
 ## 实施切片与涉及文件
 
@@ -133,10 +140,10 @@ Codex 原生名称使用 `thread/read` 和 `thread/name/set` 读写，不直接�
 
 | 切片 | 涉及位置 | 完成依据 |
 | --- | --- | --- |
-| 驻留依赖与真实协议验证 | 会话驻留管理模块的辅助借用入口；一次性探针 | 独立线程生成短标题；证明工具关闭、临时线程不入普通会话列表、原生名称保存后可读；标题中断不影响正式聊天；失败时不改生产配置 |
+| 驻留借用入口与真实协议验证 | `codex-session-manager.ts` 新增临时线程借用入口：不替换会话级回调、不暴露 `close()`、借用计入空闲回收与归档的活动判断、该线程的事件与请求只交给借用者；`--experimental` 协议导出；一次性探针 | 独立临时线程生成短标题；证明工具关闭（含 shell）、临时线程不入普通会话列表、原生名称保存后可读、改名是否触发 watcher；标题中断不影响正式聊天；失败时不改生产配置 |
 | 标题生成客户端 | 新增 `server/modules/providers/list/codex/codex-thread-title.ts`；复用驻留管理模块与 `codex-app-server.client.ts` | 借用归还、通知按 thread/turn 隔离、结构化输出、超时、取消和清理有测试；不复制 JSON-RPC 传输或会话进程表 |
 | 任务与条件落库 | 新增 `server/modules/providers/services/codex-session-title.service.ts`；`codex-runtime.provider.ts`；`server/modules/database/repositories/sessions.db.ts` | 只在符合条件的成功用户回合提交；去重、旧线程失效、手动改名保护和半完成恢复成立 |
-| 元数据广播与页面同步 | `shared/protocol/chatEvents.ts`；`server/modules/websocket/services/session-upsert-broadcast.service.ts`；`src/modules/project-workspace/hooks/useProjectsState.ts`；探针证明有必要时包含 `sessions-watcher.service.ts` 与 Codex 同步器 | 同时更新侧栏、顶部和浏览器标题；无历史刷新、未读提示、重复导航或搜索回跳；改名与新消息相邻时不漏历史变化 |
+| 元数据广播与页面同步接线 | 标题服务调用 `server/modules/websocket/services/session-upsert-broadcast.service.ts` 的 `metadataOnly` 路径；探针证明有必要时包含 `sessions-watcher.service.ts` 与 Codex 同步器 | 同时更新侧栏、顶部和浏览器标题；无历史刷新、未读提示、重复导航或搜索回跳；改名与新消息相邻时不漏历史变化 |
 | 同机制回归与文档 | providers/database/websocket/project-workspace 的对应 tests；`docs/requirements/Codex会话标题.md`；`docs/core/providers.md`、`docs/core/chat.md`、`docs/core/frontend.md` | 逐场景留下实测结果；活文档只写交付时已成立的机制 |
 
 标题任务限定在 providers 模块内。跨模块存储和广播只经 database、websocket 的 barrel 调用。需要共享的类型复用共享定义，不为这一个 Codex 功能增加所有引擎都要实现的新切面。
