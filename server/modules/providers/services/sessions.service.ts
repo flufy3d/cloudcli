@@ -4,6 +4,7 @@ import path from 'node:path';
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { broadcastSessionRemoved, broadcastSessionUpserted, chatRunRegistry } from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
+import { providerRuntimeService } from '@/modules/providers/services/provider-runtime.service.js';
 import { listBusyClaudeCliSessions } from '@/modules/providers/services/claude-cli-liveness.service.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
 import type {
@@ -252,6 +253,69 @@ function resolveProjectDisplayName(
  * class, keeping normalization/history call sites decoupled from implementation
  * file layout.
  */
+/**
+ * Archives or permanently deletes a session whose work is over.
+ *
+ * The caller has already closed the admission and checked that nothing is
+ * running, so this only performs the action and reports it.
+ */
+async function archiveOrDeleteResolvedSession(
+  session: {
+    session_id: string;
+    provider: string;
+    provider_session_id: string | null;
+    jsonl_path: string | null;
+    project_path: string | null;
+  },
+  resolvedSessionId: string,
+  options: { force?: boolean; deletedFromDisk?: boolean },
+): Promise<{ sessionId: string; action: 'archived' | 'deleted'; deletedFromDisk: boolean }> {
+  if (!options.force) {
+    sessionsDb.updateSessionIsArchived(resolvedSessionId, true);
+    // The initiating client cleans up its own list; the broadcast is for the
+    // other connected clients (idempotent for the initiator).
+    broadcastSessionRemoved([resolvedSessionId]);
+    return {
+      sessionId: resolvedSessionId,
+      action: 'archived',
+      deletedFromDisk: false,
+    };
+  }
+
+  let removedFromDisk = false;
+  if (options.deletedFromDisk) {
+    removedFromDisk = await cleanupProviderNativeSession(session);
+    // Every file the conversation has lived in, not just the one the row
+    // points at now: editing a message on a provider that rewinds by
+    // branching moves the session onto a copy and leaves the earlier
+    // transcript behind. Deleting only the current one would leave the
+    // replaced turns on disk, and unreachable through the app.
+    const transcripts = [
+      ...(session.jsonl_path ? [session.jsonl_path] : []),
+      ...sessionsDb.getSupersededTranscriptPaths(resolvedSessionId),
+    ];
+    for (const transcript of transcripts) {
+      removedFromDisk = (await removePathIfExists(transcript)) || removedFromDisk;
+    }
+  }
+
+  sessionsDb.clearSupersededProviderSessions(resolvedSessionId);
+  const deleted = sessionsDb.deleteSessionById(resolvedSessionId);
+  if (!deleted) {
+    throw new AppError(`Session "${resolvedSessionId}" was not found.`, {
+      code: 'SESSION_NOT_FOUND',
+      statusCode: 404,
+    });
+  }
+
+  broadcastSessionRemoved([resolvedSessionId]);
+  return {
+    sessionId: resolvedSessionId,
+    action: 'deleted',
+    deletedFromDisk: removedFromDisk,
+  };
+}
+
 export const sessionsService = {
   /**
    * Lists provider ids that can load session history and normalize live messages.
@@ -823,50 +887,28 @@ export const sessionsService = {
 
     const resolvedSessionId = session.session_id;
 
-    if (!options.force) {
-      sessionsDb.updateSessionIsArchived(resolvedSessionId, true);
-      // The initiating client cleans up its own list; the broadcast is for the
-      // other connected clients (idempotent for the initiator).
-      broadcastSessionRemoved([resolvedSessionId]);
-      return {
-        sessionId: resolvedSessionId,
-        action: 'archived',
-        deletedFromDisk: false,
-      };
-    }
-
-    let removedFromDisk = false;
-    if (options.deletedFromDisk) {
-      removedFromDisk = await cleanupProviderNativeSession(session);
-      // Every file the conversation has lived in, not just the one the row
-      // points at now: editing a message on a provider that rewinds by
-      // branching moves the session onto a copy and leaves the earlier
-      // transcript behind. Deleting only the current one would leave the
-      // replaced turns on disk, and unreachable through the app.
-      const transcripts = [
-        ...(session.jsonl_path ? [session.jsonl_path] : []),
-        ...sessionsDb.getSupersededTranscriptPaths(resolvedSessionId),
-      ];
-      for (const transcript of transcripts) {
-        removedFromDisk = (await removePathIfExists(transcript)) || removedFromDisk;
+    // A conversation with work in flight cannot be archived away: the work
+    // would keep running against a session the user can no longer see. The
+    // admission closes first, so no run starts between the check and the
+    // action.
+    providerRuntimeService.closeSessionAdmission(resolvedSessionId);
+    try {
+      if (providerRuntimeService.hasSessionWork(resolvedSessionId)) {
+        throw new AppError('This conversation is still working. Stop it before archiving it.', {
+          code: 'SESSION_HAS_ACTIVE_WORK',
+          statusCode: 409,
+        });
       }
-    }
+      // An idle resident process is closed with the conversation, so the
+      // engine does not keep working for a session that is gone.
+      providerRuntimeService.releaseSession(resolvedSessionId);
 
-    sessionsDb.clearSupersededProviderSessions(resolvedSessionId);
-    const deleted = sessionsDb.deleteSessionById(resolvedSessionId);
-    if (!deleted) {
-      throw new AppError(`Session "${resolvedSessionId}" was not found.`, {
-        code: 'SESSION_NOT_FOUND',
-        statusCode: 404,
-      });
+      return await archiveOrDeleteResolvedSession(session, resolvedSessionId, options);
+    } finally {
+      // The admission opens again with the session, so a conversation that
+      // was only looked at stays usable.
+      providerRuntimeService.releaseSession(resolvedSessionId);
     }
-
-    broadcastSessionRemoved([resolvedSessionId]);
-    return {
-      sessionId: resolvedSessionId,
-      action: 'deleted',
-      deletedFromDisk: removedFromDisk,
-    };
   },
 
   /**

@@ -203,6 +203,15 @@ export type CodexResidentRoundOptions = {
 
 const residentSessions = new Map<string, ResidentSession>();
 
+/**
+ * The sessions whose admission is closed.
+ *
+ * Archiving or deleting a conversation has to look at its state and act on
+ * it, and a run that starts in between would leave work behind. Closing the
+ * admission first makes the check and the action one step.
+ */
+const closedAdmission = new Set<string>();
+
 /** Reads the turn id an event carries, whichever field it arrives in. */
 function readEventTurnId(params: AnyRecord): string | null {
   const turn = params.turn && typeof params.turn === 'object' ? params.turn as AnyRecord : null;
@@ -576,6 +585,9 @@ export async function submitCodexResidentRound(
   if (session.round) {
     throw new Error('The Codex conversation is already answering.');
   }
+  if (closedAdmission.has(options.appSessionId)) {
+    throw new Error('The Codex conversation is being closed and cannot take another message.');
+  }
   if (session.initializing) {
     await session.initializing;
   }
@@ -694,6 +706,42 @@ export function releaseCodexResidentSession(appSessionId: string, options?: { di
   }
   session.lastUsedAt = Date.now();
   scheduleResidentReclaim(session);
+}
+
+/**
+ * Whether the session still has work that must not be reclaimed.
+ *
+ * A round in flight, a report the engine started on its own, or an agent
+ * that is still running all count: the session cannot be archived away while
+ * they are alive.
+ */
+export function isCodexResidentSessionBusy(appSessionId: string): boolean {
+  const session = residentSessions.get(appSessionId);
+  if (!session || session.disposed) {
+    return false;
+  }
+  return Boolean(session.round) || session.engineTurns.size > 0 || session.isBusy();
+}
+
+/**
+ * Stops new rounds from starting in the session.
+ *
+ * The caller checks the session's state afterwards and releases it, so a
+ * run cannot slip in between the check and the action.
+ */
+export function closeCodexResidentSessionAdmission(appSessionId: string): void {
+  closedAdmission.add(appSessionId);
+}
+
+/**
+ * Releases the resources the session holds.
+ *
+ * The process is closed and the admission is reopened, so a session that was
+ * only looked at can be used again.
+ */
+export function releaseCodexResidentSessionResources(appSessionId: string): void {
+  closedAdmission.delete(appSessionId);
+  releaseCodexResidentSession(appSessionId, { dispose: true });
 }
 
 /** The resident sessions that are currently open, for diagnostics and tests. */

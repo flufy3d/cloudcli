@@ -835,6 +835,51 @@ export const sessionsDb = {
   },
 
   /**
+   * Lists the sessions that are older than the cutoff and not archived yet.
+   *
+   * The caller decides which of them may be archived, so the list comes
+   * before the update. Used by Providers module (sessionsAutoArchiveService).
+   */
+  listSessionsOlderThanCutoff(cutoffIsoString: string): string[] {
+    const db = getConnection();
+    const rows = db
+      .prepare(
+        `SELECT session_id FROM sessions
+         WHERE isArchived = 0
+           AND (
+             datetime(COALESCE(updated_at, created_at)) < datetime(?)
+             OR datetime(COALESCE(updated_at, created_at)) IS NULL
+           )`,
+      )
+      .all(cutoffIsoString) as { session_id: string }[];
+    return rows.map((row) => row.session_id);
+  },
+
+  /**
+   * Archives the given sessions and returns the ids that were archived.
+   *
+   * Used by Providers module (sessionsAutoArchiveService) after it decided
+   * that these sessions have no work left.
+   */
+  archiveSessionsByIds(sessionIds: string[]): string[] {
+    if (sessionIds.length === 0) {
+      return [];
+    }
+    const db = getConnection();
+    const placeholders = sessionIds.map(() => '?').join(', ');
+    const rows = db
+      .prepare(
+        `UPDATE sessions
+         SET isArchived = 1
+         WHERE session_id IN (${placeholders})
+           AND isArchived = 0
+         RETURNING session_id`,
+      )
+      .all(...sessionIds) as { session_id: string }[];
+    return rows.map((row) => row.session_id);
+  },
+
+  /**
    * Lists every indexed session that claims a transcript file on disk.
    *
    * Only rows with a `jsonl_path` are returned, which deliberately excludes

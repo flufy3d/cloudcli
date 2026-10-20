@@ -1,4 +1,5 @@
 import { appConfigDb, sessionsDb } from '@/modules/database/index.js';
+import { providerRuntimeService } from '@/modules/providers/services/provider-runtime.service.js';
 import { broadcastSessionRemoved } from '@/modules/websocket/index.js';
 
 /**
@@ -91,7 +92,16 @@ export const sessionsAutoArchiveService = {
       const days = retentionDaysOverride ?? settings.retentionDays;
       const cutoff = calculateCutoffDate(days);
 
-      const archivedSessionIds = sessionsDb.archiveSessionsOlderThanCutoff(cutoff);
+      // The sessions that still have work are skipped: archiving them away
+      // would leave that work running against a conversation nobody sees.
+      const candidates = sessionsDb.listSessionsOlderThanCutoff(cutoff);
+      const idleCandidates = candidates.filter((sessionId) => !providerRuntimeService.hasSessionWork(sessionId));
+      const archivedSessionIds = sessionsDb.archiveSessionsByIds(idleCandidates);
+      if (archivedSessionIds.length < candidates.length) {
+        console.log(
+          `[SessionsAutoArchive] Skipped ${candidates.length - archivedSessionIds.length} session(s) with work in flight`,
+        );
+      }
       if (archivedSessionIds.length > 0) {
         console.log(`[SessionsAutoArchive] Archived ${archivedSessionIds.length} session(s) older than ${cutoff}`);
         // Manual runs and the hourly scheduler both land here, so every path

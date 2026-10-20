@@ -35,8 +35,11 @@ import {
 import { CODEX_BACKGROUND_TASK_TYPE, codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import {
   acquireCodexResidentSession,
+  closeCodexResidentSessionAdmission,
   completeCodexResidentRound,
+  isCodexResidentSessionBusy,
   releaseCodexResidentSession,
+  releaseCodexResidentSessionResources,
   stopCodexResidentRound,
   submitCodexResidentRound,
 } from '@/modules/providers/list/codex/codex-session-manager.js';
@@ -1542,6 +1545,25 @@ export const codexRuntime = {
    */
   listBackgroundWork(): SessionBackgroundWork[] {
     return codexBackgroundWork.list();
+  },
+  /**
+   * Whether the conversation still has work that must not be reclaimed.
+   */
+  hasSessionWork(sessionId: string): boolean {
+    return isCodexResidentSessionBusy(sessionId);
+  },
+  /**
+   * Stops new rounds from starting in the conversation, so an archive or a
+   * delete can look at its state and act on it.
+   */
+  closeSessionAdmission(sessionId: string): void {
+    closeCodexResidentSessionAdmission(sessionId);
+  },
+  /**
+   * Releases the process the conversation kept alive between rounds.
+   */
+  releaseSession(sessionId: string): void {
+    releaseCodexResidentSessionResources(sessionId);
   },
   /** What the composer's strip shows for a session that subscribes mid-turn. */
   backgroundTasks: {

@@ -17,6 +17,7 @@ import {
     providerRuntimeService,
     sessionsAutoArchiveService,
     setSessionWorktreeHomeResolver,
+    closeCodexResidentSessions,
     shutdownZCodeRuntime,
 } from '@/modules/providers/index.js';
 import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/index.js';
@@ -498,6 +499,13 @@ async function startServer() {
                 await shutdownZCodeRuntime();
             } catch (err) {
                 console.error('[ZCode] Error during protocol client shutdown:', getErrorMessage(err));
+            }
+            try {
+                // The Codex processes that stay alive between rounds must not
+                // outlive the host.
+                closeCodexResidentSessions();
+            } catch (err) {
+                console.error('[Codex] Error closing the resident sessions during shutdown:', getErrorMessage(err));
             }
             process.exit(0);
         };

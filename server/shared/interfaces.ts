@@ -46,6 +46,26 @@ export interface IProviderRuntime {
     context: ProviderRuntimeContext,
   ): Promise<unknown>;
   abort(sessionId: string): boolean | Promise<boolean>;
+  /**
+   * Whether the session still has work that must not be reclaimed.
+   *
+   * A conversation with a turn in flight, with a report the engine started on
+   * its own, or with an agent that is still running cannot be archived or
+   * deleted while that work is alive.
+   */
+  hasSessionWork?(sessionId: string): boolean;
+  /**
+   * Stops new work from starting in the session.
+   *
+   * The caller looks at the session's state afterwards and releases it, so a
+   * run cannot start in between the check and the action.
+   */
+  closeSessionAdmission?(sessionId: string): void;
+  /**
+   * Releases the resources the session holds, such as a process that stays
+   * alive between rounds. Called once the session's work is over.
+   */
+  releaseSession?(sessionId: string): void;
   permissions?: ProviderRuntimePermissionGateway;
   backgroundTasks?: {
     list(sessionId: string): ActiveBackgroundTask[];

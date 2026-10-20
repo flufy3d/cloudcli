@@ -168,6 +168,33 @@ export function createProviderRuntimeService(
       return (command, options, writer) => run(provider, command, options, writer);
     },
 
+    /**
+     * Whether any engine still has work in the session.
+     */
+    hasSessionWork(sessionId: string): boolean {
+      return dependencies.listProviders()
+        .some((provider) => provider.runtime.hasSessionWork?.(sessionId) === true);
+    },
+
+    /**
+     * Stops new work from starting in the session, so a caller can look at
+     * its state and act on it without a run slipping in.
+     */
+    closeSessionAdmission(sessionId: string): void {
+      for (const provider of dependencies.listProviders()) {
+        provider.runtime.closeSessionAdmission?.(sessionId);
+      }
+    },
+
+    /**
+     * Releases the resources the session holds in every engine.
+     */
+    releaseSession(sessionId: string): void {
+      for (const provider of dependencies.listProviders()) {
+        provider.runtime.releaseSession?.(sessionId);
+      }
+    },
+
     async abort(providerName: LLMProvider, sessionId: string): Promise<boolean> {
       return Boolean(await dependencies.resolveProvider(providerName).runtime.abort(sessionId));
     },
