@@ -82,8 +82,12 @@ wire_api = "responses"
   process.env.CODEX_HOME = codexHome;
   process.env.PROBE_API_KEY = 'probe-key';
 
-  const { acquireCodexResidentSession, closeCodexResidentSessions, submitCodexResidentRound } =
-    await import('@/modules/providers/list/codex/codex-session-manager.js');
+  const {
+    acquireCodexResidentSession,
+    closeCodexResidentSessions,
+    completeCodexResidentRound,
+    submitCodexResidentRound,
+  } = await import('@/modules/providers/list/codex/codex-session-manager.js');
 
   const events: string[] = [];
   let turnId: string | null = null;
@@ -116,6 +120,21 @@ wire_api = "responses"
     }
 
     const delivered = model.requests.some((body) => body.includes('RESIDENT-PROBE-TEXT'));
+
+    // The next round continues in the same process and the same thread.
+    completeCodexResidentRound('probe-session');
+    const secondEvents: string[] = [];
+    await submitCodexResidentRound({
+      appSessionId: 'probe-session',
+      input: [{ type: 'text', text: 'SECOND-RESIDENT-PROBE-TEXT' }],
+      onEvent: (method) => secondEvents.push(method),
+      onRequest: () => undefined,
+    });
+    for (let attempt = 0; attempt < 100 && !secondEvents.includes('turn/completed'); attempt += 1) {
+      await sleep(100);
+    }
+    const secondDelivered = model.requests.some((body) => body.includes('SECOND-RESIDENT-PROBE-TEXT'));
+
     console.log('\n### the round through the real engine');
     console.log(JSON.stringify({
       threadId: session.threadId,
@@ -123,6 +142,8 @@ wire_api = "responses"
       roundSawTurnCompleted: events.includes('round:turn/completed'),
       engineEvents: events.filter((event) => event.startsWith('engine:')),
       modelReceivedTheInput: delivered,
+      secondRoundEvents: secondEvents,
+      secondRoundReachedTheModel: secondDelivered,
     }, null, 2));
   } finally {
     closeCodexResidentSessions();
