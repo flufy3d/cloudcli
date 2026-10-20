@@ -1,5 +1,21 @@
 import { cleanup } from '@testing-library/react';
 import { afterEach } from 'vitest';
+import { TextEncoder } from 'node:util';
+
+// vitest's jsdom pool gives the test realm its own `Uint8Array`, so a
+// `TextEncoder` from Node's realm returns bytes that fail
+// `instanceof globalThis.Uint8Array`. esbuild asserts that invariant on
+// startup and refuses to run when it fails, so any test that loads a
+// build-time dependency (esbuild, via Vite) aborts with "your JavaScript
+// environment is broken". Point the global at the realm the encoder produces.
+if (!(new globalThis.TextEncoder().encode('') instanceof globalThis.Uint8Array)) {
+  const nodeUint8Array = new TextEncoder().encode('').constructor;
+  Object.defineProperty(globalThis, 'Uint8Array', {
+    configurable: true,
+    writable: true,
+    value: nodeUint8Array,
+  });
+}
 
 // Node >= 26 ships an inert global `localStorage` (undefined without
 // --localstorage-file) and, under vitest's jsdom pool, it shadows the storage
