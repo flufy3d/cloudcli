@@ -37,6 +37,7 @@ import {
   acquireCodexResidentSession,
   closeCodexResidentSessionAdmission,
   completeCodexResidentRound,
+  isCodexResidentSessionAdmissionClosed,
   isCodexResidentSessionBusy,
   openCodexResidentSessionAdmission,
   releaseCodexResidentSession,
@@ -218,24 +219,6 @@ const PROGRESSIVE_CODEX_ITEM_TYPES = new Set([
 
 /** Default context window reported when the server has not said otherwise. */
 const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
-
-/**
- * Maps a permission mode onto the two knobs `thread/start` takes.
- *
- * Unchanged from the `codex exec` mapping this replaced, so a mode decides
- * exactly what it decided before — except that `on-request` now means what it
- * says: the escalation reaches the user's approval card instead of dying in a
- * transport with nobody to ask.
- *
- * Who reviews an approval is deliberately not set here: Codex's own
- * `approvals_reviewer` config decides whether a request is auto-reviewed
- * before it ever reaches a client, and overriding that would quietly undo a
- * setting the user made.
- */
-function mapPermissionModeToCodexOptions(permissionMode: string): { sandbox: string; approvalPolicy: string } {
-  const policy = resolveCodexExecutionPolicy(permissionMode);
-  return { sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy };
-}
 
 /**
  * The server-to-client requests that are an approval the user can answer.
@@ -737,7 +720,6 @@ async function queryCodex(
    * manager starts the process.
    */
   let residentTaskMcpOptions: { config: Record<string, unknown>; env: NodeJS.ProcessEnv } | null = null;
-  let residentBridgeToken: string | null = null;
   const createResidentTaskMcpOptions = (generation: number) => {
     if (!normalizedUserId) {
       console.warn('[Codex] The conversation has no trusted user; the task tools are not available.');
@@ -755,9 +737,8 @@ async function queryCodex(
       residentTaskMcpOptions = null;
       return null;
     }
-    residentBridgeToken = bridge.token;
     residentTaskMcpOptions = getTaskMcpRuntimeOptions({ bridgeToken: bridge.token });
-    return residentTaskMcpOptions;
+    return { env: residentTaskMcpOptions.env, credentialToken: bridge.token };
   };
 
   /** Publishes one event to the session, outside any round. */
@@ -917,6 +898,15 @@ async function queryCodex(
   const openApprovalIds = new Set<string>();
 
   /**
+   * The approvals a session opened for the requests the engine made with no
+   * round in flight.
+   *
+   * They belong to the session rather than to a round: a round that ends must
+   * not retract the approval the engine is still waiting for.
+   */
+  const sessionApprovalIds = new Map<string, Set<string>>();
+
+  /**
    * Puts one approval in front of the user and waits for the answer.
    *
    * Codex is blocked on the JSON-RPC request until this resolves, so the wait
@@ -1003,6 +993,31 @@ async function queryCodex(
   const cancelOpenApprovals = (reason: string): void => {
     for (const requestId of [...openApprovalIds]) {
       sendMessage(ws, createNormalizedMessage({
+        kind: 'permission_cancelled',
+        requestId,
+        reason,
+        sessionId: capturedSessionId || sessionId || null,
+        provider: 'codex',
+      }));
+      pendingCodexApprovals.get(requestId)?.settle(null);
+    }
+  };
+
+  /**
+   * Retracts the approvals the session opened for the engine's own requests.
+   *
+   * They belong to the session rather than to a round: a round that ends must
+   * not retract the approval the engine is still waiting for.
+   */
+  const cancelSessionApprovals = (appSessionId: string | null, reason: string): void => {
+    const key = appSessionId || capturedSessionId || '';
+    const ids = sessionApprovalIds.get(key);
+    if (!ids) {
+      return;
+    }
+    sessionApprovalIds.delete(key);
+    for (const requestId of [...ids]) {
+      publishSessionMessage(createNormalizedMessage({
         kind: 'permission_cancelled',
         requestId,
         reason,
@@ -1235,6 +1250,12 @@ async function queryCodex(
   const residentKey = appSessionId ?? `codex-unbound-${randomUUID()}`;
 
   try {
+    // A conversation that is being archived or deleted must not start a
+    // round while that action is in flight.
+    if (appSessionId && isCodexResidentSessionAdmissionClosed(appSessionId)) {
+      throw new Error('The Codex conversation is being closed and cannot take another message.');
+    }
+
     /**
      * Ends the round.
      *
@@ -1309,7 +1330,7 @@ async function queryCodex(
         userId: normalizedUserId,
         nativeThreadId: providerSessionId,
         workingDirectory,
-        env: (generation) => createResidentTaskMcpOptions(generation)?.env,
+        env: (generation) => createResidentTaskMcpOptions(generation),
         config: async (openConnection) => {
           const excludes = residentTaskMcpOptions
             ? await readEffectiveShellEnvironmentExcludes(openConnection, workingDirectory)
@@ -1355,11 +1376,8 @@ async function queryCodex(
           }
           settle();
         },
-        revokeCredential: () => {
-          if (residentBridgeToken) {
-            context.revokeBridgeCredential?.(residentBridgeToken);
-            residentBridgeToken = null;
-          }
+        revokeCredential: (token: string) => {
+          context.revokeBridgeCredential?.(token);
         },
         onSessionDisposed: () => {
           // The agents of a closed process cannot report any more, so their

@@ -490,6 +490,10 @@ export const chatRunRegistry = {
 
     run.writer = new ChatSessionWriter({
       connection: input.connection,
+      // The sockets watching the conversation when the round starts. A tab that
+      // opens the conversation later joins the session's audience, not this
+      // round's: it replays what it missed instead.
+      audience: new Set(channel.audience),
       userId: input.userId,
       sessionName: input.sessionName,
       provider: input.provider,
@@ -548,9 +552,13 @@ export const chatRunRegistry = {
   ): boolean {
     // The session's audience is for the events that belong to the session
     // rather than to a round: a resident engine reports on it after its run
-    // is over.
+    // is over. A session that has not run yet has no channel, because a
+    // resident engine only exists once a round ran in this process.
     const channel = sessionChannels.get(appSessionId);
-    channel?.audience.add(connection);
+    if (channel) {
+      channel.audience.add(connection);
+      pruneSessionChannels();
+    }
 
     const run = runs.get(appSessionId);
     if (!run) {

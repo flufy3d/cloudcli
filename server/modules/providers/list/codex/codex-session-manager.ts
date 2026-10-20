@@ -150,8 +150,10 @@ type ResidentSession = {
   onSessionRequest: (method: string, params: AnyRecord) => unknown | Promise<unknown>;
   /** Called when the round ends without the engine reporting a terminal state. */
   onRoundEnded: (reason: 'cancelled' | 'unknown') => void;
+  /** The credential the process carried, revoked when the process is gone. */
+  credentialToken: string | null;
   /** Revokes the credential the process carried. */
-  revokeCredential: () => void;
+  revokeCredential: (token: string) => void;
   /** Called when the process of the session is closed. */
   onSessionDisposed: () => void;
 };
@@ -182,12 +184,18 @@ export type CodexResidentSessionOptions = {
   /** The working directory the rounds run in. */
   workingDirectory: string;
   /**
-   * The environment the child process starts with.
+   * The environment the child process starts with, and the credential that
+   * environment carries.
    *
    * It is built from the process generation, because the narrow credential a
-   * resident process carries is bound to it.
+   * resident process carries is bound to it. The credential is handed to the
+   * manager, so the manager can revoke it when the process is gone — a later
+   * borrow of the same process must not replace the callback that does that.
    */
-  env?: (generation: number) => NodeJS.ProcessEnv | undefined;
+  env?: (generation: number) => {
+    env: NodeJS.ProcessEnv;
+    credentialToken?: string;
+  } | null | undefined;
   /**
    * The thread configuration the engine applies.
    *
@@ -234,7 +242,7 @@ export type CodexResidentSessionOptions = {
    */
   onRoundEnded?: (reason: 'cancelled' | 'unknown') => void;
   /** Revokes the credential the process carried, when the process is gone. */
-  revokeCredential?: () => void;
+  revokeCredential?: (token: string) => void;
   /** Called when the process of the session is closed. */
   onSessionDisposed?: () => void;
   /** Whether the session still has work that must not be reclaimed. */
@@ -322,10 +330,13 @@ function disposeResidentSession(session: ResidentSession, reason: string): void 
     console.warn(`[Codex] Closing the resident session ${session.appSessionId} failed:`, error);
   }
   // The credential the process carried only ever authorized that process.
-  try {
-    session.revokeCredential();
-  } catch (error) {
-    console.warn(`[Codex] Revoking the credential of ${session.appSessionId} failed:`, error);
+  if (session.credentialToken) {
+    try {
+      session.revokeCredential(session.credentialToken);
+    } catch (error) {
+      console.warn(`[Codex] Revoking the credential of ${session.appSessionId} failed:`, error);
+    }
+    session.credentialToken = null;
   }
   try {
     session.onSessionDisposed();
@@ -362,48 +373,53 @@ async function readQueuedItems(session: ResidentSession): Promise<AnyRecord[]> {
 }
 
 /**
+ * What the queue says about the round's queued input.
+ *
+ * `armed` means the engine consumed it, `queued` means it is still waiting,
+ * `unreadable` means the queue could not be read at all, and `gone` means the
+ * round itself is over. Only `unreadable` ends the round: the round's turn
+ * cannot be identified, and waiting for it would hang the run.
+ */
+type QueueArmingState = 'armed' | 'queued' | 'unreadable' | 'gone';
+
+/**
  * Arms the round whose queued input the engine just consumed.
  *
  * The engine reports the consumption as `thread/queue/changed`, and it does so
  * after the item is gone, so listing the queue is enough to tell whether the
  * round is armed.
- *
- * The answer has three states: the round is armed, the round is still queued
- * (the engine started a turn of its own), or the queue could not be read. The
- * last one must not leave the round waiting for a turn that can no longer be
- * identified, so the caller ends it as unknown.
  */
-async function refreshRoundArmedState(session: ResidentSession): Promise<boolean | null> {
+async function refreshRoundArmedState(session: ResidentSession): Promise<QueueArmingState> {
   const round = session.round;
   if (!round) {
-    return null;
+    return 'gone';
   }
   if (round.armed) {
-    return true;
+    return 'armed';
   }
   if (round.turnId) {
-    return false;
+    return 'queued';
   }
   for (let attempt = 0; attempt < QUEUE_READ_ATTEMPTS; attempt += 1) {
     try {
       const items = await readQueuedItems(session);
       if (session.disposed || session.round !== round) {
-        return null;
+        return 'gone';
       }
       if (!items.some((item) => item?.clientUserMessageId === round.clientUserMessageId)) {
         round.armed = true;
-        return true;
+        return 'armed';
       }
-      return false;
+      return 'queued';
     } catch (error) {
       if (attempt === QUEUE_READ_ATTEMPTS - 1) {
         console.warn(`[Codex] Reading the queue of ${session.appSessionId} failed:`, error);
-        return null;
+        return 'unreadable';
       }
       await sleep(QUEUE_READ_RETRY_MS);
     }
   }
-  return null;
+  return 'unreadable';
 }
 
 /**
@@ -426,7 +442,7 @@ function routeResidentNotification(session: ResidentSession, method: string, par
       // The engine may have consumed the queued input right before this turn
       // started, but the host has not seen the consumption yet. The turn is
       // held until the queue says who owns it.
-      const key = turnId ?? '';
+      const key = turnId ?? `turn-without-id-${randomUUID()}`;
       session.pendingTurns.set(key, { turnId, events: [{ method, params }] });
       void resolvePendingTurn(session, key);
       return;
@@ -486,18 +502,22 @@ async function resolvePendingTurn(session: ResidentSession, key: string): Promis
   }
   session.pendingTurns.delete(key);
   const round = session.round;
-  if (armed === true && round && !round.turnId) {
+  if (armed === 'unreadable') {
+    console.warn(
+      `[Codex] The turn of ${session.appSessionId} could not be identified; the round ends as unknown.`,
+    );
+    session.onRoundEnded('unknown');
+  }
+  // The engine starts the turns of a thread in order, so the last waiting
+  // turn is the one the round's own input produced; an earlier one is the
+  // engine reporting on its own.
+  const isLatestWaitingTurn = session.pendingTurns.size === 0;
+  if (armed === 'armed' && round && !round.turnId && isLatestWaitingTurn) {
     round.turnId = pending.turnId;
     for (const event of pending.events) {
       round.onEvent(event.method, event.params);
     }
     return;
-  }
-  if (armed === null) {
-    console.warn(
-      `[Codex] The turn of ${session.appSessionId} could not be identified; the round ends as unknown.`,
-    );
-    session.onRoundEnded('unknown');
   }
   if (pending.turnId) {
     session.engineTurns.add(pending.turnId);
@@ -612,7 +632,6 @@ export async function acquireCodexResidentSession(
     existing.onSessionExit = options.onSessionExit ?? existing.onSessionExit;
     existing.onSessionRequest = options.onSessionRequest ?? existing.onSessionRequest;
     existing.onRoundEnded = options.onRoundEnded ?? existing.onRoundEnded;
-    existing.revokeCredential = options.revokeCredential ?? existing.revokeCredential;
     existing.onSessionDisposed = options.onSessionDisposed ?? existing.onSessionDisposed;
     existing.isBusy = options.isBusy ?? existing.isBusy;
     const wasInitializing = Boolean(existing.initializing);
@@ -667,15 +686,19 @@ export async function acquireCodexResidentSession(
     onSessionExit: options.onSessionExit ?? (() => {}),
     onSessionRequest: options.onSessionRequest ?? (() => undefined),
     onRoundEnded: options.onRoundEnded ?? (() => {}),
+    credentialToken: null,
     revokeCredential: options.revokeCredential ?? (() => {}),
     onSessionDisposed: options.onSessionDisposed ?? (() => {}),
   };
 
   const initialization = (async () => {
-    const processEnv = options.env?.(session.generation);
+    const processSetup = options.env?.(session.generation);
+    if (processSetup?.credentialToken) {
+      session.credentialToken = processSetup.credentialToken;
+    }
     const connection = await codexAppServerTransport.open(
       buildResidentHandlers(session),
-      { experimentalApi: true, ...(processEnv ? { env: processEnv } : {}) },
+      { experimentalApi: true, ...(processSetup ? { env: processSetup.env } : {}) },
     );
     session.connection = connection;
     const threadConfig = options.config ? await options.config(connection) : {};
@@ -823,6 +846,7 @@ export async function stopCodexResidentRound(
     });
   }
   session.round = null;
+  session.pendingTurns.clear();
   // The engine will report no turn for an input that was withdrawn, so the
   // round ends here instead of waiting for a terminal event that never comes.
   session.onRoundEnded('cancelled');
@@ -880,6 +904,16 @@ export function isCodexResidentSessionBusy(appSessionId: string): boolean {
     return false;
   }
   return Boolean(session.round) || session.engineTurns.size > 0 || session.isBusy();
+}
+
+/**
+ * Whether the session's admission is closed.
+ *
+ * A conversation that is being archived or deleted must not start a round
+ * while the action is in flight, whichever path the round takes.
+ */
+export function isCodexResidentSessionAdmissionClosed(appSessionId: string): boolean {
+  return closedAdmission.has(appSessionId);
 }
 
 /**

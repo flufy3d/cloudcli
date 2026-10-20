@@ -680,6 +680,41 @@ test('a changed native thread replaces the resident process', async (t) => {
   }
 });
 
+test('reusing a process keeps the credential it carried, and closing it revokes it', async (t) => {
+  const server = installFakeAppServer(t);
+  const revoked: string[] = [];
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-credential-reuse',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      env: () => ({ env: {}, credentialToken: 'tbc_first' }),
+      revokeCredential: (token) => revoked.push(token),
+    });
+
+    // A later round borrows the same process. It must not take over the
+    // revocation of the credential the process already carries.
+    await acquireCodexResidentSession({
+      appSessionId: 'app-credential-reuse',
+      nativeThreadId: THREAD_ID,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      env: () => ({ env: {}, credentialToken: 'tbc_second' }),
+      revokeCredential: (token) => revoked.push(token),
+    });
+
+    closeCodexResidentSessions();
+    assert.deepEqual(revoked, ['tbc_first'], 'the credential the process carried must be revoked');
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
 test('the credential the process carried is revoked when the process is closed', async (t) => {
   const server = installFakeAppServer(t);
   const revoked: string[] = [];
@@ -691,7 +726,8 @@ test('the credential the process carried is revoked when the process is closed',
       approvalPolicy: 'never',
       sandbox: 'workspace-write',
       sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
-      revokeCredential: () => revoked.push('tbc_probe'),
+      env: () => ({ env: {}, credentialToken: 'tbc_probe' }),
+      revokeCredential: (token) => revoked.push(token),
     });
 
     assert.deepEqual(revoked, [], 'the credential lives as long as the process');
