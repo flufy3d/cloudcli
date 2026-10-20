@@ -68,6 +68,7 @@ import { configureWebPush } from './modules/notifications/index.js';
 import {
     createTaskBridgeCredential,
     registerTaskBridgeCall,
+    revokeTaskBridgeCredential,
     startTaskContinuationRuntime,
     taskBridgeRouter,
     taskContinuationsRouter,
@@ -143,6 +144,9 @@ providerRuntimeService.setBridgeCredentialIssuer((input) => {
 });
 providerRuntimeService.setEngineToolCallRegistrar((call) => {
     registerTaskBridgeCall(call);
+});
+providerRuntimeService.setBridgeCredentialRevoker((token) => {
+    revokeTaskBridgeCredential(token);
 });
 
 createWebSocketServer(server, {

@@ -35,37 +35,6 @@ const defaultDependencies: ProviderRuntimeServiceDependencies = {
 };
 
 /**
- * The entry that publishes an event to a session outside any run.
- *
- * The gateway owns it, and the composition root installs it after both
- * modules exist. Until it is installed a runtime has no way to reach a
- * session that has no round in flight.
- */
-let sessionEventPublisher: ((appSessionId: string, message: NormalizedMessage) => void) | undefined;
-
-/**
- * The entry that records an MCP tool call the engine made.
- *
- * The composition root installs it with the task bridge's registry, so the
- * providers module never imports the task-continuations module.
- */
-let bridgeCredentialIssuer: ((input: {
-  userId: string;
-  appSessionId: string;
-  generation: number;
-}) => { token: string } | null) | undefined;
-
-let engineToolCallRegistrar: ((call: {
-  appSessionId: string;
-  threadId: string;
-  turnId: string | null;
-  callId: string;
-  server: string;
-  tool: string;
-  runToken: string;
-}) => void) | undefined;
-
-/**
  * Creates the application-facing provider runtime dispatcher.
  *
  * The provider registry owns each concrete runtime. This service supplies the
@@ -76,6 +45,44 @@ export function createProviderRuntimeService(
   dependencyOverrides: Partial<ProviderRuntimeServiceDependencies> = {},
 ) {
   const dependencies = { ...defaultDependencies, ...dependencyOverrides };
+
+  /**
+   * The entry that publishes an event to a session outside any run.
+   *
+   * The gateway owns it, and the composition root installs it after both
+   * modules exist. Until it is installed a runtime has no way to reach a
+   * session that has no round in flight.
+   */
+  let sessionEventPublisher: ((appSessionId: string, message: NormalizedMessage) => void) | undefined;
+
+  /**
+   * The entry that issues and revokes the narrow credential a resident
+   * process carries.
+   *
+   * The composition root installs it with the task bridge, so the providers
+   * module never imports the task-continuations module.
+   */
+  let bridgeCredentialIssuer: ((input: {
+    userId: string;
+    appSessionId: string;
+    generation: number;
+  }) => { token: string } | null) | undefined;
+  let bridgeCredentialRevoker: ((token: string) => void) | undefined;
+
+  /**
+   * The entry that records an MCP tool call the engine made.
+   *
+   * The composition root installs it with the task bridge's registry.
+   */
+  let engineToolCallRegistrar: ((call: {
+    appSessionId: string;
+    threadId: string;
+    turnId: string | null;
+    callId: string;
+    server: string;
+    tool: string;
+    runToken: string;
+  }) => void) | undefined;
 
   const createRuntimeContext = (
     provider: IProvider,
@@ -89,6 +96,9 @@ export function createProviderRuntimeService(
       sessionEventPublisher?.(appSessionId, message);
     },
     createBridgeCredential: (input) => bridgeCredentialIssuer?.(input) ?? null,
+    revokeBridgeCredential: (token) => {
+      bridgeCredentialRevoker?.(token);
+    },
     registerEngineToolCall: (call) => {
       engineToolCallRegistrar?.(call);
     },
@@ -144,6 +154,14 @@ export function createProviderRuntimeService(
       bridgeCredentialIssuer = issuer;
     },
 
+    /**
+     * Installs the entry that revokes a bridge credential, for example when
+     * the process that carried it is gone.
+     */
+    setBridgeCredentialRevoker(revoker: (token: string) => void): void {
+      bridgeCredentialRevoker = revoker;
+    },
+
     setEngineToolCallRegistrar(registrar: (call: {
       appSessionId: string;
       threadId: string;
@@ -192,6 +210,15 @@ export function createProviderRuntimeService(
     releaseSession(sessionId: string): void {
       for (const provider of dependencies.listProviders()) {
         provider.runtime.releaseSession?.(sessionId);
+      }
+    },
+
+    /**
+     * Opens the session's admission again in every engine.
+     */
+    openSessionAdmission(sessionId: string): void {
+      for (const provider of dependencies.listProviders()) {
+        provider.runtime.openSessionAdmission?.(sessionId);
       }
     },
 

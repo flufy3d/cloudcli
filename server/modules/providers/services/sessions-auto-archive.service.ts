@@ -94,9 +94,25 @@ export const sessionsAutoArchiveService = {
 
       // The sessions that still have work are skipped: archiving them away
       // would leave that work running against a conversation nobody sees.
+      // The admission closes before the check, so no run starts in between
+      // the check and the action.
       const candidates = sessionsDb.listSessionsOlderThanCutoff(cutoff);
-      const idleCandidates = candidates.filter((sessionId) => !providerRuntimeService.hasSessionWork(sessionId));
-      const archivedSessionIds = sessionsDb.archiveSessionsByIds(idleCandidates);
+      const archivedSessionIds: string[] = [];
+      for (const sessionId of candidates) {
+        providerRuntimeService.closeSessionAdmission(sessionId);
+        try {
+          if (providerRuntimeService.hasSessionWork(sessionId)) {
+            continue;
+          }
+          // An idle resident process is closed with the conversation.
+          providerRuntimeService.releaseSession(sessionId);
+          archivedSessionIds.push(...sessionsDb.archiveSessionsByIds([sessionId]));
+        } finally {
+          // An archived conversation can be restored, so its admission opens
+          // again.
+          providerRuntimeService.openSessionAdmission(sessionId);
+        }
+      }
       if (archivedSessionIds.length < candidates.length) {
         console.log(
           `[SessionsAutoArchive] Skipped ${candidates.length - archivedSessionIds.length} session(s) with work in flight`,

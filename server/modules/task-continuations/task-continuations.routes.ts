@@ -33,6 +33,9 @@ import { AppError, asyncHandler, createApiSuccessResponse, readObjectRecord } fr
 
 type AuthenticatedRequest = Request & { user?: { id?: number | string } };
 
+/** The MCP server the engine calls for the task tools. */
+const TASK_MCP_SERVER_NAME = 'cloudcli_task_continuations';
+
 function readUserId(request: Request): number {
   const userId = Number((request as AuthenticatedRequest).user?.id);
   if (!Number.isInteger(userId)) {
@@ -158,16 +161,21 @@ function readTaskBridgeCredential(request: Request) {
   return { context, token: match![1] };
 }
 
-/** The engine's own identity for the call, taken from the request body. */
+/**
+ * The engine's own identity for the call, taken from the request body.
+ *
+ * Every part of it is required: a call without the turn it happened in
+ * cannot be tied to a round, and a round is what the authority comes from.
+ */
 function readBridgeCallIdentity(body: Record<string, unknown>): {
   callId: string;
   threadId: string;
-  turnId: string | null;
+  turnId: string;
 } {
   const identity = readObjectRecord(body.identity);
   const callId = readString(identity?.callId, 'callId');
   const threadId = readString(identity?.threadId, 'threadId');
-  const turnId = typeof identity?.turnId === 'string' && identity.turnId.trim() ? identity.turnId.trim() : null;
+  const turnId = readString(identity?.turnId, 'turnId');
   return { callId, threadId, turnId };
 }
 
@@ -191,7 +199,9 @@ taskBridgeRouter.post(
       });
     }
     if (observed.threadId !== identity.threadId
-      || (identity.turnId !== null && observed.turnId !== null && identity.turnId !== observed.turnId)) {
+      || observed.turnId !== identity.turnId
+      || observed.tool !== tool
+      || observed.server !== TASK_MCP_SERVER_NAME) {
       throw new AppError('The call does not match the engine call that was announced.', {
         code: 'TASK_BRIDGE_CALL_MISMATCH',
         statusCode: 403,

@@ -701,9 +701,13 @@ function handleChatSubscribe(
     // keeps producing events through the same writer (task progress, the
     // turn the CLI pushes when a task reports), so a tab opened during that
     // work attaches too; the registry keeps the run while the work lasts.
-    if (isProcessing || dependencies.runtime.hasBackgroundWork(sessionId)) {
-      chatRunRegistry.attachConnection(sessionId, ws);
-    }
+    // The socket joins the session's audience whenever there is one: a
+    // resident engine can report after its run is over, and that report
+    // travels on the session's channel. The run itself only keeps the socket
+    // while it is running or while its session still has background work.
+    chatRunRegistry.attachConnection(sessionId, ws, {
+      includeRun: isProcessing || dependencies.runtime.hasBackgroundWork(sessionId),
+    });
 
     // Pending approvals are tracked under the app session id inside the
     // Claude runtime, so they can be looked up directly.

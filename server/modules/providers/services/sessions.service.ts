@@ -4,7 +4,7 @@ import path from 'node:path';
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { broadcastSessionRemoved, broadcastSessionUpserted, chatRunRegistry } from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
-import { providerRuntimeService } from '@/modules/providers/services/provider-runtime.service.js';
+import { providerRuntimeService } from './provider-runtime.service.js';
 import { listBusyClaudeCliSessions } from '@/modules/providers/services/claude-cli-liveness.service.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
 import type {
@@ -247,13 +247,6 @@ function resolveProjectDisplayName(
 }
 
 /**
- * Application service for provider-backed session message operations.
- *
- * Callers pass a provider id and this service resolves the concrete provider
- * class, keeping normalization/history call sites decoupled from implementation
- * file layout.
- */
-/**
  * Archives or permanently deletes a session whose work is over.
  *
  * The caller has already closed the admission and checked that nothing is
@@ -316,6 +309,13 @@ async function archiveOrDeleteResolvedSession(
   };
 }
 
+/**
+ * Application service for provider-backed session message operations.
+ *
+ * Callers pass a provider id and this service resolves the concrete provider
+ * class, keeping normalization/history call sites decoupled from implementation
+ * file layout.
+ */
 export const sessionsService = {
   /**
    * Lists provider ids that can load session history and normalize live messages.
@@ -892,6 +892,7 @@ export const sessionsService = {
     // admission closes first, so no run starts between the check and the
     // action.
     providerRuntimeService.closeSessionAdmission(resolvedSessionId);
+    let keepAdmissionClosed = false;
     try {
       if (providerRuntimeService.hasSessionWork(resolvedSessionId)) {
         throw new AppError('This conversation is still working. Stop it before archiving it.', {
@@ -900,14 +901,19 @@ export const sessionsService = {
         });
       }
       // An idle resident process is closed with the conversation, so the
-      // engine does not keep working for a session that is gone.
+      // engine does not keep working for a session that is gone. The
+      // admission stays closed until the action is done.
       providerRuntimeService.releaseSession(resolvedSessionId);
 
-      return await archiveOrDeleteResolvedSession(session, resolvedSessionId, options);
+      const result = await archiveOrDeleteResolvedSession(session, resolvedSessionId, options);
+      // A deleted conversation is gone for good; an archived one opens again
+      // when it is restored.
+      keepAdmissionClosed = result.action === 'deleted';
+      return result;
     } finally {
-      // The admission opens again with the session, so a conversation that
-      // was only looked at stays usable.
-      providerRuntimeService.releaseSession(resolvedSessionId);
+      if (!keepAdmissionClosed) {
+        providerRuntimeService.openSessionAdmission(resolvedSessionId);
+      }
     }
   },
 

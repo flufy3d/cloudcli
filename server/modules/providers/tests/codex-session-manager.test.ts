@@ -19,6 +19,7 @@ import {
   acquireCodexResidentSession,
   closeCodexResidentSessions,
   completeCodexResidentRound,
+  isCodexResidentSessionBusy,
   listCodexResidentSessions,
   stopCodexResidentRound,
   submitCodexResidentRound,
@@ -53,7 +54,22 @@ function installFakeAppServer(t: any): FakeServer {
       async call(method: string, params: any) {
         server.calls.push({ method, params });
         if (method === 'thread/start' || method === 'thread/resume') {
+          // A thread takes the sandbox mode as a string; the policy object
+          // belongs to a turn, and the engine ignores it here.
+          assert.ok(
+            params.sandbox === 'workspace-write' || params.sandbox === 'danger-full-access',
+            `thread/${method} needs a sandbox mode, got ${JSON.stringify(params.sandbox)}`,
+          );
+          assert.equal(params.sandboxPolicy, undefined);
           return { thread: { id: THREAD_ID } };
+        }
+        if (method === 'thread/settings/update') {
+          // A turn's settings take the policy object, which is tagged by its
+          // type; a mode string is rejected by the engine.
+          assert.ok(params.sandboxPolicy, 'thread/settings/update needs a sandbox policy');
+          assert.equal(typeof params.sandboxPolicy.type, 'string');
+          assert.equal(params.sandboxPolicy.mode, undefined);
+          return {};
         }
         if (method === 'thread/queue/add') {
           const id = `queued-${server.queue.size + 1}`;
@@ -99,14 +115,16 @@ test('two concurrent borrows of one app session open a single process', async (t
         nativeThreadId: null,
         workingDirectory: '/tmp',
         approvalPolicy: 'never',
-        sandboxMode: 'read-only',
+        sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       }),
       acquireCodexResidentSession({
         appSessionId: 'app-1',
         nativeThreadId: null,
         workingDirectory: '/tmp',
         approvalPolicy: 'never',
-        sandboxMode: 'read-only',
+        sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       }),
     ]);
 
@@ -126,14 +144,16 @@ test('a later round of the same app session reuses the process and the thread', 
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
     const second = await acquireCodexResidentSession({
       appSessionId: 'app-2',
       nativeThreadId: first.threadId,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
 
     assert.equal(second.connection, first.connection);
@@ -153,7 +173,8 @@ test('a round is written to the engine queue instead of starting a turn', async 
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
 
     const roundEvents: string[] = [];
@@ -164,7 +185,8 @@ test('a round is written to the engine queue instead of starting a turn', async 
       effort: 'low',
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       onEvent: (method) => roundEvents.push(method),
       onRequest: () => undefined,
     });
@@ -194,7 +216,8 @@ test('the turn that follows the consumption of the queued input is the round own
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       onEngineEvent: () => {},
     });
 
@@ -205,7 +228,8 @@ test('the turn that follows the consumption of the queued input is the round own
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       onEngineEvent: (method) => engineEvents.push(method),
     });
 
@@ -237,7 +261,8 @@ test('a turn the engine starts on its own never reaches the round', async (t) =>
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
 
     const roundEvents: string[] = [];
@@ -247,7 +272,8 @@ test('a turn the engine starts on its own never reaches the round', async (t) =>
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       onEngineEvent: (method) => engineEvents.push(method),
     });
 
@@ -277,7 +303,8 @@ test('stopping a running round interrupts it and stopping a queued round drops t
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
 
     await submitCodexResidentRound({
@@ -316,7 +343,8 @@ test('the process stays alive after a round ends', async (t) => {
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
     await submitCodexResidentRound({
       appSessionId: 'app-7',
@@ -344,7 +372,8 @@ test('the resident process asks for the experimental protocol it needs', async (
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
     assert.equal((server.openOptions as { experimentalApi?: boolean })?.experimentalApi, true);
   } finally {
@@ -361,21 +390,24 @@ test('the oldest idle session is evicted when the resident limit is reached', as
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
     await acquireCodexResidentSession({
       appSessionId: 'app-limit-2',
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
     await acquireCodexResidentSession({
       appSessionId: 'app-limit-3',
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
 
     const open = listCodexResidentSessions().map((session) => session.appSessionId).sort();
@@ -395,7 +427,8 @@ test('a session that still has work is not evicted for capacity', async (t) => {
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       isBusy: () => true,
     });
 
@@ -405,7 +438,8 @@ test('a session that still has work is not evicted for capacity', async (t) => {
         nativeThreadId: null,
         workingDirectory: '/tmp',
         approvalPolicy: 'never',
-        sandboxMode: 'read-only',
+        sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       }),
       /already keeping 1 conversations alive/,
     );
@@ -425,7 +459,8 @@ test('an idle session is reclaimed after the idle window', async (t) => {
       nativeThreadId: null,
       workingDirectory: '/tmp',
       approvalPolicy: 'never',
-      sandboxMode: 'read-only',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
     });
     assert.equal(listCodexResidentSessions().length, 1);
 
@@ -435,6 +470,212 @@ test('an idle session is reclaimed after the idle window', async (t) => {
     assert.equal(server.closed, true);
   } finally {
     delete process.env.CLOUDCLI_CODEX_RESIDENT_IDLE_MS;
+    closeCodexResidentSessions();
+  }
+});
+
+test('an engine turn that starts while the round waits does not take the round over', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-race',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+
+    const roundEvents: string[] = [];
+    const engineEvents: string[] = [];
+    await acquireCodexResidentSession({
+      appSessionId: 'app-race',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: (method) => engineEvents.push(method),
+    });
+    await submitCodexResidentRound({
+      appSessionId: 'app-race',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: (method) => roundEvents.push(method),
+      onRequest: () => undefined,
+    });
+
+    // The engine starts a report of its own while the input is still queued.
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: 'engine-turn', status: 'inProgress' },
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.deepEqual(roundEvents, [], 'the engine turn must not become the round');
+    assert.ok(engineEvents.includes('turn/started'));
+
+    // The input is consumed afterwards, and the turn that follows is the
+    // round's own.
+    server.queue.clear();
+    server.handlers.onNotification?.('thread/queue/changed', { threadId: THREAD_ID } as any);
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: 'round-turn', status: 'inProgress' },
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.ok(roundEvents.includes('turn/started'), 'the round must own the turn that follows');
+    assert.equal(engineEvents.filter((method) => method === 'turn/started').length, 1);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a queue that cannot be read ends the round as unknown instead of waiting forever', async (t) => {
+  const server = installFakeAppServer(t);
+  const original = server.queue;
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-unreadable',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+
+    const ended: string[] = [];
+    await acquireCodexResidentSession({
+      appSessionId: 'app-unreadable',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onRoundEnded: (reason) => ended.push(reason),
+    });
+    await submitCodexResidentRound({
+      appSessionId: 'app-unreadable',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: () => {},
+      onRequest: () => undefined,
+    });
+
+    // The queue cannot be read, so the round's turn cannot be identified.
+    server.queue = { size: 0, values: () => { throw new Error('the queue is gone'); } } as never;
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: 'unknown-turn', status: 'inProgress' },
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.deepEqual(ended, ['unknown']);
+  } finally {
+    server.queue = original;
+    closeCodexResidentSessions();
+  }
+});
+
+test('withdrawing a queued input ends the round, because no turn will report it', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-withdrawn',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+
+    const ended: string[] = [];
+    await acquireCodexResidentSession({
+      appSessionId: 'app-withdrawn',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onRoundEnded: (reason) => ended.push(reason),
+    });
+    await submitCodexResidentRound({
+      appSessionId: 'app-withdrawn',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: () => {},
+      onRequest: () => undefined,
+    });
+
+    assert.equal(await stopCodexResidentRound('app-withdrawn'), 'cancelled');
+    assert.deepEqual(ended, ['cancelled']);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a report the engine is still running keeps the session busy', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-report',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+    await submitCodexResidentRound({
+      appSessionId: 'app-report',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: () => {},
+      onRequest: () => undefined,
+    });
+    completeCodexResidentRound('app-report');
+
+    // The engine starts a report of its own and the round is over.
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: 'report-turn', status: 'inProgress' },
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.equal(isCodexResidentSessionBusy('app-report'), true);
+    server.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: 'report-turn', status: 'completed', error: null },
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(isCodexResidentSessionBusy('app-report'), false);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a changed native thread replaces the resident process', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    const first = await acquireCodexResidentSession({
+      appSessionId: 'app-reforked',
+      nativeThreadId: null,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+    assert.equal(first.threadId, THREAD_ID);
+
+    const second = await acquireCodexResidentSession({
+      appSessionId: 'app-reforked',
+      nativeThreadId: 'thread-after-edit',
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+    });
+
+    assert.notEqual(second.generation, first.generation);
+    assert.equal(server.closed, true, 'the old process must be closed');
+    assert.ok(server.calls.some((call) => call.method === 'thread/resume' && call.params.threadId === 'thread-after-edit'));
+  } finally {
     closeCodexResidentSessions();
   }
 });

@@ -56,7 +56,22 @@ function installFakeAppServer(
       async call(method: string, params: any, options?: unknown) {
         server.calls.push({ method, params, options });
         if (method === 'thread/start' || method === 'thread/resume') {
+          // A thread takes the sandbox mode as a string; the policy object
+          // belongs to a turn, and the engine ignores it here.
+          assert.ok(
+            params.sandbox === 'workspace-write' || params.sandbox === 'danger-full-access',
+            `thread/${method} needs a sandbox mode, got ${JSON.stringify(params.sandbox)}`,
+          );
+          assert.equal(params.sandboxPolicy, undefined);
           return { thread: { id: THREAD_ID } };
+        }
+        if (method === 'thread/settings/update') {
+          // A turn's settings take the policy object, which is tagged by its
+          // type; a mode string is rejected by the engine.
+          assert.ok(params.sandboxPolicy, 'thread/settings/update needs a sandbox policy');
+          assert.equal(typeof params.sandboxPolicy.type, 'string');
+          assert.equal(params.sandboxPolicy.mode, undefined);
+          return {};
         }
         if (method === 'config/read') {
           return { config: { shell_environment_policy: { exclude: ['TEST_EXISTING_EXCLUDE'] } } };

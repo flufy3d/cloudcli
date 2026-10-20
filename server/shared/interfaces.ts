@@ -63,9 +63,14 @@ export interface IProviderRuntime {
   closeSessionAdmission?(sessionId: string): void;
   /**
    * Releases the resources the session holds, such as a process that stays
-   * alive between rounds. Called once the session's work is over.
+   * alive between rounds. Called once the session's work is over; the
+   * admission stays closed until the caller opens it again.
    */
   releaseSession?(sessionId: string): void;
+  /**
+   * Opens the session's admission again, after the action that closed it.
+   */
+  openSessionAdmission?(sessionId: string): void;
   permissions?: ProviderRuntimePermissionGateway;
   backgroundTasks?: {
     list(sessionId: string): ActiveBackgroundTask[];

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import { recordRunOutcome } from '@/modules/diagnostics/index.js';
 import { ChatSessionWriter } from '@/modules/websocket/services/chat-session-writer.service.js';
@@ -370,6 +371,7 @@ function ensureSessionChannel(
   if (existing) {
     return existing;
   }
+  pruneSessionChannels();
   const channel: ChatSessionChannel = {
     appSessionId,
     audience: new Set<RealtimeClientConnection>(),
@@ -395,6 +397,26 @@ function ensureSessionChannel(
   });
   sessionChannels.set(appSessionId, channel);
   return channel;
+}
+
+/**
+ * Drops the channels that no run, no event and no socket needs any more.
+ *
+ * A channel outlives the run that created it, because a resident engine
+ * reports on it after the run is over. One that nothing points at any more
+ * would only keep its sockets alive.
+ */
+function pruneSessionChannels(): void {
+  for (const [sessionId, channel] of sessionChannels) {
+    for (const connection of channel.audience) {
+      if (connection.readyState !== WS_OPEN_STATE) {
+        channel.audience.delete(connection);
+      }
+    }
+    if (!runs.has(sessionId) && channel.events.length === 0 && channel.audience.size === 0) {
+      sessionChannels.delete(sessionId);
+    }
+  }
 }
 
 /**
@@ -439,6 +461,11 @@ export const chatRunRegistry = {
       userId: input.userId,
       provider: input.provider,
     });
+    // The socket that asked for the run also watches the session, so the
+    // events that belong to the session reach it as well.
+    if (input.connection) {
+      channel.audience.add(input.connection);
+    }
 
     const run: ChatRun = {
       appSessionId: input.appSessionId,
@@ -463,7 +490,6 @@ export const chatRunRegistry = {
 
     run.writer = new ChatSessionWriter({
       connection: input.connection,
-      audience: channel.audience,
       userId: input.userId,
       sessionName: input.sessionName,
       provider: input.provider,
@@ -515,14 +541,32 @@ export const chatRunRegistry = {
    * closed. Replay stays per-connection because each client sends its own
    * `lastSeq` with `chat.subscribe`.
    */
-  attachConnection(appSessionId: string, connection: RealtimeClientConnection): boolean {
+  attachConnection(
+    appSessionId: string,
+    connection: RealtimeClientConnection,
+    options?: { includeRun?: boolean },
+  ): boolean {
+    // The session's audience is for the events that belong to the session
+    // rather than to a round: a resident engine reports on it after its run
+    // is over.
+    const channel = sessionChannels.get(appSessionId);
+    channel?.audience.add(connection);
+
     const run = runs.get(appSessionId);
     if (!run) {
-      return false;
+      return Boolean(channel);
     }
-
-    run.writer.updateWebSocket(connection);
-    return true;
+    const includeRun = options?.includeRun ?? run.status === 'running';
+    if (includeRun) {
+      // A run that is still going, or one that the session's background work
+      // keeps alive, delivers its later events to the socket as well.
+      run.writer.updateWebSocket(connection);
+      return true;
+    }
+    // A finished run keeps its own audience: a socket that opens the
+    // conversation afterwards does not receive that run's late events, it
+    // replays them instead.
+    return Boolean(channel);
   },
 
   /**

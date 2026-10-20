@@ -38,6 +38,7 @@ import {
   closeCodexResidentSessionAdmission,
   completeCodexResidentRound,
   isCodexResidentSessionBusy,
+  openCodexResidentSessionAdmission,
   releaseCodexResidentSession,
   releaseCodexResidentSessionResources,
   stopCodexResidentRound,
@@ -625,6 +626,33 @@ function handleCodexSessionEvent(
 }
 
 /**
+ * Settles the agents of a session whose process is gone.
+ *
+ * A process that is closed takes its agents with it, so their cards would
+ * spin forever.
+ */
+function settleCodexSessionAgents(
+  appSessionId: string,
+  deliver: (message: NormalizedMessage) => void,
+): void {
+  const outstanding = codexBackgroundWork.clearSession(appSessionId);
+  if (outstanding.length === 0) {
+    return;
+  }
+  deliver(createBackgroundTasksStatusMessage(
+    { provider: 'codex', sessionId: appSessionId },
+    codexBackgroundWork.listStripTasks(appSessionId),
+    true,
+  ));
+  for (const task of outstanding) {
+    deliver(codexTaskStatus(appSessionId, task.taskId, task.toolUseId, {
+      event: 'notification',
+      status: 'stopped',
+    }));
+  }
+}
+
+/**
  * The tool each announced item needs, per session.
  *
  * A resident session can be asked for an approval while no round is in
@@ -685,7 +713,7 @@ async function queryCodex(
   const targetPermissionMode = taskSandboxPolicyType === 'dangerFullAccess'
     ? 'bypassPermissions'
     : taskApprovalPolicy === 'never' ? 'acceptEdits' : permissionMode;
-  const { sandbox, approvalPolicy } = mapPermissionModeToCodexOptions(targetPermissionMode);
+  const { sandbox, approvalPolicy, sandboxPolicy } = resolveCodexExecutionPolicy(targetPermissionMode);
   const taskExecutionContext = readObjectRecord(options.taskExecutionContext);
   const taskContinuationLifecycle = readObjectRecord(options.taskContinuationLifecycle);
   const onEngineTurnStarted = typeof taskContinuationLifecycle?.onEngineTurnStarted === 'function'
@@ -709,17 +737,32 @@ async function queryCodex(
    * manager starts the process.
    */
   let residentTaskMcpOptions: { config: Record<string, unknown>; env: NodeJS.ProcessEnv } | null = null;
+  let residentBridgeToken: string | null = null;
   const createResidentTaskMcpOptions = (generation: number) => {
+    if (!normalizedUserId) {
+      console.warn('[Codex] The conversation has no trusted user; the task tools are not available.');
+      residentTaskMcpOptions = null;
+      return null;
+    }
     const bridge = context.createBridgeCredential?.({
-      userId: normalizedUserId ?? '',
+      userId: normalizedUserId,
       appSessionId: residentKey,
       generation,
     });
     if (!bridge) {
+      // Without a bridge credential the process gets no task tools at all:
+      // a per-round capability would outlive the round it belongs to.
+      residentTaskMcpOptions = null;
       return null;
     }
+    residentBridgeToken = bridge.token;
     residentTaskMcpOptions = getTaskMcpRuntimeOptions({ bridgeToken: bridge.token });
     return residentTaskMcpOptions;
+  };
+
+  /** Publishes one event to the session, outside any round. */
+  const publishSessionMessage = (message: NormalizedMessage): void => {
+    context.publishSessionEvent?.(residentKey, message);
   };
   const catalog = await context.getProviderModels();
   const resolvedEffort = resolveModelEffort(resolvedModel, effort, catalog);
@@ -880,7 +923,12 @@ async function queryCodex(
    * is unbounded on purpose: a prompt that times out on its own would deny an
    * action the user was still reading.
    */
-  const requestApproval = (method: string, params: AnyRecord): Promise<ProviderPermissionDecision | null> => {
+  const requestApproval = (
+    method: string,
+    params: AnyRecord,
+    deliver: (message: NormalizedMessage) => void = (message) => sendMessage(ws, message),
+    subjects: Map<string, { toolName: string; input: unknown }> = approvalSubjects,
+  ): Promise<ProviderPermissionDecision | null> => {
     const itemId = readNonEmptyString(params.itemId) ?? randomUUID();
     const requestId = randomUUID();
     // A command approval is asked *before* the item is announced and carries
@@ -889,7 +937,7 @@ async function queryCodex(
     const command = readNonEmptyString(params.command);
     const subject = command
       ? { toolName: 'Bash', input: JSON.stringify({ command: readCodexCommandLine(command) }) }
-      : approvalSubjects.get(itemId);
+      : subjects.get(itemId);
     const reason = readNonEmptyString(params.reason);
     // An approval for a running agent's thread names the agent's card.
     const askingThread = readNonEmptyString(params.threadId);
@@ -920,7 +968,7 @@ async function queryCodex(
       });
       openApprovalIds.add(requestId);
 
-      sendMessage(ws, createNormalizedMessage({
+      deliver(createNormalizedMessage({
         kind: 'permission_request',
         requestId,
         toolName: subject?.toolName ?? 'Codex',
@@ -941,7 +989,7 @@ async function queryCodex(
     }).then((decision) => {
       // Every attached tab drops the prompt, including one that reconnects
       // mid-run and replays the request frame.
-      sendMessage(ws, createNormalizedMessage({
+      deliver(createNormalizedMessage({
         kind: 'permission_resolved',
         requestId,
         sessionId: capturedSessionId || sessionId || null,
@@ -1258,6 +1306,7 @@ async function queryCodex(
     if (isResidentSessionsEnabled()) {
       const resident = await acquireCodexResidentSession({
         appSessionId: residentKey,
+        userId: normalizedUserId,
         nativeThreadId: providerSessionId,
         workingDirectory,
         env: (generation) => createResidentTaskMcpOptions(generation)?.env,
@@ -1277,7 +1326,8 @@ async function queryCodex(
           };
         },
         approvalPolicy,
-        sandboxMode: sandbox,
+        sandbox,
+        sandboxPolicy,
         onEngineEvent: (method, params, threadId) => handleCodexSessionEvent({
           appSessionId: residentKey,
           threadId: () => threadId,
@@ -1288,6 +1338,34 @@ async function queryCodex(
           approvalSubjects: readSessionApprovalSubjects(residentKey),
         }, method, params),
         onSessionExit: handleProcessExit,
+        onSessionRequest: (method, params) => requestApproval(
+          method,
+          params,
+          publishSessionMessage,
+          readSessionApprovalSubjects(residentKey),
+        ),
+        onRoundEnded: (reason) => {
+          // The round cannot wait for an event that will never come: the
+          // input was withdrawn, or the turn could not be identified.
+          if (reason === 'cancelled') {
+            terminalStatus = 'interrupted';
+          } else {
+            terminalStatus = 'unknown';
+            surfaceFailure('Codex could not tell which turn answered this message.');
+          }
+          settle();
+        },
+        revokeCredential: () => {
+          if (residentBridgeToken) {
+            context.revokeBridgeCredential?.(residentBridgeToken);
+            residentBridgeToken = null;
+          }
+        },
+        onSessionDisposed: () => {
+          // The agents of a closed process cannot report any more, so their
+          // cards are settled.
+          settleCodexSessionAgents(residentKey, publishSessionMessage);
+        },
         isBusy: () => codexBackgroundWork.hasSession(residentKey),
       });
       connection = resident.connection;
@@ -1370,7 +1448,8 @@ async function queryCodex(
         effort: resolvedEffort ?? undefined,
         workingDirectory,
         approvalPolicy,
-        sandboxMode: sandbox,
+        sandbox,
+        sandboxPolicy,
         onEvent: handleRoundEvent,
         onRequest: handleRoundRequest,
       });
@@ -1571,6 +1650,12 @@ export const codexRuntime = {
    */
   releaseSession(sessionId: string): void {
     releaseCodexResidentSessionResources(sessionId);
+  },
+  /**
+   * Opens the conversation's admission again.
+   */
+  openSessionAdmission(sessionId: string): void {
+    openCodexResidentSessionAdmission(sessionId);
   },
   /** What the composer's strip shows for a session that subscribes mid-turn. */
   backgroundTasks: {

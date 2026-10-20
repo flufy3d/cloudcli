@@ -75,7 +75,7 @@ test('createSession preserves archived state of existing rows', async () => {
   });
 });
 
-test('archiveSessionsOlderThanCutoff returns the ids it archived and only those', async () => {
+test('the cutoff listing and the archiving by id cover the stale sessions and only those', async () => {
   await withIsolatedDatabase(() => {
     const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
     sessionsDb.createSession('session-stale-1', 'claude', '/workspace/demo-project', 'Stale 1', twoDaysAgo, twoDaysAgo);
@@ -84,11 +84,12 @@ test('archiveSessionsOlderThanCutoff returns the ids it archived and only those'
     sessionsDb.createSession('session-already-archived', 'claude', '/workspace/demo-project', 'Archived', twoDaysAgo, twoDaysAgo);
     sessionsDb.updateSessionIsArchived('session-already-archived', true);
 
-    const archivedIds = sessionsDb.archiveSessionsOlderThanCutoff(new Date().toISOString());
+    const candidates = sessionsDb.listSessionsOlderThanCutoff(new Date().toISOString());
+    const archivedIds = sessionsDb.archiveSessionsByIds(candidates);
 
     assert.deepEqual(archivedIds.sort(), ['session-stale-1', 'session-stale-2']);
     // A second run finds nothing left to archive.
-    assert.deepEqual(sessionsDb.archiveSessionsOlderThanCutoff(new Date().toISOString()), []);
+    assert.deepEqual(sessionsDb.listSessionsOlderThanCutoff(new Date().toISOString()), []);
   });
 });
 
