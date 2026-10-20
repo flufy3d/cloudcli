@@ -105,6 +105,14 @@ wire_api = "responses"
     await submitCodexResidentRound({
       appSessionId: 'probe-session',
       input: [{ type: 'text', text: 'RESIDENT-PROBE-TEXT' }],
+      // The round carries the same settings the runtime sends, so the probe
+      // fails the way the runtime would when the protocol shapes are wrong.
+      model: 'probe-model',
+      effort: 'medium',
+      workingDirectory: REPO_ROOT,
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       onEvent: (method) => {
         events.push(`round:${method}`);
         if (method === 'turn/started') {
@@ -127,6 +135,12 @@ wire_api = "responses"
     await submitCodexResidentRound({
       appSessionId: 'probe-session',
       input: [{ type: 'text', text: 'SECOND-RESIDENT-PROBE-TEXT' }],
+      model: 'probe-model',
+      effort: 'medium',
+      workingDirectory: REPO_ROOT,
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
       onEvent: (method) => secondEvents.push(method),
       onRequest: () => undefined,
     });
