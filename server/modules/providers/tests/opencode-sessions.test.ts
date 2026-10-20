@@ -8,6 +8,7 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { opencodeBackgroundWork } from '@/modules/providers/list/opencode/opencode-background-work.js';
 import { OpenCodeSessionEventTranslator } from '@/modules/providers/list/opencode/opencode-event-translator.js';
 import { OpenCodeSessionSynchronizer } from '@/modules/providers/list/opencode/opencode-session-synchronizer.provider.js';
 import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
@@ -907,6 +908,14 @@ type SeededSubagent = {
   /** Whether the parent session still has a run in flight (`time_idle` unset). */
   busy: boolean;
   withChild?: boolean;
+  /** Launched with `background: true`: the call returned at once and the agent ran on. */
+  background?: boolean;
+  /** The `state` of the notice the engine persisted when the background agent ended; none when absent. */
+  notice?: 'completed' | 'cancelled' | 'error';
+  /** When that notice was written; after the call by default. */
+  noticeAt?: number;
+  /** When a second background call resumed the same agent; none by default. */
+  resumedAt?: number;
 };
 
 /** Seeds a v2 database whose parent session called the `subagent` tool once. */
@@ -936,7 +945,11 @@ const seedSubagentSession = (homeDir: string, options: SeededSubagent): void => 
       status: options.status,
       input: { agent: 'general', description: 'Review the diff', prompt: 'Read the diff and report.' },
     };
-    if (options.status === 'completed') {
+    if (options.background) {
+      state.input = { ...(state.input as Record<string, unknown>), background: true };
+      state.content = [{ type: 'text', text: 'The subagent is working in the background (sessionID: ses_child).' }];
+      state.metadata = { sessionID: 'ses_child', status: 'running', truncated: false };
+    } else if (options.status === 'completed') {
       state.content = [{ type: 'text', text: '<subagent sessionID="ses_child" state="completed">Found two problems.</subagent>' }];
       state.metadata = { sessionID: 'ses_child', status: 'completed', truncated: false };
     } else if (options.status === 'error') {
@@ -947,6 +960,18 @@ const seedSubagentSession = (homeDir: string, options: SeededSubagent): void => 
     const parentContent = [{ type: 'tool', id: 'call_sub', name: 'subagent', state }];
     db.prepare("INSERT INTO session_message VALUES ('msg_p', 'ses_parent', 'assistant', 1, 1500, 1600, ?)")
       .run(JSON.stringify({ content: parentContent }));
+    if (options.resumedAt !== undefined) {
+      const again = [{ type: 'tool', id: 'call_sub_again', name: 'subagent', state: { ...state, input: { ...(state.input as Record<string, unknown>), sessionID: 'ses_child' } } }];
+      db.prepare("INSERT INTO session_message VALUES ('msg_p2', 'ses_parent', 'assistant', 3, ?, ?, ?)")
+        .run(options.resumedAt, options.resumedAt, JSON.stringify({ content: again }));
+    }
+    if (options.notice) {
+      db.prepare("INSERT INTO session_message VALUES ('msg_notice', 'ses_parent', 'synthetic', 4, ?, ?, ?)")
+        .run(options.noticeAt ?? 3000, options.noticeAt ?? 3000, JSON.stringify({
+          metadata: { source: 'subagent', childID: 'ses_child', agent: 'General', state: options.notice },
+          text: `<subagent sessionID="ses_child" state="${options.notice}">Found two problems.</subagent>`,
+        }));
+    }
 
     const childContent = [
       { type: 'text', text: 'Reading the diff.' },
@@ -1019,6 +1044,61 @@ test('a subagent call left running reads as running only while its session still
   await withSubagentHome(async (homeDir) => {
     const pending = await readSubagentRow(homeDir, { status: 'pending', busy: false });
     assert.equal(pending?.subagent?.status, 'stopped');
+  });
+});
+
+test('a background agent reads from the notice the engine persisted when it ended', { concurrency: false }, async () => {
+  await withSubagentHome(async (homeDir) => {
+    const done = await readSubagentRow(homeDir, { status: 'completed', busy: false, background: true, notice: 'completed' });
+    assert.equal(done?.subagent?.status, 'completed');
+  });
+  await withSubagentHome(async (homeDir) => {
+    const cancelled = await readSubagentRow(homeDir, { status: 'completed', busy: false, background: true, notice: 'cancelled' });
+    assert.equal(cancelled?.subagent?.status, 'stopped');
+  });
+  await withSubagentHome(async (homeDir) => {
+    const failed = await readSubagentRow(homeDir, { status: 'completed', busy: false, background: true, notice: 'error' });
+    assert.equal(failed?.subagent?.status, 'failed');
+  });
+});
+
+test('a resumed background agent is not ended by the notice of its earlier run', { concurrency: false }, async () => {
+  await withSubagentHome(async (homeDir) => {
+    // The notice is stamped before the call (1500): it belongs to an earlier run of the same child.
+    seedSubagentSession(homeDir, { status: 'completed', busy: false, background: true, notice: 'completed', noticeAt: 1000 });
+    const history = await new OpenCodeSessionsProvider().fetchHistory('ses_parent');
+    const row = history.messages.find((message) => message.kind === 'tool_use' && message.toolId === 'call_sub');
+    assert.equal(row?.subagent?.status, 'stopped', 'no notice of its own and nothing runs it');
+  });
+});
+
+test('a background call does not take the notice of a later call on the same agent', { concurrency: false }, async () => {
+  await withSubagentHome(async (homeDir) => {
+    // call_sub at 1500 never got its notice; the agent was resumed at 2500 and that run's notice is at 3000.
+    seedSubagentSession(homeDir, { status: 'completed', busy: false, background: true, notice: 'completed', noticeAt: 3000, resumedAt: 2500 });
+    const history = await new OpenCodeSessionsProvider().fetchHistory('ses_parent');
+    const first = history.messages.find((message) => message.kind === 'tool_use' && message.toolId === 'call_sub');
+    const resumed = history.messages.find((message) => message.kind === 'tool_use' && message.toolId === 'call_sub_again');
+    assert.equal(first?.subagent?.status, 'stopped');
+    assert.equal(resumed?.subagent?.status, 'completed');
+  });
+});
+
+test('a background agent with no notice yet runs while the runtime tracks it, else it was lost', { concurrency: false }, async () => {
+  await withSubagentHome(async (homeDir) => {
+    opencodeBackgroundWork.start('app-history', {
+      taskId: 'ses_child', toolUseId: 'call_sub', taskType: 'local_agent', description: 'Review the diff',
+    });
+    try {
+      const live = await readSubagentRow(homeDir, { status: 'completed', busy: false, background: true });
+      assert.equal(live?.subagent?.status, 'running', 'the launch acknowledgement is not the agent finishing');
+    } finally {
+      opencodeBackgroundWork.end('app-history', 'ses_child');
+    }
+  });
+  await withSubagentHome(async (homeDir) => {
+    const lost = await readSubagentRow(homeDir, { status: 'completed', busy: false, background: true });
+    assert.equal(lost?.subagent?.status, 'stopped', 'nothing runs it any more and no notice will come');
   });
 });
 

@@ -11,7 +11,7 @@ import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import { connectedClients } from '@/modules/websocket/index.js';
 import type { IProvider } from '@/shared/interfaces.js';
-import type { BackgroundTaskSummary } from '@/shared/types.js';
+import type { BackgroundTaskSummary, LLMProvider } from '@/shared/types.js';
 
 class FakeConnection {
   readyState = 1; // WS_OPEN_STATE
@@ -45,7 +45,7 @@ async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promis
 }
 
 async function withProviders(
-  runtimes: Partial<Record<'claude' | 'codex', IProvider['runtime']>>,
+  runtimes: Partial<Record<LLMProvider, IProvider['runtime']>>,
   runTest: () => void | Promise<void>,
 ): Promise<void> {
   const realListProviders = providerRegistry.listProviders;
@@ -424,6 +424,31 @@ test('running sessions carry their tasks on a chat run that is still going', { c
           lastSeq: 0,
           tasks,
         });
+      },
+    ));
+  });
+});
+
+test('background work whose runtime can still stop it offers the stop', { concurrency: false }, async () => {
+  await withIsolatedDatabase(async () => {
+    sessionsDb.createAppSession('report-session', 'opencode', '/tmp/running-project');
+    await withClaudeCliRegistry([], async () => await withProviders(
+      {
+        opencode: {
+          run: async () => undefined,
+          abort: () => false,
+          // The engine reports on finished background work in a turn of its own.
+          listBackgroundWork: () => [{ sessionId: 'report-session', tasks: [] }],
+          getSessionActivity: () => ({ queued: false, reporting: true }),
+          backgroundTasks: { list: () => [], canInterrupt: () => true },
+        },
+      },
+      async () => {
+        const sessions = await sessionsService.listRunningSessions();
+        assert.equal(sessions.length, 1);
+        assert.equal(sessions[0].background, true);
+        assert.equal(sessions[0].canInterrupt, true, 'abort can stop the report turn');
+        assert.equal(sessions[0].reporting, true);
       },
     ));
   });

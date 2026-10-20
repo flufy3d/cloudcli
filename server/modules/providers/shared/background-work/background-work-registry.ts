@@ -1,6 +1,8 @@
 import type { ActiveBackgroundTask, BackgroundTaskSummary, SessionBackgroundWork } from '@/shared/types.js';
 import { SUBAGENT_TOOL_NAME } from '@/shared/utils.js';
 
+import { LOCAL_BASH_TASK_TYPE } from './task-status.js';
+
 /**
  * The background work a provider runtime still has outstanding, keyed by app
  * session id and then by task id.
@@ -13,7 +15,7 @@ import { SUBAGENT_TOOL_NAME } from '@/shared/utils.js';
  * app-server, Antigravity's `agy`) empties it when the process ends, settling
  * each leftover card.
  *
- * Consumers: the Codex, ZCode and Antigravity runtime providers
+ * Consumers: the Codex, ZCode, Antigravity and OpenCode runtime providers
  * (start/end/list/clear, and `listStripTasks` for the composer's strip) and
  * their sessions providers (`has`).
  */
@@ -91,19 +93,28 @@ export class BackgroundWorkRegistry {
   }
 
   /**
-   * One session's agents in the shape the composer's background-task strip
-   * lists, each named by its `Agent` card. `taskId` is left out on purpose:
-   * the strip offers a per-task stop only for a handle `stopBackgroundTask`
-   * accepts, and none of these runtimes can stop one agent on its own.
+   * One session's tasks in the shape the composer's background-task strip
+   * lists: a backgrounded command as `Bash`, anything else under its `Agent`
+   * card. The strip offers a per-task stop only for a task carrying `taskId`,
+   * so it is set only where `stopHandle` names a handle the runtime's
+   * `stopBackgroundTask` accepts; Codex, ZCode and Antigravity cannot stop one
+   * agent on its own and pass none.
    */
-  listStripTasks(sessionKey: string): ActiveBackgroundTask[] {
-    return Array.from(this.bySession.get(sessionKey)?.values() ?? [], (task) => ({
-      id: task.toolUseId,
-      toolName: SUBAGENT_TOOL_NAME,
-      command: task.description,
-      description: task.description,
-      startedAt: task.startedAt,
-    }));
+  listStripTasks(
+    sessionKey: string,
+    stopHandle?: (task: BackgroundTaskSummary) => string | undefined,
+  ): ActiveBackgroundTask[] {
+    return Array.from(this.bySession.get(sessionKey)?.values() ?? [], (task) => {
+      const taskId = stopHandle?.(task);
+      return {
+        id: task.toolUseId,
+        ...(taskId ? { taskId } : {}),
+        toolName: task.taskType === LOCAL_BASH_TASK_TYPE ? 'Bash' : SUBAGENT_TOOL_NAME,
+        command: task.description,
+        description: task.description,
+        startedAt: task.startedAt,
+      };
+    });
   }
 
   /** Every session with work outstanding, in the shape `listBackgroundWork` returns. */

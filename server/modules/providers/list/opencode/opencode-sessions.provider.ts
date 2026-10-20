@@ -34,11 +34,18 @@ import {
   unwrapJsonStringLiteral,
 } from '@/shared/utils.js';
 
+import {
+  opencodeBackgroundWork,
+  readBackgroundNotice,
+  type OpenCodeBackgroundOutcome,
+} from './opencode-background-work.js';
 import { formatToolOutput } from './opencode-event-translator.js';
 import {
   getOpenCodeDatabasePath,
+  openOpenCodeDatabase,
   readOpenCodeSessionIdleAt,
   readOpenCodeSessionTokenTotals,
+  readOpenCodeSyntheticNoticeMetadata,
   resolveOpenCodeMessageLayout,
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
@@ -70,6 +77,22 @@ type OpenCodeHistoryContext = {
   layout: 'session_message' | 'message_part';
   /** The session being read, whose idle time says whether a call left `running` can still finish. */
   providerSessionId: string;
+  /**
+   * How each session's background work ended, by the engine's handle, read
+   * once per session from the notices it persisted. Shared by reference with
+   * the child sessions' contexts, so it is keyed by session.
+   */
+  backgroundOutcomes?: Map<string, OpenCodeSessionBackgroundRecord>;
+};
+
+/**
+ * One session's background work as persisted: the notices of work that ended,
+ * and when each agent was launched in the background, both by the engine's
+ * handle. A notice belongs to the launch it follows and not to a later one.
+ */
+type OpenCodeSessionBackgroundRecord = {
+  notices: Map<string, Array<{ outcome: OpenCodeBackgroundOutcome; at: number | null }>>;
+  launches: Map<string, number[]>;
 };
 
 type OpenCodeTokenTotals = {
@@ -78,15 +101,6 @@ type OpenCodeTokenTotals = {
   reasoningTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-};
-
-const openOpenCodeDatabase = (): Database.Database | null => {
-  const dbPath = getOpenCodeDatabasePath();
-  if (!fsSync.existsSync(dbPath)) {
-    return null;
-  }
-
-  return new Database(dbPath, { readonly: true, fileMustExist: true });
 };
 
 const formatToolContent = (value: unknown): string => {
@@ -270,6 +284,40 @@ function* flattenOpenCodeV2HistoryRows(
  * (see MessageV2.Assistant). Older DBs also had session-level counters; this
  * matches current `opencode.db` layouts that only persist message JSON.
  */
+/**
+ * When each agent of a v2 session was launched in the background, in order:
+ * the assistant messages whose `subagent` call returned still running. The
+ * message time is the call time the history reader uses for those calls.
+ */
+const readBackgroundAgentLaunchTimes = (
+  db: Database.Database,
+  sessionId: string,
+): Array<{ childSessionId: string; at: number }> => {
+  const rows = db.prepare(`
+    SELECT time_created AS at, data FROM session_message
+    WHERE session_id = ? AND type = 'assistant' AND data LIKE '%"subagent"%'
+    ORDER BY seq
+  `).all(sessionId) as Array<{ at: number | null; data: string }>;
+  const launches: Array<{ childSessionId: string; at: number }> = [];
+  for (const row of rows) {
+    const content = readJsonRecord(row.data)?.content;
+    if (!Array.isArray(content) || typeof row.at !== 'number') {
+      continue;
+    }
+    for (const part of content) {
+      const record = readObjectRecord(part);
+      const state = readObjectRecord(record?.state);
+      const metadata = readObjectRecord(state?.metadata);
+      const childSessionId = readOptionalString(metadata?.sessionID);
+      if (record?.type === 'tool' && isOpenCodeSubagentTool(readOptionalString(record.name) ?? '')
+        && readOptionalString(metadata?.status) === 'running' && childSessionId) {
+        launches.push({ childSessionId, at: row.at });
+      }
+    }
+  }
+  return launches;
+};
+
 const aggregateOpenCodeSessionTokenUsage = (
   db: Database.Database,
   sessionId: string,
@@ -476,7 +524,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       const window: NormalizedMessage[] = [];
       let total = 0;
       let head = 0;
-      for (const message of this.normalizeHistoryRows(rows, sessionId, { db, layout, providerSessionId })) {
+      for (const message of this.normalizeHistoryRows(rows, sessionId, { db, layout, providerSessionId, backgroundOutcomes: new Map() })) {
         total += 1;
         if (capacity === 0) continue;
         if (window.length < capacity) window.push(message);
@@ -687,6 +735,12 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
    * the session has a run in flight; once the session is idle the run that
    * owned the call is gone and the agent can never finish, so it reads as
    * `stopped`.
+   *
+   * A call launched in the background is persisted `completed` the moment it
+   * returns, with its metadata still saying `running`; that only says the
+   * agent started. Its outcome is the notice the engine persisted when the
+   * agent ended; with no notice yet it runs while the runtime still tracks
+   * it, and is `stopped` once nothing does.
    */
   private attachSubagent(
     toolMessage: NormalizedMessage,
@@ -705,7 +759,10 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       name: agentType,
       type: agentType,
       description,
-      status: this.resolveSubagentStatus(readOptionalString(state.status), callTime, context),
+      status: childSessionId && readOptionalString(readObjectRecord(state.metadata)?.status) === 'running'
+        && readOptionalString(state.status) === 'completed'
+        ? this.resolveBackgroundSubagentStatus(childSessionId, callTime, context)
+        : this.resolveSubagentStatus(readOptionalString(state.status), callTime, context),
     };
 
     if (childSessionId) {
@@ -716,6 +773,56 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       }
     }
     toolMessage.subagent = subagent;
+  }
+
+  /**
+   * A resumed agent keeps its child session id, so this call's outcome is the
+   * first notice written after it launched the agent and before the next
+   * call launched it again. Without one the agent runs while the runtime
+   * still tracks it (only the latest launch can be running), else it is lost.
+   */
+  private resolveBackgroundSubagentStatus(
+    childSessionId: string,
+    callTime: number | null,
+    context: OpenCodeHistoryContext,
+  ): SubagentInfo['status'] {
+    const record = this.readBackgroundRecord(context);
+    const nextLaunch = callTime === null
+      ? undefined
+      : (record.launches.get(childSessionId) ?? []).find((launchedAt) => launchedAt > callTime);
+    const notice = (record.notices.get(childSessionId) ?? []).find((entry) => entry.at === null || callTime === null
+      || (entry.at >= callTime && (nextLaunch === undefined || entry.at < nextLaunch)));
+    if (notice) {
+      return notice.outcome;
+    }
+    return nextLaunch === undefined && opencodeBackgroundWork.has(childSessionId) ? 'running' : 'stopped';
+  }
+
+  private readBackgroundRecord(context: OpenCodeHistoryContext): OpenCodeSessionBackgroundRecord {
+    const cache = context.backgroundOutcomes ?? new Map<string, OpenCodeSessionBackgroundRecord>();
+    context.backgroundOutcomes = cache;
+    const cached = cache.get(context.providerSessionId);
+    if (cached) {
+      return cached;
+    }
+    const record: OpenCodeSessionBackgroundRecord = { notices: new Map(), launches: new Map() };
+    for (const { metadata, createdAt } of readOpenCodeSyntheticNoticeMetadata(context.db, context.providerSessionId)) {
+      const notice = readBackgroundNotice(metadata);
+      if (notice) {
+        const list = record.notices.get(notice.taskId) ?? [];
+        list.push({ outcome: notice.outcome, at: createdAt });
+        record.notices.set(notice.taskId, list);
+      }
+    }
+    if (context.layout === 'session_message') {
+      for (const launch of readBackgroundAgentLaunchTimes(context.db, context.providerSessionId)) {
+        const list = record.launches.get(launch.childSessionId) ?? [];
+        list.push(launch.at);
+        record.launches.set(launch.childSessionId, list);
+      }
+    }
+    cache.set(context.providerSessionId, record);
+    return record;
   }
 
   private resolveSubagentStatus(

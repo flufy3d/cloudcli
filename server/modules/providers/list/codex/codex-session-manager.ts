@@ -1190,6 +1190,25 @@ export function readCodexResidentSessionActivity(appSessionId: string): {
 }
 
 /**
+ * Sessions whose engine runs a report turn of its own with no round of the
+ * user's in flight. The running-sessions poll lists a session by its chat run
+ * or its agents, so without these a report that follows the last agent's end
+ * would stream into a conversation the page shows as idle.
+ *
+ * Consumer: the Codex runtime's `listBackgroundWork`, which leaves out the
+ * sessions its agents already list.
+ */
+export function listCodexReportingOnlySessions(): string[] {
+  const sessions: string[] = [];
+  for (const [appSessionId, session] of residentSessions) {
+    if (!session.disposed && !session.round && session.engineTurns.size > 0) {
+      sessions.push(appSessionId);
+    }
+  }
+  return sessions;
+}
+
+/**
  * Whether the session still has work that must not be reclaimed.
  *
  * A round in flight, a report the engine started on its own, or an agent

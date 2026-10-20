@@ -39,6 +39,7 @@ import {
   completeCodexResidentRound,
   isCodexResidentSessionAdmissionClosed,
   isCodexResidentSessionBusy,
+  listCodexReportingOnlySessions,
   readCodexResidentSessionActivity,
   openCodexResidentSessionAdmission,
   releaseCodexResidentSession,
@@ -1720,12 +1721,18 @@ export const codexRuntime = {
     },
   },
   /**
-   * Sessions with collab agents still running, for the running-sessions poll.
-   * The app-server dies with the turn, so these are the agents of turns still
-   * in flight; the turn's end settles and removes the rest.
+   * Sessions with collab agents still running, for the running-sessions poll,
+   * plus resident sessions whose engine reports in a turn of its own after
+   * the last agent ended (listed with no tasks, so the page shows them
+   * working). A short-connection app-server dies with the turn, so its agents
+   * are those of turns still in flight; the turn's end settles the rest.
    */
   listBackgroundWork(): SessionBackgroundWork[] {
-    return codexBackgroundWork.list();
+    const work = codexBackgroundWork.list();
+    const reporting = listCodexReportingOnlySessions()
+      .filter((sessionId) => !codexBackgroundWork.hasSession(sessionId))
+      .map((sessionId) => ({ sessionId, tasks: [] }));
+    return [...work, ...reporting];
   },
   /**
    * What the engine is doing with the conversation's round.

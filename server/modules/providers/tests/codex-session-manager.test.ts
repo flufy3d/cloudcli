@@ -22,6 +22,7 @@ import {
   isCodexResidentSessionBusy,
   readCodexResidentSessionActivity,
   listCodexResidentSessions,
+  listCodexReportingOnlySessions,
   releaseCodexResidentSession,
   stopCodexResidentRound,
   submitCodexResidentRound,
@@ -1350,6 +1351,16 @@ test('a report the engine runs on its own is reported as reporting', async (t) =
     await new Promise((resolve) => setTimeout(resolve, 30));
 
     assert.equal(readCodexResidentSessionActivity('app-report-activity')?.reporting, true);
+    // No agent is left to list the session by, so the report itself does: else
+    // the page shows the conversation idle while the engine writes to it.
+    assert.deepEqual(listCodexReportingOnlySessions(), ['app-report-activity']);
+
+    server.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: 'report-turn', status: 'completed' },
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(listCodexReportingOnlySessions(), []);
   } finally {
     closeCodexResidentSessions();
   }

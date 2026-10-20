@@ -17,16 +17,24 @@
  * none is sent here. The `permissions` facet answers permission/question
  * cards and replays them after a reload.
  *
+ * Work the engine moved to the background outlives the run: the registry
+ * keeps the conversation and routes its frames to the session channel until
+ * the work and the engine's report turn are over, and the background facets
+ * (`listBackgroundWork`, `backgroundTasks`, `getSessionActivity`,
+ * `hasSessionWork`, `stopBackgroundTask`) answer from that state.
+ *
  * @module opencode-runtime.provider
  */
 
-import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
+import { notifyBackgroundWorkCompleted, notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type {
   AnyRecord,
+  NormalizedMessage,
   ProviderPermissionDecision,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
+  SessionBackgroundWork,
 } from '@/shared/types.js';
 import {
   createCompleteMessage,
@@ -37,12 +45,21 @@ import {
   resolveModelEffort,
 } from '@/shared/utils.js';
 
+import type { BackgroundWorkRegistry } from '../../shared/background-work/background-work-registry.js';
+import { LOCAL_AGENT_TASK_TYPE } from '../../shared/background-work/task-status.js';
+
 import {
   OpenCodeApiClient,
   OpenCodeApiError,
   parseOpenCodeModelRef,
   type OpenCodeServiceEndpoint,
 } from './opencode-api.client.js';
+import {
+  opencodeBackgroundWork,
+  readBackgroundNotice,
+  type OpenCodeBackgroundNotice,
+} from './opencode-background-work.js';
+import { openOpenCodeDatabase, readOpenCodeSyntheticNoticeMetadata } from './opencode-data-root.js';
 import { OpenCodeEventStream, type OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import {
   applyEngineRename as applyEngineRenameToApp,
@@ -66,6 +83,31 @@ type RuntimeDependencies = {
   createClient?: (endpoint: OpenCodeServiceEndpoint) => OpenCodeApiClient;
   /** Grace period before an interrupt is assumed to have landed; default 5s. */
   abortSettleGraceMs?: number;
+  /** Where background work is recorded; default the process-wide `opencodeBackgroundWork`. */
+  backgroundWork?: BackgroundWorkRegistry;
+  /** The notices the engine persisted for a session; default read from `opencode.db`. */
+  readPersistedNotices?: (providerSessionId: string) => OpenCodeBackgroundNotice[];
+};
+
+/** Notices persisted as `synthetic` session messages; none when the database cannot be read. */
+const readPersistedNoticesFromDatabase = (providerSessionId: string): OpenCodeBackgroundNotice[] => {
+  let db: ReturnType<typeof openOpenCodeDatabase> = null;
+  try {
+    db = openOpenCodeDatabase();
+    if (!db) {
+      return [];
+    }
+    return readOpenCodeSyntheticNoticeMetadata(db, providerSessionId)
+      .flatMap(({ metadata, createdAt }) => {
+        const notice = readBackgroundNotice(metadata);
+        return notice ? [{ ...notice, ...(createdAt === null ? {} : { at: createdAt }) }] : [];
+      });
+  } catch (error) {
+    console.warn('[OpenCode] failed to read the background notices the engine persisted:', error);
+    return [];
+  } finally {
+    db?.close();
+  }
 };
 
 /**
@@ -78,6 +120,8 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   const supervisor = dependencies.supervisor ?? new OpenCodeServiceSupervisor();
   const createClient = dependencies.createClient ?? ((endpoint) => new OpenCodeApiClient(endpoint));
   const abortSettleGraceMs = dependencies.abortSettleGraceMs ?? 5_000;
+  const backgroundWork = dependencies.backgroundWork ?? opencodeBackgroundWork;
+  const readPersistedNotices = dependencies.readPersistedNotices ?? readPersistedNoticesFromDatabase;
 
   // Reconnects only boot the service while a run is in flight (runs create
   // their registry entry before awaiting the stream); with nobody chatting a
@@ -94,11 +138,47 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   });
   let client: OpenCodeApiClient | null = null;
 
-  const runs = new OpenCodeRunRegistry();
   const bridge = new OpenCodeInteractionBridge({
     getClient: () => client,
     resolveChild: (providerSessionId) => runs.childOwner(providerSessionId),
   });
+  const runs = new OpenCodeRunRegistry({
+    backgroundWork,
+    hooks: {
+      // The run is over but a background agent may still ask for approval:
+      // its cards now reach the page through the session channel.
+      detached: (conversation) => {
+        bridge.attach({
+          appSessionId: conversation.appSessionId,
+          providerSessionId: conversation.providerSessionId,
+          writer: conversation.writer,
+          resolveToolCall: (callId) => conversation.translator.getToolCall(callId),
+        });
+        bridge.rebind(conversation.appSessionId, conversation.writer);
+      },
+      // Nothing runs in the conversation any more, so no card can be answered.
+      dropped: (conversation) => {
+        bridge.cancelSession(conversation.appSessionId, 'Nothing is running in the session any more.');
+        bridge.detach(conversation.providerSessionId);
+      },
+      // The run's own end was announced when it ended; this is when the
+      // work it left running and the engine's report on it are over.
+      workFinished: (conversation) => {
+        notifyBackgroundWorkCompleted({
+          userId: conversation.owner.userId,
+          provider: PROVIDER,
+          sessionId: conversation.appSessionId,
+          sessionName: conversation.owner.sessionName ?? null,
+        });
+      },
+    },
+  });
+
+  /** The cards of background agents' sessions, which outlive a run that ends. */
+  const backgroundCardSessions = (sessionId: string): Set<string> => {
+    const conversation = runs.conversation(sessionId);
+    return conversation ? runs.backgroundChildSessions(conversation) : new Set();
+  };
   const settings = new OpenCodeSessionSettingsApplier();
 
   /**
@@ -155,6 +235,9 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     });
   });
   eventStream.onReconnect(() => {
+    // A notice that fell into the gap is persisted all the same; settle the
+    // work first, so the service is then asked whether a report turn runs.
+    runs.reconcileBackground(readPersistedNotices);
     void runs.reconcile({ getSession: (sessionId) => client?.getSession(sessionId)
       ?? Promise.reject(new OpenCodeApiError('GET', '/api/session', 503, 'OpenCode service is not running')) });
   });
@@ -279,7 +362,14 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       return failRun('Nothing to send: the message is empty.');
     }
 
-    const activeRun = runs.create(appSessionId, providerSessionId, writer);
+    const publishSessionEvent = context.publishSessionEvent;
+    const channel: ProviderRuntimeWriter | null = publishSessionEvent
+      ? { send: (data) => publishSessionEvent(appSessionId, data as NormalizedMessage), userId: writer.userId }
+      : null;
+    const activeRun = runs.create(appSessionId, providerSessionId, writer, channel, {
+      userId,
+      ...(sessionSummary ? { sessionName: sessionSummary } : {}),
+    });
     bridge.attach({
       appSessionId,
       providerSessionId,
@@ -295,20 +385,21 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       await activeClient.prompt(providerSessionId, { text, files });
       activeRun.promptAccepted = true;
     } catch (error) {
+      bridge.cancelSession(appSessionId, 'The message was rejected by the OpenCode service.', backgroundCardSessions(appSessionId));
       runs.release(activeRun);
-      bridge.cancelSession(appSessionId, 'The message was rejected by the OpenCode service.');
-      bridge.detach(providerSessionId);
       return failRun(`OpenCode rejected the message: ${describeError(error)}`);
     }
 
     const settlement = await activeRun.settled;
     // Read before release forgets the children: calls they never resolved.
     const childSettleFrames = runs.settleChildren(activeRun);
+    // Retract any cards still pending except a running background agent's.
+    // Releasing then either moves the bridge attachment to the session channel
+    // (the engine still works in the conversation) or retracts the rest and
+    // detaches, so finished sessions do not pin memory forever (the
+    // registry's hooks).
+    bridge.cancelSession(appSessionId, 'The run ended with cards still pending.', backgroundCardSessions(appSessionId));
     runs.release(activeRun);
-    // Retract any cards still pending, then drop the run's writer from the
-    // bridge so finished sessions do not pin memory forever.
-    bridge.cancelSession(appSessionId, 'The run ended with cards still pending.');
-    bridge.detach(providerSessionId);
     // A spawn call the run never resolved would spin on its card forever.
     for (const frame of [...activeRun.translator.settleOpenSubagents(), ...childSettleFrames]) {
       writer.send(frame);
@@ -343,14 +434,47 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     throw new Error(settlement.error);
   };
 
-  const abort = (sessionId: string): boolean => {
+  /**
+   * Stops what the engine still does in a conversation with no run: the
+   * report turn and every background agent. A backgrounded command has no
+   * request that stops it and keeps running.
+   */
+  const abortBackground = (sessionId: string): false | Promise<boolean> => {
+    const conversation = runs.conversation(sessionId);
+    if (!conversation || !client) {
+      return false;
+    }
+    const activeClient = client;
+    const targets = backgroundWork.list()
+      .filter((entry) => entry.sessionId === conversation.appSessionId)
+      .flatMap((entry) => entry.tasks)
+      .filter((task) => task.taskType === LOCAL_AGENT_TASK_TYPE)
+      .map((task) => task.taskId);
+    if (conversation.engineTurn) {
+      targets.push(conversation.providerSessionId);
+    }
+    if (targets.length === 0) {
+      return false;
+    }
+    return Promise.allSettled(targets.map((target) => activeClient.interrupt(target))).then((results) => {
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          console.warn('[OpenCode] failed to stop background work:', result.reason);
+        }
+      }
+      // `false` from the service: that session was not running any more.
+      return results.some((result) => result.status === 'fulfilled' && result.value);
+    });
+  };
+
+  const abort = (sessionId: string): boolean | Promise<boolean> => {
     const activeRun = runs.get(sessionId);
     if (!activeRun) {
-      return false;
+      return abortBackground(sessionId);
     }
     if (!activeRun.aborted) {
       activeRun.aborted = true;
-      bridge.cancelSession(activeRun.appSessionId, 'The run was stopped.');
+      bridge.cancelSession(activeRun.appSessionId, 'The run was stopped.', backgroundCardSessions(sessionId));
       if (!client) {
         activeRun.settle({ outcome: 'interrupted', reason: 'user' });
       } else {
@@ -377,9 +501,56 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     return true;
   };
 
+  /** Stops one background agent by interrupting its own session. */
+  const stopBackgroundTask = async (sessionId: string, taskId: string): Promise<boolean> => {
+    const appSessionId = runs.conversation(sessionId)?.appSessionId ?? sessionId;
+    const task = backgroundWork.get(appSessionId, taskId);
+    if (!task || task.taskType !== LOCAL_AGENT_TASK_TYPE || !client) {
+      return false;
+    }
+    try {
+      const interrupted = await client.interrupt(taskId);
+      if (!interrupted) {
+        // The agent's session was not running any more: its notice was
+        // missed, and the engine persisted it all the same.
+        runs.reconcileBackground(readPersistedNotices);
+      }
+      return interrupted;
+    } catch (error) {
+      console.warn('[OpenCode] failed to stop a background agent:', error);
+      return false;
+    }
+  };
+
   return {
     run,
     abort,
+    stopBackgroundTask,
+    listBackgroundWork(): SessionBackgroundWork[] {
+      return [
+        ...backgroundWork.list(),
+        ...runs.listReportingOnly().map((entry) => ({ ...entry, tasks: [] })),
+      ];
+    },
+    /**
+     * Said outright while the conversation is known, `reporting: false`
+     * included: the page keeps the last value a poll reported, so a report
+     * that ended while a command still runs must be cleared.
+     */
+    getSessionActivity(sessionId: string) {
+      return runs.conversation(sessionId) ? { queued: false, reporting: runs.isReporting(sessionId) } : null;
+    },
+    hasSessionWork(sessionId: string): boolean {
+      const conversation = runs.conversation(sessionId);
+      return Boolean(conversation?.run) || runs.isReporting(sessionId)
+        || backgroundWork.hasSession(conversation?.appSessionId ?? sessionId);
+    },
+    backgroundTasks: {
+      list: (sessionId: string) => runs.listStripTasks(runs.conversation(sessionId)?.appSessionId ?? sessionId),
+      canInterrupt: (sessionId: string) => runs.canInterrupt(sessionId),
+      // The engine files a new message into its inbox; background work goes on.
+      queuesInput: () => false,
+    },
     permissions: {
       resolve(requestId: string, decision: ProviderPermissionDecision): void {
         bridge.resolve(requestId, decision);

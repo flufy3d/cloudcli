@@ -85,8 +85,13 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
   // has to say that the conversation waits for the engine instead of
   // pretending it is being worked on.
   const isQueued = Boolean(renderedActivity.queued) && !isBackground;
+  // Once background work ends the engine reports on it in a turn of its own:
+  // the conversation is being answered, and what still runs is named beside.
+  const isReporting = isBackground && Boolean(renderedActivity.reporting);
   const actionWords = ACTION_KEYS.map((key, i) => t(key, { defaultValue: DEFAULT_ACTION_WORDS[i] }));
-  const label = isBackground
+  const label = isReporting
+    ? t('claudeStatus.reportingBackground', 'Reporting on background work')
+    : isBackground
     ? t('claudeStatus.backgroundWork', 'Background work')
     : isQueued
       ? (renderedActivity.reporting
@@ -95,7 +100,9 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
         : t('claudeStatus.queuedInEngine', 'Queued — waiting for the engine'))
       : (renderedActivity.statusText || actionWords[Math.floor(elapsedSeconds / 4) % actionWords.length])
         .replace(/\.+$/, '');
-  const detail = isBackground ? describeBackgroundTasks(renderedActivity.tasks ?? [], t) : '';
+  const detail = isBackground && (!isReporting || (renderedActivity.tasks?.length ?? 0) > 0)
+    ? describeBackgroundTasks(renderedActivity.tasks ?? [], t)
+    : '';
 
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;

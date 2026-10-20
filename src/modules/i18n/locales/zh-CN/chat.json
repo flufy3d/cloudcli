@@ -240,7 +240,15 @@
     "queuedInEngine": "排队中——等引擎空闲",
     "cancelQueued": "取消排队中的消息",
     "cancelQueuedShort": "取消",
-    "queuedReporting": "排队中——引擎正在汇报，它结束后这一轮自动开始"
+    "queuedReporting": "排队中——引擎正在汇报，它结束后这一轮自动开始",
+    "backgroundWork": "后台工作",
+    "reportingBackground": "正在汇报后台结果",
+    "backgroundTask": {
+      "workflow": "工作流 {{name}}",
+      "agent": "子代理 {{description}}",
+      "command": "命令 {{description}}",
+      "count": "{{count}} 个任务"
+    }
   },
   "projectSelection": {
     "startChatWithProvider": "选择一个项目以开始与 {{provider}} 聊天"

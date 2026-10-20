@@ -14,6 +14,11 @@
  * - `session.execution.{succeeded,failed,interrupted}` → run terminal
  *   (`session.step.ended` carries token totals, but the runtime reads the
  *   authoritative session totals from the API snapshot instead)
+ * - a `tool.success` whose metadata still says `running` is a background
+ *   launch, not a finished call; a synthetic `session.inbox.enqueued` item is
+ *   the engine's notice that such work ended; `session.execution.started`
+ *   marks a turn beginning, which the run registry needs to tell a turn the
+ *   engine started on its own (see `opencode-background-work.ts`)
  *
  * Ids on transcript rows (text / thinking / tool_use / tool_result) derive
  * from the engine's own identifiers (assistant message id + per-type part
@@ -35,6 +40,12 @@ import {
   readOptionalString,
 } from '@/shared/utils.js';
 
+import {
+  readBackgroundLaunch,
+  readBackgroundNotice,
+  type OpenCodeBackgroundLaunch,
+  type OpenCodeBackgroundNotice,
+} from './opencode-background-work.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import {
   isOpenCodeSubagentTool,
@@ -61,6 +72,12 @@ export type OpenCodeRunOutcome =
 export type OpenCodeTranslatedEvent = {
   frames: NormalizedMessage[];
   terminal?: OpenCodeRunOutcome;
+  /** `session.execution.started`: the session began a turn. */
+  executionStarted?: boolean;
+  /** A call the engine moved to the background; its card stays running. */
+  launch?: OpenCodeBackgroundLaunch;
+  /** The engine's notice that background work ended. */
+  notice?: OpenCodeBackgroundNotice;
 };
 
 /** A tool call the translator has seen; the interaction bridge labels permission cards with it. */
@@ -282,6 +299,22 @@ export class OpenCodeSessionEventTranslator {
         if (!callId) {
           return { frames: [] };
         }
+        const known = this.toolCalls.get(callId);
+        const launch = known ? readBackgroundLaunch(callId, known.name, known.input, data.metadata) : null;
+        if (launch) {
+          // The call only says the work started; its card runs until the
+          // engine's notice, and it is no longer this run's to settle.
+          this.openSubagentCalls.delete(callId);
+          const result = this.toolResultFrame(callId, formatToolOutput(data.content), false, timestamp);
+          result.toolUseResult = { isAsync: true, taskId: launch.taskId };
+          return {
+            frames: [result, createTaskStatusMessage(
+              { provider: PROVIDER, sessionId: this.sessionId, taskId: launch.taskId, toolUseId: callId, taskType: launch.taskType },
+              { id: `${callId}_started`, timestamp, event: 'started', status: 'running', description: launch.description },
+            )],
+            launch,
+          };
+        }
         const frames = [this.toolResultFrame(callId, formatToolOutput(data.content), false, timestamp)];
         if (this.openSubagentCalls.delete(callId)) {
           frames.push(this.subagentStatusFrame(callId, readSubagentChildSessionId(data.metadata) ?? callId, 'completed', timestamp));
@@ -306,6 +339,18 @@ export class OpenCodeSessionEventTranslator {
         // fetches for the budget frame; nothing to accumulate here.
         return { frames: [] };
 
+      case 'session.inbox.enqueued': {
+        const item = readObjectRecord(data.item);
+        if (readOptionalString(item?.type) !== 'synthetic') {
+          return { frames: [] };
+        }
+        const notice = readBackgroundNotice(readObjectRecord(item?.payload)?.metadata);
+        return notice ? { frames: [], notice } : { frames: [] };
+      }
+
+      case 'session.execution.started':
+        return { frames: [], executionStarted: true };
+
       case 'session.execution.succeeded':
         return { frames: [], terminal: { outcome: 'succeeded' } };
 
@@ -322,7 +367,7 @@ export class OpenCodeSessionEventTranslator {
 
       default:
         // step.started/streamed/failed, text/reasoning.started, usage.updated,
-        // inbox.*, model/agent.selected, permissions, instructions.updated and
+        // inbox.delivered, model/agent.selected, permissions, instructions.updated and
         // anything newer carry nothing the timeline renders on its own.
         return { frames: [] };
     }

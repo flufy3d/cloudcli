@@ -294,6 +294,8 @@ function notifyPermissionRequired({ userId, provider, sessionId = null, toolName
  * Uses the `stop` kind so it rides the existing "run stopped" preference rather
  * than needing a new opt-in that would default to off. No explicit dedupeKey, so
  * the default composite key collapses repeats inside the dedupe window.
+ *
+ * @param {{ userId?: string | null, provider: string, sessionId?: string | null, sessionName?: string | null }} options
  */
 function notifyBackgroundWorkCompleted({ userId, provider, sessionId = null, sessionName = null }) {
   notifyUserIfEnabled({

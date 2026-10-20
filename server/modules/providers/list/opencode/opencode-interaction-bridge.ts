@@ -274,14 +274,31 @@ export class OpenCodeInteractionBridge {
     return views;
   }
 
-  /** Retracts every card of a session whose run is ending; the server settles its own forms. */
-  cancelSession(appSessionId: string, reason: string): void {
+  /**
+   * Retracts every card of a session whose run is ending; the server settles
+   * its own forms. Cards asked by a session in `keep` stay: a background
+   * agent's session still waits for its answer after the run ends.
+   */
+  cancelSession(appSessionId: string, reason: string, keep: ReadonlySet<string> = new Set()): void {
     for (const entry of [...this.pending.values()]) {
-      if (entry.appSessionId !== appSessionId) {
+      if (entry.appSessionId !== appSessionId || keep.has(entry.providerSessionId)) {
         continue;
       }
       this.pending.delete(entry.requestId);
       this.retract(entry, 'cancelled', reason);
+    }
+  }
+
+  /**
+   * Points the session's pending cards at a new writer, so the answer and the
+   * retraction of a card kept past its run reach the page through the
+   * session channel instead of the finished run.
+   */
+  rebind(appSessionId: string, writer: ProviderRuntimeWriter): void {
+    for (const entry of this.pending.values()) {
+      if (entry.appSessionId === appSessionId) {
+        entry.writer = writer;
+      }
     }
   }
 

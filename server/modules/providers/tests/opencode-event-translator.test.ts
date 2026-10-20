@@ -212,12 +212,59 @@ test('ignores lifecycle chatter and unknown event types', () => {
   for (const type of [
     'session.created', 'session.model.selected', 'session.agent.selected', 'session.permissions',
     'session.inbox.enqueued', 'session.inbox.delivered', 'session.instructions.updated',
-    'session.execution.started', 'session.step.started', 'session.step.streamed',
+    'session.step.started', 'session.step.streamed',
     'session.step.failed', 'session.usage.updated', 'session.text.started', 'session.reasoning.started',
     'session.something.new',
   ]) {
     assert.deepEqual(translator.translate(event(type, { anything: true })), { frames: [] }, type);
   }
+  // A turn starting draws nothing, but the run registry needs to know: with
+  // no run of ours in the session it is the engine's own report turn.
+  assert.deepEqual(translator.translate(event('session.execution.started', {})), { frames: [], executionStarted: true });
+});
+
+test('a background launch keeps its card running, and the engine\'s notice names how it ended', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  translator.translate(event('session.tool.called', {
+    assistantMessageID: 'm', id: 'call_bg', name: 'subagent', input: { ...SUBAGENT_INPUT, background: true },
+  }));
+  const launched = translator.translate(event('session.tool.success', {
+    assistantMessageID: 'm', id: 'call_bg', content: [{ type: 'text', text: 'The subagent is working in the background.' }],
+    metadata: { sessionID: 'ses_child', status: 'running', truncated: false },
+  }));
+  assert.deepEqual(launched.launch, { callId: 'call_bg', taskId: 'ses_child', taskType: 'local_agent', description: 'Review the diff' });
+  assert.deepEqual(launched.frames.map((frame) => [frame.kind, frame.status]), [['tool_result', undefined], ['task_status', 'running']]);
+  assert.deepEqual(launched.frames[0].toolUseResult, { isAsync: true, taskId: 'ses_child' });
+  // The run that launched it ends; the agent is not the run's to settle.
+  assert.deepEqual(translator.settleOpenSubagents(), []);
+
+  const notice = translator.translate(event('session.inbox.enqueued', {
+    inboxID: 'msg_n',
+    item: { type: 'synthetic', payload: { text: '<subagent/>', metadata: { source: 'subagent', childID: 'ses_child', state: 'completed' } }, delivery: 'steer' },
+  }));
+  assert.deepEqual(notice, { frames: [], notice: { taskId: 'ses_child', outcome: 'completed' } });
+
+  const userMessage = translator.translate(event('session.inbox.enqueued', {
+    inboxID: 'msg_u', item: { type: 'user', payload: { text: 'hi' } },
+  }));
+  assert.deepEqual(userMessage, { frames: [] }, 'a message the user queued is not a notice');
+});
+
+test('a backgrounded command is a launch named by its shell id and its command', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  translator.translate(event('session.tool.called', { assistantMessageID: 'm', id: 'call_sh', name: 'shell', input: { command: 'npm test', background: true } }));
+  const launched = translator.translate(event('session.tool.success', {
+    assistantMessageID: 'm', id: 'call_sh', content: [{ type: 'text', text: 'Command moved to the background.' }],
+    metadata: { status: 'running', truncated: false, shellID: 'sh_1' },
+  }));
+  assert.deepEqual(launched.launch, { callId: 'call_sh', taskId: 'sh_1', taskType: 'local_bash', description: 'npm test' });
+
+  translator.translate(event('session.tool.called', { assistantMessageID: 'm', id: 'call_fg', name: 'shell', input: { command: 'ls' } }));
+  const foreground = translator.translate(event('session.tool.success', {
+    assistantMessageID: 'm', id: 'call_fg', content: [{ type: 'text', text: 'a.txt' }],
+    metadata: { status: 'completed', truncated: false, exit: 0 },
+  }));
+  assert.equal(foreground.launch, undefined, 'a command that finished in the foreground launched nothing');
 });
 
 // ---------------------------------------------------------------------------

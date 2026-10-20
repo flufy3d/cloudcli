@@ -124,6 +124,12 @@ export type {
 export type SessionBackgroundWork = {
   sessionId: string;
   tasks: BackgroundTaskSummary[];
+  /**
+   * When the work the entry stands for began, for an entry with no task to
+   * date it: a report turn the engine runs on its own. The running-sessions
+   * poll otherwise dates the entry by its earliest task.
+   */
+  startedAt?: number;
 };
 
 export type {

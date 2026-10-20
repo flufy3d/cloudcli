@@ -9,6 +9,7 @@ import test, { after, before } from 'node:test';
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { connectedClients } from '@/modules/websocket/index.js';
 import { createOpenCodeRuntime } from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
+import { BackgroundWorkRegistry } from '@/modules/providers/shared/background-work/background-work-registry.js';
 import type { NormalizedMessage, ProviderModelsDefinition, ProviderRuntimeContext } from '@/shared/types.js';
 
 // Run notifications consult the app database; give the suite a throwaway one.
@@ -41,6 +42,10 @@ type FakeService = {
   requests: RecordedRequest[];
   snapshot: Record<string, unknown>;
   emit: (event: Record<string, unknown>) => void;
+  /** Pushes several events in one chunk, so the runtime dispatches them in one tick. */
+  emitBatch: (events: Array<Record<string, unknown>>) => void;
+  /** What `/interrupt` answers: false says nothing was running. */
+  interruptResult: boolean;
   waitForRequest: (predicate: (request: RecordedRequest) => boolean) => Promise<RecordedRequest>;
   close: () => void;
 };
@@ -58,6 +63,12 @@ const startFakeService = async (): Promise<FakeService> => {
         feed.write(`data: ${JSON.stringify(event)}\n\n`);
       }
     },
+    emitBatch: (events) => {
+      for (const feed of feeds) {
+        feed.write(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''));
+      }
+    },
+    interruptResult: true,
     waitForRequest: (predicate) => new Promise((resolve) => {
       const existing = requests.find(predicate);
       if (existing) {
@@ -102,7 +113,7 @@ const startFakeService = async (): Promise<FakeService> => {
       } else if (request.method === 'POST' && url.endsWith('/prompt')) {
         reply(200, { data: { id: 'msg_1' } });
       } else if (request.method === 'POST' && url.endsWith('/interrupt')) {
-        reply(200, { interrupted: true });
+        reply(200, { interrupted: service.interruptResult });
       } else if (request.method === 'GET' && url.startsWith('/api/session/')) {
         reply(200, { data: service.snapshot });
       } else {
@@ -121,8 +132,12 @@ const MODELS: ProviderModelsDefinition = {
   OPTIONS: [{ value: 'opencode-go/glm-5.3', label: 'GLM 5.3', effort: { values: [{ value: 'high', label: 'High' }] } }],
 } as unknown as ProviderModelsDefinition;
 
-const makeContext = (providerSessionId: string | null): ProviderRuntimeContext => ({
+const makeContext = (
+  providerSessionId: string | null,
+  publishSessionEvent?: ProviderRuntimeContext['publishSessionEvent'],
+): ProviderRuntimeContext => ({
   resolveProviderSessionId: () => providerSessionId,
+  ...(publishSessionEvent ? { publishSessionEvent } : {}),
   resolveResumeModel: async (_sessionId, requested) => requested ?? undefined,
   getProviderModels: async () => MODELS,
   normalizeMessage: () => [],
@@ -170,21 +185,36 @@ const waitFor = async (assertion: () => void, timeoutMs = 2_000): Promise<void> 
   }
 };
 
-const withRuntime = async (run: (input: { service: FakeService; runtime: ReturnType<typeof createOpenCodeRuntime> }) => Promise<void>) => {
+type RuntimeHarness = {
+  service: FakeService;
+  runtime: ReturnType<typeof createOpenCodeRuntime>;
+  /** The work this runtime alone tracks, so tests never see each other's tasks. */
+  backgroundWork: BackgroundWorkRegistry;
+  /** Plays the service process exiting. */
+  exitService: () => void;
+};
+
+const withRuntime = async (run: (input: RuntimeHarness) => Promise<void>) => {
   const service = await startFakeService();
   const endpoint = { url: service.url, authorization: 'Basic dGVzdA==' };
+  const exitListeners: Array<() => void> = [];
+  const backgroundWork = new BackgroundWorkRegistry();
   const runtime = createOpenCodeRuntime({
     supervisor: {
       // currentEndpoint backs the event stream's re-resolver: after a boot it
       // must hand out the same endpoint the supervisor does.
       ensureEndpoint: async () => endpoint,
-      onExit: () => () => {},
+      onExit: (listener) => {
+        exitListeners.push(() => listener(endpoint));
+        return () => {};
+      },
       currentEndpoint: () => endpoint,
     },
     abortSettleGraceMs: 300,
+    backgroundWork,
   });
   try {
-    await run({ service, runtime });
+    await run({ service, runtime, backgroundWork, exitService: () => exitListeners.forEach((listener) => listener()) });
   } finally {
     service.close();
   }
@@ -677,5 +707,384 @@ test('steps dropped because the card never became known are logged once', async 
 
     service.emit(session('session.execution.succeeded', {}));
     await running;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Background work: a `subagent` or `shell` call made with `background: true`
+// returns at once and keeps running after the run ends; the engine then posts
+// a synthetic notice into the parent's inbox and starts a report turn of its
+// own (shapes captured from OpenCode 2.0.31).
+// ---------------------------------------------------------------------------
+
+const BG_CALL = 'call_bg_agent';
+const SHELL_CALL = 'call_bg_shell';
+const SHELL_ID = 'sh_bg_1';
+
+const makeSessionChannel = () => {
+  const published: NormalizedMessage[] = [];
+  return {
+    published,
+    publish: (appSessionId: string, message: NormalizedMessage) => {
+      published.push({ ...message, sessionId: message.sessionId ?? appSessionId });
+    },
+  };
+};
+
+const launchBackgroundAgent = (service: FakeService) => {
+  service.emit(session('session.tool.called', {
+    assistantMessageID: 'm_p', id: BG_CALL, name: 'subagent',
+    input: { agent: 'general', description: 'Independent review', prompt: 'review it', background: true },
+  }));
+  service.emit(session('session.created', { sessionID: CHILD, parentID: 'ses_new', title: 'Independent review' }));
+  service.emit(session('session.tool.progress', { assistantMessageID: 'm_p', id: BG_CALL, metadata: { sessionID: CHILD, status: 'running' } }));
+  service.emit(session('session.tool.success', {
+    assistantMessageID: 'm_p', id: BG_CALL,
+    content: [{ type: 'text', text: `The subagent is working in the background (sessionID: ${CHILD}).` }],
+    metadata: { sessionID: CHILD, status: 'running', truncated: false },
+  }));
+};
+
+const launchBackgroundShell = (service: FakeService) => {
+  service.emit(session('session.tool.called', {
+    assistantMessageID: 'm_p', id: SHELL_CALL, name: 'shell', input: { command: 'npm test', background: true },
+  }));
+  service.emit({ type: 'shell.created', data: { info: { id: SHELL_ID, status: 'running', command: 'npm test', metadata: { sessionID: 'ses_new' } } } });
+  service.emit(session('session.tool.progress', { assistantMessageID: 'm_p', id: SHELL_CALL, metadata: { shellID: SHELL_ID } }));
+  service.emit(session('session.tool.success', {
+    assistantMessageID: 'm_p', id: SHELL_CALL,
+    content: [{ type: 'text', text: `Command moved to the background (shell ID: ${SHELL_ID}).` }],
+    metadata: { status: 'running', truncated: false, shellID: SHELL_ID },
+  }));
+};
+
+const inboxNotice = (metadata: Record<string, unknown>, text = '<notice/>') => session('session.inbox.enqueued', {
+  inboxID: `msg_notice_${Math.random()}`,
+  item: { type: 'synthetic', payload: { text, metadata }, delivery: 'steer' },
+});
+
+test('a background agent keeps its card running and the session working after the run completes', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('review in the background', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.text.ended', { assistantMessageID: 'm_p2', ordinal: 0, text: 'Started the review.' }));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    const statuses = frames.filter((frame) => frame.kind === 'task_status' && frame.toolUseId === BG_CALL);
+    assert.deepEqual(statuses.map((frame) => frame.status), ['running'], 'the launch acknowledgement is not the agent finishing');
+    assert.equal(statuses[0].taskId, CHILD);
+    assert.ok(frames.some((frame) => frame.kind === 'complete'), 'the run itself still completes');
+
+    assert.deepEqual(runtime.listBackgroundWork?.().map((entry) => [entry.sessionId, entry.tasks.map((task) => [task.taskId, task.toolUseId, task.taskType])]), [
+      ['app-1', [[CHILD, BG_CALL, 'local_agent']]],
+    ]);
+    assert.equal(runtime.hasSessionWork?.('app-1'), true, 'a session with a running agent cannot be archived or deleted');
+    assert.deepEqual(runtime.backgroundTasks?.list('app-1').map((task) => [task.id, task.toolName, task.description]), [
+      [BG_CALL, 'Agent', 'Independent review'],
+    ]);
+    assert.equal(runtime.backgroundTasks?.queuesInput?.('app-1'), false, 'the engine takes a new message without disturbing the agent');
+    const strip = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+    assert.equal(strip.at(-1)?.backgroundTasks?.length, 1);
+    // The live strip says what the subscribe ack says, or the page queues the
+    // next message until the work and the report are over.
+    assert.ok(strip.every((frame) => frame.backgroundWorkQueuesInput === false));
+
+    // The agent keeps working after the run: its steps reach the page through
+    // the session channel, still tied to the card.
+    service.emit(session('session.tool.called', { sessionID: CHILD, assistantMessageID: 'm_c', id: 'call_read', name: 'read', input: { path: 'a.ts' } }));
+    await waitFor(() => assert.ok(channel.published.some((frame) => frame.kind === 'tool_use' && frame.toolId === 'call_read')));
+    const childRow = channel.published.find((frame) => frame.toolId === 'call_read');
+    assert.equal(childRow?.parentToolUseId, BG_CALL);
+    assert.equal(childRow?.sessionId, 'app-1');
+  });
+});
+
+test('the engine\'s notice settles the agent, and the report turn it starts reaches the page', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('review in the background', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    service.emit(session('session.execution.succeeded', { sessionID: CHILD }));
+    service.emit(inboxNotice({ source: 'subagent', childID: CHILD, agent: 'General', state: 'completed' }));
+    service.emit(session('session.execution.started', {}));
+    await waitFor(() => assert.ok(channel.published.some((frame) => frame.kind === 'task_status' && frame.status === 'completed')));
+    const settled = channel.published.find((frame) => frame.kind === 'task_status' && frame.status === 'completed');
+    assert.equal(settled?.toolUseId, BG_CALL);
+    assert.deepEqual(runtime.backgroundTasks?.list('app-1'), []);
+    const strip = channel.published.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+    assert.deepEqual(strip.at(-1)?.backgroundTasks, [], 'an emptied strip is announced, or it never clears');
+
+    // The report turn the engine started on its own: the session is working
+    // and the reply streams in through the session channel.
+    await waitFor(() => assert.deepEqual(runtime.getSessionActivity?.('app-1'), { queued: false, reporting: true }));
+    const [reportEntry] = runtime.listBackgroundWork?.() ?? [];
+    assert.equal(reportEntry?.sessionId, 'app-1');
+    assert.deepEqual(reportEntry?.tasks, []);
+    assert.ok(reportEntry?.startedAt && Date.now() - reportEntry.startedAt < 2_000, 'the report\'s clock starts with the report');
+    assert.equal(runtime.hasSessionWork?.('app-1'), true);
+    assert.equal(runtime.backgroundTasks?.canInterrupt?.('app-1'), true, 'abort can stop the report turn');
+    service.emit(session('session.text.ended', { assistantMessageID: 'm_report', ordinal: 0, text: 'The review found two problems.' }));
+    service.emit(session('session.execution.succeeded', {}));
+    await waitFor(() => assert.ok(channel.published.some((frame) => frame.kind === 'text' && frame.content === 'The review found two problems.')));
+
+    await waitFor(() => assert.equal(runtime.getSessionActivity?.('app-1') ?? null, null));
+    assert.deepEqual(runtime.listBackgroundWork?.(), []);
+    assert.equal(runtime.hasSessionWork?.('app-1'), false);
+  });
+});
+
+test('a background command shows in the strip as a command and its notice clears it', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('run the tests in the background', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundShell(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    assert.deepEqual(runtime.backgroundTasks?.list('app-1').map((task) => [task.id, task.toolName, task.command]), [
+      [SHELL_CALL, 'Bash', 'npm test'],
+    ]);
+    assert.equal(runtime.listBackgroundWork?.()[0]?.tasks[0]?.taskType, 'local_bash');
+    // No request stops one backgrounded command, and no run is left to abort.
+    assert.equal(runtime.backgroundTasks?.canInterrupt?.('app-1'), false);
+    assert.equal(frames.filter((frame) => frame.kind === 'task_status').every((frame) => frame.status === 'running'), true);
+    // The page keeps the last word a poll gave, so "not reporting" is said outright.
+    assert.deepEqual(runtime.getSessionActivity?.('app-1'), { queued: false, reporting: false });
+
+    service.emit({ type: 'shell.exited', data: { id: SHELL_ID, exit: 0, status: 'exited' } });
+    service.emit(inboxNotice({ source: 'shell', shellID: SHELL_ID, jobID: SHELL_ID, state: 'completed', exit: 0 }));
+    await waitFor(() => assert.deepEqual(runtime.backgroundTasks?.list('app-1'), []));
+    assert.deepEqual(channel.published.filter((frame) => frame.text === 'background_tasks').at(-1)?.backgroundTasks, []);
+  });
+});
+
+test('a cancelled agent reads as stopped', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    service.emit(inboxNotice({ source: 'subagent', childID: CHILD, state: 'cancelled' }));
+    await waitFor(() => assert.equal(channel.published.find((frame) => frame.kind === 'task_status')?.status, 'stopped'));
+  });
+});
+
+test('stopping one background agent interrupts its own session', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', makeSessionChannel().publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    assert.equal(runtime.backgroundTasks?.list('app-1')[0]?.taskId, CHILD, 'an agent offers its own stop');
+    assert.equal(await runtime.stopBackgroundTask?.('app-1', CHILD), true);
+    await service.waitForRequest((request) => request.path === `/api/session/${CHILD}/interrupt`);
+    assert.equal(await runtime.stopBackgroundTask?.('app-1', 'ses_unknown'), false);
+  });
+});
+
+test('abort with no run stops the background agents and the report turn', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', makeSessionChannel().publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+    service.emit(session('session.execution.started', {}));
+    await waitFor(() => assert.equal(runtime.getSessionActivity?.('app-1')?.reporting, true));
+
+    assert.equal(await runtime.abort('app-1'), true);
+    await service.waitForRequest((request) => request.path === `/api/session/${CHILD}/interrupt`);
+    await service.waitForRequest((request) => request.path === '/api/session/ses_new/interrupt');
+  });
+});
+
+test('a message sent during the report turn takes the turn over and ends with it', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const first = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, first.writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+    service.emit(inboxNotice({ source: 'subagent', childID: CHILD, state: 'completed' }));
+    service.emit(session('session.execution.started', {}));
+    await waitFor(() => assert.equal(runtime.getSessionActivity?.('app-1')?.reporting, true));
+
+    const second = makeWriter();
+    const prompts = service.requests.filter((request) => request.path.endsWith('/prompt')).length;
+    const followUp = runtime.run('and fix them', { sessionId: 'app-1', projectPath: '/tmp/p' }, second.writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt') && service.requests.filter((entry) => entry.path.endsWith('/prompt')).length > prompts);
+    // The engine steers the message into the execution it is running.
+    service.emit(session('session.text.ended', { assistantMessageID: 'm_fix', ordinal: 0, text: 'Fixing both.' }));
+    service.emit(session('session.execution.succeeded', {}));
+    await followUp;
+
+    assert.ok(second.frames.some((frame) => frame.kind === 'text' && frame.content === 'Fixing both.'), 'the run owns the turn now');
+    assert.equal(channel.published.some((frame) => frame.content === 'Fixing both.'), false);
+    assert.ok(second.frames.some((frame) => frame.kind === 'complete'));
+    assert.equal(runtime.getSessionActivity?.('app-1') ?? null, null);
+  });
+});
+
+test('the service exiting settles every background task as stopped', async () => {
+  await withRuntime(async ({ service, runtime, exitService }) => {
+    const { writer } = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    launchBackgroundShell(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    exitService();
+    const stopped = channel.published.filter((frame) => frame.kind === 'task_status' && frame.status === 'stopped');
+    assert.deepEqual(stopped.map((frame) => frame.toolUseId).sort(), [BG_CALL, SHELL_CALL].sort());
+    assert.deepEqual(runtime.listBackgroundWork?.(), []);
+    assert.equal(runtime.hasSessionWork?.('app-1'), false);
+  });
+});
+
+test('a background agent\'s permission request after the run still reaches the page', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p', permissionMode: 'default' }, writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    service.emit(session('session.tool.called', { sessionID: CHILD, assistantMessageID: 'm_c', id: 'call_shell', name: 'shell', input: { command: 'rm x' } }));
+    service.emit({ type: 'permission.asked', data: { id: 'per_bg', sessionID: CHILD, action: 'shell', resources: ['rm x'], source: { type: 'tool', messageID: 'm_c', id: 'call_shell' } } });
+    await waitFor(() => assert.ok(channel.published.some((frame) => frame.kind === 'permission_request' && frame.requestId === 'per_bg')));
+    runtime.permissions?.resolve('per_bg', { allow: false });
+    const reply = await service.waitForRequest((request) => request.path.endsWith('/permission/per_bg/reply'));
+    assert.equal(reply.path, `/api/session/${CHILD}/permission/per_bg/reply`);
+  });
+});
+
+test('a background agent that finishes before the run ends is settled within the run', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', makeSessionChannel().publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(inboxNotice({ source: 'subagent', childID: CHILD, state: 'completed' }));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    assert.deepEqual(frames.filter((frame) => frame.kind === 'task_status').map((frame) => frame.status), ['running', 'completed']);
+    assert.deepEqual(runtime.listBackgroundWork?.(), []);
+    assert.equal(runtime.hasSessionWork?.('app-1'), false);
+  });
+});
+
+test('the report turn the engine starts in the same tick the run ends is not lost', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const channel = makeSessionChannel();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', channel.publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    await waitFor(() => assert.equal(runtime.backgroundTasks?.list('app-1').length, 1));
+    // The agent finishes as the run ends: the run's terminal, the notice and
+    // the engine's report turn arrive together, before the run is released.
+    service.emitBatch([
+      session('session.execution.succeeded', {}),
+      inboxNotice({ source: 'subagent', childID: CHILD, state: 'completed' }),
+      session('session.execution.started', {}),
+    ]);
+    await running;
+
+    assert.deepEqual(runtime.getSessionActivity?.('app-1'), { queued: false, reporting: true });
+    service.emit(session('session.text.ended', { assistantMessageID: 'm_report', ordinal: 0, text: 'Reported.' }));
+    await waitFor(() => assert.ok(channel.published.some((frame) => frame.kind === 'text' && frame.content === 'Reported.')));
+  });
+});
+
+test('a notice that arrives before its launch is acknowledged still ends the work', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const running = runtime.run('quick command', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', makeSessionChannel().publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    service.emit(session('session.tool.called', { assistantMessageID: 'm_p', id: SHELL_CALL, name: 'shell', input: { command: 'true', background: true } }));
+    service.emit(inboxNotice({ source: 'shell', shellID: SHELL_ID, state: 'completed', exit: 0 }));
+    service.emit(session('session.tool.success', {
+      assistantMessageID: 'm_p', id: SHELL_CALL, content: [{ type: 'text', text: 'Command moved to the background.' }],
+      metadata: { status: 'running', truncated: false, shellID: SHELL_ID },
+    }));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    assert.deepEqual(runtime.listBackgroundWork?.(), []);
+    assert.equal(runtime.hasSessionWork?.('app-1'), false);
+  });
+});
+
+test('a finished background agent\'s card does not outlive the conversation', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p', permissionMode: 'default' }, writer, makeContext('ses_new', makeSessionChannel().publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit({ type: 'permission.asked', data: { id: 'per_stale', sessionID: CHILD, action: 'shell', resources: ['x'], source: { type: 'tool', messageID: 'm_c', id: 'call_x' } } });
+    await waitFor(() => assert.equal(runtime.permissions?.listPending('app-1').length, 1));
+    // The agent ends while the run still runs, so nothing keeps its card.
+    service.emit(inboxNotice({ source: 'subagent', childID: CHILD, state: 'completed' }));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    assert.deepEqual(runtime.permissions?.listPending('app-1'), []);
+  });
+});
+
+test('the service exiting leaves no background agent\'s card pending', async () => {
+  await withRuntime(async ({ service, runtime, exitService }) => {
+    const { writer } = makeWriter();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p', permissionMode: 'default' }, writer, makeContext('ses_new', makeSessionChannel().publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit({ type: 'permission.asked', data: { id: 'per_dead', sessionID: CHILD, action: 'shell', resources: ['x'], source: { type: 'tool', messageID: 'm_c', id: 'call_x' } } });
+    await waitFor(() => assert.equal(runtime.permissions?.listPending('app-1').length, 1));
+    exitService();
+    await running.catch(() => undefined);
+
+    assert.deepEqual(runtime.permissions?.listPending('app-1'), []);
+  });
+});
+
+test('abort reports failure when nothing it asked to stop was running', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const running = runtime.run('review', { sessionId: 'app-1', projectPath: '/tmp/p' }, writer, makeContext('ses_new', makeSessionChannel().publish));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    launchBackgroundAgent(service);
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    service.interruptResult = false;
+    assert.equal(await runtime.abort('app-1'), false);
+    assert.equal(await runtime.stopBackgroundTask?.('app-1', CHILD), false);
   });
 });

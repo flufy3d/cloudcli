@@ -9,10 +9,11 @@
  * @module opencode-data-root
  */
 
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { Database as SqliteDatabase } from 'better-sqlite3';
+import Database, { type Database as SqliteDatabase } from 'better-sqlite3';
 
 /**
  * Resolves the OpenCode SQLite session database path.
@@ -26,6 +27,21 @@ import type { Database as SqliteDatabase } from 'better-sqlite3';
  */
 export function getOpenCodeDatabasePath(): string {
   return path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db');
+}
+
+/**
+ * Opens the shared OpenCode database read-only, or returns null when the
+ * engine has never written one. The caller closes it.
+ *
+ * Consumers: the opencode sessions provider (history) and the opencode
+ * runtime (notices persisted while the event stream was down).
+ */
+export function openOpenCodeDatabase(): SqliteDatabase | null {
+  const dbPath = getOpenCodeDatabasePath();
+  if (!fs.existsSync(dbPath)) {
+    return null;
+  }
+  return new Database(dbPath, { readonly: true, fileMustExist: true });
 }
 
 /**
@@ -155,4 +171,39 @@ export function readOpenCodeSessionTokenTotals(
   `).get(sessionId) as OpenCodeSessionTokenTotals | undefined;
 
   return row ?? null;
+}
+
+/**
+ * The metadata of every `synthetic` message the engine persisted in a session,
+ * in order, with the time it was written. The engine writes one when
+ * background work it ran for the session ends (`{ source, childID | shellID,
+ * state }`); other synthetic messages (instruction updates) carry other
+ * metadata and are the reader's to skip. Empty for layouts that predate v2,
+ * which have no synthetic messages.
+ *
+ * Consumers: the opencode sessions provider and the opencode runtime, both
+ * through `readBackgroundNotice`.
+ */
+export function readOpenCodeSyntheticNoticeMetadata(
+  db: OpenCodeReadableDatabase,
+  sessionId: string,
+): Array<{ metadata: unknown; createdAt: number | null }> {
+  if (resolveOpenCodeMessageLayout(db) !== 'session_message') {
+    return [];
+  }
+  const rows = db.prepare(`
+    SELECT time_created AS createdAt, data FROM session_message
+    WHERE session_id = ? AND type = 'synthetic'
+    ORDER BY seq
+  `).all(sessionId) as Array<{ createdAt: number | null; data: string | null }>;
+  return rows.map((row) => {
+    let metadata: unknown;
+    try {
+      const parsed: unknown = JSON.parse(row.data ?? 'null');
+      metadata = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).metadata : undefined;
+    } catch {
+      metadata = undefined;
+    }
+    return { metadata, createdAt: typeof row.createdAt === 'number' ? row.createdAt : null };
+  });
 }
