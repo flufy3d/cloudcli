@@ -32,6 +32,7 @@ import {
   createCompleteMessage,
   createNormalizedMessage,
   generateMessageId,
+  readObjectRecord,
   readOptionalString,
   resolveModelEffort,
 } from '@/shared/utils.js';
@@ -42,7 +43,11 @@ import {
   parseOpenCodeModelRef,
   type OpenCodeServiceEndpoint,
 } from './opencode-api.client.js';
-import { OpenCodeEventStream } from './opencode-event-stream.js';
+import { OpenCodeEventStream, type OpenCodeEventEnvelope } from './opencode-event-stream.js';
+import {
+  applyEngineRename as applyEngineRenameToApp,
+  noteEngineSessionEvent,
+} from './opencode-engine-renames.js';
 import { OpenCodeInteractionBridge } from './opencode-interaction-bridge.js';
 import { buildOpenCodePromptFiles, buildOpenCodePromptText } from './opencode-prompt-attachments.js';
 import { OpenCodeRunRegistry, toOpenCodeTokenBudget } from './opencode-run-registry.js';
@@ -96,9 +101,58 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   });
   const settings = new OpenCodeSessionSettingsApplier();
 
+  /**
+   * Applies the name OpenCode generated for one of its sessions.
+   *
+   * The engine names a session on its own and announces the name on the event
+   * stream, in its own time — often after the reply is already on screen. The
+   * name is written into the app row here, and announced as a name-only
+   * update, so the client takes the new title without re-reading the
+   * transcript, marking the session as needing attention or re-ordering the
+   * list.
+   */
+  const applyEngineRename = async (event: OpenCodeEventEnvelope): Promise<void> => {
+    if (event.type !== 'session.renamed') {
+      return;
+    }
+    const data = readObjectRecord(event.data) ?? {};
+    const providerSessionId = readOptionalString(data.sessionID);
+    const title = readOptionalString(data.title);
+    if (!providerSessionId || !title) {
+      return;
+    }
+    // The engine stamps the rename with the event's own creation time, which
+    // is the value its session row carries from then on.
+    const engineUpdatedAtMs = typeof event.created === 'number' && Number.isFinite(event.created)
+      ? event.created
+      : Date.now();
+    const { applied } = applyEngineRenameToApp({ providerSessionId, title, engineUpdatedAtMs });
+    if (!applied) {
+      // The user renamed the session, so their name is final.
+      return;
+    }
+    // The websocket module pulls the providers module in, so it is loaded on
+    // demand: a static import here would close a cycle that starts at the
+    // provider registry, and loading it lazily keeps the websocket module
+    // out of the startup path of a process that never names a session.
+    const { broadcastSessionUpserted } = await import('@/modules/websocket/index.js');
+    await broadcastSessionUpserted(providerSessionId, { metadataOnly: true });
+  };
+
   eventStream.subscribe((event) => {
     bridge.handleEvent(event);
     runs.dispatch(event);
+    const data = readObjectRecord(event.data) ?? {};
+    const sessionId = readOptionalString(data.sessionID);
+    const created = typeof event.created === 'number' && Number.isFinite(event.created) ? event.created : null;
+    if (sessionId && created !== null && event.type !== 'session.renamed') {
+      noteEngineSessionEvent(sessionId, created);
+    }
+    // The engine's event feed is the runtime's lifeline, so a failure to
+    // apply one event must not take the process down with it.
+    void applyEngineRename(event).catch((error: unknown) => {
+      console.warn('[OpenCode] failed to apply the name the engine generated:', error);
+    });
   });
   eventStream.onReconnect(() => {
     void runs.reconcile({ getSession: (sessionId) => client?.getSession(sessionId)
@@ -181,7 +235,12 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     let providerSessionId = context.resolveProviderSessionId(appSessionId);
     try {
       if (!providerSessionId) {
-        const created = await activeClient.createSession({ directory: workingDir, title: sessionSummary });
+        // No title on purpose: the engine names a session it has not named
+        // yet, and it only does so while the session still carries the
+        // placeholder it falls back to. A title handed in here would occupy
+        // that placeholder and the session would keep the first message as
+        // its name forever.
+        const created = await activeClient.createSession({ directory: workingDir });
         providerSessionId = created.id;
         // The writer swallows session_created and persists the provider id.
         writer.setSessionId?.(providerSessionId);

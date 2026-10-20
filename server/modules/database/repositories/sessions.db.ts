@@ -532,6 +532,29 @@ export const sessionsDb = {
     ).run(customName, options.lockName ? 1 : 0, sessionId);
   },
 
+  /**
+   * Applies a name the engine generated for one session.
+   *
+   * A user rename (`name_locked = 1`) is final, so the engine's name is
+   * dropped and the call reports that nothing was written — the caller then
+   * leaves the page showing the name the user chose.
+   *
+   * The row's activity time is left alone: a name is not something the user
+   * did in the conversation, so it must not move the session in a list that
+   * is ordered by activity.
+   *
+   * Returns true when the row was written.
+   */
+  applyEngineSessionName(sessionId: string, customName: string): boolean {
+    const db = getConnection();
+    const result = db.prepare(
+      `UPDATE sessions
+       SET custom_name = ?
+       WHERE session_id = ? AND name_locked = 0`
+    ).run(customName, sessionId);
+    return result.changes > 0;
+  },
+
   getSessionById(sessionId: string): SessionRow | null {
     const db = getConnection();
     const row = db

@@ -197,6 +197,8 @@ export function useChatSessionState({
   /* ---------------------------------------------------------------- */
 
   const activeSessionId = selectedSession?.id || currentSessionId || null;
+  /** The id of the session on screen, without the rest of its metadata. */
+  const openSessionId = selectedSession?.id ?? null;
 
   // The activity indicator always reflects the latest status of the session
   // being viewed — never stale local UI state from the last time it was
@@ -557,7 +559,7 @@ export function useChatSessionState({
 
   // External message update (e.g. WebSocket reconnect, background refresh)
   useEffect(() => {
-    if (!externalMessageUpdate || !selectedSession || !selectedProject) return;
+    if (!externalMessageUpdate || !openSessionId || !selectedProject) return;
 
     const reloadExternalMessages = async () => {
       try {
@@ -565,7 +567,7 @@ export function useChatSessionState({
         if (!isProcessing) {
           // Sticking is the viewport's default while pinned; a refresh that
           // replaces the tail needs no separate scroll choreography.
-          await requestLatestMessages(selectedSession.id);
+          await requestLatestMessages(openSessionId);
         }
       } catch (error) {
         console.error('Error reloading messages from external update:', error);
@@ -577,7 +579,9 @@ export function useChatSessionState({
     externalMessageUpdate,
     requestLatestMessages,
     selectedProject,
-    selectedSession,
+    // The session's id, not the session itself: a title that arrives for the
+    // open session must not read as "the transcript changed".
+    openSessionId,
     isProcessing,
   ]);
 

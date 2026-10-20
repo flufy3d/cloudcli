@@ -9,6 +9,8 @@ import type { ServerEvent,
   Project,
   ProjectSession,
   IsSessionProcessing,
+  SessionRemovedEvent,
+  SessionUpsertedEvent,
 } from '@/shared/types';
 import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
 import {
@@ -38,31 +40,9 @@ type UseProjectsStateArgs = {
  * Produced on the wire by exactly one builder,
  * `server/modules/websocket/services/session-upsert-broadcast.service.ts`,
  * which both the on-disk sessions watcher and the chat run registry go through.
+ * The shape itself is the shared wire contract, so both sides read the same
+ * fields.
  */
-type SessionUpsertedEvent = ServerEvent & {
-  sessionId: string;
-  providerSessionId?: string | null;
-  provider: LLMProvider;
-  session: ProjectSession;
-  project: {
-    projectId: string;
-    path: string;
-    fullPath: string;
-    displayName: string;
-    isStarred: boolean;
-  } | null;
-};
-
-/**
- * Wire shape of the `session_removed` gateway delta — sessions that left the
- * active list because they were archived (auto-archive run, single-session
- * archive) or deleted, announced by the same broadcast service as
- * `session_upserted`. Deliberately plural-only: a singular `sessionId` field
- * would trip the generic per-session handling below for rows that are gone.
- */
-type SessionRemovedEvent = ServerEvent & {
-  sessionIds?: string[];
-};
 
 type FetchProjectsOptions = {
   showLoadingState?: boolean;
@@ -136,14 +116,19 @@ const removeSessionAliasesFromProject = (project: Project, aliasIds: Set<string>
   return updatedProject;
 };
 
-// Writes a confirmed rename onto the matching sidebar row. Returns the same
-// project when it holds no such row, or the row already carries that title, so
-// the sidebar list does not re-render for projects the rename did not touch.
-const renameSessionInProject = (project: Project, sessionIdToRename: string, summary: string): Project => {
+// Writes a session's title onto the sidebar row that holds it. The row keeps
+// its message count, its activity time and its place in the list: only the
+// title changed, and a title that re-orders the sidebar would move the
+// session under the user's cursor for a change they cannot see.
+const applySessionTitleToProject = (
+  project: Project,
+  aliasIds: Set<string>,
+  summary: string,
+): Project => {
   const sessions = project.sessions ?? [];
   let changed = false;
   const nextSessions = sessions.map((session) => {
-    if (session.id !== sessionIdToRename || session.summary === summary) {
+    if (!aliasIds.has(String(session.id)) || session.summary === summary) {
       return session;
     }
     changed = true;
@@ -154,6 +139,12 @@ const renameSessionInProject = (project: Project, sessionIdToRename: string, sum
   }
   return { ...project, sessions: nextSessions };
 };
+
+// Writes a confirmed rename onto the matching sidebar row. Returns the same
+// project when it holds no such row, or the row already carries that title, so
+// the sidebar list does not re-render for projects the rename did not touch.
+const renameSessionInProject = (project: Project, sessionIdToRename: string, summary: string): Project =>
+  applySessionTitleToProject(project, new Set([sessionIdToRename]), summary);
 
 const DEFAULT_PROVIDER: LLMProvider = 'claude';
 
@@ -459,6 +450,35 @@ export function useProjectsState({
       const next = new Set(previous);
       next.delete(targetSessionId);
       return next;
+    });
+  }, []);
+
+  /**
+   * Writes a session's title onto the open session.
+   *
+   * The sidebar row and `selectedSession` are two copies of one session, and
+   * the workspace header and the document title read the second one — so a
+   * title that reaches only the sidebar leaves the header showing the old
+   * name. The provider, project and worktree fields are left as they are.
+   */
+  const mergeSelectedSessionTitle = useCallback((event: SessionUpsertedEvent, summary: string) => {
+    if (!summary) {
+      return;
+    }
+
+    setSelectedSession((previousSession) => {
+      if (!previousSession) {
+        return previousSession;
+      }
+      if (!getSessionAliasIds(event).has(String(previousSession.id)) || previousSession.summary === summary) {
+        return previousSession;
+      }
+      // A session opened from a Conversations search hit carries the one-shot
+      // jump target the chat reads off every new `selectedSession` identity.
+      // Leave it behind, or the new title would scroll the transcript back to
+      // the matched message and flash the search highlight again.
+      const { __searchTargetSnippet: _snippet, __searchTargetTimestamp: _timestamp, ...session } = previousSession;
+      return { ...session, summary };
     });
   }, []);
 
@@ -776,6 +796,34 @@ export function useProjectsState({
         return;
       }
 
+      // Every delta carries the session's current title, and the open
+      // session's own copy of it is what the workspace header and the
+      // document title read — so the title is merged on both paths, not only
+      // when the provider id is merged into the app id.
+      const summary = upsert.session.summary?.trim() ? upsert.session.summary : '';
+      mergeSelectedSessionTitle(upsert, summary);
+
+      if (upsert.metadataOnly) {
+        // A name-only update: the sidebar row takes the title and nothing
+        // else moves — no transcript re-read, no attention mark, no
+        // re-ordering, no navigation.
+        if (summary) {
+          const aliasIds = getSessionAliasIds(upsert);
+          setProjects((previousProjects) => {
+            let changed = false;
+            const nextProjects = previousProjects.map((project) => {
+              const updatedProject = applySessionTitleToProject(project, aliasIds, summary);
+              if (updatedProject !== project) {
+                changed = true;
+              }
+              return updatedProject;
+            });
+            return changed ? nextProjects : previousProjects;
+          });
+        }
+        return;
+      }
+
       // The transcript of the currently viewed session changed on disk while
       // no run is active here (e.g. edited from another client or the CLI):
       // signal the chat view to reload its messages.
@@ -904,7 +952,7 @@ export function useProjectsState({
     };
 
     return subscribe(handleEvent);
-  }, [clearSessionAttention, isSessionProcessing, markSessionAttention, navigate, refreshProjectsSilently, sessionId, subscribe]);
+  }, [clearSessionAttention, isSessionProcessing, markSessionAttention, mergeSelectedSessionTitle, navigate, refreshProjectsSilently, sessionId, subscribe]);
 
   useEffect(() => {
     return () => {

@@ -335,6 +335,16 @@ export type SessionUpsertedEvent = {
   sessionId: string;
   providerSessionId: string | null;
   provider: LLMProvider;
+  /**
+   * True when the delta carries a new session name and nothing else.
+   *
+   * A name-only delta updates the title in the sidebar and in the open
+   * session's header; it must not make the client re-read the transcript,
+   * mark the session as needing attention, or re-order the list. Absent means
+   * the session changed in a way the client has to look at (new messages, new
+   * activity), which is the historical meaning of this event.
+   */
+  metadataOnly?: boolean;
   session: {
     id: string;
     summary: string;

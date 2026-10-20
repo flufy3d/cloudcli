@@ -6,7 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after, before } from 'node:test';
 
-import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
+import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { connectedClients } from '@/modules/websocket/index.js';
 import { createOpenCodeRuntime } from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
 import type { NormalizedMessage, ProviderModelsDefinition, ProviderRuntimeContext } from '@/shared/types.js';
 
@@ -148,6 +149,27 @@ const session = (type: string, data: Record<string, unknown>) => ({
   id: `evt_${type}_${Math.random()}`, created: Date.now(), type, data: { sessionID: 'ses_new', ...data },
 });
 
+/**
+ * Waits until the assertion holds.
+ *
+ * The runtime handles an engine event in the background, so the effect of the
+ * event shows up a tick after the test pushed it into the feed.
+ */
+const waitFor = async (assertion: () => void, timeoutMs = 2_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      if (Date.now() > deadline) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+};
+
 const withRuntime = async (run: (input: { service: FakeService; runtime: ReturnType<typeof createOpenCodeRuntime> }) => Promise<void>) => {
   const service = await startFakeService();
   const endpoint = { url: service.url, authorization: 'Basic dGVzdA==' };
@@ -190,7 +212,10 @@ test('first send creates the session in the project directory, applies mode and 
       ['POST', '/api/session/ses_new/prompt'],
       ['GET', '/api/session/ses_new'],
     ]);
-    assert.deepEqual(service.requests[0].body, { location: { directory: '/tmp/project-a' }, title: 'Greeting' });
+    assert.deepEqual(service.requests[0].body, { location: { directory: '/tmp/project-a' } });
+    // No title on the create request: the engine only names a session while it
+    // still carries the placeholder it falls back to, and a title handed in
+    // here would occupy that placeholder for good.
     assert.deepEqual(service.requests[1].body, { agent: 'build' });
     assert.deepEqual(service.requests[2].body, {
       permissions: ['shell', 'edit', 'write', 'patch'].map((action) => ({ action, resource: '*', effect: 'ask' })),
@@ -212,6 +237,75 @@ test('first send creates the session in the project directory, applies mode and 
     assert.deepEqual(frames[4].tokenBudget, { used: 18, inputTokens: 12, outputTokens: 5, breakdown: { input: 12, output: 5 } });
     assert.equal(frames[5].success, true);
     assert.equal(frames[5].exitCode, 0);
+  });
+});
+
+test('the name the engine generated reaches the app row and is announced as a name-only update', async () => {
+  const sent: unknown[] = [];
+  const connection = {
+    readyState: 1,
+    send: (payload: string) => { sent.push(JSON.parse(payload)); },
+  };
+  connectedClients.add(connection as never);
+  try {
+    await withRuntime(async ({ service, runtime }) => {
+      // The row the chat run leaves behind: the app's own session, mapped to
+      // the engine's session id, still carrying the first message as its name.
+      sessionsDb.createAppSession('app-1', 'opencode', '/tmp/project-a', 'The first message');
+      sessionsDb.assignProviderSessionId('app-1', 'ses_new');
+
+      // A chat has to have run for the runtime to be listening to the
+      // engine's event feed, which is where the name arrives.
+      const { writer } = makeWriter();
+      const running = runtime.run('hello', { sessionId: 'app-1', projectPath: '/tmp/project-a' }, writer, makeContext('ses_new'));
+      await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+      service.emit(session('session.execution.succeeded', {}));
+      await running;
+
+      service.emit({
+        id: 'evt_renamed',
+        created: 1_700_000_009_000,
+        type: 'session.renamed',
+        data: { sessionID: 'ses_new', title: 'The name the engine chose' },
+      });
+
+      await waitFor(() => {
+        assert.equal(sessionsDb.getSessionById('app-1')?.custom_name, 'The name the engine chose');
+      });
+
+      const upserts = sent.filter((payload): payload is { kind: string; metadataOnly?: boolean; session: { summary: string } } =>
+        (payload as { kind?: string }).kind === 'session_upserted');
+      assert.equal(upserts.length, 1);
+      assert.equal(upserts[0].metadataOnly, true);
+      assert.equal(upserts[0].session.summary, 'The name the engine chose');
+    });
+  } finally {
+    connectedClients.delete(connection as never);
+  }
+});
+
+test('a name the user chose is not replaced by the engine', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    sessionsDb.createAppSession('app-locked', 'opencode', '/tmp/project-a', 'The name I chose');
+    sessionsDb.assignProviderSessionId('app-locked', 'ses_new');
+    sessionsDb.updateSessionCustomName('app-locked', 'The name I chose', { lockName: true });
+
+    const { writer } = makeWriter();
+    const running = runtime.run('hello', { sessionId: 'app-locked', projectPath: '/tmp/project-a' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    service.emit({
+      id: 'evt_renamed',
+      created: 1_700_000_009_000,
+      type: 'session.renamed',
+      data: { sessionID: 'ses_new', title: 'The name the engine chose' },
+    });
+
+    await waitFor(() => {
+      assert.equal(sessionsDb.getSessionById('app-locked')?.custom_name, 'The name I chose');
+    });
   });
 });
 

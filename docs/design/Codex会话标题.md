@@ -1,6 +1,6 @@
 # Codex 会话标题
 
-> 状态：待实施
+> 状态：待实施（公共前置：仅元数据通知与名称合并已随 [OpenCode 会话标题](OpenCode会话标题.md) 落地）
 > 基准：2.10.0 / 2026-10-19；源码核对点 `692ce960`，仓库依赖 `@openai/codex` 0.163.0
 
 ## 目标与范围
@@ -27,8 +27,8 @@
 | Codex 索引 | `server/modules/providers/list/codex/codex-session-synchronizer.provider.ts`，`processSessionFile` | 读取 `session_index.jsonl` 的最新 `thread_name`；没有名称时保留已有占位标题 |
 | Codex 运行 | `server/modules/providers/list/codex/codex-runtime.provider.ts` | 运行用户回合，没有标题生成任务；回合退出时关闭 app-server 连接 |
 | 标题保护 | `server/modules/providers/shared/sessions/session-title-resolution.ts`，`resolveSessionTitle` | `name_locked` 保护用户命名；引擎名称可以替换未锁定的占位标题 |
-| 页面同步 | `src/modules/project-workspace/hooks/useProjectsState.ts`，`handleEvent` | `session_upserted` 更新侧栏；当前选择的会话只在 provider id 归并为应用 id 时直接更新，普通同 id 的名称更新没有对应合并分支 |
-| 页面副作用 | 同上 | 当前会话空闲时收到 `session_upserted` 会触发历史刷新；后台会话收到更新会被标记为需要关注 |
+| 页面同步 | `src/modules/project-workspace/hooks/useProjectsState.ts`，`handleEvent` | `session_upserted` 更新侧栏；同 id 的名称更新会合并进当前会话（该合并已随 OpenCode 方案落地） |
+| 页面副作用 | 同上 | 普通 `session_upserted` 落到空闲的当前会话仍会触发历史刷新，后台会话仍会被标记需要关注；带 `metadataOnly` 的增量两者都不触发 |
 
 Codex 自带终端界面在客户端组织标题生成。上游 `rust-v0.163.0` 的 [`app/thread_title.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/app/thread_title.rs) 调用临时线程生成结构化标题；[`temporary_structured_request.rs`](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/temporary_structured_request.rs) 负责临时线程、工具隔离、超时和清理。这段客户端逻辑不会因为 CloudCLI 调用了 `thread/start` 就自动执行。
 
@@ -124,6 +124,8 @@ Codex 原生名称使用 `thread/read` 和 `thread/name/set` 读写，不直接�
 仅元数据更新不触发历史重新读取、不标记后台会话需要关注，也不改变消息数、活跃时间和会话排序。当前会话名称更新需要保留 provider、项目和工作树信息，并沿用手动改名对一次性搜索定位信息的处理，防止标题变化把聊天滚回先前搜索命中的位置。
 
 `WorkspaceTitle` 和浏览器标题继续从当前会话状态派生，不增加第二套标题缓存。这个同步修复适用于所有引擎的同 id 名称更新；其他引擎的普通会话文件更新仍保留原有历史刷新行为。
+
+上面这套机制已随 [OpenCode 会话标题](OpenCode会话标题.md) 落地，Codex 侧直接复用。落地时补了一条约束：仅元数据更新要换掉当前会话的对象才能带上新名字，重读消息的副作用因此只能挂在会话 id 上（`useChatSessionState` 的刷新 effect 依赖 `selectedSession` 对象时，标题到达会被当成「对话变了」而重读一遍）。
 
 ## 实施切片与涉及文件
 

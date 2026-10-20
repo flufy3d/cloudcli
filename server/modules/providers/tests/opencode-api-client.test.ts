@@ -151,6 +151,16 @@ test('omits an empty files list from the prompt body', async () => {
   });
 });
 
+test('creates a session without a title when none is given', async () => {
+  await withFakeService(async ({ client, requests }) => {
+    const created = await client.createSession({ directory: '/tmp/project' });
+    assert.equal(created.id, 'ses_fake');
+    // The engine only names a session while it carries the placeholder it
+    // falls back to, so the title is left out rather than filled in.
+    assert.deepEqual(requests[0].body, { location: { directory: '/tmp/project' } });
+  });
+});
+
 test('turns non-2xx answers into OpenCodeApiError carrying status and message', async () => {
   await withFakeService(async ({ client }) => {
     await assert.rejects(

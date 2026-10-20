@@ -137,6 +137,21 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
   protected abstract deriveSessionName(db: Database.Database, row: Row): DerivedSessionTitle;
 
   /**
+   * True when the app row already carries this provider row's state, so the
+   * scan has nothing to apply and must not announce the session again.
+   *
+   * An adapter whose engine writes the app row itself uses this: OpenCode
+   * names a session on its own, and the runtime applies that name to the app
+   * row when the engine announces it. The scan that follows the engine's
+   * write would otherwise announce the same rename a second time, as a
+   * content change — which makes the client re-read the transcript and mark
+   * the session as needing attention.
+   */
+  protected isProviderStateAlreadyApplied(_row: Row): boolean {
+    return false;
+  }
+
+  /**
    * Extracts the provider-native session id from a row. Adapters may override
    * to add defensive filtering (zcode's subagent-prefix double-check).
    */
@@ -217,6 +232,12 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
     }
 
     this.bindPendingAppSession(sessionId, projectPath);
+
+    if (this.isProviderStateAlreadyApplied(row)) {
+      // Another path already wrote this provider state into the app row.
+      // Applying it again would announce a change the client has seen.
+      return null;
+    }
 
     const derivedTitle = this.deriveSessionName(db, row);
     const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId)

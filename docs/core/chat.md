@@ -138,6 +138,8 @@ flowchart TD
 
 run 结束 → `sessions-watcher.service.ts`（chokidar，watch 根由各引擎 `getSessionWatchTarget()` 声明）→ `session-synchronizer.service.ts` `synchronizeFile` → `sessionsDb` upsert → `session-upserted-broadcast.service.ts` 推 `session_upserted`（侧边栏增量，归 projects 状态管，不归 chat）。会话离开活跃列表（归档：自动归档手动/定时、单会话归档；强制删除）由同一服务推 `session_removed`（批量 `sessionIds` 一帧，前端按 id 从 projects 树剔除，幂等）。历史读取走 `GET /api/providers/sessions/:sessionId/messages`（尾偏移分页：`offset: 0` 是最新一页），读密集缓存见 `session-history-cache.service.ts`。
 
+`session_upserted` 带一个可选的 `metadataOnly` 标记：只带新名字的增量（引擎自己起的名，如 opencode）打这个标记。带标记的增量只许改名字，不许重读消息、不许打待看标记、不许改列表排序与活跃时间；不带标记的增量保持原义（会话有动静，客户端要重新看）。产生方必须能确认变化来源，不能靠「两个推送里的名字不同」反推。前端收到带标记的增量后，当前会话的副本要换新对象才能带上新名字；重读消息的副作用因此只能挂在会话 id 上，不能挂在会话对象上。
+
 ## 接收侧：WS 帧 → React 的四层
 
 ```mermaid
