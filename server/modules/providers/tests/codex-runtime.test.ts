@@ -227,6 +227,59 @@ test('a resident conversation keeps its process and reuses it for the next round
   }
 });
 
+test('stopping a finished round reports that there is nothing to stop', async (t) => {
+  const server = installFakeAppServer(t);
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-stop-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(false));
+
+    assert.equal(codexRuntime.abort('resident-stop-session'), false);
+  } finally {
+    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    closeCodexResidentSessions();
+  }
+});
+
+test('stopping a running resident round interrupts the turn the engine started', async (t) => {
+  const server = installFakeAppServer(t, (fake) => {
+    // The turn stays in flight, so the stop has a turn to interrupt.
+    fake.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'inProgress' },
+    } as any);
+  });
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    const run = codexRuntime.run('hey there', {
+      sessionId: 'resident-running-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(false));
+
+    await waitFor(() => server.calls.some((call) => call.method === 'thread/queue/add'));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(codexRuntime.abort('resident-running-session'), true);
+    await waitFor(() => server.calls.some((call) => call.method === 'turn/interrupt'));
+    assert.equal(
+      server.calls.find((call) => call.method === 'turn/interrupt')?.params.turnId,
+      TURN_ID,
+    );
+
+    // The engine reports the interrupted turn, which ends the round.
+    server.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'interrupted', error: null },
+    } as any);
+    await run;
+  } finally {
+    delete process.env.CLOUDCLI_CODEX_RESIDENT;
+    closeCodexResidentSessions();
+  }
+});
+
 test('a turn the engine starts by itself is published to the session, not to the round', async (t) => {
   const server = installFakeAppServer(t);
   const messages: any[] = [];

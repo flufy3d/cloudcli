@@ -1021,7 +1021,11 @@ async function queryCodex(
    */
   const handleRoundEvent = (method: string, params: AnyRecord): void => {
     const session = currentSession();
-    if (session?.status === 'aborted') {
+    // A stop the user asked for silences the events that follow it, but the
+    // terminal event still has to arrive: the round waits for it, and a
+    // resident process keeps running after the stop, so nothing else would
+    // ever settle the round.
+    if (session?.status === 'aborted' && method !== 'turn/completed') {
       return;
     }
 
@@ -1487,7 +1491,10 @@ async function queryCodex(
 function abortCodexSession(sessionId: string) {
   const session = activeCodexSessions.get(sessionId);
 
-  if (!session) {
+  // A session whose round is over has nothing to stop: the entry stays for
+  // the diagnostics, but a stop must not report success for a round that
+  // already ended.
+  if (!session || session.status !== 'running') {
     return false;
   }
 
