@@ -1,9 +1,9 @@
 import fsSync from 'node:fs';
 import fsp from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
+import { getCodexHome } from '@/shared/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import { codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
@@ -1071,7 +1071,7 @@ export class CodexSessionsProvider implements IProviderSessions {
       ? input.jsonlPath
       : null;
     const sessionFilePath = indexedFilePath ?? await findCodexSessionFile(
-      path.join(os.homedir(), '.codex', 'sessions'),
+      path.join(getCodexHome(), 'sessions'),
       input.nativeSessionId,
     );
 

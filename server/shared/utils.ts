@@ -2048,6 +2048,60 @@ export function forwardToLoopbackService(
 }
 
 /**
+ * Codex title client/service bound waits to their shared abort deadline.
+ * Rejecting stops the wait, not the underlying I/O; callers must guard later
+ * writes and retain cleanup ownership. Source rejection is always observed.
+ */
+export function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason ?? new Error('Operation aborted.')); };
+    signal.addEventListener('abort', abort, { once: true });
+    operation.then((value) => { signal.removeEventListener('abort', abort); resolve(value); }, (error) => { signal.removeEventListener('abort', abort); reject(error); });
+    if (signal.aborted) abort();
+  });
+}
+
+//----------------- CODEX TITLE ISOLATION ------------
+/** The runtime injects this server; the title client's config must explicitly disable it. */
+export const CODEX_TASK_MCP_NAME = 'cloudcli_task_continuations';
+
+/** Runtime sandbox commands and manager-owned title workers exclude host-only credentials. */
+export const CODEX_HOST_CREDENTIAL_ENV_NAMES = [
+  'API_KEY', 'CLOUDCLI_TASK_API_KEY', 'CLOUDCLI_TASK_RUN_CONTEXT', 'CLOUDCLI_TASK_BRIDGE',
+  'CLOUDCLI_REGISTRATION_TOKEN', 'CLOUDCLI_TASK_TOKEN', 'JWT_SECRET',
+] as const;
+
+/**
+ * Codex title client and the real protocol probe use the terminal's isolation
+ * recipe. Input is config/read's effective config; an unreadable MCP table
+ * fails closed. This does not replace checking thread/start's actual sandbox.
+ */
+export function buildCodexTitleIsolationConfig(effectiveConfig: unknown): Record<string, unknown> {
+  const config = readObjectRecord(effectiveConfig);
+  if (!config || (config.mcp_servers != null && !readObjectRecord(config.mcp_servers))) {
+    throw new AppError('Codex title configuration could not be verified.', { code: 'CODEX_TITLE_ISOLATION', statusCode: 502 });
+  }
+  const features = [
+    'apps', 'code_mode', 'code_mode_only', 'context_management', 'current_time_reminder',
+    'deferred_executor', 'enable_fanout', 'goals', 'hooks', 'image_generation', 'memories',
+    'multi_agent', 'multi_agent_v2', 'plugins', 'request_permissions_tool', 'shell_snapshot',
+    'shell_tool', 'standalone_web_search', 'token_budget', 'tool_suggest', 'unified_exec', 'view_image',
+  ];
+  // Disable every configured server, including the host bridge when present.
+  // Creating an absent entry with only enabled=false fails transport validation.
+  const servers = Object.keys(readObjectRecord(config.mcp_servers) ?? {});
+  return {
+    ...Object.fromEntries(features.map((feature) => [`features.${feature}`, false])),
+    'cloud.skills.enabled': false, 'skills.include_instructions': false,
+    'tools.experimental_request_user_input.enabled': false, 'tools.update_plan.enabled': false,
+    web_search: 'disabled', default_permissions: ':read-only',
+    project_doc_max_bytes: 0, developer_instructions: '', instructions: '',
+    mcp_servers: Object.fromEntries(servers.map((server) => [server, { enabled: false }])),
+  };
+}
+
+// ---------------------------
+/**
  * Resolves the permission mode for Codex's app-server turn and any detached
  * command that must inherit that same sandbox. The chat gateway and Codex
  * adapter both use this mapping so task registration cannot claim a broader
@@ -2095,4 +2149,15 @@ export function canonicalizeJson(value: unknown): unknown {
   if (typeof value !== 'object' || value === null) return value;
   const record = value as Record<string, unknown>;
   return Object.fromEntries(Object.keys(record).sort().map((key) => [key, canonicalizeJson(record[key])]));
+}
+
+//----------------- CODEX CONFIGURATION ROOT ------------
+/**
+ * Codex auth, models, MCP, skills and history adapters use the same home as the
+ * engine process. Read at call time so isolated workers and probes can select
+ * CODEX_HOME without retaining another account's configuration. Workspace-local
+ * .codex directories and the independent ~/.agents directory are unaffected.
+ */
+export function getCodexHome(): string {
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 }

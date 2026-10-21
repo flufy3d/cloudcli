@@ -555,6 +555,21 @@ export const sessionsDb = {
     return result.changes > 0;
   },
 
+  /**
+   * Providers' title jobs use this compare-and-write after inference. The
+   * mapping, provider, archive state and user lock must still match. Naming
+   * changes no activity/project fields and never inserts or revives a row.
+   */
+  applyAutomaticSessionName(sessionId: string, provider: string, nativeThreadId: string, name: string): boolean {
+    const result = getConnection().prepare(
+      `UPDATE sessions SET custom_name = ?
+       WHERE session_id = ? AND provider = ? AND provider_session_id = ?
+         AND name_locked = 0 AND isArchived = 0 AND forked_from_session_id IS NULL
+         AND custom_name IS NOT ?`
+    ).run(name, sessionId, provider, nativeThreadId, name);
+    return result.changes > 0;
+  },
+
   getSessionById(sessionId: string): SessionRow | null {
     const db = getConnection();
     const row = db

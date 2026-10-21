@@ -281,3 +281,24 @@ test('recent sessions are globally ordered, paginated, and limited to visible co
     );
   });
 });
+
+test('automatic names only change the matching unlocked active native session', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('auto-title', 'codex', '/workspace/title', 'Original');
+    sessionsDb.assignProviderSessionId('auto-title', 'thread-a');
+    const before = sessionsDb.getSessionById('auto-title')!;
+    assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', 'codex', 'thread-a', '排查重复消息'), true);
+    assert.equal(sessionsDb.getSessionById('auto-title')?.custom_name, '排查重复消息');
+    assert.equal(sessionsDb.getSessionById('auto-title')?.updated_at, before.updated_at);
+    for (const [provider, nativeId] of [['claude', 'thread-a'], ['codex', 'thread-b']]) {
+      assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', provider, nativeId, 'Wrong'), false);
+    }
+    sessionsDb.updateSessionIsArchived('auto-title', true);
+    assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', 'codex', 'thread-a', 'Archived'), false);
+    sessionsDb.updateSessionIsArchived('auto-title', false);
+    sessionsDb.updateSessionCustomName('auto-title', 'My title', { lockName: true });
+    assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', 'codex', 'thread-a', 'Overwrite'), false);
+    assert.equal(sessionsDb.getSessionById('auto-title')?.custom_name, 'My title');
+    assert.equal(sessionsDb.applyAutomaticSessionName('missing', 'codex', 'thread-a', 'Missing'), false);
+  });
+});

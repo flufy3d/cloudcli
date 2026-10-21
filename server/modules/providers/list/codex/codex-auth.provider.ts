@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
+import { getCodexHome } from '@/shared/index.js';
 import { createCliInstallationProbe } from '@/modules/providers/shared/installation/cli-installation-probe.js';
 import type { IProviderAuth } from '@/shared/interfaces.js';
 import type { ProviderAuthStatus, ProviderQuotaData, ProviderQuotaResetConsumeInput, ProviderQuotaResetConsumeResult } from '@/shared/types.js';
@@ -67,7 +67,7 @@ export class CodexProviderAuth implements IProviderAuth {
    */
   private async checkCredentials(): Promise<CodexCredentialsStatus> {
     try {
-      const authPath = path.join(os.homedir(), '.codex', 'auth.json');
+      const authPath = path.join(getCodexHome(), 'auth.json');
       const content = await readFile(authPath, 'utf8');
       const auth = readObjectRecord(JSON.parse(content)) ?? {};
       const tokens = readObjectRecord(auth.tokens) ?? {};
@@ -105,3 +105,6 @@ export class CodexProviderAuth implements IProviderAuth {
     return extractEmailFromJwt(idToken) ?? 'Authenticated';
   }
 }
+
+/** Provider registry and automatic title jobs share the existing credential reader. */
+export const codexAuth = new CodexProviderAuth();

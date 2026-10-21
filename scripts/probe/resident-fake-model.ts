@@ -1,7 +1,7 @@
 import http from 'node:http';
 
 /** The fake model: one assistant message per request, then the turn ends. */
-export function startFakeModel() {
+export function startFakeModel(answer = 'probe-ok') {
   const requests: string[] = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -13,7 +13,7 @@ export function startFakeModel() {
         type: 'message',
         status: 'completed',
         role: 'assistant',
-        content: [{ type: 'output_text', text: 'probe-ok' }],
+        content: [{ type: 'output_text', text: answer }],
       };
       const response = {
         id: `resp_probe_${requests.length}`,
@@ -27,7 +27,7 @@ export function startFakeModel() {
       const events = [
         ['response.created', { type: 'response.created', response: { ...response, status: 'in_progress', output: [] } }],
         ['response.output_item.added', { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } }],
-        ['response.output_text.delta', { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'probe-ok' }],
+        ['response.output_text.delta', { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: answer }],
         ['response.output_item.done', { type: 'response.output_item.done', output_index: 0, item }],
         ['response.completed', { type: 'response.completed', response }],
       ];

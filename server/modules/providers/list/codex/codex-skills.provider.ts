@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 
+import { getCodexHome } from '@/shared/index.js';
 import { SkillsProvider } from '@/modules/providers/shared/skills/skills.provider.js';
 import type { ProviderSkillSource } from '@/shared/types.js';
 import {
@@ -46,7 +47,7 @@ export class CodexSkillsProvider extends SkillsProvider {
     });
     addUniqueProviderSkillSource(sources, seenRootDirs, {
       scope: 'user',
-      rootDir: path.join(os.homedir(), '.codex', 'skills'),
+      rootDir: path.join(getCodexHome(), 'skills'),
       commandPrefix: '$',
     });
     addUniqueProviderSkillSource(sources, seenRootDirs, {
@@ -56,7 +57,7 @@ export class CodexSkillsProvider extends SkillsProvider {
     });
     addUniqueProviderSkillSource(sources, seenRootDirs, {
       scope: 'system',
-      rootDir: path.join(os.homedir(), '.codex', 'skills', '.system'),
+      rootDir: path.join(getCodexHome(), 'skills', '.system'),
       commandPrefix: '$',
     });
 

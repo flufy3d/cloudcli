@@ -1,5 +1,5 @@
 import { AbstractProvider } from '@/modules/providers/shared/base/abstract.provider.js';
-import { CodexProviderAuth } from '@/modules/providers/list/codex/codex-auth.provider.js';
+import { codexAuth } from '@/modules/providers/list/codex/codex-auth.provider.js';
 import { CodexForkProvider } from '@/modules/providers/list/codex/codex-fork.provider.js';
 import { CodexProviderModels } from '@/modules/providers/list/codex/codex-models.provider.js';
 import { codexRuntime } from '@/modules/providers/list/codex/codex-runtime.provider.js';
@@ -21,7 +21,7 @@ export class CodexProvider extends AbstractProvider {
   readonly runtime: IProviderRuntime = codexRuntime;
   readonly models: IProviderModels = new CodexProviderModels();
   readonly mcp = new CodexMcpProvider();
-  readonly auth: IProviderAuth = new CodexProviderAuth();
+  readonly auth: IProviderAuth = codexAuth;
   readonly skills: IProviderSkills = new CodexSkillsProvider();
   readonly sessions: IProviderSessions = new CodexSessionsProvider();
   readonly fork: IProviderFork = new CodexForkProvider();

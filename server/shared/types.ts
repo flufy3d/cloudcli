@@ -379,6 +379,27 @@ export type ProviderRuntimePermissionGateway = {
   listPending(sessionId: string): unknown[];
 };
 
+//----------------- CODEX AUTOMATIC SESSION TITLES ------------
+/**
+ * Immutable identity captured after a successful normal user turn. Providers'
+ * runtime, title scheduler and title client use it to reject late work after
+ * thread replacement. `models` is the runtime's discovered catalog snapshot;
+ * `initialPrompt` is supplied only when this turn created the native thread.
+ */
+export type CodexSessionTitleTarget = {
+  appSessionId: string;
+  nativeThreadId: string;
+  /** Zero requests a manager-owned transient worker after a short chat connection. */
+  generation: number;
+  /** Manager record key when a transient worker serves a different app-session key. */
+  residentKey?: string;
+  workingDirectory: string;
+  model: string;
+  models: ProviderModelsDefinition;
+  initialPrompt?: string;
+};
+
+// ---------------------------
 //----------------- RESIDENT TASK BRIDGE ------------
 /** Trusted process identity issued by providers and verified by task-continuations. */
 export type TaskBridgeCredentialContext = {

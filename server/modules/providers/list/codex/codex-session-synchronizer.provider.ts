@@ -1,7 +1,7 @@
-import os from 'node:os';
 import path from 'node:path';
 
 
+import { getCodexHome } from '@/shared/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import {
   readJsonlRecords,
@@ -29,7 +29,7 @@ type ParsedSession = {
  */
 export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
   private readonly provider = 'codex' as const;
-  private readonly codexHome = path.join(os.homedir(), '.codex');
+  private get codexHome(): string { return getCodexHome(); }
 
   /**
    * Declares the watched artifact layout: the sessions directory holding the

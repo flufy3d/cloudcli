@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
 import type { ServerEvent } from '@/shared/context/WebSocketContext';
-import { showCompletionTitleIndicator } from '@/modules/chat/utils/pageTitleNotification';
+import { showCompletionTitleIndicator } from '@/shared/utils';
 import { playChatCompletionSound, playNotificationSound } from '@/modules/chat/utils/notificationSound';
 import type { MarkSessionIdle, MarkSessionProcessing, SessionActivityMap, PendingPermissionRequest, ProjectSession, LLMProvider } from '@/shared/types';
 import type { ServerEventDirective } from '@/modules/chat/utils/sessionTimelineStore';

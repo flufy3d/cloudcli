@@ -13,6 +13,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { codexAppServerTransport } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import { acquireCodexResidentSession, borrowCodexAuxiliaryThread, closeCodexResidentSessions } from '@/modules/providers/list/codex/codex-session-manager.js';
+import { buildCodexTitleIsolationConfig } from '@/shared/index.js';
 import { startFakeModel } from './resident-fake-model.js';
 
 const real = process.argv.includes('--real');
@@ -50,12 +51,6 @@ codexAppServerTransport.open = async (handlers, options) => {
   };
 };
 
-const disabled = [
-  'apps', 'code_mode', 'code_mode_only', 'context_management', 'current_time_reminder',
-  'deferred_executor', 'enable_fanout', 'goals', 'hooks', 'image_generation', 'memories',
-  'multi_agent', 'multi_agent_v2', 'plugins', 'request_permissions_tool', 'shell_snapshot',
-  'shell_tool', 'standalone_web_search', 'token_budget', 'tool_suggest', 'unified_exec', 'view_image',
-];
 let isolationConfig: Record<string, unknown> = {};
 let auxiliary: Awaited<ReturnType<typeof borrowCodexAuxiliaryThread>> | undefined;
 let watcher: ReturnType<typeof watch> | undefined;
@@ -123,13 +118,7 @@ try {
     config: async (connection) => {
       const effective = await connection.call('config/read', { cwd: probeRoot, includeLayers: false }) as any;
       assert.ok(effective?.config && typeof effective.config === 'object');
-      isolationConfig = {
-        ...Object.fromEntries(disabled.map((feature) => [`features.${feature}`, false])),
-        'cloud.skills.enabled': false, 'skills.include_instructions': false,
-        'tools.experimental_request_user_input.enabled': false, 'tools.update_plan.enabled': false,
-        web_search: 'disabled', default_permissions: ':read-only',
-        mcp_servers: Object.fromEntries(Object.keys(effective.config.mcp_servers ?? {}).map((name) => [name, { enabled: false }])),
-      };
+      isolationConfig = buildCodexTitleIsolationConfig(effective.config);
       // The persistent thread keeps shell; external servers remain disabled.
       return { ...isolationConfig, 'features.shell_tool': true, 'features.unified_exec': true };
     },

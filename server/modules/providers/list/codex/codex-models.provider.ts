@@ -1,9 +1,9 @@
 import { readFile } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 import TOML from '@iarna/toml';
 
+import { getCodexHome } from '@/shared/index.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
@@ -19,7 +19,6 @@ import {
 
 import { codexAppServerTransport } from './codex-app-server.client.js';
 
-const CODEX_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
 
 const invalidCatalog = () => new AppError('Codex returned an invalid or empty model catalog.', {
   code: 'CODEX_MODEL_CATALOG_INVALID', statusCode: 502,
@@ -108,7 +107,7 @@ export class CodexProviderModels implements IProviderModels {
   async getCurrentActiveModel(): Promise<ProviderCurrentActiveModel> {
     let model: string | null = null;
     try {
-      const raw = await readFile(CODEX_CONFIG_PATH, 'utf8');
+      const raw = await readFile(path.join(getCodexHome(), 'config.toml'), 'utf8');
       const parsed = readObjectRecord(TOML.parse(raw));
       model = readOptionalString(parsed?.model) ?? null;
     } catch {

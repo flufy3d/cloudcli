@@ -57,6 +57,7 @@ import {
   type CodexThreadItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
 import { createBackgroundTasksStatusMessage, createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
+import { codexSessionTitleService } from '@/modules/providers/services/codex-session-title.service.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import {
   appendFilesInputTag,
@@ -66,6 +67,10 @@ import {
   createNormalizedMessage,
   resolveCodexExecutionPolicy,
   resolveModelEffort,
+  AppError,
+  readObjectRecord,
+  CODEX_TASK_MCP_NAME,
+  CODEX_HOST_CREDENTIAL_ENV_NAMES,
 } from '@/shared/index.js';
 import type {
   AnyRecord,
@@ -74,9 +79,8 @@ import type {
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
 import type { NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
-import { AppError, readObjectRecord } from '@/shared/utils.js';
 
-const TASK_MCP_NAME = 'cloudcli_task_continuations';
+const TASK_MCP_NAME = CODEX_TASK_MCP_NAME;
 const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
 const TASK_API_KEY_ENV = 'CLOUDCLI_TASK_API_KEY';
 const TASK_RUN_CONTEXT_ENV = 'CLOUDCLI_TASK_RUN_CONTEXT';
@@ -173,15 +177,7 @@ const DETACHED_COMMAND_ENV_ALLOWLIST = [
   'PATH', 'HOME', 'CODEX_HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
   'TERM', 'USER', 'LOGNAME', 'SHELL', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
 ] as const;
-const TASK_CREDENTIAL_ENV_NAMES = [
-  'API_KEY',
-  'CLOUDCLI_TASK_API_KEY',
-  'CLOUDCLI_TASK_RUN_CONTEXT',
-  'CLOUDCLI_TASK_BRIDGE',
-  'CLOUDCLI_REGISTRATION_TOKEN',
-  'CLOUDCLI_TASK_TOKEN',
-  'JWT_SECRET',
-] as const;
+const TASK_CREDENTIAL_ENV_NAMES = CODEX_HOST_CREDENTIAL_ENV_NAMES;
 const DETACHED_COMMAND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -835,6 +831,7 @@ async function queryCodex(
    * publish entry.
    */
   let residentGeneration: number | null = null;
+  let knownNativeName: string | null = null;
   let residentRoundId: string | null = null;
   const roundTarget: CodexEventTarget = {
     appSessionId: sessionId || null,
@@ -1048,7 +1045,7 @@ async function queryCodex(
    * they are only settled when the process itself is gone.
    */
   const settleAgentsWhenProcessIsGone = (): void => {
-    if (!isResidentSessionsEnabled() || residentProcessExited) {
+    if (residentGeneration === null || residentProcessExited) {
       settleOutstandingAgents();
     }
   };
@@ -1296,7 +1293,7 @@ async function queryCodex(
      * down behind the interrupt.
      */
     const stopRound = (): Promise<unknown> => {
-      if (isResidentSessionsEnabled()) {
+      if (residentGeneration !== null) {
         // The confirmation matters: the engine may already have run the input,
         // and the user must not see a success before that is known.
         return stopCodexResidentRound(residentKey);
@@ -1450,6 +1447,7 @@ async function queryCodex(
     if (resident) {
       connection = resident.connection;
       residentGeneration = resident.generation;
+      knownNativeName = resident.nativeName;
       adoptNativeThread(resident.threadId);
     } else {
       connection = await codexAppServerTransport.open({
@@ -1514,7 +1512,7 @@ async function queryCodex(
 
 
 
-    if (isResidentSessionsEnabled()) {
+    if (residentGeneration !== null) {
       // The engine's queue is the admission gate: the input waits while the
       // thread is busy and becomes a turn of its own once it is idle.
       const submitted = await submitCodexResidentRound({
@@ -1628,7 +1626,7 @@ async function queryCodex(
     if (session) {
       session.status = session.status === 'aborted' ? 'aborted' : 'completed';
     }
-    if (isResidentSessionsEnabled()) {
+    if (residentGeneration !== null) {
       // The process stays alive: the next round continues in the same thread.
       if (residentGeneration !== null && residentRoundId) {
         completeCodexResidentRound(residentKey, { generation: residentGeneration, clientUserMessageId: residentRoundId });
@@ -1647,9 +1645,21 @@ async function queryCodex(
     }
   }
 
+  const finalStatus = resolveCodexTerminalStatus(terminalStatus, Boolean(terminalFailure));
+  if (finalStatus === 'completed' && !terminalFailure && !toolOutputParam
+    && currentSession()?.status !== 'aborted' && appSessionId && capturedSessionId) {
+    void codexSessionTitleService.enqueue({
+      appSessionId, nativeThreadId: capturedSessionId, generation: residentGeneration ?? 0,
+      workingDirectory, model: resolvedModel ?? catalog.DEFAULT, models: catalog,
+      ...(!providerSessionId ? { initialPrompt: command } : {}),
+    }, knownNativeName).catch(() => {
+      console.warn(`[CodexTitle] ${appSessionId} ${capturedSessionId} enqueue_failed`);
+    });
+  }
+
   return {
     engineTurnId,
-    terminalStatus: resolveCodexTerminalStatus(terminalStatus, Boolean(terminalFailure)),
+    terminalStatus: finalStatus,
   };
 }
 

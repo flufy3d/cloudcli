@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { NavigateFunction } from 'react-router-dom';
 
 import { api } from '@/shared/api';
+import { getPageTitle, setPageTitle } from '@/shared/utils';
 import type { ServerEvent,
   AppTab,
   LLMProvider,
@@ -334,6 +335,16 @@ export function useProjectsState({
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [selectedSession, setSelectedSession] = useState<ProjectSession | null>(null);
+  // The workspace remains mounted in Projects, Conversations and search views.
+  // A conditional sidebar list cannot own the browser's title.
+  const pageTitle = getPageTitle(selectedProject, selectedSession);
+  const pageTitleIdentity = selectedSession?.id ?? selectedProject?.projectId ?? null;
+  const previousPageTitleIdentity = useRef<string | null>(null);
+  useEffect(() => {
+    setPageTitle(pageTitle, previousPageTitleIdentity.current === pageTitleIdentity);
+    previousPageTitleIdentity.current = pageTitleIdentity;
+  }, [pageTitle, pageTitleIdentity]);
+
   const [attentionSessionIds, setAttentionSessionIds] = useState<Set<string>>(new Set());
   const [activeTab, setActiveTab] = useState<AppTab>(readPersistedTab);
 

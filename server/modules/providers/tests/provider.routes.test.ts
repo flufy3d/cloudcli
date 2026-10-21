@@ -378,3 +378,20 @@ test('the workflow agent route reads an agent\'s timeline and status from its ru
     assert.equal(missing.error.code, 'WORKFLOW_AGENT_NOT_FOUND');
   });
 });
+
+test('Codex title settings default on and validate the persisted switch', async () => {
+  await withProviderServer(async (baseUrl) => {
+    const url = `${baseUrl}/api/providers/codex/session-titles/settings`;
+    const initial = await fetch(url);
+    assert.equal(initial.status, 200);
+    assert.deepEqual((await initial.json() as any).data, { enabled: true });
+    const disabled = await fetch(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false }) });
+    assert.equal(disabled.status, 200);
+    assert.deepEqual((await (await fetch(url)).json() as any).data, { enabled: false });
+    for (const body of [{ enabled: 'false' }, {}, { enabled: true, model: 'other' }]) {
+      const invalid = await fetch(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      assert.equal(invalid.status, 400);
+    }
+    assert.deepEqual((await (await fetch(url)).json() as any).data, { enabled: false });
+  });
+});

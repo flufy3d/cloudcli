@@ -38,8 +38,8 @@ import {
   type CodexAppServerConnection,
   type CodexAppServerHandlers,
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
-import type { AnyRecord } from '@/shared/index.js';
-import { AppError } from '@/shared/utils.js';
+import type { AnyRecord, CodexSessionTitleTarget } from '@/shared/index.js';
+import { AppError, buildCodexTitleIsolationConfig, CODEX_HOST_CREDENTIAL_ENV_NAMES } from '@/shared/index.js';
 
 /** How long a resident process may sit idle before it is reclaimed. */
 const RESIDENT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -144,6 +144,10 @@ type ResidentSession = {
   connection: CodexAppServerConnection;
   /** The native thread the rounds run in. */
   threadId: string;
+  /** Explicit native name; never the first-message preview. */
+  nativeName: string | null;
+  auxiliaryOwner: string | null;
+  auxiliaryTargetThreadId: string | null;
   /** The round in flight, if any. */
   round: ResidentRound | null;
   /** Turns the engine started on its own, so their events stay out of the round. */
@@ -157,6 +161,8 @@ type ResidentSession = {
    * lent the process has work and is not reclaimed.
    */
   auxThreads: Map<string, AuxiliaryBorrow>;
+  /** Retired ids also reject late events/approvals until this process exits. */
+  auxiliaryThreadIds: Set<string>;
   /** Starts in flight also prevent reclaim, eviction and archive. */
   auxiliaryStarting: number;
   /** Source markers used by auxiliary starts on this process, including timed-out starts. */
@@ -208,6 +214,8 @@ type ResidentSession = {
 
 /** The resident session a caller borrows. */
 export type CodexResidentSession = {
+  /** Current explicit name, refreshed by engine metadata reads and name notifications. */
+  readonly nativeName: string | null;
   appSessionId: string;
   /** Increases whenever the process is replaced. */
   generation: number;
@@ -218,6 +226,8 @@ export type CodexResidentSession = {
 
 /** What a caller needs to open or reuse a resident session. */
 export type CodexResidentSessionOptions = {
+  /** Manager-internal transient worker, never a resumed formal conversation. */
+  auxiliaryWorker?: { ownerAppSessionId: string; nativeThreadId: string; deadline: number };
   /** Tool-result callers request an exclusive fresh process that lives for one turn. */
   lifetime?: 'session' | 'turn';
   /** Chat runtime reserves input preparation; diagnostics may share an unreserved connection. */
@@ -417,6 +427,9 @@ function disposeResidentSession(session: ResidentSession, reason: string): void 
   const exited = session.connection?.waitForExit?.() ?? null;
   if (exited) {
     releasedProcessExits.set(session.appSessionId, exited);
+    void exited.then(() => {
+      if (releasedProcessExits.get(session.appSessionId) === exited) releasedProcessExits.delete(session.appSessionId);
+    }).catch((error) => { console.warn(`[Codex] Waiting for ${session.appSessionId} to exit failed:`, error); });
   }
   // The credential the process carried only ever authorized that process.
   if (session.credentialToken) {
@@ -708,6 +721,10 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
           return;
         }
         const eventThreadId = readEventThreadId(params);
+        if (method === 'thread/name/updated' && eventThreadId === session.threadId) {
+          session.nativeName = typeof params.threadName === 'string' && params.threadName.trim() ? params.threadName.trim() : null;
+          return;
+        }
         const borrow = eventThreadId ? session.auxThreads.get(eventThreadId) : undefined;
         if (borrow) {
           // A lent thread's traffic is its borrower's alone: it is neither the
@@ -718,10 +735,12 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
           }
           return;
         }
+        if (eventThreadId && session.auxiliaryThreadIds.has(eventThreadId)) return;
         const announced = method === 'thread/started' && params.thread && typeof params.thread === 'object'
           ? params.thread as AnyRecord : null;
         if (eventThreadId && announced?.ephemeral === true
           && typeof announced.threadSource === 'string' && session.auxiliarySources.has(announced.threadSource)) {
+          session.auxiliaryThreadIds.add(eventThreadId);
           session.auxiliaryAnnouncements.set(eventThreadId, 'waiting');
           detachUnclaimedAuxiliaryThreads(session);
           return;
@@ -759,6 +778,7 @@ function buildResidentHandlers(session: ResidentSession): CodexAppServerHandlers
           try { return await borrow.onRequest?.(method, params); }
           catch (error) { failAuxiliaryBorrow(session, borrow, error); return undefined; }
         }
+        if (threadId && session.auxiliaryThreadIds.has(threadId)) return undefined;
         if (round && turnId && !round.turnId) {
           await round.submitted;
           await session.pendingTurns.get(turnId)?.resolution;
@@ -813,11 +833,11 @@ function scheduleResidentReclaim(session: ResidentSession): void {
  */
 function evictResidentSessionIfNeeded(): void {
   const limit = residentMaxSessions();
-  if (residentSessions.size < limit) {
+  if ([...residentSessions.values()].filter((session) => !session.auxiliaryOwner).length < limit) {
     return;
   }
   const candidates = [...residentSessions.values()]
-    .filter((session) => !session.disposed && !hasResidentWork(session))
+    .filter((session) => !session.disposed && !session.auxiliaryOwner && !hasResidentWork(session))
     .sort((left, right) => left.lastUsedAt - right.lastUsedAt);
   const evicted = candidates[0];
   if (evicted) {
@@ -840,7 +860,7 @@ function evictResidentSessionIfNeeded(): void {
 export async function acquireCodexResidentSession(
   options: CodexResidentSessionOptions,
 ): Promise<CodexResidentSession> {
-  if (closedAdmission.has(options.appSessionId)) {
+  if (closedAdmission.has(options.appSessionId) || (options.auxiliaryWorker && closedAdmission.has(options.auxiliaryWorker.ownerAppSessionId))) {
     throw new Error('The Codex conversation is being closed and cannot take another message.');
   }
   const existing = residentSessions.get(options.appSessionId);
@@ -900,6 +920,7 @@ export async function acquireCodexResidentSession(
           generation: settled.generation,
           threadId: settled.threadId,
           connection: settled.connection,
+          get nativeName() { return settled.nativeName; },
         };
       }
       console.log(
@@ -925,7 +946,7 @@ export async function acquireCodexResidentSession(
     }
   }
 
-  evictResidentSessionIfNeeded();
+  if (!options.auxiliaryWorker) evictResidentSessionIfNeeded();
 
   const session: ResidentSession = {
     appSessionId: options.appSessionId,
@@ -935,10 +956,14 @@ export async function acquireCodexResidentSession(
     reservedForRound: options.reserveForRound ?? false,
     connection: undefined as unknown as CodexAppServerConnection,
     threadId: '',
+    nativeName: null,
+    auxiliaryOwner: options.auxiliaryWorker?.ownerAppSessionId ?? null,
+    auxiliaryTargetThreadId: options.auxiliaryWorker?.nativeThreadId ?? null,
     round: null,
     engineTurns: new Set<string>(),
     pendingRequests: 0,
     auxThreads: new Map(),
+    auxiliaryThreadIds: new Set(),
     auxiliaryStarting: 0,
     auxiliarySources: new Set(),
     auxiliaryAnnouncements: new Map(),
@@ -965,7 +990,7 @@ export async function acquireCodexResidentSession(
     }
     const connection = await codexAppServerTransport.open(
       buildResidentHandlers(session),
-      { experimentalApi: true, ...(processSetup ? { env: processSetup.env } : {}) },
+      { experimentalApi: true, ...(processSetup ? { env: processSetup.env } : {}), ...(options.auxiliaryWorker ? { inheritEnv: false } : {}) },
     );
     if (session.disposed) {
       connection.close();
@@ -977,15 +1002,16 @@ export async function acquireCodexResidentSession(
       throw new Error('The Codex conversation was closed during initialization.');
     }
     const thread = await connection.call(
-      options.nativeThreadId ? 'thread/resume' : 'thread/start',
+      options.nativeThreadId && !options.auxiliaryWorker ? 'thread/resume' : 'thread/start',
       {
         ...(options.nativeThreadId ? { threadId: options.nativeThreadId, excludeTurns: true } : {}),
         cwd: options.workingDirectory,
         approvalPolicy: options.approvalPolicy,
-        sandbox: options.sandbox,
+        sandbox: options.auxiliaryWorker ? 'read-only' : options.sandbox,
         config: threadConfig,
+        ...(options.auxiliaryWorker ? { ephemeral: true, threadSource: 'cloudcli_title_worker', dynamicTools: [], environments: [], runtimeWorkspaceRoots: [], selectedCapabilityRoots: [] } : {}),
       },
-    ) as { thread?: { id?: unknown } } | undefined;
+    ) as { thread?: { id?: unknown; name?: unknown } } | undefined;
     if (session.disposed) {
       throw new Error('The Codex conversation was closed during initialization.');
     }
@@ -994,6 +1020,7 @@ export async function acquireCodexResidentSession(
       throw new Error('Codex app-server opened no thread to run the session in.');
     }
     session.threadId = threadId;
+    session.nativeName = typeof thread?.thread?.name === 'string' && thread.thread.name.trim() ? thread.thread.name.trim() : null;
     session.initializing = null;
     residentSessions.set(options.appSessionId, session);
     return session;
@@ -1013,6 +1040,7 @@ export async function acquireCodexResidentSession(
       generation: settled.generation,
       threadId: settled.threadId,
       connection: settled.connection,
+      get nativeName() { return settled.nativeName; },
     };
   } catch (error) {
     disposeResidentSession(session, 'initialization failed');
@@ -1317,10 +1345,8 @@ export function listCodexReportingOnlySessions(): string[] {
  */
 export function isCodexResidentSessionBusy(appSessionId: string): boolean {
   const session = residentSessions.get(appSessionId);
-  if (!session || session.disposed) {
-    return false;
-  }
-  return hasResidentWork(session);
+  return (!!session && !session.disposed && hasResidentWork(session))
+    || [...residentSessions.values()].some((worker) => worker.auxiliaryOwner === appSessionId && !worker.disposed && hasResidentWork(worker));
 }
 
 /**
@@ -1352,6 +1378,9 @@ export function closeCodexResidentSessionAdmission(appSessionId: string): void {
  */
 export function releaseCodexResidentSessionResources(appSessionId: string): void {
   releaseCodexResidentSession(appSessionId, { dispose: true });
+  for (const worker of [...residentSessions.values()]) {
+    if (worker.auxiliaryOwner === appSessionId) disposeResidentSession(worker, 'owning conversation closed');
+  }
 }
 
 /**
@@ -1444,7 +1473,7 @@ export async function borrowCodexAuxiliaryThread(options: CodexAuxiliaryThreadOp
   if (typeof options.generation === 'number' && options.generation !== session.generation) {
     throw auxiliaryUnavailable('The resident Codex process was replaced; borrow the thread again.');
   }
-  if (closedAdmission.has(options.appSessionId)) {
+  if (closedAdmission.has(options.appSessionId) || (session.auxiliaryOwner && closedAdmission.has(session.auxiliaryOwner))) {
     throw auxiliaryUnavailable('The Codex conversation is being closed and lends no thread.');
   }
   if (options.start.ephemeral !== true) {
@@ -1474,6 +1503,7 @@ export async function borrowCodexAuxiliaryThread(options: CodexAuxiliaryThreadOp
     }
 
     session.auxiliaryAnnouncements.delete(threadId);
+    session.auxiliaryThreadIds.add(threadId);
     session.auxThreads.set(threadId, {
       failed: false,
       onNotification: options.onNotification,
@@ -1503,6 +1533,24 @@ export async function borrowCodexAuxiliaryThread(options: CodexAuxiliaryThreadOp
   }
 }
 
+/** A timed-out/abandoned turn/start may still succeed; only its own turn is stopped. */
+async function stopLateAuxiliaryTurn(session: ResidentSession, threadId: string, result: unknown): Promise<void> {
+  const turn = result && typeof result === 'object' ? (result as AnyRecord).turn as AnyRecord | undefined : undefined;
+  const turnId = typeof turn?.id === 'string' ? turn.id : null;
+  if (!turnId || session.disposed) return;
+  session.pendingRequests += 1;
+  scheduleResidentReclaim(session);
+  try {
+    try { await session.connection.call('turn/interrupt', { threadId, turnId }, { timeoutMs: 1500 }); }
+    catch { console.warn(`[CodexTitle] ${session.appSessionId} ${threadId} late_interrupt_failed`); }
+    try { await session.connection.call('thread/unsubscribe', { threadId }, { timeoutMs: 1500 }); }
+    catch { console.warn(`[CodexTitle] ${session.appSessionId} ${threadId} late_unsubscribe_failed`); }
+  } finally {
+    session.pendingRequests -= 1;
+    scheduleResidentReclaim(session);
+  }
+}
+
 /**
  * The borrower's calls, kept to its own thread.
  *
@@ -1521,7 +1569,7 @@ async function callForAuxiliaryThread(
   const target = record.threadId;
   const globalRead = AUXILIARY_GLOBAL_READS.has(method);
   const validTarget = typeof target === 'string' && target.length > 0
-    && (target === threadId || (target === session.threadId && AUXILIARY_CROSS_THREAD_METHODS.has(method)));
+    && (target === threadId || (target === (session.auxiliaryTargetThreadId ?? session.threadId) && AUXILIARY_CROSS_THREAD_METHODS.has(method)));
   if ((!globalRead && (!AUXILIARY_THREAD_METHODS.has(method) || !validTarget))
     || 'thread_id' in record || 'thread' in record) {
     throw new AppError(`An auxiliary thread cannot call ${method} outside its scope.`, {
@@ -1531,7 +1579,66 @@ async function callForAuxiliaryThread(
   if (session.disposed || !session.auxThreads.has(threadId)) {
     throw auxiliaryUnavailable('The auxiliary thread is no longer lent.');
   }
-  return session.connection.call(method, params, callOptions);
+  const result = await session.connection.call(method, params, {
+    ...callOptions,
+    ...(method === 'turn/start' ? { onLateResult: (late: unknown) => stopLateAuxiliaryTurn(session, threadId, late) } : {}),
+  });
+  if (method === 'turn/start' && !session.auxThreads.has(threadId)) await stopLateAuxiliaryTurn(session, threadId, result);
+  if (method === 'thread/name/set' && target === (session.auxiliaryTargetThreadId ?? session.threadId) && typeof record.name === 'string') session.nativeName = record.name.trim() || null;
+  return result;
+}
+
+/**
+ * Title service/client preflight reads on an already resident process, without
+ * acquiring the conversation again or replacing its callbacks. Thread reads
+ * are bound to the manager's native thread and process generation.
+ */
+export async function readCodexResidentMetadata(input: {
+  appSessionId: string; generation: number; method: 'thread/read' | 'config/read';
+  workingDirectory: string; timeoutMs: number;
+}): Promise<unknown> {
+  const session = residentSessions.get(input.appSessionId);
+  if (!session || session.disposed || session.initializing || session.generation !== input.generation
+    || closedAdmission.has(input.appSessionId) || (session?.auxiliaryOwner && closedAdmission.has(session.auxiliaryOwner))) throw auxiliaryUnavailable('The Codex title target is no longer resident.');
+  const result = await session.connection.call(input.method, input.method === 'thread/read'
+    ? { threadId: session.auxiliaryTargetThreadId ?? session.threadId, includeTurns: false }
+    : { cwd: input.workingDirectory, includeLayers: false }, { timeoutMs: input.timeoutMs });
+  if (input.method === 'thread/read') {
+    const thread = (result as { thread?: { name?: unknown } } | null)?.thread;
+    session.nativeName = typeof thread?.name === 'string' && thread.name.trim() ? thread.name.trim() : null;
+  }
+  return result;
+}
+
+/**
+ * The title scheduler uses a transient managed worker when the completed chat
+ * used a short connection. It creates no stored thread and never resumes the
+ * formal conversation; read/name calls are scoped to its native target.
+ * The scheduler must dispose the returned key in finally, including late init.
+ */
+export async function createCodexTitleWorker(target: CodexSessionTitleTarget, deadline: number, signal: AbortSignal): Promise<{ key: string; generation: number }> {
+  const key = `codex-title-worker-${randomUUID()}`;
+  signal.throwIfAborted();
+  const stopInitializing = () => releaseCodexResidentSession(key, { dispose: true });
+  signal.addEventListener('abort', stopInitializing, { once: true });
+  const env = { ...process.env };
+  for (const name of CODEX_HOST_CREDENTIAL_ENV_NAMES) delete env[name];
+  try {
+    const worker = await acquireCodexResidentSession({
+      appSessionId: key, nativeThreadId: null, workingDirectory: target.workingDirectory,
+      auxiliaryWorker: { ownerAppSessionId: target.appSessionId, nativeThreadId: target.nativeThreadId, deadline },
+      sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false }, approvalPolicy: 'never',
+      env: () => ({ env }), isBusy: () => true,
+      config: async (connection) => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw auxiliaryUnavailable('The title worker startup deadline expired.');
+        const effective = await connection.call('config/read', { cwd: target.workingDirectory, includeLayers: false }, { timeoutMs: remaining }) as AnyRecord | null;
+        return buildCodexTitleIsolationConfig(effective?.config);
+      },
+    });
+    signal.throwIfAborted();
+    return { key, generation: worker.generation };
+  } finally { signal.removeEventListener('abort', stopInitializing); }
 }
 
 /** The resident sessions that are currently open, for diagnostics and tests. */

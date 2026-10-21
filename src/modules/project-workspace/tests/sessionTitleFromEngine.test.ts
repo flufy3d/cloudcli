@@ -194,3 +194,56 @@ test('a delta that carries activity still titles the open session', async () => 
   // The delta means the session changed, so the chat still re-reads it.
   assert.equal(result.current.externalMessageUpdate, updatesBefore + 1);
 });
+
+for (const provider of ['codex', 'opencode', 'claude', 'zcode', 'antigravity'] as const) {
+  test(`${provider} title updates the document without mounting the Projects list`, async () => {
+    document.title = 'Unrelated old title';
+    respondWith([buildProject([{ id: APP_SESSION_ID, summary: 'Original title', __provider: provider } as ProjectSession])]);
+    const { result } = await renderProjectsState(vi.fn());
+    await waitFor(() => assert.equal(result.current.projects.length, 1));
+    act(() => result.current.handleSessionSelect({ id: APP_SESSION_ID, summary: 'Original title', __provider: provider, __projectId: 'project-1', __searchTargetSnippet: 'matched text' } as ProjectSession));
+    await waitFor(() => assert.equal(document.title, 'Original title'));
+    const update = buildUpsert({ summary: 'Named after search', metadataOnly: true });
+    await act(async () => emit({ ...update, provider }));
+    assert.equal(document.title, 'Named after search');
+    assert.equal(result.current.selectedSession?.__searchTargetSnippet, undefined);
+  });
+}
+
+test('an automatic title preserves the background completion marker until the user returns', async () => {
+  respondWith([buildProject([{ id: APP_SESSION_ID, summary: 'Original title', __provider: 'codex' } as ProjectSession])]);
+  const { result } = await renderProjectsState(vi.fn());
+  await waitFor(() => assert.equal(result.current.projects.length, 1));
+  selectSession(result, APP_SESSION_ID);
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+  const focus = vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+  const { showCompletionTitleIndicator } = await import('@/shared/utils');
+  showCompletionTitleIndicator();
+  assert.equal(document.title, '[Done] First message');
+  const update = buildUpsert({ summary: 'Named while away', metadataOnly: true });
+  await act(async () => emit({ ...update, provider: 'codex' }));
+  assert.equal(document.title, '[Done] Named while away');
+  vi.useFakeTimers();
+  visibility.mockReturnValue('visible');
+  focus.mockReturnValue(true);
+  window.dispatchEvent(new Event('focus'));
+  await vi.advanceTimersByTimeAsync(2000);
+  assert.equal(document.title, 'Named while away');
+  vi.useRealTimers();
+  visibility.mockRestore();
+  focus.mockRestore();
+});
+
+test('switching conversations clears the previous conversation completion marker', async () => {
+  respondWith([buildProject([{ id: APP_SESSION_ID, summary: 'Original title' } as ProjectSession, { id: OTHER_SESSION_ID, summary: 'Other title' } as ProjectSession])]);
+  const { result } = await renderProjectsState(vi.fn());
+  await waitFor(() => assert.equal(result.current.projects.length, 1));
+  selectSession(result, APP_SESSION_ID);
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+  const { showCompletionTitleIndicator } = await import('@/shared/utils');
+  showCompletionTitleIndicator();
+  assert.equal(document.title, '[Done] First message');
+  act(() => result.current.handleSessionSelect({ id: OTHER_SESSION_ID, summary: 'Other title', __projectId: 'project-1' } as ProjectSession));
+  assert.equal(document.title, 'Other title');
+  visibility.mockRestore();
+});

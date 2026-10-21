@@ -7,6 +7,7 @@ import { providerModelsService } from '@/modules/providers/services/provider-mod
 import { providerTokenUsageService } from '@/modules/providers/services/provider-token-usage.service.js';
 import { providerSkillsService } from '@/modules/providers/services/skills.service.js';
 import { sessionConversationsSearchService } from '@/modules/providers/services/session-conversations-search.service.js';
+import { codexSessionTitleService } from '@/modules/providers/services/codex-session-title.service.js';
 import { sessionsAutoArchiveService } from '@/modules/providers/services/sessions-auto-archive.service.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type {
@@ -802,6 +803,18 @@ router.get(
     res.json(createApiSuccessResponse({ sessions }));
   }),
 );
+
+router.get('/codex/session-titles/settings', asyncHandler(async (_req: Request, res: Response) => {
+  res.json(createApiSuccessResponse(codexSessionTitleService.getSettings()));
+}));
+
+router.put('/codex/session-titles/settings', asyncHandler(async (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown> | null;
+  if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1 || typeof body.enabled !== 'boolean') {
+    throw new AppError('enabled must be a boolean and the only setting.', { code: 'INVALID_CODEX_TITLE_SETTINGS', statusCode: 400 });
+  }
+  res.json(createApiSuccessResponse(codexSessionTitleService.updateSettings(body.enabled)));
+}));
 
 router.get(
   '/sessions/auto-archive/settings',

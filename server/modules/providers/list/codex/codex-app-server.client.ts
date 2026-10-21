@@ -71,7 +71,7 @@ function resolveCodexLauncher(): string {
  */
 export type CodexAppServerConnection = {
   /** Sends a JSON-RPC request and resolves with its result. */
-  call(method: string, params: unknown, options?: { timeoutMs?: number }): Promise<unknown>;
+  call(method: string, params: unknown, options?: { timeoutMs?: number; onLateResult?: (result: unknown) => void | Promise<void> }): Promise<unknown>;
   /** Kills the child. Safe to call more than once. */
   close(): void;
   /**
@@ -246,7 +246,15 @@ export async function openCodexAppServer(
         : REQUEST_TIMEOUT_MS;
       const id = nextRequestId++;
       const timer = setTimeout(() => {
-        pending.delete(id);
+        if (options?.onLateResult) {
+          // A timeout ends the caller's wait, not the engine request. Keep a
+          // cleanup owner until the late response or connection exit arrives.
+          pending.set(id, (response) => {
+            if (response.error) { console.warn(`[Codex] Late RPC ${method} failed.`); return; }
+            void Promise.resolve().then(() => options.onLateResult!(response.result))
+              .catch(() => { console.warn(`[Codex] Late RPC cleanup for ${method} failed.`); });
+          });
+        } else pending.delete(id);
         reject(new AppError(`Codex app-server did not answer "${method}" within ${timeoutMs}ms.`, {
           code: 'CODEX_APP_SERVER_TIMEOUT',
           statusCode: 504,
