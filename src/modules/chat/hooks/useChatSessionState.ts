@@ -120,7 +120,12 @@ export function useChatSessionState({
 }: UseChatSessionStateArgs) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(selectedSession?.id || null);
   const [isLoadingSessionMessages, setIsLoadingSessionMessages] = useState(false);
-  const [isLoadingMoreMessages, _setIsLoadingMoreMessages] = useState(false);
+  /**
+   * Drives the floating older-history spinner at the top of the transcript.
+   * The ref alone cannot render it — it never re-renders — so this state
+   * mirrors the in-flight window around each `fetchMore`.
+   */
+  const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [totalMessages, setTotalMessages] = useState(0);
   const [tokenBudget, setTokenBudget] = useState<Record<string, unknown> | null>(null);
@@ -371,6 +376,7 @@ export function useChatSessionState({
       if (!hasMoreMessages || !selectedSession || !selectedProject) return false;
 
       isLoadingMoreRef.current = true;
+      setIsLoadingMoreMessages(true);
 
       try {
         const result = await sessionStore.fetchMore(selectedSession.id, {
@@ -390,6 +396,7 @@ export function useChatSessionState({
         return prependedCount > 0;
       } finally {
         isLoadingMoreRef.current = false;
+        setIsLoadingMoreMessages(false);
       }
     },
     [hasMoreMessages, isActive, isLoadingMoreMessages, selectedProject, selectedSession, sessionStore],
