@@ -734,6 +734,35 @@ async function buildPromptMessages(command, images, files, cwd) {
 }
 
 /**
+ * The text a turn's prompt offers for naming the session, or null when it
+ * offers none.
+ *
+ * The engine declines to name a session from a slash command, so
+ * `/archify 生成一下 core 的整体架构图` is named from what follows the command,
+ * and a command without arguments (`/compact`) from nothing. What counts as a
+ * command mirrors the engine's own check: after leading whitespace, a `/`
+ * followed by a name the process lists in its `init` `slash_commands`, read
+ * either as the leading `[A-Za-z0-9:_-]` run or as the text up to the first
+ * whitespace. Anything else, such as `/tmp 里面的日志` or an absolute path, is
+ * kept as typed; so is every prompt when the process listed no commands.
+ *
+ * @param {unknown} command - The turn's prompt text
+ * @param {Set<string>} slashCommands - Command names from the process's `init`
+ * @returns {string|null} Description for `generateSessionTitle`
+ */
+function sessionTitleSource(command, slashCommands) {
+  if (typeof command !== 'string') return null;
+  const text = command.trimStart();
+  if (!text.startsWith('/')) return command.trim() || null;
+  const body = text.slice(1);
+  const leadingName = body.match(/^[A-Za-z0-9:_-]+/)?.[0];
+  const firstWord = body.split(/\s/, 1)[0];
+  const name = [leadingName, firstWord].find((candidate) => candidate && slashCommands.has(candidate));
+  if (!name) return command.trim() || null;
+  return body.slice(name.length).trim() || null;
+}
+
+/**
  * Wraps prompt messages in an async iterable that yields them and then parks.
  *
  * The SDK closes the CLI's stdin as soon as its input iterable is exhausted (and
@@ -1181,13 +1210,16 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // answers with the title it already has (custom or ai) without a model
     // call, declines a slash command, and otherwise writes a fresh `ai-title`
     // that the session synchronizer picks up. Once it reports a title, this
-    // process stops asking; one request at a time.
+    // process stops asking; one request at a time. A slash command is named
+    // from its arguments (see `sessionTitleSource`).
     let sessionTitleKnown = false;
     let sessionTitleRequested = false;
+    let slashCommands = new Set();
     const requestSessionTitle = () => {
       if (sessionTitleKnown || sessionTitleRequested) return;
       if (typeof queryInstance.generateSessionTitle !== 'function') return;
-      if (typeof command !== 'string' || !command.trim()) return;
+      const description = sessionTitleSource(command, slashCommands);
+      if (!description) return;
       const reportFailure = (error) => {
         // A process that exits before the title arrives drops the request;
         // the next turn asks again.
@@ -1195,7 +1227,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       };
       sessionTitleRequested = true;
       try {
-        Promise.resolve(queryInstance.generateSessionTitle(command, { persist: true })).then((title) => {
+        Promise.resolve(queryInstance.generateSessionTitle(description, { persist: true })).then((title) => {
           if (title) sessionTitleKnown = true;
         }, reportFailure).finally(() => { sessionTitleRequested = false; });
       } catch (error) {
@@ -1363,6 +1395,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         || (!current && abortedInstances.has(queryInstance))) break;
       if (message.type === 'system' && message.subtype === 'init') {
         cliTurnActive = true;
+        if (Array.isArray(message.slash_commands)) slashCommands = new Set(message.slash_commands);
         requestSessionTitle();
       }
       // Capture session ID from first message

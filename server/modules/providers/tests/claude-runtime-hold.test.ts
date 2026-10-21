@@ -797,12 +797,47 @@ test('a held process stops asking for a title once the engine has one', async ()
 test('a held process keeps asking while the engine has no title yet', async () => {
   await withRun(async ({ script, nextTurn }) => {
     await holdForBackgroundBash(script);
-    const second = nextTurn('/hi then a real topic');
+    const second = nextTurn('a real topic');
     await until(() => script.prompts.length >= 2);
     script.emit(init());
     script.emit(result());
     await second.done;
-    assert.deepEqual(script.titleRequests, ['hello', '/hi then a real topic']);
+    assert.deepEqual(script.titleRequests, ['hello', 'a real topic']);
+  });
+});
+
+const titledAs: Array<[string, string, string | null]> = [
+  ['a known command is titled from its arguments', '/archify  生成一下 core 的整体架构图\n要中文', '生成一下 core 的整体架构图\n要中文'],
+  ['arguments on the next line count too', '/archify\n生成架构图', '生成架构图'],
+  ['a plugin command is titled from its arguments', '/vercel:deploy 上线预览环境', '上线预览环境'],
+  ['leading whitespace does not hide a command', '  /compact ', null],
+  ['a short path that is no command is kept as typed', '/tmp 里面的日志怎么清', '/tmp 里面的日志怎么清'],
+  ['an absolute path is kept as typed', '/Users/me/docs/ 看看这里的文档', '/Users/me/docs/ 看看这里的文档'],
+];
+
+for (const [name, prompt, expected] of titledAs) {
+  test(`session title: ${name}`, async () => {
+    await withRun(async ({ script, nextTurn }) => {
+      await holdForBackgroundBash(script);
+      const second = nextTurn(prompt);
+      await until(() => script.prompts.length >= 2);
+      script.emit({ ...init(), slash_commands: ['archify', 'compact', 'vercel:deploy'] });
+      script.emit(result());
+      await second.done;
+      assert.deepEqual(script.titleRequests, expected === null ? ['hello'] : ['hello', expected]);
+    });
+  });
+}
+
+test('a process that lists no commands keeps a slash prompt as typed, for the engine to judge', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('/archify 生成架构图');
+    await until(() => script.prompts.length >= 2);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+    assert.deepEqual(script.titleRequests, ['hello', '/archify 生成架构图']);
   });
 });
 
