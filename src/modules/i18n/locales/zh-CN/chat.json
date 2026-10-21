@@ -137,6 +137,11 @@
       "willSend": "将在当前完成后发送",
       "edit": "编辑排队消息",
       "delete": "删除排队消息"
+    },
+    "compactQueued": {
+      "label": "压缩已排队",
+      "willRun": "将在本轮回答结束后压缩上下文",
+      "cancel": "取消"
     }
   },
   "providerSelection": {

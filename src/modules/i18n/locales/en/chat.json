@@ -144,6 +144,11 @@
       "willSend": "Will send when this finishes",
       "edit": "Edit queued message",
       "delete": "Delete queued message"
+    },
+    "compactQueued": {
+      "label": "Compaction queued",
+      "willRun": "Will compact when this turn finishes",
+      "cancel": "Cancel"
     }
   },
   "composer": {

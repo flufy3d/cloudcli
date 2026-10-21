@@ -19,10 +19,13 @@ import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabiliti
 import { uploadAttachmentFiles } from '@/modules/chat/utils/attachmentUpload';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
 import {
+  clearQueuedCompact,
   clearQueuedMessage,
   readProviderToolsSettings,
+  readQueuedCompact,
   readQueuedMessage,
   safeLocalStorage,
+  writeQueuedCompact,
   writeQueuedMessage,
   type QueuedSendOptions,
 } from '@/modules/chat/utils/chatStorage';
@@ -360,6 +363,19 @@ export function useChatComposerState({
   // effect must not write across that gap.
   const queuedDraftSessionRef = useRef<string | null>(sessionKey);
 
+  /**
+   * The session whose `/compact` is parked until its running turn ends.
+   * Compaction is a run of its own, so the gateway refuses it while any run
+   * holds the session; parking it — rather than surfacing that refusal — is
+   * what lets the user ask mid-turn and have it happen automatically.
+   */
+  const [pendingCompactSession, setPendingCompactSession] = useState<string | null>(() => (
+    typeof window !== 'undefined' && sessionKey && readQueuedCompact(sessionKey)
+      ? sessionKey
+      : null
+  ));
+  const pendingCompact = Boolean(sessionKey) && pendingCompactSession === sessionKey;
+
   const handleBuiltInCommand = useCallback(
     (result: CommandExecutionResult) => {
       const { action, data } = result;
@@ -495,13 +511,27 @@ export function useChatComposerState({
           return;
         }
 
+        const compactOptions = {
+          model: currentProviderModel,
+          effort: currentProviderEffort,
+        };
+
+        // Compaction is a run of its own — it cannot ride the turn in flight
+        // the way a message can, so the gateway would answer RUN_IN_PROGRESS.
+        // Park the request instead and let the turn-end flush dispatch it.
+        if (isLoading && targetSessionId === sessionKey) {
+          writeQueuedCompact(targetSessionId, { options: compactOptions });
+          setPendingCompactSession(targetSessionId);
+          if (!options?.preserveInput) {
+            updateInput('');
+          }
+          return;
+        }
+
         sendMessage({
           type: 'chat.compact',
           sessionId: targetSessionId,
-          options: {
-            model: currentProviderModel,
-            effort: currentProviderEffort,
-          },
+          options: compactOptions,
         });
         onSessionProcessing?.(targetSessionId, { statusText: null, canInterrupt: false });
         if (!options?.preserveInput) {
@@ -576,9 +606,11 @@ export function useChatComposerState({
       handleBuiltInCommand,
       handleCustomCommand,
       input,
+      isLoading,
       provider,
       selectedProject,
       selectedSession?.id,
+      sessionKey,
       addMessage,
       tokenBudget,
       updateInput,
@@ -1123,8 +1155,10 @@ export function useChatComposerState({
   }, [handleSubmit]);
 
   // Once the in-flight turn ends, replay the queued draft through the normal
-  // submit path. The draft itself is passed directly so submission never
-  // depends on React committing restored attachment state first.
+  // submit path. A `/compact` parked during that turn goes first: it is a run
+  // of its own, so the queued draft has to wait behind the compaction. The
+  // draft itself is passed directly so submission never depends on React
+  // committing restored attachment state first.
   const wasBusyRef = useRef(queuesInput);
   const flushSessionKeyRef = useRef(sessionKey);
   useEffect(() => {
@@ -1141,8 +1175,10 @@ export function useChatComposerState({
     }
 
     // A manual submit in flight owns the latch; flushing now would be refused.
-    // This effect re-runs when it finishes, which is the retry.
-    if (queuesInput || isSubmitting || !queuedDraft) {
+    // This effect re-runs when it finishes, which is the retry. `isLoading` is
+    // checked on its own because the gateway refuses a `/compact` while any
+    // run is live, even on providers that take messages mid-turn.
+    if (queuesInput || isLoading || isSubmitting || (!queuedDraft && !pendingCompact)) {
       return;
     }
 
@@ -1152,6 +1188,38 @@ export function useChatComposerState({
     // still live (the cleanup below cancels the send in that case).
     const delay = wasBusy ? 0 : 750;
     const timer = setTimeout(() => {
+      // A parked `/compact` claims this turn-end: the storage key is the claim
+      // ticket shared with the app-level auto-send, so an empty key means the
+      // request was already dispatched and must not be sent twice.
+      if (sessionKey) {
+        const parkedCompact = readQueuedCompact(sessionKey);
+        if (parkedCompact) {
+          clearQueuedCompact(sessionKey);
+          setPendingCompactSession((current) => (current === sessionKey ? null : current));
+          sendMessage({
+            type: 'chat.compact',
+            sessionId: sessionKey,
+            options: {
+              model: currentProviderModel,
+              effort: currentProviderEffort,
+              ...parkedCompact.options,
+            },
+          });
+          // Dispatching marks the session processing, so the queued draft (if
+          // any) flushes when the compaction's own run completes.
+          onSessionProcessing?.(sessionKey, { statusText: null, canInterrupt: false });
+          return;
+        }
+        if (pendingCompact) {
+          // The request was claimed elsewhere, so there is nothing left to run.
+          setPendingCompactSession((current) => (current === sessionKey ? null : current));
+        }
+      }
+
+      if (!queuedDraft) {
+        return;
+      }
+
       // The saved key is the claim ticket shared with the app-level auto-send
       // (which handles sessions that finish while not viewed). If it's gone,
       // the message was already dispatched — don't send it twice.
@@ -1173,7 +1241,18 @@ export function useChatComposerState({
       });
     }, delay);
     return () => clearTimeout(timer);
-  }, [queuesInput, isSubmitting, queuedDraft, sessionKey]);
+  }, [
+    queuesInput,
+    isLoading,
+    isSubmitting,
+    queuedDraft,
+    pendingCompact,
+    sessionKey,
+    currentProviderModel,
+    currentProviderEffort,
+    sendMessage,
+    onSessionProcessing,
+  ]);
 
   const editQueuedDraft = useCallback(() => {
     if (!queuedDraft) {
@@ -1277,6 +1356,21 @@ export function useChatComposerState({
       return;
     }
     setQueuedDraft(restoreQueuedDraft(sessionKey));
+  }, [sessionKey]);
+
+  // The parked `/compact` follows the session the same way: it belongs to the
+  // session it was requested for, not to whichever composer is mounted now.
+  useEffect(() => {
+    setPendingCompactSession(
+      sessionKey && readQueuedCompact(sessionKey) ? sessionKey : null,
+    );
+  }, [sessionKey]);
+
+  const cancelPendingCompact = useCallback(() => {
+    if (sessionKey) {
+      clearQueuedCompact(sessionKey);
+    }
+    setPendingCompactSession((current) => (current === sessionKey ? null : current));
   }, [sessionKey]);
 
   useEffect(() => {
@@ -1533,6 +1627,9 @@ export function useChatComposerState({
     editQueuedDraft,
     deleteQueuedDraft,
     forceSendQueuedDraft,
+    /** True while a `/compact` waits for the running turn to end. */
+    pendingCompact,
+    cancelPendingCompact,
     backgroundTasks,
     hasActiveBackgroundTasks,
     backgroundWorkQueuesInput,

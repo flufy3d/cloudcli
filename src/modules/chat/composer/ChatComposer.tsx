@@ -103,6 +103,9 @@ type ChatComposerProps = {
   isDragActive: boolean;
   queuedDraft: QueuedDraft | null;
   onEditQueuedDraft: () => void;
+  /** True while a `/compact` waits for the running turn to end before it runs. */
+  pendingCompact: boolean;
+  onCancelPendingCompact: () => void;
   /** True while the composer is editing an already-sent message (edit & resend). */
   isEditingSentMessage: boolean;
   /** Whether editing also reverts the files the agent changed, so the banner can say which. */
@@ -204,6 +207,8 @@ function ChatComposer({
   isDragActive,
   queuedDraft,
   onEditQueuedDraft,
+  pendingCompact,
+  onCancelPendingCompact,
   isEditingSentMessage,
   editRevertsFiles,
   onCancelEditMessage,
@@ -406,6 +411,28 @@ function ChatComposer({
           onStopTasks={onStopBackgroundTasks}
           onRevealTask={onRevealBackgroundTask}
         />
+      )}
+
+      {pendingCompact && (
+        <div className="settings-content-enter mx-auto mb-2 flex max-w-[54.25rem] items-center gap-2 rounded-xl border border-dashed border-primary/25 bg-primary/[0.04] px-3 py-2 text-xs text-foreground">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary/60" aria-hidden />
+          <span className="min-w-0 flex-1">
+            <span className="font-medium uppercase tracking-wide text-primary/70">
+              {t('input.compactQueued.label', { defaultValue: 'Compaction queued' })}
+            </span>
+            <span className="text-muted-foreground">
+              {' · '}
+              {t('input.compactQueued.willRun', { defaultValue: 'Will compact when this turn finishes' })}
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={onCancelPendingCompact}
+            className="shrink-0 rounded-md px-2 py-1 font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            {t('input.compactQueued.cancel', { defaultValue: 'Cancel' })}
+          </button>
+        </div>
       )}
 
       {queuedDraft && (
