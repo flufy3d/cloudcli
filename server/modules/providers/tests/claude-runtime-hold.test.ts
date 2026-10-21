@@ -40,6 +40,12 @@ type Scripted = {
   rejectSwitches: boolean;
   /** Makes the stream throw, as a CLI that dies does. */
   fail: (error: Error) => void;
+  /** The description of every `generateSessionTitle` call, in order. */
+  titleRequests: string[];
+  /** What `generateSessionTitle` answers: a title, null, or an error to reject with. */
+  titleReply: string | null | Error;
+  /** Makes `generateSessionTitle` throw before returning a promise. */
+  throwTitleSynchronously: boolean;
 };
 
 /** A stand-in for the SDK query: yields what the test emits, and reads the held prompt to notice its release. */
@@ -62,6 +68,9 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
     switches,
     rejectSwitches: false,
     fail: (error) => { failure = error; wake?.(); },
+    titleRequests: [],
+    titleReply: null,
+    throwTitleSynchronously: false,
     interrupt: async () => {},
     drain: () => {
       if (wake && queue.length === 0) return new Promise((resolve) => setImmediate(resolve));
@@ -115,7 +124,17 @@ function createScriptedQuery(): { createQuery: NonNullable<ProviderRuntimeContex
         if (script.rejectSwitches) throw new Error('switch refused');
         switches.push(['applyFlagSettings', settings]);
       },
+      generateSessionTitle: (description: string, options?: { persist?: boolean }) => {
+        if (script.throwTitleSynchronously) throw new Error('query closed');
+        return generateTitle(description, options);
+      },
     });
+    async function generateTitle(description: string, options?: { persist?: boolean }) {
+      assert.equal(options?.persist, true, 'the title must be written to the transcript');
+      script.titleRequests.push(description);
+      if (script.titleReply instanceof Error) throw script.titleReply;
+      return script.titleReply;
+    }
   };
 
   return { createQuery, script };
@@ -749,6 +768,80 @@ test('a turn sent while the process is held goes into that process, and the back
     assert.equal(completes(sent).length, 1, 'the first writer saw only its own turn complete');
     assert.equal(script.released(), false, 'still held for the background Bash');
     assert.deepEqual(listClaudeSDKBackgroundWork().map((entry) => entry.tasks.map((task) => task.taskId)), [['b1']]);
+  });
+});
+
+test('every turn asks the engine to title the session from its prompt, since a resumed CLI never does', async () => {
+  await withRun(async ({ script, sent }) => {
+    script.emit(init());
+    script.emit(result());
+    await script.drain();
+    assert.deepEqual(script.titleRequests, ['hello']);
+    assert.equal(completes(sent).length, 1);
+  });
+});
+
+test('a held process stops asking for a title once the engine has one', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    script.titleReply = 'Dev server work';
+    await holdForBackgroundBash(script);
+    const second = nextTurn('change direction');
+    await until(() => script.prompts.length >= 2);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+    assert.deepEqual(script.titleRequests, ['hello'], 'the second turn does not ask again');
+  });
+});
+
+test('a held process keeps asking while the engine has no title yet', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    await holdForBackgroundBash(script);
+    const second = nextTurn('/hi then a real topic');
+    await until(() => script.prompts.length >= 2);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+    assert.deepEqual(script.titleRequests, ['hello', '/hi then a real topic']);
+  });
+});
+
+test('a failed title request does not disturb the turn', async () => {
+  await withRun(async ({ script, sent }) => {
+    script.titleReply = new Error('Control request aborted');
+    script.emit(init());
+    script.emit(assistantText('done'));
+    script.emit(result());
+    await script.drain();
+    assert.deepEqual(script.titleRequests, ['hello']);
+    assert.equal(completes(sent).length, 1);
+    assert.ok(sent.some((message) => message.kind === 'text' && message.content === 'done'));
+  });
+});
+
+test('a held process asks again on the next turn after a failed title request', async () => {
+  await withRun(async ({ script, nextTurn }) => {
+    script.titleReply = new Error('Control request aborted');
+    await holdForBackgroundBash(script);
+    script.titleReply = 'Dev server work';
+    const second = nextTurn('change direction');
+    await until(() => script.prompts.length >= 2);
+    script.emit(init());
+    script.emit(result());
+    await second.done;
+    assert.deepEqual(script.titleRequests, ['hello', 'change direction']);
+  });
+});
+
+test('a title request that throws synchronously does not disturb the turn', async () => {
+  await withRun(async ({ script, sent }) => {
+    script.throwTitleSynchronously = true;
+    script.emit(init());
+    script.emit(assistantText('done'));
+    script.emit(result());
+    await script.drain();
+    assert.equal(completes(sent).length, 1);
+    assert.ok(sent.some((message) => message.kind === 'text' && message.content === 'done'));
   });
 });
 

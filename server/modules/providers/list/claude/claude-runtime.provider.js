@@ -1173,6 +1173,38 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       });
     }
 
+    // The CLI titles a session (its `ai-title`) only from the first prompt of
+    // the process that created it, and skips a slash command. Every turn here
+    // after the first resumes in a new process, which never tries again, so a
+    // session opened with `/skill ...` or whose one attempt failed stays
+    // untitled for good. Each turn therefore asks the engine itself: it
+    // answers with the title it already has (custom or ai) without a model
+    // call, declines a slash command, and otherwise writes a fresh `ai-title`
+    // that the session synchronizer picks up. Once it reports a title, this
+    // process stops asking; one request at a time.
+    let sessionTitleKnown = false;
+    let sessionTitleRequested = false;
+    const requestSessionTitle = () => {
+      if (sessionTitleKnown || sessionTitleRequested) return;
+      if (typeof queryInstance.generateSessionTitle !== 'function') return;
+      if (typeof command !== 'string' || !command.trim()) return;
+      const reportFailure = (error) => {
+        // A process that exits before the title arrives drops the request;
+        // the next turn asks again.
+        console.warn('[Claude SDK] Session title request failed:', error?.message || error);
+      };
+      sessionTitleRequested = true;
+      try {
+        Promise.resolve(queryInstance.generateSessionTitle(command, { persist: true })).then((title) => {
+          if (title) sessionTitleKnown = true;
+        }, reportFailure).finally(() => { sessionTitleRequested = false; });
+      } catch (error) {
+        // The method is not declared in the SDK's types; never let it break the turn.
+        sessionTitleRequested = false;
+        reportFailure(error);
+      }
+    };
+
     const isTurnInFlight = () => !turnCompleteSent;
 
     // A turn the process cannot take after all goes to a fresh process,
@@ -1331,6 +1363,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         || (!current && abortedInstances.has(queryInstance))) break;
       if (message.type === 'system' && message.subtype === 'init') {
         cliTurnActive = true;
+        requestSessionTitle();
       }
       // Capture session ID from first message
       if (message.session_id && !capturedSessionId) {
