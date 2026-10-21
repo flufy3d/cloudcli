@@ -13,7 +13,7 @@
  */
 
 import crypto from 'crypto';
-import { promises as fs } from 'fs';
+import { promises as fs, statSync } from 'fs';
 import os from 'os';
 import path from 'path';
 
@@ -95,14 +95,171 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 //     push follow-up turns (background-task completions, Monitor notifications,
 //     scheduled wake-ups).
 //
-// The hold normally ends long before this: a turn with nothing outstanding closes
-// stdin immediately, and background work releases it as soon as it reports back;
-// a new turn either continues on the held process or supersedes it. This ceiling
+// The hold normally ends long before this: background work hands the process
+// over to idle residency (below) as soon as it reports back, and a new turn
+// either continues on the held process or supersedes it. This ceiling
 // only catches background work that never reports at all, so an abandoned session
 // cannot leak a CLI process forever. The timer resets on every message, so it
 // measures silence, not total time — and a dev server left running in the
 // background prints nothing back for long stretches, hence two hours.
 const BG_WAIT_CEILING_MS = 2 * 60 * 60 * 1000;
+
+// Idle residency (docs/design/Claude会话常驻.md): a process whose turn ended
+// with nothing outstanding stays alive for the session's next turn, which
+// then skips starting a CLI and resuming the whole transcript (measured on an
+// 18MB session: 13–26s to the first reply on a fresh process, 1.5–1.8s on the
+// same one). Read on every use so an operator can change them without a
+// restart, and so tests can turn residency on and off.
+const DEFAULT_RESIDENT_IDLE_MS = 10 * 60 * 1000;
+const DEFAULT_RESIDENT_MAX = 4;
+
+/** How long an idle process waits for the next turn; 0 turns residency off. */
+function residentIdleMs() {
+  const value = Number.parseInt(process.env.CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS ?? '', 10);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_RESIDENT_IDLE_MS;
+}
+
+/** How many idle processes stay alive at once; processes held for background work are not counted. */
+function residentMax() {
+  const value = Number.parseInt(process.env.CLOUDCLI_CLAUDE_RESIDENT_MAX ?? '', 10);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_RESIDENT_MAX;
+}
+
+// Idle processes in the order they went idle, oldest first, so the oldest is
+// the one let go when there are too many. Keyed by session; the instance
+// tells a stale entry from the session's current process.
+const idleResidents = new Map();
+
+function registerIdleResident(sessionKey, instance, release) {
+  idleResidents.delete(sessionKey);
+  idleResidents.set(sessionKey, { instance, release });
+  while (idleResidents.size > residentMax()) {
+    const [oldestKey, oldest] = idleResidents.entries().next().value;
+    idleResidents.delete(oldestKey);
+    oldest.release();
+  }
+}
+
+function unregisterIdleResident(sessionKey, instance) {
+  if (idleResidents.get(sessionKey)?.instance === instance) idleResidents.delete(sessionKey);
+}
+
+// Sessions being archived or deleted: no turn may start in them until the
+// action is over (see `closeSessionAdmission`).
+const closedAdmissions = new Set();
+
+/**
+ * The modification times of the configuration a CLI process reads once, at
+ * start. Measured: a process does not see a CLAUDE.md written after it
+ * started, and a fresh one does. An idle-resident process whose fingerprint
+ * differs from the next turn's cannot take that turn.
+ *
+ * The skills, commands, agents and rules folders are read one level down:
+ * each skill's `SKILL.md` and each file directly in the other folders. A
+ * folder's own time changes only when a direct child is added or removed, so
+ * editing `skills/deploy/SKILL.md` would otherwise go unseen. Files deeper
+ * than that, and files a CLAUDE.md pulls in with `@path`, are not followed.
+ * @param {string|undefined} cwd - The turn's working directory
+ * @returns {Promise<string>} Comparable fingerprint
+ */
+async function readClaudeConfigFingerprint(cwd) {
+  const userDir = path.join(os.homedir(), '.claude');
+  const files = [
+    path.join(userDir, 'settings.json'),
+    path.join(userDir, 'CLAUDE.md'),
+    path.join(userDir, 'plugins', 'installed_plugins.json'),
+  ];
+  const folders = [userDir];
+  if (cwd) {
+    const projectDir = path.join(cwd, '.claude');
+    files.push(
+      path.join(cwd, '.mcp.json'),
+      path.join(projectDir, 'CLAUDE.md'),
+      path.join(projectDir, 'settings.json'),
+      path.join(projectDir, 'settings.local.json'),
+    );
+    folders.push(projectDir);
+    // The CLI reads CLAUDE.md (and CLAUDE.local.md) from the working directory
+    // and every directory above it.
+    for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+      files.push(path.join(dir, 'CLAUDE.md'), path.join(dir, 'CLAUDE.local.md'));
+      if (path.dirname(dir) === dir) break;
+    }
+  }
+  const listed = await Promise.all(folders.flatMap((base) => [
+    listConfigFolder(path.join(base, 'skills'), 'SKILL.md'),
+    listConfigFolder(path.join(base, 'commands')),
+    listConfigFolder(path.join(base, 'agents')),
+    listConfigFolder(path.join(base, 'rules')),
+  ]));
+  const paths = [...files, ...listed.flat()];
+  const times = await Promise.all(paths.map((file) => fs.stat(file).then((stat) => stat.mtimeMs, () => null)));
+  return JSON.stringify(paths.map((file, index) => [file, times[index]]));
+}
+
+/**
+ * A config folder and what one level down in it can change: each entry, and
+ * for a skills folder each entry's `inner` file. Sorted, so the fingerprint
+ * does not depend on listing order. A missing folder lists only itself.
+ * @param {string} folder - Folder to list
+ * @param {string} [inner] - File inside each entry to include (`SKILL.md`)
+ * @returns {Promise<string[]>} Paths to stat
+ */
+async function listConfigFolder(folder, inner) {
+  let names;
+  try {
+    names = await fs.readdir(folder);
+  } catch {
+    return [folder];
+  }
+  const entries = names.sort().map((name) => path.join(folder, name));
+  return [folder, ...entries, ...(inner ? entries.map((entry) => path.join(entry, inner)) : [])];
+}
+
+/**
+ * Whether lines written to a transcript after `offset` show that another
+ * process continued the conversation: a user or assistant line the resident
+ * process did not report on its stream, or a `continued-in` record (the
+ * terminal moved the session to a background job). Measured: a terminal
+ * `claude -p --resume` appends its turn to the same file, and the stream
+ * reports the uuid of every assistant line the process itself writes; its
+ * own prompt lines are written before the turn ends, so before `offset`.
+ * @param {string} transcriptPath - The session's transcript
+ * @param {number} offset - Byte length of the file when the process went idle
+ * @param {Set<string>} ownUuids - Uuids the process reported on its stream
+ * @returns {Promise<boolean>} True when another writer is evident
+ */
+async function transcriptWrittenByAnother(transcriptPath, offset, ownUuids) {
+  let content;
+  try {
+    const handle = await fs.open(transcriptPath, 'r');
+    try {
+      const { size } = await handle.stat();
+      // A file that shrank was rewritten, which no idle process does.
+      if (size < offset) return true;
+      const buffer = Buffer.alloc(size - offset);
+      await handle.read(buffer, 0, buffer.length, offset);
+      content = buffer.toString('utf8');
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    console.warn('[Claude SDK] Could not read the transcript to check for another writer:', error?.message || error);
+    return false;
+  }
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry?.type === 'continued-in') return true;
+    if ((entry?.type === 'user' || entry?.type === 'assistant') && !ownUuids.has(entry.uuid)) return true;
+  }
+  return false;
+}
 
 const TOOLS_REQUIRING_INTERACTION = new Set(['AskUserQuestion', 'ExitPlanMode']);
 
@@ -384,9 +541,12 @@ function mapCliOptionsToSDK(options = {}) {
  * @param {Object} queryInstance - SDK query instance
  * @param {Object} writer - WebSocket writer for reconnect support
  * @param {Function} releaseInput - Closes the held stdin stream so the CLI can exit
- * @param {{ isTurnInFlight?: Function, continueTurn?: Function, withdrawPendingTurn?: Function }} turnHooks -
+ * @param {{ isTurnInFlight?: Function, continueTurn?: Function, withdrawPendingTurn?: Function,
+ *   isResidentIdle?: Function, hasWork?: Function, writtenByAnotherWhileIdle?: Function }} turnHooks -
  *   Whether the current turn's reply is still running, how a later turn hands itself to this
- *   process, and how a stop withdraws a handed-over turn not yet written into it
+ *   process, how a stop withdraws a handed-over turn not yet written into it, whether the
+ *   process waits idle for the next turn, whether it has work that must not be reclaimed,
+ *   and whether another process continued the conversation while it was idle
  */
 function addSession(sessionId, queryInstance, writer = null, releaseInput = null, turnHooks = {}) {
   const existing = activeSessions.get(sessionId);
@@ -421,7 +581,10 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
     releaseInput: releaseInput || carried?.releaseInput || null,
     isTurnInFlight: turnHooks.isTurnInFlight || carried?.isTurnInFlight || null,
     continueTurn: turnHooks.continueTurn || carried?.continueTurn || null,
-    withdrawPendingTurn: turnHooks.withdrawPendingTurn || carried?.withdrawPendingTurn || null
+    withdrawPendingTurn: turnHooks.withdrawPendingTurn || carried?.withdrawPendingTurn || null,
+    isResidentIdle: turnHooks.isResidentIdle || carried?.isResidentIdle || null,
+    hasWork: turnHooks.hasWork || carried?.hasWork || null,
+    writtenByAnotherWhileIdle: turnHooks.writtenByAnotherWhileIdle || carried?.writtenByAnotherWhileIdle || null
   });
   // The history reader reports a background agent as running or stopped by
   // whether this entry exists, and the cached history does not see this map.
@@ -838,6 +1001,7 @@ async function prepareTurnInputs(command, options, context, providerSessionId) {
     promptMessages,
     baseAllowedTools,
     compatibilityKey: heldProcessCompatibilityKey(sdkOptions, baseAllowedTools),
+    configFingerprint: await readClaudeConfigFingerprint(options.cwd),
     // Whether the model takes an effort at all; the CLI ignores one for a
     // model that does not (measured: no `output_config` after `setModel('haiku')`).
     // A model with no catalog entry is assumed to, as `resolveClaudeEffort` does.
@@ -850,7 +1014,10 @@ async function prepareTurnInputs(command, options, context, providerSessionId) {
  * process start. The model, permission mode and effort are left out because a
  * held process switches them (`setModel`, `setPermissionMode`,
  * `applyFlagSettings({ effortLevel })`); the resume id is left out because it
- * is the session the process already runs.
+ * is the session the process already runs. The configuration files it read at
+ * start (`readClaudeConfigFingerprint`) are compared separately, and only for
+ * an idle-resident process: one held for background work keeps that work
+ * running rather than restart for a CLAUDE.md edit.
  */
 function heldProcessCompatibilityKey(sdkOptions, baseAllowedTools) {
   const {
@@ -921,6 +1088,10 @@ async function loadMcpConfig(cwd) {
 
 /**
  * Executes a Claude query using the SDK
+ *
+ * Settles when the turn's process exits, or as soon as it goes idle-resident
+ * after the turn: the process then waits for the session's next turn on its
+ * own, and the caller has nothing more to wait for.
  * @param {string} command - User prompt/command
  * @param {Object} options - Query options
  * @param {Object} ws - WebSocket connection
@@ -928,6 +1099,32 @@ async function loadMcpConfig(cwd) {
  * @returns {Promise<void>}
  */
 async function queryClaudeSDK(command, options = {}, ws, context) {
+  if (refusedByClosedAdmission(options, ws)) return undefined;
+  let wentIdle;
+  const idle = new Promise((resolve) => { wentIdle = resolve; });
+  return Promise.race([runClaudeProcess(command, options, ws, context, wentIdle), idle]);
+}
+
+/**
+ * Refuses a turn in a conversation that is being archived or deleted, with an
+ * error and the run's terminal `complete`. Checked on entry and again right
+ * before a new process would start, since a turn can wait on file reads in
+ * between.
+ * @returns {boolean} True when the turn was refused
+ */
+function refusedByClosedAdmission(options, ws) {
+  if (!options.sessionId || !closedAdmissions.has(options.sessionId)) return false;
+  ws.send(createNormalizedMessage({ kind: 'error', content: 'The Claude conversation is being closed and cannot take another message.', sessionId: options.sessionId, provider: 'claude' }));
+  ws.send(createCompleteMessage({ provider: 'claude', sessionId: options.sessionId, exitCode: 1 }));
+  return true;
+}
+
+/**
+ * Runs one turn on a new CLI process, or hands it to the session's held one,
+ * and keeps that process going for as long as it is held or resident.
+ * @param {Function} onResidentIdle - Called when the process goes idle-resident
+ */
+async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
   const { sessionId } = options;
   // Rebound, with `command`, `options` and `ws`, when a later turn of the
   // session continues on this run's held process (see `continueTurn`).
@@ -964,6 +1161,17 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // True while the process is being held open for background work, so a later
   // `result` can be recognised as that work reporting back.
   let heldForBackgroundWork = false;
+  // Idle residency: the turn ended with nothing outstanding and the process
+  // waits for the session's next turn. `idleTranscriptOffset` is the
+  // transcript's byte length when it went idle, for telling another writer's
+  // lines from its own (`ownEntryUuids`, the uuids it reported on its stream).
+  let residentIdle = false;
+  let residentIdleTimer = null;
+  let idleTranscriptOffset = null;
+  const ownEntryUuids = new Set();
+  // The idle process a turn was handed to, so a stop that withdraws that turn
+  // before it is written can put the process back to idle.
+  let idleBeforeHandover = false;
   // Set once a turn publishes a budget read from an assistant message, so the
   // turn-ending `result` is only mined for usage when nothing better arrived.
   let assistantBudgetSent = false;
@@ -995,6 +1203,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   if (continued) {
     return continued.turn;
   }
+  if (refusedByClosedAdmission(options, ws)) return undefined;
 
   // Otherwise a new turn supersedes any earlier one still holding this
   // session's process open, so held runs cannot stack up across a conversation.
@@ -1061,9 +1270,26 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // still owns the activeSessions entry (or was superseded by a newer run).
   let queryInstance = null;
 
+  // Ends idle residency: the process takes a turn again, or is going away.
+  const leaveResidentIdle = () => {
+    if (!residentIdle) return;
+    residentIdle = false;
+    if (residentIdleTimer) {
+      clearTimeout(residentIdleTimer);
+      residentIdleTimer = null;
+    }
+    unregisterIdleResident(sessionKey(), queryInstance);
+    // Idle means nothing was outstanding, so the run that follows starts
+    // afresh as far as the history reader is concerned: an agent launched
+    // before it can no longer report.
+    const session = getSession(sessionKey());
+    if (session?.instance === queryInstance) session.startTime = Date.now();
+    sessionHistoryCache.invalidate(sessionKey());
+  };
+
   try {
     // The key is fixed before `canUseTool` can widen `allowedTools` for a remembered grant.
-    const { sdkOptions, promptMessages, compatibilityKey } = await prepareTurnInputs(command, options, context, providerSessionId);
+    const { sdkOptions, promptMessages, compatibilityKey, configFingerprint } = await prepareTurnInputs(command, options, context, providerSessionId);
     // What the process was started with, for the switches a continued turn makes.
     const startedWithEffort = sdkOptions.effort !== undefined;
     const startedInPlan = sdkOptions.permissionMode === 'plan';
@@ -1182,7 +1408,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // stream to drive the hold logic below without a CLI process).
     const createQuery = context.createQuery ?? query;
     let heldPrompt = createHeldPromptStream(promptMessages);
-    releasePromptStream = () => { inputReleased = true; heldPrompt.release(); };
+    releasePromptStream = () => { leaveResidentIdle(); inputReleased = true; heldPrompt.release(); };
     try {
       queryInstance = createQuery({
         prompt: heldPrompt.stream,
@@ -1249,6 +1475,50 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     const processGoingAway = () => inputReleased || supersededInstances.has(queryInstance)
       || (abortedInstances.has(queryInstance) && !turnOnlyAbortTokens.has(queryInstance));
 
+    // The turn ended with nothing outstanding. Keep the process for the
+    // session's next turn unless residency is off, the turn's prompt is about
+    // to be re-sent on a fresh process (`pendingIdleResend`), or the process is
+    // already going. The caller is released here: it waits for nothing more.
+    // Only a caller that sends the session's later turns through here asks
+    // for it (`residentBetweenTurns`, the chat gateway); a one-shot caller's
+    // process would wait for a turn that never comes.
+    const enterResidentIdle = () => {
+      if (residentIdle) return;
+      const idleMs = residentIdleMs();
+      if (!options.residentBetweenTurns || idleMs <= 0 || residentMax() <= 0 || pendingIdleResend
+        || processGoingAway() || !sessionKey() || getSession(sessionKey())?.instance !== queryInstance) {
+        releasePromptStream();
+        return;
+      }
+      residentIdle = true;
+      idleTranscriptOffset = null;
+      const transcriptPath = context.resolveTranscriptPath?.(sessionKey());
+      if (transcriptPath) {
+        // Read now, synchronously: a line another process appends a moment
+        // later must land after the recorded length.
+        try {
+          idleTranscriptOffset = statSync(transcriptPath).size;
+        } catch {
+          // No transcript yet: nothing to compare against.
+        }
+      }
+      residentIdleTimer = setTimeout(() => {
+        residentIdleTimer = null;
+        releasePromptStream();
+      }, idleMs);
+      residentIdleTimer.unref?.();
+      registerIdleResident(sessionKey(), queryInstance, () => releasePromptStream());
+      sessionHistoryCache.invalidate(sessionKey());
+      onResidentIdle();
+    };
+    // Whether another process continued the conversation while this one was
+    // idle; it then holds a stale conversation and must not take the turn.
+    const writtenByAnotherWhileIdle = async () => {
+      const transcriptPath = context.resolveTranscriptPath?.(sessionKey());
+      if (!residentIdle || !transcriptPath || idleTranscriptOffset === null) return false;
+      return transcriptWrittenByAnother(transcriptPath, idleTranscriptOffset, ownEntryUuids);
+    };
+
     // Applies a continued turn's model, permission mode and effort to the
     // live process. Measured: each takes effect from the next turn's request.
     const switchProcessFor = async (next) => {
@@ -1305,6 +1575,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       // Withdrawn by a stop, or already moved by the wind-down.
       if (pendingTurn !== next || processGoingAway()) return;
       pendingTurn = null;
+      idleBeforeHandover = false;
+      leaveResidentIdle();
+      // Only the lines written from here on are compared against another writer.
+      ownEntryUuids.clear();
 
       ws = next.writer;
       command = next.command;
@@ -1355,6 +1629,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       const awaitingStoppedResult = turnOnlyAbortTokens.has(queryInstance);
       if ((!turnCompleteSent && !awaitingStoppedResult) || pendingTurn || processGoingAway()
         || next.compatibilityKey !== compatibilityKey
+        // Measured: a process does not see a CLAUDE.md written after it started.
+        || (residentIdle && next.configFingerprint !== configFingerprint)
         || (startedInPlan && next.sdkOptions.permissionMode !== 'plan')
         // Measured: the CLI refuses bypass unless launched with it.
         || (!startedWithBypass && next.sdkOptions.permissionMode === 'bypassPermissions')
@@ -1363,6 +1639,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       }
       return new Promise((resolve) => {
         pendingTurn = { ...next, resolve };
+        // Out of the idle timer and the eviction order while the turn goes in.
+        idleBeforeHandover = residentIdle;
+        leaveResidentIdle();
         if (!cliTurnActive && !awaitingStoppedResult) runPendingTurn();
       });
     };
@@ -1373,9 +1652,20 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       if (!next) return false;
       pendingTurn = null;
       next.resolve();
+      if (idleBeforeHandover) {
+        idleBeforeHandover = false;
+        enterResidentIdle();
+      }
       return true;
     };
-    const turnHooks = { isTurnInFlight, continueTurn, withdrawPendingTurn };
+    const isResidentIdle = () => residentIdle;
+    // Work that must not be reclaimed: a reply in flight, background work or
+    // the reply it owes, or a turn handed over and not yet written.
+    const hasWork = () => !turnCompleteSent || cliTurnActive || Boolean(pendingTurn) || pendingIdleResend
+      || backgroundReplyPending || backgroundWork.hasPending(sessionKey());
+    const turnHooks = {
+      isTurnInFlight, continueTurn, withdrawPendingTurn, isResidentIdle, hasWork, writtenByAnotherWhileIdle,
+    };
     // Track the query instance for abort capability
     if (sessionKey()) {
       addSession(sessionKey(), queryInstance, ws, releasePromptStream, turnHooks);
@@ -1393,8 +1683,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       if (current && current.instance !== queryInstance) supersededInstances.add(queryInstance);
       if (supersededInstances.has(queryInstance)
         || (!current && abortedInstances.has(queryInstance))) break;
+      if (typeof message.uuid === 'string') ownEntryUuids.add(message.uuid);
       if (message.type === 'system' && message.subtype === 'init') {
         cliTurnActive = true;
+        leaveResidentIdle();
         if (Array.isArray(message.slash_commands)) slashCommands = new Set(message.slash_commands);
         requestSessionTitle();
       }
@@ -1492,7 +1784,11 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         && !pendingTurn
       ) {
         heldForBackgroundWork = false;
-        releasePromptStream();
+        if (idleReleaseTimer) {
+          clearTimeout(idleReleaseTimer);
+          idleReleaseTimer = null;
+        }
+        enterResidentIdle();
       }
 
       if (message.type === 'result') {
@@ -1566,12 +1862,16 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
           scheduleRelease();
         } else if (!pendingTurn) {
           // Either nothing was backgrounded, or the background work just
-          // reported in — let the CLI exit now, as it always has.
+          // reported in — the process waits for the next turn, idle.
           heldForBackgroundWork = false;
+          if (idleReleaseTimer) {
+            clearTimeout(idleReleaseTimer);
+            idleReleaseTimer = null;
+          }
           if (lastBroadcastHadTasks) {
             broadcastBackgroundTasks();
           }
-          releasePromptStream();
+          enterResidentIdle();
         }
         // A turn that waited for this turn to end goes in now.
         if (pendingTurn) runPendingTurn();
@@ -1657,6 +1957,13 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       return;
     }
 
+    // An idle-resident process that dies (killed, out of memory) failed no
+    // turn: the last one completed long ago, and the next starts afresh.
+    if (residentIdle) {
+      console.warn(`[Claude SDK] Idle process for session ${sessionKey()} exited:`, error?.message || error);
+      return;
+    }
+
     // Check if Claude CLI is installed for a clearer error message
     const installed = await context.isProviderInstalled();
     const errorContent = !installed
@@ -1728,6 +2035,16 @@ async function continueOnHeldProcess(command, options, writer, context, provider
     return null;
   }
   // Another turn may have replaced the process while the inputs were read.
+  if (getSession(sessionId) !== held) {
+    return null;
+  }
+  // Another process (the terminal) continued the conversation while this one
+  // was idle: it holds a stale conversation, so the turn resumes afresh.
+  if (await held.writtenByAnotherWhileIdle?.()) {
+    console.log(`[Claude SDK] Session ${sessionId} was continued elsewhere while idle; resuming it on a fresh process`);
+    held.releaseInput?.();
+    return null;
+  }
   if (getSession(sessionId) !== held) {
     return null;
   }
@@ -1875,7 +2192,21 @@ function isClaudeSDKSessionActive(sessionId) {
  */
 function getClaudeSDKSessionStartTime(sessionId) {
   const session = getSession(sessionId);
-  return session && session.status === 'active' ? session.startTime : null;
+  // An idle-resident process has nothing outstanding: an agent that never
+  // reported back can no longer report, so it reads as stopped.
+  if (!session || session.status !== 'active' || session.isResidentIdle?.()) return null;
+  return session.startTime;
+}
+
+/**
+ * Lets every Claude process the server keeps go, idle-resident or held for
+ * background work, so none outlives the host. The server entrypoint calls it
+ * at shutdown.
+ */
+function closeClaudeResidentSessions() {
+  for (const session of activeSessions.values()) {
+    session.releaseInput?.();
+  }
 }
 
 /**
@@ -1948,6 +2279,13 @@ export const claudeRuntime = {
   },
   listBackgroundWork: listClaudeSDKBackgroundWork,
   stopBackgroundTask: stopClaudeSDKTask,
+  /** Whether the session has work that must not be reclaimed; an idle-resident process has none. */
+  hasSessionWork: (sessionId) => Boolean(getSession(sessionId)?.hasWork?.()),
+  /** Refuses new turns while the session is archived or deleted. */
+  closeSessionAdmission: (sessionId) => { closedAdmissions.add(sessionId); },
+  openSessionAdmission: (sessionId) => { closedAdmissions.delete(sessionId); },
+  /** Lets the session's process go, such as an idle-resident one. */
+  releaseSession: (sessionId) => { getSession(sessionId)?.releaseInput?.(); },
 };
 
 // Export public API
@@ -1958,6 +2296,7 @@ export {
   stopClaudeSDKTask,
   isClaudeSDKSessionActive,
   getClaudeSDKSessionStartTime,
+  closeClaudeResidentSessions,
   getActiveClaudeSDKSessions,
   resolveToolApproval,
   getPendingApprovalsForSession,

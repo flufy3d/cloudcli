@@ -371,6 +371,9 @@ async function dispatchRun(
     sessionId,
     cwd: clientOptions.cwd ?? session.project_path ?? undefined,
     projectPath: session.project_path ?? clientOptions.projectPath,
+    // The conversation's later turns come through here too, so a runtime may
+    // keep its engine process alive for them (Claude's idle residency).
+    residentBetweenTurns: true,
   };
 
   let failure: string | null = null;

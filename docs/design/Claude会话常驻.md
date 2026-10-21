@@ -1,6 +1,6 @@
 # Claude 会话常驻
 
-> 状态：待评审（2026-10-21）
+> 状态：已实施（2026-10-21）；交付前待用户在自己的大会话上连发几轮验收
 > 目标：Claude 会话一轮结束后，CLI 进程留一段空闲时间。用户在这段时间里发的下一轮直接写进这个进程，不再新开进程、不再续接整份记录。
 
 ## 为什么要改
@@ -29,7 +29,7 @@
 
 数据的局限：大会话只测了一个，两次新开进程分别是 13 秒和 26 秒，波动很大。只能说"大会话每轮多等 10 秒以上"这个量级可信，具体数字不准。测试用的是 18MB 会话的副本，放在临时项目目录里，测完已删除。
 
-内存：本机一个空闲的 CLI 进程（`claude --session-id ...`，后台会话）RSS 约 230MB。Codex 一个 app-server 进程组约 158MB（见 [Codex 会话驻留](Codex会话驻留.md)）。
+内存：产品评审时量了一个正在运行的 CLI 进程（4.7MB 的会话），主进程 394MB，加上它拉起的 MCP 子进程（zai-mcp-server、playwright-mcp、rea、codegraph，每个 40–50MB），整组约 727MB。常驻时这些子进程一起留着。只量了这一个进程，更大的会话可能更多。Codex 一个 app-server 进程组约 158MB（见 [Codex 会话驻留](Codex会话驻留.md)）。
 
 ## 方案
 
@@ -68,13 +68,18 @@ stateDiagram-v2
 
 常驻把进程寿命从一轮拉长到最多十分钟以后，多出两种需要新开进程的情况。
 
-**1. 配置文件改了。** 进程启动时读过的配置，常驻期间改了它看不到：CLAUDE.md、settings.json、技能和命令。办法是在兼容判断里加一份配置指纹，内容是这些文件和目录的修改时间：
+**1. 配置文件改了。** 进程启动时读过的配置，常驻期间改了它看不到：CLAUDE.md、settings.json、技能、命令、agents、rules、`.mcp.json`、已装插件。办法是在续用判断里比较一份配置指纹（`readClaudeConfigFingerprint`），内容是这些路径的修改时间：
 
-- `~/.claude/settings.json`、`~/.claude/CLAUDE.md`
-- `<cwd>/CLAUDE.md`、`<cwd>/.claude/settings.json`、`<cwd>/.claude/settings.local.json`
-- `~/.claude/skills`、`~/.claude/commands`、`<cwd>/.claude/skills`、`<cwd>/.claude/commands` 这几个目录
+- 用户级：`~/.claude/settings.json`、`~/.claude/CLAUDE.md`、`~/.claude/plugins/installed_plugins.json`
+- 项目级：`<cwd>/.mcp.json`、`<cwd>/.claude/CLAUDE.md`、`<cwd>/.claude/settings.json`、`<cwd>/.claude/settings.local.json`
+- 工作目录和它往上每一级的 `CLAUDE.md`、`CLAUDE.local.md`
+- 用户级与项目级的 `skills`、`commands`、`agents`、`rules` 四个目录往下一层：目录本身、每一项、每个技能目录里的 `SKILL.md`
 
-每轮多做十来次 `stat`。局限：目录的修改时间只在增删直接子项时变化，只改某个技能目录里的 `SKILL.md` 看不出来，要等空闲到期才生效。CLI 在终端里长时间开着的会话也有同样的局限，这里不比终端差。实施前先用探针确认：常驻进程是不是真的看不到 CLAUDE.md 的改动。如果 CLI 自己会重读，就把它从指纹里拿掉。
+例子：用户在会话里让 Claude 改了 `.claude/skills/deploy/SKILL.md`，接着说"再试一次"。目录的修改时间只在增删直接子项时变，只看目录会漏掉这次修改，常驻进程还用旧技能，页面上又看不出进程是常驻的，用户会以为没改成功。所以往下多看一层。在本机真实配置上（全局 175 个技能），一次指纹要看 506 个路径，中位数 3.8 毫秒。仍看不出的：更深一层的文件（技能目录里 `SKILL.md` 以外的文件），以及 CLAUDE.md 用 `@path` 引入的文件，这些要等空闲到期才生效。
+
+指纹只约束空闲常驻的进程。为后台工作留着的进程不看指纹，照旧续用：用户起了后台 dev server，又让 Claude 往 CLAUDE.md 记一条规则，下一轮不能因此杀掉 dev server。
+
+实测：空闲期间写入「每次回复都以『喵』开头」的 CLAUDE.md，常驻进程回「好」，新开进程续接回「喵好」，所以 CLAUDE.md 必须在指纹里。
 
 **2. 别的进程写了同一份记录。** 用户在常驻期间用终端 `claude --resume` 打开了同一个会话。常驻进程手里的对话状态不知道终端那边新增的内容，继续用它会让两边各走各的。今天在回合进行中就有这个风险，常驻把风险窗口拉长到十分钟。
 
@@ -83,9 +88,9 @@ stateDiagram-v2
 - `type` 为 `user` 或 `assistant` 的行。空闲常驻期间本进程不会自己写对话行，只会追加 `ai-title`、`cost-state` 这类元数据行。
 - `continued-in` 行，即会话被终端转去了后台任务（2026-10-21 实际遇到过）。
 
-这一条要用探针验证两件事：空闲期间本进程确实不写对话行；终端续接同一会话时写的是同一个文件。如果终端续接会新开 transcript 文件，就改成同时检查同目录下有没有更新的同会话文件。
+实测结果：空闲 8 秒内本进程没往记录里写任何一行；终端 `claude -p --resume` 把整轮（`user`、`assistant` 及元数据行）追加在同一个文件末尾，且这些行的 `entrypoint` 也是 `sdk-ts`，不能按写入方区分。所以判断依据是 uuid：本进程写的助手行 uuid 都在 SDK 流上出现过，自己的提示词行流上没有，但它们在回合开始时就写入了，早于记下的长度。规则因此是"记下长度之后新增的 `user` / `assistant` 行，uuid 不在本进程流上出现过的，就是别人写的"。记录文件路径取会话行的 `jsonl_path`；新会话还没被同步器收录时拿不到路径，这一轮跳过检查。
 
-**登录凭证**：`sdkOptions.env` 现在不进兼容判断。它就是服务进程自己的 `process.env`，CloudCLI 不往里注入 Claude 凭证（`claude-auth.provider.ts` 只检测凭证来源）。凭证写在 `~/.claude/settings.json` 的 `env` 里时，配置指纹已经覆盖；用订阅登录时，CLI 自己读 `~/.claude` 的登录状态。实施时确认用户在应用里切换 Claude 账号后，常驻进程会不会用新账号。如果不会，就把账号标识加进兼容判断。
+**登录凭证**：`sdkOptions.env` 不进兼容判断。它就是服务进程自己的 `process.env`，CloudCLI 不往里注入 Claude 凭证（`claude-auth.provider.ts` 只检测凭证来源）。凭证写在 `~/.claude/settings.json` 的 `env` 里时，配置指纹已经覆盖；用订阅登录时，CLI 自己读 `~/.claude` 的登录状态。换订阅账号后常驻进程是否立即用新账号没有实测；最坏情况是空闲期内的下一轮还用旧账号，空闲到期后恢复。
 
 ### 生命周期
 
@@ -96,14 +101,21 @@ Codex 常驻引入了三个运行时接口（`server/shared/interfaces.ts`）：
 - `releaseSession`：关掉这个会话的常驻进程（空闲常驻或为后台工作留着的都关）。
 - 服务关闭：在 `server/index.ts` 的关机流程里关掉所有 Claude 常驻进程。和 Codex 一样，PM2 重启本来也会杀掉子进程，这一步是为了让 CLI 正常退出、把记录写完整。
 
-还有一处要改。历史读取靠 `activeSessions` 里有没有这个会话，来判断一个没汇报结果的后台 agent 是"还在跑"还是"已停止"（`addSession` 里的注释）。空闲常驻会让条目一直在，没汇报就结束的 agent 会被显示成还在跑。条目上要标出是否空闲常驻，历史读取据此把这类 agent 当作已停止。
+还有一处要改。历史读取靠 `getClaudeSDKSessionStartTime` 判断一个没汇报结果的后台 agent 是"还在跑"还是"已停止"：启动时间晚于当前进程的读作还在跑。空闲常驻会让进程一直在，没汇报就结束的 agent 会被显示成还在跑。所以进程空闲常驻时这个函数返回 null：空闲就意味着没有后台工作，不可能还有 agent 在跑。
+
+`queryClaudeSDK` 现在一直要等进程退出才返回，网关在返回后执行 `touchSession`。常驻会把这一步拖到十分钟后，侧边栏里的会话会在用户早已离开时被顶到前面。所以进入空闲常驻时，拥有进程的那次调用立即返回。Claude 不带任务接续凭证（那只给 Codex），提前返回不会让进程手里的凭证失效。空闲重发的那一轮不进入常驻，仍等进程退出后在新进程上重发。
 
 ## 代价与什么情况下反而亏
 
-- **内存**：默认上限下，Claude 常驻进程最多约 4 × 230MB ≈ 0.9GB，加上 Codex 的上限，最坏约 1.5GB。为后台工作留着的进程不受上限约束，现在也是这样。
+- **内存**：每个常驻进程连同 MCP 子进程约 700MB，默认上限 4 个时最坏约 2.8GB；加上 Codex 的上限（4 × 158MB）约 3.4GB。为后台工作留着的进程不受上限约束，现在也是这样。产品评审按本机近 30 天的记录模拟 10 分钟窗口：同时 1 个常驻约 56.5 小时/月，2 个约 3.7 小时，3 个及以上合计约 0.8 小时，所以平时多占 0.7–1.4GB，上限很少用满。
+- **MCP 进程的状态跨轮保留**：常驻进程拉起的 MCP 服务一起留着。例如某一轮用 playwright 打开了浏览器，这个浏览器会多留最多 10 分钟；以前这一轮结束就关了。
 - **会话多、每个只聊一两轮**：进程留了十分钟没人用，白占内存，换不来任何提速。这种用法下应把 `CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS` 调小或设为 0。
-- **改技能内容后马上测**：常驻期间改技能目录里的文件，指纹看不出来（见上文局限），要么等空闲到期，要么改一下别的指纹文件。
+- **改技能目录里 `SKILL.md` 以外的文件后马上测**：指纹看不出来（见上文），要等空闲到期。
 - **只读型 hook 少触发**：`SessionStart` 之类的 hook 只在进程启动时触发。常驻后，一个会话连续聊天只触发一次，不再每轮一次。终端里就是这个行为，但如果用户有依赖"每轮触发"的 hook，行为会变。
+
+## 关闭常驻
+
+PM2 管理的进程不读 shell 配置，环境变量要写进 `~/.pm2/ecosystem.config.cjs` 里 `cloudcli` 应用的 `env`：加 `CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS: '0'`，然后由用户执行 `pm2 restart cloudcli` 和 `pm2 save`。关掉后每轮结束进程就退出，与改动前相同。常驻不改记录格式、不留持久状态，关掉不需要迁移。调空闲时长、上限同理（`CLOUDCLI_CLAUDE_RESIDENT_MAX`）。
 
 ## 不在本方案范围
 
@@ -113,8 +125,9 @@ Codex 常驻引入了三个运行时接口（`server/shared/interfaces.ts`）：
 
 ## 改动范围
 
-后端：`claude-runtime.provider.js`（空闲常驻状态、计时、上限与淘汰、配置指纹、外部写入检查）、`claude.provider.ts`（三个生命周期接口）、`claude-sessions.provider.ts`（历史读取的 agent 状态判断）、`server/index.ts`（关机时关常驻进程）。
-文档：`docs/core/providers.md`（Claude 进程生命周期）、`docs/core/overview.md`（关机流程）。
+后端：`claude-runtime.provider.js`（空闲常驻状态、计时、上限与淘汰、配置指纹、外部写入检查、生命周期接口、关机入口）、`chat-websocket.service.ts`（聊天网关带 `residentBetweenTurns: true` 开启常驻；`/api/agent` 与提交信息生成这两个一次性调用方不带，避免进程白等，`/api/agent` 还会在返回后删掉进程的工作目录）、`server/shared/types.ts`（运行时 context 增加 `resolveTranscriptPath`）、`provider-runtime.service.ts` 与 `sessions.service.ts`（按会话行的 `jsonl_path` 提供这个路径）、`providers/index.ts` 与 `server/index.ts`（关机时关 Claude 进程）。生命周期接口直接挂在 `claudeRuntime` 上，`claude.provider.ts` 不用改；历史读取的判断由 runtime 返回 null 解决，`claude-sessions.provider.ts` 不用改。
+文档：`docs/core/providers.md`（Claude 进程生命周期）、`docs/core/chat.md`（`residentBetweenTurns`）、`docs/core/overview.md`（关机流程）。
+探针：`scripts/probe/claude-resident.probe.mjs`（引擎行为）、`scripts/probe/claude-resident-runtime.probe.ts`（经 runtime 的耗时对比）。
 前端：不改。
 
 ## 测试与验收
@@ -129,11 +142,15 @@ Codex 常驻引入了三个运行时接口（`server/shared/interfaces.ts`）：
 - `hasSessionWork`：空闲常驻为假；回合中、有后台工作时为真。`releaseSession` 关掉进程。
 - 空闲常驻期间，没汇报的 agent 在历史里显示为已停止。
 
-真实引擎探针（`scripts/probe/claude-resident.probe.mjs`，临时项目目录，不碰生产会话）：
+真实引擎探针（临时项目目录，不碰生产会话）的结果已写进上文各节。经 runtime 的耗时对比（`claude-resident-runtime.probe.ts`，haiku，每轮回一个字，单位秒，到首条回复）：
 
-- 用大会话副本对比改前改后的第二轮到首条回复时间，验收标准是同一进程续轮的耗时不随记录大小明显增长。
-- 常驻期间修改 CLAUDE.md，确认 CLI 是否自己重读，决定指纹要不要包含它。
-- 常驻期间用终端续接同一会话，确认外部写入检查能发现。
-- 常驻期间本进程只写元数据行，不写对话行。
+| 会话 | 常驻 | 第 1 轮 | 第 2 轮 | 第 3 轮 |
+| --- | --- | --- | --- | --- |
+| 新建小会话 | 关 | 6.2 | 11.3 | 6.3 |
+| 新建小会话 | 开 | 5.8 | 2.4 | 1.5 |
+| 18MB 会话副本 | 关 | 44.1 | 44.9 | 57.1 |
+| 18MB 会话副本 | 开 | 10.7 | 3.4 | 2.5 |
+
+两组第 1 轮条件相同（都是新开进程），大会话却差了 4 倍，说明接口本身波动很大，只能用来看量级。
 
 交付前请用户在自己的大会话上连续发几轮，确认第二轮起回复明显变快。

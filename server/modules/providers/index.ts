@@ -19,6 +19,10 @@ export { listCodexThreadTurns } from './list/codex/codex-app-server.client.js';
 // Codex processes that stay alive between rounds.
 export { closeCodexResidentSessions } from './list/codex/codex-session-manager.js';
 
+// closeClaudeResidentSessions: used by the server entrypoint to stop the
+// Claude processes kept alive between turns or for background work.
+export { closeClaudeResidentSessions } from './list/claude/claude-runtime.provider.js';
+
 export { initializeSessionsWatcher } from './services/sessions-watcher.service.js';
 export { closeSessionsWatcher } from './services/sessions-watcher.service.js';
 

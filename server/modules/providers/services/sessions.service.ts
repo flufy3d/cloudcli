@@ -455,6 +455,14 @@ export const sessionsService = {
   },
 
   /**
+   * The engine transcript recorded for an app session, or null before the
+   * session synchronizer has indexed it.
+   */
+  resolveTranscriptPath(sessionId: string): string | null {
+    return sessionsDb.getSessionById(sessionId)?.jsonl_path ?? null;
+  },
+
+  /**
    * Normalizes one provider-native event into frontend session message events.
    */
   normalizeMessage(

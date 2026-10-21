@@ -101,6 +101,7 @@ flowchart TD
 
 ## 后台任务与输入排队
 
+- **跨轮常驻的开关**：网关组装运行参数时带 `residentBetweenTurns: true`，告诉运行时这个会话的后续轮次也从这里进来，可以把引擎进程留到下一轮（Claude 的空闲常驻，见 providers.md「Claude 后台任务生命周期」）。`/api/agent`、提交信息生成这类一次性调用方不带这个参数，进程照旧在回合结束时退出。
 - **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台执行（如后台 `Bash`、Agent 或定时唤醒）。广播任务条的引擎是 Claude、Antigravity、Codex、ZCode；OpenCode 没有后台登记，不发任务条。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。`TaskCreate` 只创建待办项，不属于后台执行。
 - **状态同步与广播**：
   - `ActiveBackgroundTask` 表示输入框需要展示的执行任务，具体字段以共享协议为准。

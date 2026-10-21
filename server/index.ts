@@ -17,6 +17,7 @@ import {
     providerRuntimeService,
     sessionsAutoArchiveService,
     setSessionWorktreeHomeResolver,
+    closeClaudeResidentSessions,
     closeCodexResidentSessions,
     shutdownZCodeRuntime,
 } from '@/modules/providers/index.js';
@@ -510,6 +511,14 @@ async function startServer() {
                 closeCodexResidentSessions();
             } catch (err) {
                 console.error('[Codex] Error closing the resident sessions during shutdown:', getErrorMessage(err));
+            }
+            try {
+                // Likewise the Claude processes kept for the next turn or for
+                // background work: closing stdin is the CLI's own signal to
+                // wind down, ahead of the exit below.
+                closeClaudeResidentSessions();
+            } catch (err) {
+                console.error('[Claude] Error closing the resident sessions during shutdown:', getErrorMessage(err));
             }
             process.exit(0);
         };

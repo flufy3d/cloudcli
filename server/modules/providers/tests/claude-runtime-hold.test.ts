@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -8,6 +8,9 @@ import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-s
 import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude-models.provider.js';
 import {
   abortClaudeSDKSession,
+  claudeRuntime,
+  closeClaudeResidentSessions,
+  getClaudeSDKSessionStartTime,
   listClaudeSDKBackgroundWork,
   queryClaudeSDK,
   stopClaudeSDKTask,
@@ -23,6 +26,12 @@ import type { NormalizedMessage, ProviderRuntimeContext } from '@/shared/types.j
  */
 
 const SESSION_ID = 'app-hold-session';
+
+// The tests before the "resident process" section describe the hold for
+// background work on its own, so they run with the idle residency off: a turn
+// with nothing outstanding lets its process go at `result`, as it did before
+// residency. That section turns residency on test by test.
+process.env.CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS = '0';
 const NATIVE_ID = 'native-hold-session';
 
 type Scripted = {
@@ -152,9 +161,14 @@ async function withRun(
     /** One scripted CLI process per `createQuery` call, the first being `script`. */
     processes: Scripted[];
     cwd: string;
+    /** The session's transcript, as the runtime resolves it. */
+    transcriptPath: string;
   }) => Promise<void>,
+  /** Options every turn of the run carries, as a caller passes them each time. */
+  baseOptions: Record<string, unknown> = {},
 ): Promise<void> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'claude-runtime-hold-'));
+  const transcriptPath = path.join(cwd, 'transcript.jsonl');
   const first = createScriptedQuery();
   const script = first.script;
   const processes: Scripted[] = [];
@@ -172,21 +186,22 @@ async function withRun(
     getProviderModels: async () => CLAUDE_PREDEFINED_MODELS as never,
     normalizeMessage: (raw, sessionId) => sessions.normalizeMessage(raw, sessionId),
     isProviderInstalled: async () => true,
+    resolveTranscriptPath: () => transcriptPath,
     createQuery,
   };
   const turns: Array<Promise<unknown>> = [];
   const nextTurn: NextTurn = (command, options = {}) => {
     const turnSent: NormalizedMessage[] = [];
     const turnWriter = { send: (message: NormalizedMessage) => { turnSent.push(message); }, userId: null };
-    const turnDone = queryClaudeSDK(command, { sessionId: SESSION_ID, cwd, ...options }, turnWriter as never, context);
+    const turnDone = queryClaudeSDK(command, { sessionId: SESSION_ID, cwd, ...baseOptions, ...options }, turnWriter as never, context);
     turns.push(turnDone);
     return { sent: turnSent, done: turnDone };
   };
 
   try {
-    const done = queryClaudeSDK('hello', { sessionId: SESSION_ID, cwd }, writer as never, context);
+    const done = queryClaudeSDK('hello', { sessionId: SESSION_ID, cwd, ...baseOptions }, writer as never, context);
     try {
-      await runTest({ script, sent, done, nextTurn, processes, cwd });
+      await runTest({ script, sent, done, nextTurn, processes, cwd, transcriptPath });
     } finally {
       for (const scripted of processes.length ? processes : [script]) scripted.end();
       await done;
@@ -1185,5 +1200,378 @@ test('a held process outlasts two hours of silence minus a minute, and is let go
     t.mock.timers.tick(2 * 60 * 1000);
     await tick();
     assert.equal(script.released(), true, 'released once two silent hours have passed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resident process: kept between turns with nothing outstanding
+// ---------------------------------------------------------------------------
+// Measured against claude CLI via the agent SDK (2026-10-21,
+// scripts/probe/claude-resident.probe.mjs): an idle process writes nothing to
+// its transcript; it does not see a CLAUDE.md written while it was idle (a
+// fresh process does); a terminal `claude -p --resume` of the same session
+// appends its own user and assistant lines to the same file; the stream
+// reports the uuid of every assistant line the process writes.
+
+/** Turns idle residency on for one test. */
+async function withResidency(settings: { idleMs: number; max?: number }, body: () => Promise<void>): Promise<void> {
+  const saved = { idle: process.env.CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS, max: process.env.CLOUDCLI_CLAUDE_RESIDENT_MAX };
+  process.env.CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS = String(settings.idleMs);
+  if (settings.max === undefined) delete process.env.CLOUDCLI_CLAUDE_RESIDENT_MAX;
+  else process.env.CLOUDCLI_CLAUDE_RESIDENT_MAX = String(settings.max);
+  try {
+    await body();
+  } finally {
+    for (const [name, value] of [['CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS', saved.idle], ['CLOUDCLI_CLAUDE_RESIDENT_MAX', saved.max]] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+/** The chat gateway asks for residency on every turn it sends. */
+const RESIDENT = { residentBetweenTurns: true };
+const withResidentRun: typeof withRun = (runTest, baseOptions = {}) => withRun(runTest, { ...RESIDENT, ...baseOptions });
+
+const TEN_MINUTES = 10 * 60 * 1000;
+const appendLines = async (file: string, entries: Array<Record<string, unknown>>) => {
+  await appendFile(file, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(''));
+};
+/** Ends a plain turn and waits until the process has settled into idle residency. */
+async function endTurnIdle(script: Scripted, done?: Promise<unknown>): Promise<void> {
+  script.emit(init());
+  script.emit(assistantText('ok'));
+  script.emit(result());
+  await script.drain();
+  await done;
+}
+
+test('resident: a turn with nothing outstanding keeps its process for the next turn', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, sent, done, nextTurn, processes }) => {
+      await endTurnIdle(script, done);
+      assert.equal(completes(sent).length, 1, 'the turn reported complete');
+      assert.equal(script.released(), false, 'the process stays for the next turn');
+      assert.deepEqual(listClaudeSDKBackgroundWork(), [], 'an idle process is no background work');
+      assert.equal(sent.filter((message) => message.text === 'background_tasks').at(-1)?.backgroundWorkPending ?? false, false);
+
+      const second = nextTurn('again');
+      await until(() => script.prompts.length >= 2);
+      assert.equal(processes.length, 1, 'no second CLI process');
+      assert.match(promptText(script.prompts[1]), /again/);
+      script.emit(init());
+      script.emit(assistantText('again ok'));
+      script.emit(result());
+      await second.done;
+      assert.ok(second.sent.some((message) => message.kind === 'text' && message.content === 'again ok'));
+      assert.equal(completes(second.sent).length, 1);
+    });
+  });
+});
+
+test('resident: the call that started the process returns when its turn ends', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, done }) => {
+      let returned = false;
+      void done.then(() => { returned = true; });
+      script.emit(init());
+      script.emit(result());
+      await until(() => returned);
+      assert.equal(returned, true, 'the gateway is not kept waiting for the process to exit');
+      assert.equal(script.released(), false);
+    });
+  });
+});
+
+test('resident: an idle process is let go once the idle time has passed', async () => {
+  await withResidency({ idleMs: 30 }, async () => {
+    await withResidentRun(async ({ script }) => {
+      await endTurnIdle(script);
+      await until(() => script.released());
+      assert.equal(script.released(), true);
+    });
+  });
+});
+
+test('resident: residency off lets the process go at result', async () => {
+  await withResidency({ idleMs: 0 }, async () => {
+    await withResidentRun(async ({ script }) => {
+      await endTurnIdle(script);
+      assert.equal(script.released(), true);
+    });
+  });
+});
+
+test('resident: background work that reports back leaves the process idle, not gone', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script }) => {
+      await holdForBackgroundBash(script);
+      script.emit(taskNotification('b1', 'toolu_bg', 'completed'));
+      script.emit(init());
+      script.emit(assistantText('the dev server exited'));
+      script.emit(result());
+      await script.drain();
+      assert.equal(script.released(), false, 'kept for the next turn');
+      assert.deepEqual(listClaudeSDKBackgroundWork(), []);
+    });
+  });
+});
+
+test('resident: an idle process does not mark unreported agents as running', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script }) => {
+      script.emit(init());
+      await script.drain();
+      assert.notEqual(getClaudeSDKSessionStartTime(SESSION_ID), null, 'a turn in flight has a live run');
+      script.emit(result());
+      await script.drain();
+      assert.equal(getClaudeSDKSessionStartTime(SESSION_ID), null, 'an idle process can report nothing more');
+    });
+  });
+});
+
+test('resident: a CLAUDE.md written while idle sends the next turn to a fresh process', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, done, nextTurn, processes, cwd }) => {
+      await endTurnIdle(script, done);
+      await writeFile(path.join(cwd, 'CLAUDE.md'), 'Always answer in French.\n');
+      const second = nextTurn('again');
+      await until(() => processes.length >= 2);
+      assert.equal(processes.length, 2, 'the idle process cannot see the new instructions');
+      await until(() => script.released());
+      assert.equal(script.released(), true, 'the stale process is let go');
+      processes[1].emit(init());
+      processes[1].emit(result());
+      processes[1].end();
+      await second.done;
+    });
+  });
+});
+
+for (const [name, entry] of [
+  ['a user line written by another process', { type: 'user', uuid: 'terminal-user', message: { role: 'user', content: 'hi' } }],
+  ['an assistant line written by another process', { type: 'assistant', uuid: 'terminal-assistant', message: { role: 'assistant', content: [] } }],
+  ['a continued-in record', { type: 'continued-in', continuedInSessionId: 'background-copy' }],
+] as const) {
+  test(`resident: ${name} sends the next turn to a fresh process`, async () => {
+    await withResidency({ idleMs: TEN_MINUTES }, async () => {
+      await withResidentRun(async ({ script, done, nextTurn, processes, transcriptPath }) => {
+        await writeFile(transcriptPath, `${JSON.stringify({ type: 'user', uuid: 'first', message: { content: 'hello' } })}\n`);
+        await endTurnIdle(script, done);
+        await appendLines(transcriptPath, [entry]);
+        const second = nextTurn('again');
+        await until(() => processes.length >= 2);
+        assert.equal(processes.length, 2);
+        processes[1].emit(init());
+        processes[1].emit(result());
+        processes[1].end();
+        await second.done;
+      });
+    });
+  });
+}
+
+test('resident: the process\'s own lines and metadata written while idle do not count as another writer', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, done, nextTurn, processes, transcriptPath }) => {
+      await writeFile(transcriptPath, `${JSON.stringify({ type: 'user', uuid: 'first', message: { content: 'hello' } })}\n`);
+      script.emit(init());
+      script.emit({ ...assistantText('ok'), uuid: 'own-assistant' });
+      script.emit(result());
+      await script.drain();
+      await done;
+      // The CLI flushes the turn's last assistant line and its metadata late.
+      await appendLines(transcriptPath, [
+        { type: 'assistant', uuid: 'own-assistant', message: { role: 'assistant', content: [] } },
+        { type: 'ai-title', aiTitle: 'Greeting' },
+        { type: 'cost-state' },
+      ]);
+      const second = nextTurn('again');
+      await until(() => script.prompts.length >= 2);
+      assert.equal(processes.length, 1);
+      script.emit(init());
+      script.emit(result());
+      await second.done;
+    });
+  });
+});
+
+test('resident: the oldest idle process is let go beyond the maximum, while one held for background work stays', async () => {
+  await withResidency({ idleMs: TEN_MINUTES, max: 1 }, async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), 'claude-runtime-resident-'));
+    const scripts = new Map<string, Scripted>();
+    const contextFor = (sessionId: string): ProviderRuntimeContext => {
+      const scripted = createScriptedQuery();
+      scripts.set(sessionId, scripted.script);
+      const sessions = new ClaudeSessionsProvider({ getLiveRunStartTime: () => null });
+      return {
+        resolveProviderSessionId: () => null,
+        resolveResumeModel: async () => undefined,
+        getProviderModels: async () => CLAUDE_PREDEFINED_MODELS as never,
+        normalizeMessage: (raw, sid) => sessions.normalizeMessage(raw, sid),
+        isProviderInstalled: async () => true,
+        createQuery: scripted.createQuery,
+      };
+    };
+    const writer = { send: () => {}, userId: null };
+    const start = (sessionId: string) => queryClaudeSDK('hello', { sessionId, cwd, ...RESIDENT }, writer as never, contextFor(sessionId));
+    try {
+      const background = start('app-resident-bg');
+      await holdForBackgroundBash(scripts.get('app-resident-bg')!);
+      const first = start('app-resident-a');
+      await endTurnIdle(scripts.get('app-resident-a')!, first);
+      const second = start('app-resident-b');
+      await endTurnIdle(scripts.get('app-resident-b')!, second);
+
+      await until(() => scripts.get('app-resident-a')!.released());
+      assert.equal(scripts.get('app-resident-a')!.released(), true, 'the oldest idle process is let go');
+      assert.equal(scripts.get('app-resident-b')!.released(), false, 'the newest idle process stays');
+      assert.equal(scripts.get('app-resident-bg')!.released(), false, 'background work is never evicted');
+      void background;
+    } finally {
+      for (const scripted of scripts.values()) scripted.end();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test('resident: lifecycle — an idle process is no work, and releasing the session lets it go', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script }) => {
+      script.emit(init());
+      await script.drain();
+      assert.equal(claudeRuntime.hasSessionWork(SESSION_ID), true, 'a turn in flight is work');
+      script.emit(result());
+      await script.drain();
+      assert.equal(claudeRuntime.hasSessionWork(SESSION_ID), false, 'an idle process is not');
+      claudeRuntime.releaseSession(SESSION_ID);
+      await until(() => script.released());
+      assert.equal(script.released(), true);
+    });
+  });
+});
+
+test('resident: lifecycle — background work counts as work', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script }) => {
+      await holdForBackgroundBash(script);
+      assert.equal(claudeRuntime.hasSessionWork(SESSION_ID), true);
+    });
+  });
+});
+
+test('resident: a closed admission refuses a new turn without starting a process', async () => {
+  const sent: NormalizedMessage[] = [];
+  const writer = { send: (message: NormalizedMessage) => { sent.push(message); }, userId: null };
+  let started = 0;
+  const context: ProviderRuntimeContext = {
+    resolveProviderSessionId: () => null,
+    resolveResumeModel: async () => undefined,
+    getProviderModels: async () => CLAUDE_PREDEFINED_MODELS as never,
+    normalizeMessage: () => [],
+    isProviderInstalled: async () => true,
+    createQuery: () => { started += 1; throw new Error('must not start'); },
+  };
+  claudeRuntime.closeSessionAdmission('app-closed-session');
+  try {
+    await queryClaudeSDK('hello', { sessionId: 'app-closed-session', cwd: os.tmpdir() }, writer as never, context);
+  } finally {
+    claudeRuntime.openSessionAdmission('app-closed-session');
+  }
+  assert.equal(started, 0);
+  assert.ok(sent.some((message) => message.kind === 'error'));
+  assert.equal(completes(sent).length, 1);
+});
+
+test('resident: closing the resident sessions at shutdown lets every process go', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script }) => {
+      await endTurnIdle(script);
+      closeClaudeResidentSessions();
+      await until(() => script.released());
+      assert.equal(script.released(), true);
+    });
+  });
+});
+
+test('resident: a caller that does not ask for residency lets the process go at result', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    // One-shot callers (the agent API, commit-message generation) send a
+    // single turn; a process kept for a next turn that never comes would
+    // linger, and the agent API removes its working directory right after.
+    await withRun(async ({ script }) => {
+      await endTurnIdle(script);
+      await until(() => script.released());
+      assert.equal(script.released(), true);
+    });
+  });
+});
+
+test('resident: a CLAUDE.md change does not end a process held for background work', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, nextTurn, processes, cwd }) => {
+      await holdForBackgroundBash(script);
+      await writeFile(path.join(cwd, 'CLAUDE.md'), 'Remember the dev server port.\n');
+      const second = nextTurn('again');
+      await until(() => script.prompts.length >= 2);
+      assert.equal(processes.length, 1, 'the background dev server keeps running in the same process');
+      script.emit(init());
+      script.emit(result());
+      await second.done;
+    });
+  });
+});
+
+test('resident: an idle process that dies is not reported as a failed run', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, sent, done }) => {
+      await endTurnIdle(script, done);
+      const before = sent.length;
+      script.fail(new Error('Claude Code process exited with code 137'));
+      await until(() => !claudeRuntime.hasSessionWork(SESSION_ID) && getClaudeSDKSessionStartTime(SESSION_ID) === null);
+      await tick();
+      assert.deepEqual(sent.slice(before).filter((message) => message.kind === 'error' || message.kind === 'complete'), [],
+        'the user left long ago; nothing failed on their side');
+    });
+  });
+});
+
+test('resident: a turn on the idle process counts its agents from that turn on', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, done, nextTurn }) => {
+      await endTurnIdle(script, done);
+      const resumedAt = Date.now();
+      const second = nextTurn('again');
+      await until(() => script.prompts.length >= 2);
+      script.emit(init());
+      await script.drain();
+      const startedAt = getClaudeSDKSessionStartTime(SESSION_ID);
+      assert.ok(startedAt !== null && startedAt >= resumedAt, 'an agent launched in an earlier turn reads as stopped');
+      script.emit(result());
+      await second.done;
+    });
+  });
+});
+
+test('resident: editing a skill\'s SKILL.md while idle sends the next turn to a fresh process', async () => {
+  await withResidency({ idleMs: TEN_MINUTES }, async () => {
+    await withResidentRun(async ({ script, done, nextTurn, processes, cwd }) => {
+      const skillFile = path.join(cwd, '.claude', 'skills', 'deploy', 'SKILL.md');
+      await mkdir(path.dirname(skillFile), { recursive: true });
+      await writeFile(skillFile, 'Deploy with npm run deploy.\n');
+      // The process starts on this turn, so it read the skill as written above.
+      await endTurnIdle(script, done);
+      // Only the file inside the skill's folder changes; the folders keep their times.
+      await writeFile(skillFile, 'Deploy with pnpm run deploy.\n');
+      const later = new Date(Date.now() + 5_000);
+      await utimes(skillFile, later, later);
+      const second = nextTurn('deploy again');
+      await until(() => processes.length >= 2);
+      assert.equal(processes.length, 2, 'the idle process still has the old skill');
+      processes[1].emit(init());
+      processes[1].emit(result());
+      processes[1].end();
+      await second.done;
+    });
   });
 });

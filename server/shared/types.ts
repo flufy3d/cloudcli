@@ -474,6 +474,12 @@ export type ProviderRuntimeContext = {
    * engine call it observed, and this is how that call reaches the host.
    */
   registerEngineToolCall?(call: TaskBridgeEngineCall): void;
+  /**
+   * The engine's transcript file for an app session, or null when it is not
+   * known yet. A runtime whose process outlives a turn reads it to notice
+   * another process continuing the conversation in the meantime.
+   */
+  resolveTranscriptPath?(appSessionId: string): string | null;
   /** Optional provider hook for clearing incomplete real-time state at a terminal run outcome. */
   resetLiveMessageState?(sessionId: string): void;
   isProviderInstalled(): Promise<boolean>;
