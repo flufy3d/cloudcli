@@ -582,6 +582,10 @@ export class OpenCodeRunRegistry {
       }
     }
     this.backgroundByApp.delete(appSessionId);
+    // Announced before the writer is let go: the composer strip only clears
+    // on a `background_tasks` frame, so dropping the list silently left it on
+    // screen until a reload re-read the empty list from the subscribe ack.
+    this.broadcastBackgroundWork(appSessionId);
     this.backgroundWriterByApp.delete(appSessionId);
     this.clearBackgroundDeadline(appSessionId);
     this.resolveBackgroundWaiters(appSessionId);
@@ -647,6 +651,24 @@ export class OpenCodeRunRegistry {
         if (error instanceof OpenCodeApiError && error.status === 404) {
           run.settle({ outcome: 'lost', error: 'The OpenCode session no longer exists.' });
         }
+      }
+    }
+
+    // A background child's own terminal can fall in the same gap, and nothing
+    // else would retire its strip entry and card before the next deadline,
+    // up to half an hour later. Same judgement as the deadline recheck.
+    for (const [childSessionId, appSessionId] of [...this.backgroundAppByChild]) {
+      const task = this.backgroundByApp.get(appSessionId)?.get(childSessionId);
+      if (!task) {
+        continue;
+      }
+      try {
+        const snapshot = await client.getSession(childSessionId);
+        if (snapshot.idleAt !== null && snapshot.idleAt >= task.startedAt) {
+          this.finishBackgroundWork(childSessionId, settledStatusFromSnapshot(snapshot));
+        }
+      } catch {
+        // A failed read proves nothing; the child's deadline still judges it.
       }
     }
   }

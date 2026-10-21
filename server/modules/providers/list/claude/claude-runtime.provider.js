@@ -762,6 +762,82 @@ export function startsBackgroundWork(sdkMessage) {
 const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'killed']);
 
 /**
+ * Retires the composer strip's entries as the SDK's task events settle them.
+ *
+ * The strip is keyed by the launching call (`extractBackgroundTasks`), but a
+ * task can settle by its task id alone: a terminal `task_updated` carries no
+ * `tool_use_id`, and a `task_notification` need not either. `task_started`
+ * links the two. A call the heuristic scored as background but the CLI runs
+ * in the foreground (`is_backgrounded: false`, an Agent without
+ * `run_in_background`) is parked off the strip, and comes back if the task is
+ * moved to the background later. Without this, such entries stayed listed
+ * until the whole hold ended.
+ *
+ * Used by `queryClaudeSDK`, one per process; exported for the providers
+ * module's tests, which drive the event shapes directly.
+ *
+ * @param {Map<string, import('../../../../shared/types.js').ActiveBackgroundTask>} strip - The process's strip entries by tool-use id; mutated in place
+ * @returns {(message: any) => boolean} Folds one SDK message; true when the strip changed
+ */
+export function createBackgroundStripSettler(strip) {
+  const toolUseIdByTaskId = new Map();
+  const parkedForeground = new Map();
+
+  return (message) => {
+    if (message?.type !== 'system' || typeof message.task_id !== 'string') {
+      return false;
+    }
+    const taskId = message.task_id;
+    switch (message.subtype) {
+      case 'task_started': {
+        if (typeof message.tool_use_id !== 'string') {
+          return false;
+        }
+        toolUseIdByTaskId.set(taskId, message.tool_use_id);
+        const entry = strip.get(message.tool_use_id);
+        if (message.is_backgrounded === false && entry) {
+          parkedForeground.set(message.tool_use_id, entry);
+          strip.delete(message.tool_use_id);
+          return true;
+        }
+        return false;
+      }
+      case 'task_updated': {
+        const toolUseId = toolUseIdByTaskId.get(taskId);
+        if (!toolUseId) {
+          return false;
+        }
+        if (TERMINAL_TASK_STATUSES.has(message.patch?.status)) {
+          toolUseIdByTaskId.delete(taskId);
+          parkedForeground.delete(toolUseId);
+          return strip.delete(toolUseId);
+        }
+        const parked = parkedForeground.get(toolUseId);
+        if (message.patch?.is_backgrounded === true && parked) {
+          parkedForeground.delete(toolUseId);
+          strip.set(toolUseId, parked);
+          return true;
+        }
+        return false;
+      }
+      case 'task_notification': {
+        const toolUseId = typeof message.tool_use_id === 'string'
+          ? message.tool_use_id
+          : toolUseIdByTaskId.get(taskId);
+        toolUseIdByTaskId.delete(taskId);
+        if (!toolUseId) {
+          return false;
+        }
+        parkedForeground.delete(toolUseId);
+        return strip.delete(toolUseId);
+      }
+      default:
+        return false;
+    }
+  };
+}
+
+/**
  * Tracks the background tasks each live session still has outstanding, folded
  * from the `system` task events the SDK stream already carries.
  *
@@ -1210,6 +1286,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   });
 
   const activeBackgroundTasks = new Map();
+  const settleStripTask = createBackgroundStripSettler(activeBackgroundTasks);
   const broadcastBackgroundTasks = () => {
     const list = Array.from(activeBackgroundTasks.values());
     if (sessionKey()) {
@@ -1572,12 +1649,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
 
       // A task stopped from the strip (or one that finished) leaves the strip
       // at once instead of lingering until the whole hold ends.
-      if (
-        message.type === 'system'
-        && message.subtype === 'task_notification'
-        && typeof message.tool_use_id === 'string'
-        && activeBackgroundTasks.delete(message.tool_use_id)
-      ) {
+      if (settleStripTask(message)) {
         broadcastBackgroundTasks();
       }
 

@@ -90,6 +90,8 @@ export type ProviderRuntimeGateway = {
   hasBackgroundWork(sessionId: string): boolean;
   /** Narrower than `hasBackgroundWork`: only work whose end the runtime broadcasts, including the reply after it. */
   isBackgroundWorkPending(sessionId: string): boolean;
+  /** Wider than `hasBackgroundWork`: also while the composer strip still lists a task, whose clearing frame the run's writer carries. */
+  hasLiveBackgroundState?(sessionId: string): boolean;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
   /**
@@ -807,7 +809,11 @@ function handleChatSubscribe(
     // keeps producing events through the same writer (task progress, the
     // turn the CLI pushes when a task reports), so a tab opened during that
     // work attaches too; the registry keeps the run while the work lasts.
-    if (isProcessing || dependencies.runtime.hasBackgroundWork(sessionId)) {
+    // The strip's own list counts as well: it can outlive the task tracker,
+    // and a socket left off the writer never hears the frame that clears it.
+    const hasLiveBackgroundState = dependencies.runtime.hasLiveBackgroundState?.(sessionId)
+      ?? dependencies.runtime.hasBackgroundWork(sessionId);
+    if (isProcessing || hasLiveBackgroundState) {
       chatRunRegistry.attachConnection(sessionId, ws);
     }
 

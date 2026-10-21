@@ -155,6 +155,20 @@ export function createProviderRuntimeService(
         (provider.runtime.listBackgroundWork?.() ?? []).some((entry) => entry.sessionId === sessionId));
     },
 
+    /**
+     * Wider than `hasBackgroundWork`: also true while the composer strip still
+     * lists a task. The strip comes from its own list (Claude's is keyed by the
+     * launching call, not by the task tracker), and its clearing frame rides
+     * the run's writer — so the run must stay registered, and a reconnecting
+     * socket attached, until that list is empty too. Otherwise the socket
+     * missed the clear and the strip stuck until a reload.
+     */
+    hasLiveBackgroundState(sessionId: string): boolean {
+      return isBackgroundWorkPending(sessionId) || dependencies.listProviders().some((provider) =>
+        (provider.runtime.listBackgroundWork?.() ?? []).some((entry) => entry.sessionId === sessionId)
+        || (provider.runtime.backgroundTasks?.list(sessionId) ?? []).length > 0);
+    },
+
     resolveToolApproval(requestId: string, decision: ProviderPermissionDecision): void {
       for (const provider of dependencies.listProviders()) {
         provider.runtime.permissions?.resolve(requestId, decision);

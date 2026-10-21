@@ -1727,3 +1727,24 @@ test('updates backgroundTasks when chat_subscribed or status frame carries backg
   });
   assert.deepEqual(store.getBackgroundTasks(SESSION_ID), []);
 });
+
+test('a settled task_status retires its strip entry without waiting for the background_tasks frame', () => {
+  const store = new SessionTimelineStore();
+  emit(store, {
+    kind: 'status',
+    sessionId: SESSION_ID,
+    text: 'background_tasks',
+    backgroundTasks: [
+      { id: 'toolu_bash', toolName: 'Bash', command: 'npm test', startedAt: 1 },
+      { id: 'toolu_agent', toolName: 'Agent', command: 'Audit', startedAt: 2 },
+    ],
+  });
+
+  // Progress and task-id-only updates leave the strip alone.
+  emit(store, { id: 'ts_1', kind: 'task_status', sessionId: SESSION_ID, timestamp: '2026-01-01T00:00:00Z', provider: 'claude', event: 'progress', status: 'running', taskId: 't_bash', toolUseId: 'toolu_bash' });
+  emit(store, { id: 'ts_2', kind: 'task_status', sessionId: SESSION_ID, timestamp: '2026-01-01T00:00:01Z', provider: 'claude', event: 'updated', status: 'completed', taskId: 't_agent' });
+  assert.equal(store.getBackgroundTasks(SESSION_ID).length, 2);
+
+  emit(store, { id: 'ts_3', kind: 'task_status', sessionId: SESSION_ID, timestamp: '2026-01-01T00:00:02Z', provider: 'claude', event: 'notification', status: 'completed', taskId: 't_bash', toolUseId: 'toolu_bash' });
+  assert.deepEqual(store.getBackgroundTasks(SESSION_ID).map((task) => task.id), ['toolu_agent']);
+});

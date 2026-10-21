@@ -275,6 +275,16 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         }));
       };
 
+      // Every way the run ends must tell the client its cards are gone: the
+      // composer strip only changes on a `background_tasks` frame, so a list
+      // emptied silently (abort, crash, watchdog) stayed on screen until a
+      // reload re-read it from the subscribe ack.
+      const clearBackgroundTasks = () => {
+        if (sessionTasks.size === 0) return;
+        sessionTasks.clear();
+        broadcastBackgroundTasks();
+      };
+
       // Numbers the interrupted-stream notices of this run so two of them
       // cannot collide on one id.
       let streamInterruptedNoticeCount = 0;
@@ -329,9 +339,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
                 : describeFailure(code)),
           });
         }
-        if (sessionTasks) {
-          sessionTasks.clear();
-        }
+        clearBackgroundTasks();
         activeSessionBackgroundTasks.delete(finalSessionId);
         if (sessionId) activeSessionBackgroundTasks.delete(sessionId);
         if (capturedSessionId) activeSessionBackgroundTasks.delete(capturedSessionId);
@@ -637,9 +645,8 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             // cards go before the client sees the turn complete. An
             // interrupted-stream result is not the end of the turn (below).
             const turnContinues = isError && isStreamInterruptedNotice(errorMessage);
-            if (sessionTasks.size > 0 && !turnContinues) {
-              sessionTasks.clear();
-              broadcastBackgroundTasks();
+            if (!turnContinues) {
+              clearBackgroundTasks();
             }
 
             // A finished turn releases the stdin that was holding the CLI
@@ -805,6 +812,9 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         // An exit right after an interrupted-stream notice settles as a
         // success below, so its complete must not report a failure either.
         const succeeded = !watchdogExpired && (code === 0 || (streamInterruptedResult && !sawErrorResult));
+        // Before the complete, and ahead of the aborted early return below,
+        // which never reaches notifyTerminalState.
+        clearBackgroundTasks();
         if (!completeSent) {
           completeSent = true;
           writer.send(createCompleteMessage({
@@ -869,6 +879,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
           isError: true,
         }));
 
+        clearBackgroundTasks();
         if (!completeSent) {
           completeSent = true;
           writer.send(createCompleteMessage({

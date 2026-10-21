@@ -144,12 +144,15 @@ test('abort clears subagent cards and stops the process', async () => {
     { event: 'init', conversation_id: 'conv-abort', init: { cwd: '/tmp' } },
     step({ ...subagentStep('DONE', ['subagent-abort-1']), conversation_id: 'conv-abort' }),
   ], async () => {
-    const { runtime, done, waitForCard } = await createRun('conv-abort');
+    const { runtime, sent, done, waitForCard } = await createRun('conv-abort');
     await waitForCard();
     assert.equal(runtime.backgroundTasks.list('conv-abort').length, 1);
     assert.equal(await runtime.abort('conv-abort'), true);
     assert.equal(runtime.backgroundTasks.list('conv-abort').length, 0);
     assert.equal((await done as any).aborted, true);
+    // The strip only clears on a frame; without one it stayed until a reload.
+    const statuses = sent.filter((msg) => msg.kind === 'status' && msg.text === 'background_tasks');
+    assert.deepEqual(statuses.map((msg) => msg.backgroundTasks.length), [1, 0]);
   }, false);
 });
 

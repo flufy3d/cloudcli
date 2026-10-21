@@ -450,3 +450,49 @@ test('concurrent runs each publish occupancy through their own tracker', () => {
   assert.equal(budgetsOf(second.frames).length, 1, "B's equal reading is not throttled by A's");
   assert.equal(budgetsOf(first.frames)[0]?.sessionId, 'app-a');
 });
+
+test('the service exiting clears the composer strip live, not only on the next reload', () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+  startBackgroundChild(registry);
+  frames.length = 0;
+
+  registry.settleAll({ outcome: 'lost', error: 'The OpenCode service exited.' });
+
+  assert.equal(registry.isBackgroundWorkPending('app-parent'), false);
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(announced.length, 1);
+  assert.deepEqual(announced[0]?.backgroundTasks, []);
+  assert.equal(announced[0]?.backgroundWorkPending, false);
+});
+
+test('reconcile retires a background child whose terminal fell in the stream gap', async () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+  startBackgroundChild(registry, { childId: 'ses_done', callId: 'call_done' });
+  startBackgroundChild(registry, { childId: 'ses_busy', callId: 'call_busy' });
+  startBackgroundChild(registry, { childId: 'ses_unreadable', callId: 'call_unreadable' });
+  frames.length = 0;
+
+  await registry.reconcile({
+    getSession: async (id) => {
+      if (id === 'ses_done') return { outcome: 'failed', idleAt: Date.now() + 1_000, tokens: null };
+      if (id === 'ses_busy') return { outcome: null, idleAt: null, tokens: null };
+      throw new Error('unreadable');
+    },
+  });
+
+  assert.deepEqual(
+    registry.backgroundTasksFor('app-parent').map((task) => task.id).sort(),
+    ['call_busy', 'call_unreadable'],
+    'only the child the engine reports idle is retired; a failed read proves nothing',
+  );
+  const settled = frames.filter((frame) => frame.kind === 'task_status');
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0]?.toolUseId, 'call_done');
+  assert.equal(settled[0]?.status, 'failed');
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(announced.at(-1)?.backgroundTasks?.length, 2);
+});

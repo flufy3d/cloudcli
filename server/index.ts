@@ -129,8 +129,9 @@ const agentRoutes = createAgentModule({
 
 // Single WebSocket server that handles chat, shell, and plugin proxy paths.
 // A completed run stays subscribable while its session's background work
-// (agents, workflows, backgrounded commands) is still reporting through it.
-chatRunRegistry.setRetentionGuard((sessionId) => providerRuntimeService.hasBackgroundWork(sessionId));
+// (agents, workflows, backgrounded commands) is still reporting through it,
+// including the frame that clears the composer's task strip.
+chatRunRegistry.setRetentionGuard((sessionId) => providerRuntimeService.hasLiveBackgroundState(sessionId));
 
 // Executions the opencode engine starts on its own — a background subagent
 // completing resumes the parent session from its inbox, with no client prompt

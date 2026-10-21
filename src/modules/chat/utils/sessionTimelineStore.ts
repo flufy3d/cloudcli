@@ -962,6 +962,10 @@ export class SessionTimelineStore {
       this.flushStream(sid, message?.parentToolUseId ?? null);
     }
 
+    if (sid && message?.kind === 'task_status') {
+      this.retireSettledBackgroundTask(sid, message);
+    }
+
     switch (route.action) {
       case 'none':
         return null;
@@ -1907,6 +1911,25 @@ export class SessionTimelineStore {
     const slot = this.slots.get(sessionId);
     if (!slot?.backgroundTasks.length) return slot?.backgroundWorkSince;
     return Math.min(...slot.backgroundTasks.map((task) => task.startedAt));
+  }
+
+  /**
+   * A task the live stream reports settled leaves the strip at once. The
+   * strip otherwise changes only on the runtime's `background_tasks` frame,
+   * and one lost on the way (a socket the run's writer no longer reached)
+   * left a finished task listed until a reload re-read the subscribe ack.
+   * The card and the strip entry share the launching call's id.
+   */
+  private retireSettledBackgroundTask(sid: string, message: NormalizedMessage): void {
+    const { toolUseId, status } = message;
+    if (!toolUseId || !status || status === 'running') return;
+    const slot = this.slots.get(sid);
+    if (!slot?.backgroundTasks.some((task) => task.id === toolUseId)) return;
+    this.setBackgroundState(
+      sid,
+      slot.backgroundTasks.filter((task) => task.id !== toolUseId),
+      slot.backgroundWorkPending,
+    );
   }
 
   private setBackgroundState(sid: string, tasks: ActiveBackgroundTask[], pending: unknown): void {
