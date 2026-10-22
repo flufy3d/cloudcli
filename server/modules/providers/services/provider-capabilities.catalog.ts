@@ -46,6 +46,12 @@ export type ProviderCatalogEntry = {
   supportsAbort: boolean;
   /** Whether the provider runtime can accept model-level reasoning effort. */
   supportsEffort: boolean;
+  /**
+   * Reasoning-effort levels the runtime can pass on, weakest first, and so the
+   * levels a custom model-library entry may declare. Empty exactly when
+   * `supportsEffort` is false.
+   */
+  effortLevels: readonly string[];
 };
 
 export const PROVIDER_CATALOG = {
@@ -57,6 +63,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -66,6 +73,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: false,
+    effortLevels: [],
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -75,6 +83,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
   },
   opencode: {
     // Mapped by the runtime onto the service: the read-only `plan` agent
@@ -88,6 +97,9 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    // Passed on as OpenCode's `--variant`. `thinking` (MiniMax's on/off
+    // variant, paired with `none`) is not a strength, so it sorts last.
+    effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
   },
   zcode: {
     // Mapped by the runtime onto ZCode's session/setMode modes: build
@@ -104,6 +116,7 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    effortLevels: ['low', 'high', 'max'],
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -113,5 +126,6 @@ export const PROVIDER_CATALOG = {
     supportsFiles: true,
     supportsAbort: true,
     supportsEffort: true,
+    effortLevels: ['low', 'medium', 'high'],
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;

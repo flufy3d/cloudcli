@@ -40,6 +40,10 @@ import {
   notifyUserIfEnabled
 } from '@/modules/notifications/index.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
+import {
+  getReportedClaudeContextWindow,
+  rememberClaudeContextWindow
+} from '@/modules/providers/services/claude-usage.js';
 import { canonicalClaudeSubagentToolName, createCompleteMessage, createNormalizedMessage, resolveModelEffort } from '@/shared/utils.js';
 import type {
   ActiveBackgroundTask,
@@ -732,6 +736,43 @@ function mapCliOptionsToSDK(options: ClaudeRunOptions = {}): ClaudeSdkOptions {
 /**
  * Adds a session to the active sessions map. Used by this runtime only.
  */
+/**
+ * Lets go of the process an earlier run left holding a session open, so the
+ * next turn can take the session over.
+ *
+ * Closing stdin is not enough on its own: the CLI's wind-down waits for the
+ * background agents the process still has going — for up to the ceiling it
+ * was started with (BG_WAIT_CEILING_MS) — so an abandoned process with an
+ * agent outstanding would run next to the process that replaced it for as
+ * long as the agent does, both appending to the same session file. Stop the
+ * tasks first, while stdin is still open: the SDK drops control requests
+ * written after stdin has ended, which is also why the interrupt a later
+ * supersede sends to this process cannot do the job.
+ *
+ * The stops are not awaited — each request is written to the CLI before this
+ * returns, and a reply is only missing when the process has already gone.
+ */
+function releaseHeldSession(sessionId: string): void {
+  const held = getSession(sessionId);
+  if (!held) {
+    return;
+  }
+  for (const task of backgroundWork.activeTasks(sessionId)) {
+    if (!task.taskId) {
+      continue;
+    }
+    // A stop that cannot be delivered changes nothing about what happens
+    // next: the process is on its way out either way. Guard the synchronous
+    // call too, so a failing stop can never skip the release below.
+    try {
+      Promise.resolve(held.instance?.stopTask?.(task.taskId)).catch(() => {});
+    } catch {
+      // Same as a rejected stop.
+    }
+  }
+  held.releaseInput?.();
+}
+
 function addSession(
   sessionId: string,
   queryInstance: ClaudeQuery,
@@ -756,7 +797,7 @@ function addSession(
       .catch((error) => {
         console.error(`Error interrupting superseded run for session ${sessionId}:`, (error as { message?: string })?.message || error);
       });
-    existing.releaseInput?.();
+    releaseHeldSession(sessionId);
     // Whatever the superseded process had outstanding dies with it and will
     // never report, so the new run starts from an empty task set.
     backgroundWork.clear(sessionId);
@@ -847,19 +888,59 @@ function readNumber(value: unknown): number {
 }
 
 /**
+ * The window a budget is measured against: the one the SDK reported for the
+ * session's model when known, else the server-wide CONTEXT_WINDOW setting.
+ */
+function resolveContextWindow(reportedContextWindow: number | null | undefined): number {
+  if (Number.isFinite(reportedContextWindow) && (reportedContextWindow as number) > 0) {
+    return reportedContextWindow as number;
+  }
+  return parseInt(process.env.CONTEXT_WINDOW ?? '', 10) || 160000;
+}
+
+/**
+ * Reads the context window the SDK measured for the model that served a turn.
+ *
+ * `result.modelUsage` has one entry per model the turn billed, subagents'
+ * included, so the entry has to be the main thread's model. Its key is the id
+ * the CLI requested, which for a 1M variant carries a `[1m]` suffix that the
+ * assistant rows' `message.model` lacks (`claude-sonnet-5-5[1m]` vs
+ * `claude-sonnet-5-5`); newer CLIs also state the bare id as `canonicalModel`.
+ */
+function readReportedContextWindow(sdkMessage: unknown, mainModel: string | null): number | null {
+  const streamMessage = sdkMessage as { type?: string; modelUsage?: Record<string, Record<string, unknown>> } | null;
+  const modelUsage = streamMessage?.type === 'result' ? streamMessage.modelUsage : null;
+  if (!modelUsage || typeof modelUsage !== 'object') {
+    return null;
+  }
+
+  const reported = Object.entries(modelUsage).filter(
+    ([, modelData]) => modelData && typeof modelData === 'object' && readNumber(modelData.contextWindow) > 0
+  );
+  const exactMatch = reported.find(([modelKey]) => modelKey === mainModel);
+  const variantMatch = reported.find(([modelKey, modelData]) => (
+    Boolean(mainModel)
+    && (modelData.canonicalModel === mainModel || modelKey.replace(/\[[^\]]*\]$/, '') === mainModel)
+  ));
+  // A turn that billed a single model was served by it, whatever it is called.
+  const entry = exactMatch ?? variantMatch ?? (reported.length === 1 ? reported[0] : null);
+  return entry ? readNumber(entry[1].contextWindow) : null;
+}
+
+/**
  * Builds a context-window budget from an Anthropic-shaped usage payload.
  *
  * `input_tokens + cache_read + cache_creation` is one request's whole prompt,
  * which is exactly what the context window holds at that moment.
  */
-function buildTokenBudget(messageUsage: Record<string, unknown>): TokenBudget {
+function buildTokenBudget(messageUsage: Record<string, unknown>, reportedContextWindow?: number | null): TokenBudget {
   const directInputTokens = readNumber(messageUsage.input_tokens ?? messageUsage.inputTokens);
   const cacheCreationTokens = readNumber(messageUsage.cache_creation_input_tokens ?? messageUsage.cacheCreationInputTokens ?? messageUsage.cacheCreationTokens);
   const cacheReadTokens = readNumber(messageUsage.cache_read_input_tokens ?? messageUsage.cacheReadInputTokens ?? messageUsage.cacheReadTokens);
   const cacheTokens = cacheCreationTokens + cacheReadTokens;
   const inputTokens = directInputTokens + cacheTokens;
   const outputTokens = readNumber(messageUsage.output_tokens ?? messageUsage.outputTokens);
-  const contextWindow = parseInt(process.env.CONTEXT_WINDOW ?? '', 10) || 160000;
+  const contextWindow = resolveContextWindow(reportedContextWindow);
 
   return {
     used: inputTokens + outputTokens,
@@ -884,7 +965,7 @@ function buildTokenBudget(messageUsage: Record<string, unknown>): TokenBudget {
  * a source here — see `extractCumulativeTokenBudget`. Used by the stream loop
  * and the token-budget tests.
  */
-export function extractTokenBudget(sdkMessage: unknown): TokenBudget | null {
+export function extractTokenBudget(sdkMessage: unknown, reportedContextWindow?: number | null): TokenBudget | null {
   if (!sdkMessage || typeof sdkMessage !== 'object') {
     return null;
   }
@@ -910,7 +991,7 @@ export function extractTokenBudget(sdkMessage: unknown): TokenBudget | null {
     return null;
   }
 
-  return buildTokenBudget(messageUsage);
+  return buildTokenBudget(messageUsage, reportedContextWindow);
 }
 
 /**
@@ -928,7 +1009,7 @@ export function extractTokenBudget(sdkMessage: unknown): TokenBudget | null {
  * produced no assistant budget at all. Used by the stream loop as that
  * fallback and by the token-budget tests.
  */
-export function extractCumulativeTokenBudget(sdkMessage: unknown): TokenBudget | null {
+export function extractCumulativeTokenBudget(sdkMessage: unknown, reportedContextWindow?: number | null): TokenBudget | null {
   const streamMessage = sdkMessage as ClaudeStreamMessage | null | undefined;
   if (!streamMessage || typeof streamMessage !== 'object' || streamMessage.type !== 'result') {
     return null;
@@ -936,7 +1017,7 @@ export function extractCumulativeTokenBudget(sdkMessage: unknown): TokenBudget |
 
   const usage = streamMessage.usage as unknown as Record<string, unknown> | undefined;
   if (usage && typeof usage === 'object') {
-    return buildTokenBudget(usage);
+    return buildTokenBudget(usage, reportedContextWindow);
   }
 
   const modelUsage = streamMessage.modelUsage as unknown as Record<string, Record<string, unknown>> | undefined;
@@ -955,7 +1036,7 @@ export function extractCumulativeTokenBudget(sdkMessage: unknown): TokenBudget |
   const inputTokens = readNumber(modelData.cumulativeInputTokens ?? modelData.inputTokens);
   const outputTokens = readNumber(modelData.cumulativeOutputTokens ?? modelData.outputTokens);
   const totalUsed = inputTokens + outputTokens;
-  const contextWindow = parseInt(process.env.CONTEXT_WINDOW ?? '', 10) || 160000;
+  const contextWindow = resolveContextWindow(reportedContextWindow);
 
   return {
     used: totalUsed,
@@ -1347,6 +1428,13 @@ async function runClaudeProcess(
   // Set once a turn publishes a budget read from an assistant message, so the
   // turn-ending `result` is only mined for usage when nothing better arrived.
   let assistantBudgetSent = false;
+  // The window the SDK reported for this session's model (a resumed session
+  // starts from the one its last run reported), the model the main thread's
+  // assistant rows name, and the budget last published — re-sent with the
+  // right total when the turn's `result` is the first to state the window.
+  let reportedContextWindow = getReportedClaudeContextWindow(providerSessionId) ?? null;
+  let mainThreadModel: string | null = null;
+  let lastSentTokenBudget: TokenBudget | null = null;
   // Idle-turn detection: a resumed turn that only acknowledges an injected
   // task-notification ("No response requested.") leaves the user's prompt
   // unacted upon. Signals are collected across the stream and evaluated once
@@ -1381,7 +1469,7 @@ async function runClaudeProcess(
   // session's process open, so held runs cannot stack up across a conversation.
   const initialKey = sessionKey();
   if (initialKey) {
-    getSession(initialKey)?.releaseInput?.();
+    releaseHeldSession(initialKey);
   }
 
   let lastBroadcastHadTasks = false;
@@ -1926,15 +2014,49 @@ async function runClaudeProcess(
         ws.send(msg);
       }
 
+      if (
+        message.type === 'assistant'
+        && !message.parent_tool_use_id
+        && typeof message.message?.model === 'string'
+        && message.message.model !== '<synthetic>'
+      ) {
+        mainThreadModel = message.message.model;
+      }
+
+      // Only a turn's `result` states the window of the model that served it.
+      const turnContextWindow = readReportedContextWindow(message, mainThreadModel);
+      const contextWindowChanged = Boolean(turnContextWindow) && turnContextWindow !== reportedContextWindow;
+      if (turnContextWindow) {
+        reportedContextWindow = turnContextWindow;
+        rememberClaudeContextWindow(message.session_id || capturedSessionId || '', turnContextWindow);
+        const cacheKey = sessionKey();
+        if (contextWindowChanged && cacheKey) {
+          // A history page cached before this turn ended carries the old total.
+          sessionHistoryCache.invalidate(cacheKey);
+        }
+      }
+
       // Extract and send token budget updates from assistant usage payloads,
       // falling back to the turn's cumulative bill only for SDK builds that
       // report no per-assistant usage at all.
-      const tokenBudgetData = extractTokenBudget(message)
-        || (assistantBudgetSent ? null : extractCumulativeTokenBudget(message));
+      let tokenBudgetData = extractTokenBudget(message, reportedContextWindow)
+        || (assistantBudgetSent ? null : extractCumulativeTokenBudget(message, reportedContextWindow));
+      // Read through a cast: the assignment sits later in this loop body.
+      const previousBudget = lastSentTokenBudget as TokenBudget | null;
+      if (
+        !tokenBudgetData
+        && turnContextWindow
+        && previousBudget
+        && previousBudget.total !== turnContextWindow
+      ) {
+        // The reading stands; only the window it is measured against was wrong.
+        tokenBudgetData = { ...previousBudget, total: turnContextWindow };
+      }
       if (tokenBudgetData) {
         if (message.type === 'assistant') {
           assistantBudgetSent = true;
         }
+        lastSentTokenBudget = tokenBudgetData;
         ws.send(createNormalizedMessage({ kind: 'status', text: 'token_budget', tokenBudget: tokenBudgetData, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
       }
 

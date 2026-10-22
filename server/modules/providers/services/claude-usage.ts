@@ -2,6 +2,53 @@ import type { AnyRecord, ProviderTokenUsageResult } from '@/shared/types.js';
 import { readUsageNumber } from '@/shared/utils.js';
 
 /**
+ * Context windows the Claude SDK reported per provider session id.
+ *
+ * The SDK states the real window of the model that served a turn only in the
+ * turn's `result.modelUsage[model].contextWindow`; the transcript records the
+ * model id at most, and an id cannot tell a 200K from a 1M variant, nor what a
+ * self-hosted model behind ANTHROPIC_BASE_URL allows. Remembering the reported
+ * value lets the history-derived usage show the same window the live counter
+ * did. It is process memory on purpose: after a restart the counter falls back
+ * to CONTEXT_WINDOW until the session's next turn reports again.
+ */
+const reportedClaudeContextWindows = new Map<string, number>();
+
+/** One number per session; the cap only bounds a long-lived server's memory. */
+const MAX_REPORTED_CLAUDE_CONTEXT_WINDOWS = 1000;
+
+/**
+ * Used by the Claude runtime provider to record the window the SDK reported for
+ * a session's turn. Non-positive or non-numeric values are ignored so a build
+ * that reports no window never overwrites one that did.
+ */
+export function rememberClaudeContextWindow(providerSessionId: string, contextWindow: number): void {
+  if (!providerSessionId || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return;
+  }
+
+  // Re-insert so the most recently reported sessions are the last evicted.
+  reportedClaudeContextWindows.delete(providerSessionId);
+  reportedClaudeContextWindows.set(providerSessionId, contextWindow);
+  if (reportedClaudeContextWindows.size > MAX_REPORTED_CLAUDE_CONTEXT_WINDOWS) {
+    const oldestSessionId = reportedClaudeContextWindows.keys().next().value;
+    if (oldestSessionId !== undefined) {
+      reportedClaudeContextWindows.delete(oldestSessionId);
+    }
+  }
+}
+
+/**
+ * Used by the Claude runtime provider (a resumed run starts from the window its
+ * session last reported) and the Claude history reader.
+ */
+export function getReportedClaudeContextWindow(
+  providerSessionId: string | null | undefined,
+): number | undefined {
+  return providerSessionId ? reportedClaudeContextWindows.get(providerSessionId) : undefined;
+}
+
+/**
  * Latest context-window usage from a Claude transcript's already-parsed rows.
  *
  * Exported because the session-messages reader hands the same usage back on
@@ -13,10 +60,14 @@ import { readUsageNumber } from '@/shared/utils.js';
  * cache_creation` is that one request's whole prompt, i.e. what the context
  * window currently holds. Summing turns would count the same cached prefix
  * once per turn.
+ *
+ * The total is the window the SDK reported for the session when there is one,
+ * and the CONTEXT_WINDOW setting otherwise.
  */
 export function summarizeClaudeTokenUsage(
   entries: AnyRecord[],
   configuredContextWindow: string | undefined = process.env.CONTEXT_WINDOW,
+  reportedContextWindow?: number,
 ): ProviderTokenUsageResult {
   let inputTokens = 0;
   let outputTokens = 0;
@@ -65,7 +116,10 @@ export function summarizeClaudeTokenUsage(
   }
 
   const parsedContextWindow = Number.parseInt(configuredContextWindow ?? '', 10);
-  const contextWindow = Number.isFinite(parsedContextWindow) ? parsedContextWindow : 160_000;
+  const configuredOrDefaultContextWindow = Number.isFinite(parsedContextWindow) ? parsedContextWindow : 160_000;
+  const contextWindow = reportedContextWindow && reportedContextWindow > 0
+    ? reportedContextWindow
+    : configuredOrDefaultContextWindow;
   const cacheTokens = cacheReadTokens + cacheCreationTokens;
 
   return {

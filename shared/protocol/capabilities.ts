@@ -66,6 +66,14 @@ export type ProviderCapabilities = {
   supportsQuotaReset: boolean;
   supportsEffort: boolean;
   /**
+   * Reasoning-effort levels the runtime can pass on, weakest first, and so the
+   * levels a custom model-library entry may declare. Empty exactly when
+   * `supportsEffort` is false. Covers every level a predefined model declares
+   * (a providers test enforces this) and, unlike the model catalog, does not
+   * depend on which upstream providers this machine has connected.
+   */
+  effortLevels: string[];
+  /**
    * Whether an already-sent message can be replaced, which requires the
    * provider to re-run a conversation truncated at a chosen point.
    */

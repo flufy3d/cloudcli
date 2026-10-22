@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.10.0 / 2026-10-21
+> 基准：2.11.0 / 2026-10-22
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -289,6 +289,9 @@ opencode 的自动命名由引擎自己做，CloudCLI 只负责不挡路。引�
 
 `provider-capabilities.catalog.ts` 放**推导不出来的静态事实**（权限模式、默认模型、附件/中止/effort）；
 `provider-capabilities.service.ts` 从**已注册切面推导**其余能力——切面在即能力在，加减切面自动翻转，不必改表。
+推理档位清单（`effortLevels`）也在静态目录里：它是运行时可传的档位全集、 weakest first，
+自定义模型库只能从这份清单里挑选声明（`supportsEffort` 为假时必为空）；
+目录里某个精选模型声明了清单之外的档位会被 `provider-capabilities.service.test.ts` 拦下。
 `supportsQuota` 就是这样推导的：`auth.getQuota` 存在即为真，而 `provider-token-usage.service.ts`
 本来就按这个方法分发配额请求；`supportsQuotaReset`（能否花掉重置卡）同理，看 `auth.consumeQuotaReset`。
 

@@ -182,6 +182,8 @@ function ChatInterface({
     openAttachmentPicker,
     handleSubmit,
     isSubmitting,
+    backgroundSendPrompt,
+    resolveBackgroundSendPrompt,
     queuedDraft,
     editingAnchorId,
     beginEditMessage,
@@ -494,6 +496,8 @@ function ChatInterface({
           isSubmitting={isSubmitting}
           isDragActive={isDragActive}
           queuedDraft={queuedDraft}
+          backgroundSendPrompt={backgroundSendPrompt}
+          onResolveBackgroundSendPrompt={resolveBackgroundSendPrompt}
           onEditQueuedDraft={editQueuedDraft}
           onDeleteQueuedDraft={deleteQueuedDraft}
           attachedFiles={attachedFiles}

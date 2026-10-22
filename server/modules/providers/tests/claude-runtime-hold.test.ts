@@ -212,6 +212,17 @@ async function withRun(
   }
 }
 
+const settle = () => new Promise((resolve) => { setTimeout(resolve, 25); });
+
+// A fixed settle can be too short on a loaded machine; the supersede tests
+// wait for the run to have actually processed its turn instead.
+async function waitFor(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 200 && !condition(); attempt += 1) {
+    await settle();
+  }
+  assert.ok(condition(), 'condition never became true');
+}
+
 const init = () => ({ type: 'system', subtype: 'init', session_id: NATIVE_ID });
 const toolUse = (id: string, name: string, input: Record<string, unknown>) => ({
   type: 'assistant', session_id: NATIVE_ID, parent_tool_use_id: null,

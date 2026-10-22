@@ -12,7 +12,13 @@ import {
   OPENCODE_PREDEFINED_MODELS,
 } from '@/modules/providers/list/opencode/opencode-models.provider.js';
 
-const OPENCODE_ENV_KEYS = ['OPENCODE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
+const OPENCODE_ENV_KEYS = [
+  'OPENCODE_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENCODE_CONFIG',
+  'OPENCODE_CONFIG_CONTENT',
+];
 
 /**
  * Runs one case against a throwaway OpenCode home, so the catalog the adapter
@@ -406,6 +412,13 @@ test('OpenCode composes the provider prefix into session model ids', async () =>
           id: 'ses_plain_string',
           model: 'opencode/gpt-5.6-terra',
         },
+        {
+          id: 'ses_github_copilot',
+          model: JSON.stringify({
+            id: 'gpt-5.6-terra',
+            providerID: 'github-copilot',
+          }),
+        },
       ]),
       async (adapter) => {
         assert.equal(
@@ -419,6 +432,10 @@ test('OpenCode composes the provider prefix into session model ids', async () =>
         assert.equal(
           (await adapter.getCurrentActiveModel('ses_plain_string')).model,
           'opencode/gpt-5.6-terra',
+        );
+        assert.equal(
+          (await adapter.getCurrentActiveModel('ses_github_copilot')).model,
+          'github-copilot/gpt-5.6-terra',
         );
       },
     );

@@ -1088,7 +1088,12 @@ function CostContent({ data }: { data: CostCommandData }) {
           },
         ]
       : []),
-    ...(total > 0
+    // Only when it is consistent with what was actually used. Claude reports
+    // the window its model has once a turn completes, but until then (and for
+    // providers that report none) it is the CONTEXT_WINDOW setting, which cannot
+    // know whether a session runs a 200K or a 1M variant of the same model —
+    // and a row reading "used 404,009 / window 160,000" is worse than no row.
+    ...(total > used
       ? [{ label: t('cost.contextWindow', { defaultValue: 'Context window' }), value: formatNumber(total), icon: Gauge }]
       : []),
   ];

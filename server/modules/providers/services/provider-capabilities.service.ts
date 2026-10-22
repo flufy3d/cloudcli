@@ -51,6 +51,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     supportsQuota: typeof provider.auth?.getQuota === 'function',
     supportsQuotaReset: typeof provider.auth?.consumeQuotaReset === 'function',
     supportsEffort: catalog.supportsEffort,
+    effortLevels: [...catalog.effortLevels],
     supportsMessageEditing: typeof provider.sessions?.resolveEditAnchor === 'function',
     supportsSessionForking: provider.fork !== undefined,
     mcp: provider.mcp.capabilities,

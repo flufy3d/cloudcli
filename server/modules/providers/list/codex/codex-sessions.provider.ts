@@ -14,13 +14,14 @@ import {
   readCodexProposedPlan,
   readCodexRolloutItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
-import { parseFilesInputTag } from '@/shared/image-attachments.js';
+import { parseFilesInputTag, toImageAttachments } from '@/shared/image-attachments.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import { prepareTranscriptMessages } from '@/shared/message-unification.js';
 import type {
   AnyRecord,
   FetchHistoryOptions,
   FetchHistoryResult,
+  MemoryCitation,
     NormalizedMessage,
     ProviderSessionUsageInput,
     ProviderTokenUsageResult,
@@ -130,10 +131,7 @@ function createCodexTurnTracker() {
  */
 async function readCodexLiveTurnIds(filePath: string): Promise<string[]> {
   const turns = createCodexTurnTracker();
-  const stream = fsSync.createReadStream(filePath);
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  for await (const line of lines) {
+  for await (const line of readCodexRolloutLines(filePath)) {
     if (!line.trim()) {
       continue;
     }
@@ -151,6 +149,795 @@ async function readCodexLiveTurnIds(filePath: string): Promise<string[]> {
   }
 
   return turns.getLiveTurnIds();
+}
+
+/** Resolve reference-backed history without requiring the source to remain indexed. */
+async function findCodexHistorySource(filePath: string, threadId: string): Promise<string | null> {
+  const indexed = sessionsDb.getSessionByProviderSessionId(threadId);
+  if (indexed?.provider === PROVIDER && indexed.jsonl_path) {
+    try {
+      if ((await fsp.stat(indexed.jsonl_path)).isFile()) {
+        return indexed.jsonl_path;
+      }
+    } catch {
+      // The native CLI can archive a rollout without updating the app row.
+    }
+  }
+
+  let directory = path.dirname(filePath);
+  while (path.dirname(directory) !== directory) {
+    if (path.basename(directory) === 'sessions' || path.basename(directory) === 'archived_sessions') {
+      const home = path.dirname(directory);
+      for (const storage of ['sessions', 'archived_sessions']) {
+        const found = await findFileWithSuffix(path.join(home, storage), `-${threadId}.jsonl`, 3);
+        if (found) return found;
+      }
+      break;
+    }
+    directory = path.dirname(directory);
+  }
+  return null;
+}
+
+/**
+ * Codex 0.160 paginated forks keep a frozen prefix in `history_base` instead
+ * of copying it. Read each ancestor only through its recorded byte boundary,
+ * then the child's own rows. `forked_from_id` alone also appears on copied
+ * legacy rollouts and must never cause history to be included twice.
+ */
+async function* readCodexRolloutLines(
+  filePath: string,
+  endByteOffset?: number,
+  ancestors = new Set<string>(),
+): AsyncGenerator<string> {
+  const canonicalPath = await fsp.realpath(filePath);
+  if (ancestors.has(canonicalPath) || ancestors.size >= 128) {
+    throw new AppError('Codex fork history contains a cyclic or excessively deep source chain.', {
+      code: 'CODEX_HISTORY_SOURCE_INVALID', statusCode: 502,
+    });
+  }
+  if (endByteOffset !== undefined) {
+    if ((await fsp.stat(canonicalPath)).size < endByteOffset) {
+      throw new AppError('The source transcript is shorter than the Codex fork snapshot.', {
+        code: 'CODEX_HISTORY_SOURCE_INVALID', statusCode: 502,
+      });
+    }
+    if (endByteOffset === 0) return;
+  }
+  const nextAncestors = new Set(ancestors).add(canonicalPath);
+  const stream = fsSync.createReadStream(canonicalPath, {
+    ...(endByteOffset !== undefined ? { end: endByteOffset - 1 } : {}),
+  });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let readMetadata = false;
+  try {
+    for await (const line of lines) {
+      let entry: AnyRecord | undefined;
+      if (!readMetadata) {
+        try { entry = readObjectRecord(JSON.parse(line)) ?? undefined; } catch { /* Skip malformed rows. */ }
+      }
+      if (entry?.type === 'session_meta') {
+        readMetadata = true;
+        const payload = readObjectRecord(entry.payload);
+        if (payload?.history_base != null) {
+          const base = readObjectRecord(payload.history_base);
+          const threadId = readNonEmptyString(base?.thread_id);
+          const offset = base?.end_byte_offset;
+          if (!threadId || !/^[a-zA-Z0-9-]+$/.test(threadId)
+            || typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
+            throw new AppError('Codex fork history has an invalid source boundary.', {
+              code: 'CODEX_HISTORY_SOURCE_INVALID', statusCode: 502,
+            });
+          }
+          const sourcePath = await findCodexHistorySource(canonicalPath, threadId);
+          if (!sourcePath) {
+            throw new AppError('The source transcript referenced by this Codex fork is unavailable.', {
+              code: 'CODEX_HISTORY_SOURCE_UNAVAILABLE', statusCode: 502,
+            });
+          }
+          yield* readCodexRolloutLines(sourcePath, offset, nextAncestors);
+        }
+      }
+      yield line;
+    }
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+}
+
+/**
+ * Reads the image attachments Codex records on `user_message` events.
+ * Turns sent with `local_image` input items land in `local_images` as file
+ * paths (verified against real rollout JSONL); the `images` array can carry
+ * base64 data URLs, which are passed through as inline `data` attachments so
+ * the UI can preview them without a file lookup.
+ *
+ * Exported for tests.
+ */
+export function extractCodexUserImages(
+  payload: AnyRecord | null | undefined,
+): Array<{ path?: string; data?: string }> | undefined {
+  if (!payload) {
+    return undefined;
+  }
+
+  const candidates = [
+    ...(Array.isArray(payload.local_images) ? payload.local_images : []),
+    ...(Array.isArray(payload.images) ? payload.images : []),
+  ];
+
+  const attachments: Array<{ path?: string; data?: string }> = [];
+  for (const entry of candidates) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      continue;
+    }
+    if (entry.startsWith('data:')) {
+      attachments.push({ data: entry });
+    } else {
+      attachments.push(...toImageAttachments([entry]));
+    }
+  }
+
+  return attachments.length > 0 ? attachments : undefined;
+}
+
+function extractCodexTextContent(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return typeof content === 'string' ? content : '';
+  }
+
+  return content
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return '';
+      }
+
+      const record = item as AnyRecord;
+      if (
+        (record.type === 'input_text' || record.type === 'output_text' || record.type === 'text')
+        && typeof record.text === 'string'
+      ) {
+        return record.text;
+      }
+
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** Reads image inputs from a typed UserMessage item. */
+function extractCodexTypedUserImages(
+  content: unknown,
+): Array<{ path?: string; data?: string }> | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+
+  const attachments: Array<{ path?: string; data?: string }> = [];
+  for (const rawEntry of content) {
+    const entry = readObjectRecord(rawEntry);
+    if (!entry) {
+      continue;
+    }
+
+    const value = entry.type === 'local_image'
+      ? readNonEmptyString(entry.path)
+      : entry.type === 'image'
+        ? readNonEmptyString(entry.image_url)
+        : undefined;
+    if (!value) {
+      continue;
+    }
+    if (value.startsWith('data:')) {
+      attachments.push({ data: value });
+    } else {
+      attachments.push(...toImageAttachments([value]));
+    }
+  }
+
+  return attachments.length > 0 ? attachments : undefined;
+}
+
+/**
+ * Reads the markdown out of Codex's `<proposed_plan>` envelope.
+ *
+ * Codex delivers a plan as a wrapped assistant message while Claude delivers
+ * one as an `ExitPlanMode` call. Recognizing the envelope here lets both end up
+ * on the same plan card instead of one provider showing a card and the other
+ * showing prose with a stray tag in it. The closing tag is optional because a
+ * streamed plan exposes the opening tag first.
+ *
+/**
+ * The block Codex appends to a reply that leaned on its memory files. It is
+ * always the last thing in the message and is meant for programmatic parsing,
+ * so it reads as raw XML when left in the prose.
+ */
+const CODEX_MEMORY_CITATION_BLOCK = /<oai-mem-citation>([\s\S]*?)<\/oai-mem-citation>\s*$/i;
+
+/**
+ * Lifts Codex's memory citations out of an assistant reply.
+ *
+ * The block names the memory files and line ranges the answer drew on, which is
+ * worth showing — but as a footnote under the reply, not as markup inside it.
+ * The trailing `<rollout_ids>` list is dropped: those are handles to earlier
+ * rollouts that the transcript view has no way to open.
+ *
+ * Exported for tests.
+ */
+export function readCodexMemoryCitations(text: string): { text: string; memoryCitations?: MemoryCitation[] } {
+  const block = CODEX_MEMORY_CITATION_BLOCK.exec(text);
+  if (!block) {
+    return { text };
+  }
+
+  const entries = /<citation_entries>([\s\S]*?)<\/citation_entries>/i.exec(block[1])?.[1] ?? '';
+  const memoryCitations: MemoryCitation[] = [];
+  for (const line of entries.split('\n')) {
+    const entry = line.trim();
+    if (!entry) {
+      continue;
+    }
+
+    const noteMarker = entry.indexOf('|note=');
+    const source = (noteMarker === -1 ? entry : entry.slice(0, noteMarker)).trim();
+    if (!source) {
+      continue;
+    }
+
+    const note = noteMarker === -1
+      ? ''
+      : entry.slice(noteMarker + '|note='.length).trim().replace(/^\[/, '').replace(/\]$/, '').trim();
+    memoryCitations.push(note ? { source, note } : { source });
+  }
+
+  const prose = text.slice(0, block.index).trimEnd();
+  return memoryCitations.length > 0 ? { text: prose, memoryCitations } : { text: prose };
+}
+
+function extractCodexToolOutput(output: unknown): string {
+  if (typeof output === 'string') {
+    return output;
+  }
+
+  if (!Array.isArray(output)) {
+    return output == null ? '' : JSON.stringify(output);
+  }
+
+  return output
+    .map((item) => {
+      const record = readObjectRecord(item);
+      return typeof record?.text === 'string' ? record.text : '';
+    })
+    .filter(Boolean)
+    .join('');
+}
+
+// ─── Codex "code mode" exec scripts ─────────────────────────────────────────
+// Newer Codex builds (and every Sol-family model) stop calling shell/patch
+// tools directly. Instead they emit one `exec` custom tool call whose input is
+// a small JavaScript program that awaits `tools.<name>({...})`. Persisting that
+// program verbatim is what makes the transcript read as raw machinery, so it is
+// parsed back into the operations it performs.
+
+type CodexExecOperation =
+  | { kind: 'shell'; command: string; justification?: string }
+  | { kind: 'stdin'; chars: string }
+  | { kind: 'patch'; patch: string }
+  | { kind: 'search'; queries: string[] }
+  | { kind: 'plan'; todos: CodexPlanTodo[] };
+
+/** One step of a checklist, in the shape the shared todo renderer consumes. */
+type CodexPlanTodo = { content: string; status: string };
+
+/**
+ * Decodes one JavaScript string literal (single, double or backtick quoted).
+ *
+ * Template literals with `${}` interpolation are returned with the expression
+ * text intact — the transcript has no bindings to evaluate, and showing the
+ * raw template is still far more readable than the surrounding program.
+ */
+function decodeJavaScriptStringLiteral(literal: string): string {
+  if (literal.startsWith('"')) {
+    try {
+      return JSON.parse(literal) as string;
+    } catch {
+      return literal.slice(1, -1);
+    }
+  }
+
+  return literal
+    .slice(1, -1)
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\([\\'`])/g, '$1');
+}
+
+/**
+ * Returns the source of the argument list of the call that opens at
+ * `openParenIndex`, skipping over parens that appear inside string literals.
+ *
+ * A plain regex cannot be used here: shell commands routinely embed `(`/`)`
+ * and quotes, so the argument object has to be found by balancing.
+ */
+function readCallArguments(source: string, openParenIndex: number): string | null {
+  let depth = 0;
+  let quote: string | null = null;
+
+  for (let index = openParenIndex; index < source.length; index += 1) {
+    const character = source[index];
+
+    if (quote) {
+      if (character === '\\') {
+        index += 1;
+        continue;
+      }
+      if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character;
+      continue;
+    }
+
+    if (character === '(') {
+      depth += 1;
+      continue;
+    }
+
+    if (character === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(openParenIndex + 1, index);
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Reads `key: "value"` / `"key": "value"` out of an object-literal source. */
+function readStringProperty(objectSource: string, key: string): string | undefined {
+  const pattern = new RegExp(
+    `(?:["']${key}["']|\\b${key})\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|\`(?:\\\\.|[^\`\\\\])*\`)`,
+    's',
+  );
+  const match = pattern.exec(objectSource);
+  return match ? decodeJavaScriptStringLiteral(match[1]) : undefined;
+}
+
+/** Reads every `q: "..."` entry out of a `web__run` search-query array. */
+function readSearchQueries(objectSource: string): string[] {
+  const pattern = /(?:["']q["']|\bq)\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/gs;
+  return Array.from(objectSource.matchAll(pattern), (match) => decodeJavaScriptStringLiteral(match[1]));
+}
+
+/**
+ * Finds the patch body an `apply_patch` call is given.
+ *
+ * The program almost always assigns it to a local first
+ * (`const patch = "*** Begin Patch..."; tools.apply_patch(patch)`), so the
+ * argument itself is usually an identifier. Scanning the whole script for the
+ * literal that carries the patch header covers both forms.
+ */
+function readPatchLiteral(source: string): string | undefined {
+  const pattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/gs;
+  for (const match of source.matchAll(pattern)) {
+    const decoded = decodeJavaScriptStringLiteral(match[1]);
+    if (decoded.includes('*** Begin Patch')) {
+      return decoded;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reads the steps of an `update_plan` call made from an exec script.
+ *
+ * The script writes its argument as a JavaScript object literal with unquoted
+ * keys, so it is not JSON — each `{step, status}` entry is matched directly.
+ */
+function readPlanSteps(objectSource: string): CodexPlanTodo[] {
+  const todos: CodexPlanTodo[] = [];
+  for (const entry of objectSource.matchAll(/\{([^{}]*)\}/g)) {
+    const content = readStringProperty(entry[1], 'step') ?? readStringProperty(entry[1], 'content');
+    if (content) {
+      todos.push({ content, status: readStringProperty(entry[1], 'status') ?? 'pending' });
+    }
+  }
+
+  return todos;
+}
+
+/**
+ * Recovers commands a script keeps in a local array and maps over, which is how
+ * Codex batches several shell calls:
+ *   `const cmds = ["a", "b"]; await Promise.all(cmds.map(command => tools.shell_command({ command })))`
+ * The call site then passes `{ command }` shorthand, so there is no literal to
+ * read at the call itself.
+ */
+function readMappedCommandCandidates(source: string): string[] {
+  const commands: string[] = [];
+  const arrayPattern = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\[([\s\S]*?)\]\s*;/g;
+  const stringPattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/gs;
+
+  for (const arrayMatch of source.matchAll(arrayPattern)) {
+    if (!new RegExp(`\\b${arrayMatch[1]}\\.map\\s*\\(`).test(source)) {
+      continue;
+    }
+    for (const stringMatch of arrayMatch[2].matchAll(stringPattern)) {
+      commands.push(decodeJavaScriptStringLiteral(stringMatch[1]));
+    }
+  }
+
+  return commands;
+}
+
+/**
+ * Turns one Codex `exec` script into the operations it performs, in source
+ * order. An empty result means the script did nothing recognizable and the
+ * caller should fall back to showing it as code.
+ *
+ * Exported for tests.
+ */
+export function parseCodexExecScript(input: unknown): CodexExecOperation[] {
+  const source = typeof input === 'string' ? input : String(input ?? '');
+  if (!source.includes('tools.')) {
+    return [];
+  }
+
+  const operations: CodexExecOperation[] = [];
+  const callPattern = /tools\.([A-Za-z_0-9]+)\s*\(/g;
+  /** Filled in lazily, and only once, for shorthand-argument shell calls. */
+  let mappedCommands: string[] | null = null;
+
+  for (const match of source.matchAll(callPattern)) {
+    const toolName = match[1];
+    const openParenIndex = match.index + match[0].length - 1;
+    const argumentSource = readCallArguments(source, openParenIndex) ?? '';
+
+    switch (toolName) {
+      case 'shell_command':
+      case 'exec_command': {
+        const command = readStringProperty(argumentSource, 'command')
+          ?? readStringProperty(argumentSource, 'cmd');
+        if (command) {
+          operations.push({
+            kind: 'shell',
+            command,
+            justification: readStringProperty(argumentSource, 'justification'),
+          });
+          break;
+        }
+
+        if (mappedCommands === null) {
+          mappedCommands = readMappedCommandCandidates(source);
+          for (const mappedCommand of mappedCommands) {
+            operations.push({ kind: 'shell', command: mappedCommand });
+          }
+        }
+        break;
+      }
+      case 'write_stdin': {
+        operations.push({ kind: 'stdin', chars: readStringProperty(argumentSource, 'chars') ?? '' });
+        break;
+      }
+      case 'apply_patch': {
+        const patch = readPatchLiteral(argumentSource) ?? readPatchLiteral(source);
+        if (patch) {
+          operations.push({ kind: 'patch', patch });
+        }
+        break;
+      }
+      case 'web__run':
+      case 'web_search': {
+        const queries = readSearchQueries(argumentSource);
+        if (queries.length > 0) {
+          operations.push({ kind: 'search', queries });
+        }
+        break;
+      }
+      case 'update_plan': {
+        const todos = readPlanSteps(argumentSource);
+        if (todos.length > 0) {
+          operations.push({ kind: 'plan', todos });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  return operations;
+}
+
+// ─── Codex shell output ─────────────────────────────────────────────────────
+
+type CodexShellOutput = {
+  output: string;
+  /** Set when the command has exited; `undefined` while it is still running. */
+  exitCode?: number;
+  /** Present while the command runs in the background under this cell id. */
+  runningCellId?: string;
+  truncated: boolean;
+};
+
+/**
+ * Strips the two nested envelopes Codex wraps shell output in.
+ *
+ * The outer one reports on the sandbox *script* (`Script completed`, its wall
+ * time, and `Output:`); the inner one reports on the *command* (`Exit code`,
+ * its own wall time, an optional line count). Neither is useful in a chat
+ * transcript, but the exit code decides whether the row is shown as failed, so
+ * it is lifted out before the text is discarded.
+ *
+ * Exported for tests.
+ */
+export function cleanCodexShellOutput(rawOutput: string): CodexShellOutput {
+  let output = rawOutput;
+  let exitCode: number | undefined;
+  let runningCellId: string | undefined;
+  let truncated = false;
+
+  const runningMatch = /^Script running with cell ID\s+(\S+)[^\n]*\n?/i.exec(output);
+  if (runningMatch) {
+    runningCellId = runningMatch[1];
+    output = output.slice(runningMatch[0].length);
+  } else {
+    output = output.replace(/^Script (?:completed|failed)[^\n]*\n?/i, '');
+  }
+
+  output = output.replace(/^Wall time[^\n]*\n?/i, '');
+  output = output.replace(/^Output:\s*\n?/i, '');
+  output = output.replace(/^Script error:\s*\n?/i, '');
+
+  const truncationMatch = /^Warning: truncated output[^\n]*\n(?:Total output lines:[^\n]*\n)?\n?/i.exec(output);
+  if (truncationMatch) {
+    truncated = true;
+    output = output.slice(truncationMatch[0].length);
+    output = output.replace(/^Script error:\s*\n?/i, '');
+  }
+
+  const exitCodeMatch = /^Exit code:\s*(-?\d+)[^\n]*\n?/i.exec(output);
+  if (exitCodeMatch) {
+    exitCode = Number.parseInt(exitCodeMatch[1], 10);
+    output = output.slice(exitCodeMatch[0].length);
+    output = output.replace(/^Wall time:[^\n]*\n?/i, '');
+    output = output.replace(/^Total output lines:[^\n]*\n?/i, '');
+    output = output.replace(/^Output:\s*\n?/i, '');
+  }
+
+  return { output, exitCode, runningCellId, truncated };
+}
+
+/**
+ * `write_stdin` answers with a JSON envelope rather than plain text. Only its
+ * `output` and `exit_code` matter to a reader.
+ */
+function readCodexStdinOutput(rawOutput: string): CodexShellOutput | null {
+  const trimmed = rawOutput.trim();
+  const jsonStart = trimmed.indexOf('{');
+  if (jsonStart === -1) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed.slice(jsonStart)) as AnyRecord;
+    if (typeof parsed.output !== 'string') {
+      return null;
+    }
+    return {
+      output: parsed.output,
+      exitCode: typeof parsed.exit_code === 'number' ? parsed.exit_code : undefined,
+      truncated: false,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Unified patches ────────────────────────────────────────────────────────
+
+type CodexFileChange = {
+  filePath: string;
+  /** `add` and `delete` are rendered as a whole-file write/removal. */
+  changeType: 'add' | 'update' | 'delete';
+  oldText: string;
+  newText: string;
+};
+
+/**
+ * Rebuilds the before/after text of one unified diff.
+ *
+ * Only the hunks are available — never the whole file — so the reconstruction
+ * keeps context lines in both sides and drops hunk headers. Feeding that pair
+ * to the frontend's line differ reproduces exactly the additions, removals and
+ * surrounding context the patch described, which is what Claude's `Edit` rows
+ * already show.
+ *
+ * Exported for tests.
+ */
+export function unifiedDiffToTexts(unifiedDiff: string): { oldText: string; newText: string } {
+  const oldLines: string[] = [];
+  const newLines: string[] = [];
+
+  for (const line of unifiedDiff.split('\n')) {
+    if (line.startsWith('@@') || line.startsWith('\\ No newline')) {
+      continue;
+    }
+    if (line.startsWith('+')) {
+      newLines.push(line.slice(1));
+      continue;
+    }
+    if (line.startsWith('-')) {
+      oldLines.push(line.slice(1));
+      continue;
+    }
+    const contextLine = line.startsWith(' ') ? line.slice(1) : line;
+    oldLines.push(contextLine);
+    newLines.push(contextLine);
+  }
+
+  // A unified diff ends with a newline, which would otherwise reconstruct as a
+  // phantom trailing blank line on both sides.
+  if (oldLines[oldLines.length - 1] === '' && newLines[newLines.length - 1] === '') {
+    oldLines.pop();
+    newLines.pop();
+  }
+
+  return { oldText: oldLines.join('\n'), newText: newLines.join('\n') };
+}
+
+/**
+ * Splits a `*** Begin Patch` body into one change per file.
+ *
+ * Exported for tests.
+ */
+export function parseCodexPatch(patch: string): CodexFileChange[] {
+  const changes: CodexFileChange[] = [];
+  const lines = patch.split('\n');
+  let current: { filePath: string; changeType: CodexFileChange['changeType']; body: string[] } | null = null;
+
+  const flush = () => {
+    if (!current) {
+      return;
+    }
+    const { oldText, newText } = unifiedDiffToTexts(current.body.join('\n'));
+    changes.push({
+      filePath: current.filePath,
+      changeType: current.changeType,
+      oldText: current.changeType === 'add' ? '' : oldText,
+      newText: current.changeType === 'delete' ? '' : newText,
+    });
+    current = null;
+  };
+
+  for (const line of lines) {
+    const fileHeader = /^\*\*\* (Add|Update|Delete) File:\s*(.+)$/.exec(line);
+    if (fileHeader) {
+      flush();
+      const changeType = fileHeader[1].toLowerCase() as CodexFileChange['changeType'];
+      current = { filePath: fileHeader[2].trim(), changeType, body: [] };
+      continue;
+    }
+
+    if (line.startsWith('*** ')) {
+      // `*** Begin Patch`, `*** End Patch`, `*** Move to:` — never diff content.
+      continue;
+    }
+
+    current?.body.push(line);
+  }
+
+  flush();
+  return changes;
+}
+
+/** Converts a `patch_apply_end` change map into the same per-file shape. */
+function readPatchApplyChanges(changes: unknown): CodexFileChange[] {
+  const record = readObjectRecord(changes);
+  if (!record) {
+    return [];
+  }
+
+  const parsed: CodexFileChange[] = [];
+  for (const [filePath, rawChange] of Object.entries(record)) {
+    const change = readObjectRecord(rawChange);
+    if (!change) {
+      continue;
+    }
+    const changeType = change.type === 'add' || change.type === 'delete' ? change.type : 'update';
+    const { oldText, newText } = unifiedDiffToTexts(
+      typeof change.unified_diff === 'string' ? change.unified_diff : '',
+    );
+    parsed.push({
+      filePath,
+      changeType,
+      oldText: changeType === 'add' ? '' : oldText,
+      newText: changeType === 'delete' ? '' : newText,
+    });
+  }
+
+  return parsed;
+}
+
+/** Maps a file change onto the tool the frontend already renders diffs for. */
+function fileChangeToToolMessage(change: CodexFileChange, timestamp: string, toolCallId: string): AnyRecord {
+  const toolName = change.changeType === 'add' ? 'Write' : 'Edit';
+  return {
+    type: 'tool_use',
+    timestamp,
+    toolName,
+    toolInput: JSON.stringify({
+      file_path: change.filePath,
+      old_string: change.oldText,
+      new_string: change.newText,
+      ...(change.changeType === 'delete' ? { deleted: true } : {}),
+    }),
+    toolCallId,
+  };
+}
+
+/** Reads the `file_path` back out of a rendered file-change row. */
+function readRowFilePath(row: AnyRecord): string {
+  try {
+    return String((JSON.parse(String(row.toolInput ?? '{}')) as AnyRecord).file_path ?? '');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Rewrites the rows reconstructed from a patch call's input with the
+ * authoritative diffs Codex reports once the patch has been applied.
+ *
+ * Rows are matched by path, never by position: `patch_apply_end` reports the
+ * touched files in map order, which does not follow the order they appeared in
+ * the patch body. Rows whose file the report does not mention are dropped
+ * rather than left behind claiming an edit that never happened.
+ */
+function rewritePatchRows(
+  rows: AnyRecord[],
+  changes: CodexFileChange[],
+  callId: string,
+  messages: AnyRecord[],
+): void {
+  const rowsByPath = new Map<string, AnyRecord>();
+  for (const row of rows) {
+    rowsByPath.set(readRowFilePath(row), row);
+  }
+
+  const keptRows: AnyRecord[] = [];
+  for (const [index, change] of changes.entries()) {
+    const replacement = fileChangeToToolMessage(change, String(rows[0]?.timestamp ?? ''), `${callId}#${index}`);
+    const existing = rowsByPath.get(change.filePath);
+    if (existing) {
+      existing.toolName = replacement.toolName;
+      existing.toolInput = replacement.toolInput;
+      keptRows.push(existing);
+      rowsByPath.delete(change.filePath);
+      continue;
+    }
+
+    replacement.timestamp = rows[0]?.timestamp ?? replacement.timestamp;
+    keptRows.push(replacement);
+    messages.push(replacement);
+  }
+
+  for (const surplus of rowsByPath.values()) {
+    const position = messages.indexOf(surplus);
+    if (position !== -1) {
+      messages.splice(position, 1);
+    }
+  }
+
+  rows.splice(0, rows.length, ...keptRows);
 }
 
 // ─── Subagents ──────────────────────────────────────────────────────────────
@@ -514,10 +1301,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     });
   };
 
-  const fileStream = fsSync.createReadStream(sessionFilePath);
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-  for await (const line of rl) {
+  for await (const line of readCodexRolloutLines(sessionFilePath)) {
     if (!line.trim()) {
       continue;
     }
@@ -732,6 +1516,7 @@ async function attachCodexSubagentTranscripts(
   }
 }
 
+/** The provider registry uses this reader for session history and message edits. */
 export class CodexSessionsProvider implements IProviderSessions {
   /**
    * Resolves the last turn to keep when the turn `anchorId` names is replaced.
@@ -1015,6 +1800,10 @@ export class CodexSessionsProvider implements IProviderSessions {
       result = await getCodexSessionMessages(sessionId);
     } catch (error) {
       if (error instanceof ProviderDisplayAssetError) throw error;
+      // A broken inherited snapshot must not masquerade as an empty thread.
+      if (error instanceof AppError && error.code.startsWith('CODEX_HISTORY_SOURCE_')) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[CodexProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };

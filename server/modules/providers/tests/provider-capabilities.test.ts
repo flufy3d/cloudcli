@@ -43,6 +43,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: false,
     supportsEffort: true,
+    // Runtime levels; a custom model may only declare from this list.
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
     supportsMessageEditing: true,
     supportsSessionForking: true,
     mcp: {
@@ -63,6 +65,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: false,
     supportsQuotaReset: false,
     supportsEffort: false,
+    // Runtime levels; a custom model may only declare from this list.
+    effortLevels: [],
     supportsMessageEditing: false,
     supportsSessionForking: false,
     mcp: {
@@ -86,6 +90,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: true,
     supportsEffort: true,
+    // Runtime levels; a custom model may only declare from this list.
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     // `thread/fork` copies a thread up to a chosen turn; editing is that fork
     // plus a new prompt, which is how Codex's own IDE clients do it.
     supportsMessageEditing: true,
@@ -110,6 +116,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: false,
     supportsQuotaReset: false,
     supportsEffort: true,
+    // Runtime levels; a custom model may only declare from this list.
+    effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
     supportsMessageEditing: false,
     supportsSessionForking: false,
     mcp: {
@@ -135,6 +143,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: true,
     supportsEffort: true,
+    // Runtime levels; a custom model may only declare from this list.
+    effortLevels: ['low', 'high', 'max'],
     // No resolveEditAnchor/fork facets: transcripts are append-only for this
     // provider today.
     supportsMessageEditing: false,
@@ -157,6 +167,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: false,
     supportsEffort: true,
+    // Runtime levels; a custom model may only declare from this list.
+    effortLevels: ['low', 'medium', 'high'],
     supportsMessageEditing: false,
     supportsSessionForking: false,
     mcp: {

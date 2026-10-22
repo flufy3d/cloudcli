@@ -1,5 +1,6 @@
-import { providerModelsDb, sessionsDb } from '@/modules/database/index.js';
+import { appConfigDb, providerModelsDb, sessionsDb } from '@/modules/database/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
+import { providerCapabilitiesService } from '@/modules/providers/services/provider-capabilities.service.js';
 import type { IProvider } from '@/shared/interfaces.js';
 import type {
   CustomProviderModelInput,
@@ -30,12 +31,33 @@ type ProviderModelsCatalogStore = Pick<
   | 'deleteCustomProviderModel'
 >;
 
+/** App-wide key-value settings, narrowed to what the "custom models only" flag needs. */
+type ProviderModelsSettingsStore = Pick<typeof appConfigDb, 'get' | 'set'>;
+
 type ProviderModelsServiceDependencies = {
   resolveProvider?: (provider: LLMProvider) => Pick<IProvider, 'models'>;
   catalog?: ProviderModelsCatalogStore;
   sessions?: ProviderModelsSessionStore;
+  settings?: ProviderModelsSettingsStore;
 };
 
+/**
+ * `app_config` key of one provider's "use only my models" flag. It is app-wide
+ * like the custom rows it filters, which carry no user id either.
+ */
+const customModelsOnlyConfigKey = (provider: LLMProvider): string => (
+  `provider_models_custom_only:${provider}`
+);
+
+/**
+ * Converts a stored custom row into a catalog option.
+ *
+ * `effort` is emitted in the same shape predefined models use, so the composer
+ * and every runtime's effort validation treat declared levels identically.
+ * Rows without declared levels omit `effort` on purpose: the composer then
+ * hides Reasoning and runtimes send no effort, instead of guessing levels the
+ * model might reject.
+ */
 const toCustomProviderModelOption = (
   record: CustomProviderModelRecord,
 ): ProviderModelOption => ({
@@ -43,31 +65,101 @@ const toCustomProviderModelOption = (
   label: record.model,
   recordId: record.recordId,
   isCustom: true,
+  ...(record.effort
+    ? {
+      effort: {
+        ...(record.effort.default ? { default: record.effort.default } : {}),
+        values: record.effort.values.map((value) => ({ value })),
+      },
+    }
+    : {}),
 });
 
+/**
+ * Effort levels a custom model of this provider may declare, weakest first:
+ * the levels its runtime can pass on, from the capability matrix. Empty
+ * (Cursor) means no effort support at all.
+ *
+ * Deliberately not derived from the predefined models: OpenCode narrows its
+ * catalog to the upstream providers this machine has connected, and only its
+ * OpenCode Go models declare effort, so a catalog-derived set would vanish for
+ * Zen, Anthropic, or OpenAI users and change with unrelated credentials.
+ */
+const readCustomModelEffortLevels = (provider: LLMProvider): string[] => (
+  providerCapabilitiesService.getProviderCapabilities(provider).effortLevels
+);
+
+/**
+ * Builds the catalog every picker, command, and runtime reads.
+ *
+ * Built-in models come first, then custom ones. With `customModelsOnly` set the
+ * built-ins are left out and the first custom model becomes the default, so a
+ * provider pointed at a gateway lists only what that gateway serves. The flag
+ * only applies while at least one custom model exists: an empty catalog would
+ * leave the composer and the runtimes with no model at all.
+ */
 const mergeProviderModels = (
+  provider: LLMProvider,
   predefined: ProviderModelsDefinition,
   custom: CustomProviderModelRecord[],
+  customModelsOnly: boolean,
 ): ProviderModelsDefinition => {
   const customById = new Map(custom.map((record) => [record.modelId, record]));
+  const customOptions = custom.map(toCustomProviderModelOption);
+  const listOnlyCustomModels = customModelsOnly && customOptions.length > 0;
   const predefinedIds = new Set(predefined.OPTIONS.map((option) => option.value));
   return {
-    OPTIONS: [
-      ...predefined.OPTIONS.map((option) => {
-        const record = customById.get(option.value);
+    OPTIONS: listOnlyCustomModels
+      ? customOptions
+      : [
         // Keep the saved label and edit target while inheriting discovered capabilities.
-        return record ? { ...option, ...toCustomProviderModelOption(record) } : { ...option, isCustom: false };
-      }),
-      ...custom.filter((record) => !predefinedIds.has(record.modelId)).map(toCustomProviderModelOption),
-    ],
-    DEFAULT: predefined.DEFAULT,
+        ...predefined.OPTIONS.map((option) => {
+          const record = customById.get(option.value);
+          return record ? { ...option, ...toCustomProviderModelOption(record) } : { ...option, isCustom: false };
+        }),
+        ...custom.filter((record) => !predefinedIds.has(record.modelId)).map(toCustomProviderModelOption),
+      ],
+    DEFAULT: listOnlyCustomModels ? customOptions[0].value : predefined.DEFAULT,
+    // Copied so no caller can mutate the shared capability matrix.
+    EFFORT_LEVELS: [...readCustomModelEffortLevels(provider)],
+    CUSTOM_MODELS_ONLY: customModelsOnly,
   };
 };
 
 const normalizeCustomModelInput = (input: CustomProviderModelInput): CustomProviderModelInput => ({
   id: input.id.trim(),
   model: input.model.trim(),
+  ...(input.effort === undefined ? {} : { effort: input.effort }),
 });
+
+const assertEffortLevelsSupported = (
+  provider: LLMProvider,
+  input: CustomProviderModelInput,
+): void => {
+  const declaredLevels = input.effort?.values ?? [];
+  if (declaredLevels.length === 0) {
+    return;
+  }
+
+  const supportedLevels = readCustomModelEffortLevels(provider);
+  if (supportedLevels.length === 0) {
+    throw new AppError(`${provider} models do not support reasoning effort.`, {
+      code: 'MODEL_EFFORT_NOT_SUPPORTED',
+      statusCode: 400,
+    });
+  }
+
+  const unsupportedLevel = declaredLevels.find((level) => !supportedLevels.includes(level));
+  if (unsupportedLevel) {
+    throw new AppError(
+      `"${unsupportedLevel}" is not a ${provider} effort level. Use one of: ${supportedLevels.join(', ')}.`,
+      {
+        code: 'INVALID_MODEL_EFFORT',
+        statusCode: 400,
+      },
+    );
+  }
+};
 
 const isUniqueConstraintError = (error: unknown): boolean => (
   error !== null
@@ -92,10 +184,40 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
   const resolveProvider = dependencies.resolveProvider ?? providerRegistry.resolveProvider;
   const catalog = dependencies.catalog ?? providerModelsDb;
   const sessions = dependencies.sessions ?? sessionsDb;
+  const settings = dependencies.settings ?? appConfigDb;
+
+  const isCustomModelsOnly = (provider: LLMProvider): boolean => (
+    settings.get(customModelsOnlyConfigKey(provider)) === 'true'
+  );
+
+  /** Merges the adapter catalog with the provider's stored custom rows and flag. */
+  const readMergedCatalog = (
+    provider: LLMProvider,
+    predefined: ProviderModelsDefinition,
+  ): ProviderModelsDefinition => mergeProviderModels(
+    provider,
+    predefined,
+    catalog.listCustomProviderModels(provider),
+    isCustomModelsOnly(provider),
+  );
 
   const getProviderModels = async (provider: LLMProvider): Promise<ProviderModelsDefinition> => {
     const predefined = await resolveProvider(provider).models.getSupportedModels();
-    return mergeProviderModels(predefined, catalog.listCustomProviderModels(provider));
+    return readMergedCatalog(provider, predefined);
+  };
+
+  /**
+   * Turns "use only my models" on or off for one provider and returns the
+   * catalog it produces. Turning it on with no custom models is allowed: the
+   * built-ins stay listed until the first custom model is added.
+   */
+  const setCustomModelsOnly = async (
+    provider: LLMProvider,
+    enabled: boolean,
+  ): Promise<ProviderModelsDefinition> => {
+    const predefined = await resolveProvider(provider).models.getSupportedModels();
+    settings.set(customModelsOnlyConfigKey(provider), enabled ? 'true' : 'false');
+    return readMergedCatalog(provider, predefined);
   };
 
   const getCurrentActiveModel = async (
@@ -148,12 +270,13 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
     const predefined = await resolveProvider(provider).models.getSupportedModels();
     const normalized = normalizeCustomModelInput(input);
     assertModelIdAvailable(provider, predefined, normalized.id);
+    assertEffortLevelsSupported(provider, normalized);
 
     try {
       const created = catalog.createCustomProviderModel(provider, normalized);
       return {
         model: toCustomProviderModelOption(created),
-        models: mergeProviderModels(predefined, catalog.listCustomProviderModels(provider)),
+        models: readMergedCatalog(provider, predefined),
       };
     } catch (error) {
       if (isUniqueConstraintError(error)) {
@@ -175,6 +298,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
     readCustomModel(provider, recordId);
     const normalized = normalizeCustomModelInput(input);
     assertModelIdAvailable(provider, predefined, normalized.id, recordId);
+    assertEffortLevelsSupported(provider, normalized);
 
     try {
       const updated = catalog.updateCustomProviderModel(provider, recordId, normalized);
@@ -187,7 +311,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
 
       return {
         model: toCustomProviderModelOption(updated),
-        models: mergeProviderModels(predefined, catalog.listCustomProviderModels(provider)),
+        models: readMergedCatalog(provider, predefined),
       };
     } catch (error) {
       if (isUniqueConstraintError(error)) {
@@ -206,9 +330,21 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
   ): Promise<{ model: ProviderModelOption; models: ProviderModelsDefinition }> => {
     const predefined = await resolveProvider(provider).models.getSupportedModels();
     const existing = readCustomModel(provider, recordId);
-    const fallback = predefined.OPTIONS.some((option) => option.value === existing.modelId)
-      ? existing.modelId : predefined.DEFAULT;
-    const removed = catalog.deleteCustomProviderModel(provider, recordId, fallback);
+    // A custom name for an engine-discovered model survives the deletion as
+    // the built-in entry: sessions on it keep the model, effort included.
+    // Otherwise they move to the default of the catalog left behind — the
+    // first remaining custom model (the new DEFAULT) while only custom models
+    // are listed, or the built-in default once none remain.
+    const merged = mergeProviderModels(
+      provider,
+      predefined,
+      catalog.listCustomProviderModels(provider).filter((record) => record.recordId !== recordId),
+      isCustomModelsOnly(provider),
+    );
+    const fallbackModelId = merged.OPTIONS.some((option) => option.value === existing.modelId)
+      ? existing.modelId
+      : merged.DEFAULT;
+    const removed = catalog.deleteCustomProviderModel(provider, recordId, fallbackModelId);
     if (!removed) {
       throw new AppError('Model not found.', {
         code: 'MODEL_NOT_FOUND',
@@ -218,7 +354,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
 
     return {
       model: toCustomProviderModelOption(removed),
-      models: mergeProviderModels(predefined, catalog.listCustomProviderModels(provider)),
+      models: readMergedCatalog(provider, predefined),
     };
   };
 
@@ -332,10 +468,14 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
         };
       }
 
-      const providerCatalog = await getProviderModels(provider);
+      const predefined = await resolveProvider(provider).models.getSupportedModels();
+      const providerCatalog = readMergedCatalog(provider, predefined);
       const providerModel = await getCurrentActiveModel(provider, normalizedSessionId);
       const resolvedProviderModel = providerModel.model?.trim();
-      if (resolvedProviderModel && resolvedProviderModel !== providerCatalog.DEFAULT) {
+      // Adapters answer with their own built-in default when they know nothing
+      // about the session. That value, not the merged default (a custom model
+      // while only custom models are listed), is what means "no answer".
+      if (resolvedProviderModel && resolvedProviderModel !== predefined.DEFAULT) {
         return {
           provider,
           sessionId: normalizedSessionId,
@@ -398,6 +538,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
 
   return {
     getProviderModels,
+    setCustomModelsOnly,
     createCustomModel,
     updateCustomModel,
     deleteCustomModel,

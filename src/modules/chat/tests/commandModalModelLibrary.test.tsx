@@ -55,6 +55,7 @@ const noopActions: ProviderModelActions = {
   create: vi.fn(() => Promise.resolve()),
   update: vi.fn(() => Promise.resolve()),
   remove: vi.fn(() => Promise.resolve()),
+  setCustomModelsOnly: vi.fn(() => Promise.resolve()),
 };
 
 const catalog: Partial<Record<LLMProvider, ProviderModelsDefinition>> = Object.fromEntries(
