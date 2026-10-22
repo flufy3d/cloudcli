@@ -352,6 +352,7 @@ function pruneRealtimeSupersededByServer(
     realtimeMessages,
     slot.pendingPrompts,
     slot.runEnded,
+    slot.retiredOptimisticUserAnchors,
   );
   for (const [localId, serverId] of retiredAnchors) {
     slot.retiredOptimisticUserAnchors.set(localId, serverId);
@@ -597,6 +598,7 @@ function computeMerged(
     realtime,
     slot.pendingPrompts,
     slot.runEnded,
+    slot.retiredOptimisticUserAnchors,
   );
   for (const [localId, serverId] of retiredAnchors) {
     slot.retiredOptimisticUserAnchors.set(localId, serverId);
