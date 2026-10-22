@@ -63,7 +63,7 @@ function normalizeNotificationPreferences(value: unknown): NotificationPreferenc
 
 export const notificationPreferencesDb = {
   /** Returns the normalized preferences for a user, creating defaults on first read. */
-  getNotificationPreferences(userId: number): NotificationPreferences {
+  getNotificationPreferences(userId: number | string): NotificationPreferences {
     const db = getConnection();
     const row = db
       .prepare(
@@ -107,8 +107,10 @@ export const notificationPreferencesDb = {
     return normalized;
   },
 
-  // Legacy aliases used by existing services/routes
-  getPreferences(userId: number): NotificationPreferences {
+  // Legacy aliases used by existing services/routes.
+  // userId stays loose because notification callers pass the runtime writer's
+  // id, which may be a number or a string; the queries bind either.
+  getPreferences(userId: number | string): NotificationPreferences {
     return notificationPreferencesDb.getNotificationPreferences(userId);
   },
   updatePreferences(userId: number, preferences: unknown): NotificationPreferences {

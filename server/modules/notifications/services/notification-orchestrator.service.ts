@@ -3,20 +3,75 @@ import webPush from 'web-push';
 import { notificationPreferencesDb, pushSubscriptionsDb, sessionsDb } from '@/modules/database/index.js';
 import { sendDesktopNotification as sendDesktopNotificationToClients } from '@/modules/notifications/services/desktop-notification-clients.service.js';
 
-const KIND_TO_PREF_KEY = {
+//----------------- NOTIFICATION ORCHESTRATOR TYPES ------------
+
+/** The snapshot `notificationPreferencesDb.getPreferences` resolves for a user. */
+type NotificationPreferencesSnapshot = ReturnType<typeof notificationPreferencesDb.getPreferences>;
+
+/** The push payload a channel delivers to the user's devices. */
+type NotificationPayload = {
+  title: string;
+  body: string;
+  data: {
+    sessionId: string | null;
+    code: string;
+    provider: string | null;
+    sessionName: string | null;
+    tag: string;
+  };
+};
+
+/** One normalized notification event as providers and the gateway create it. */
+export type NotificationEvent = {
+  provider: string;
+  sessionId: string | null;
+  kind: 'info' | 'stop' | 'error' | 'action_required';
+  code: string;
+  meta: Record<string, unknown>;
+  severity: 'info' | 'warning' | 'error';
+  requiresUserAction: boolean;
+  dedupeKey: string | null;
+  createdAt: string;
+};
+
+/** One delivery channel (web push, desktop relay) with its preference gate. */
+type NotificationChannel = {
+  id: string;
+  isEnabled: (preferences: NotificationPreferencesSnapshot) => boolean;
+  send: (input: { userId: string | number; event: NotificationEvent; payload: NotificationPayload }) => unknown;
+};
+
+/**
+ * The event shape the payload builder accepts: a full event, or the partial
+ * records tests and internal callers construct.
+ */
+type NotificationEventInput = Omit<NotificationEvent, 'severity' | 'requiresUserAction' | 'dedupeKey' | 'createdAt'>
+  & Partial<Pick<NotificationEvent, 'severity' | 'requiresUserAction' | 'dedupeKey' | 'createdAt'>>;
+
+/** Who a notification is for. Callers pass the runtime writer's user id, so numbers happen. */
+type NotificationTarget = {
+  userId?: string | number | null;
+  provider: string;
+  sessionId?: string | null;
+  sessionName?: string | null;
+};
+
+//----------------- DEDUPE AND PREFERENCE MAPS ------------
+
+const KIND_TO_PREF_KEY: Partial<Record<string, keyof NotificationPreferencesSnapshot['events']>> = {
   action_required: 'actionRequired',
   stop: 'stop',
   error: 'error'
 };
 
-const PROVIDER_LABELS = {
+const PROVIDER_LABELS: Record<string, string> = {
   claude: 'Claude',
   cursor: 'Cursor',
   codex: 'Codex',
   system: 'System'
 };
 
-const recentEventKeys = new Map();
+const recentEventKeys = new Map<string, number>();
 const DEDUPE_WINDOW_MS = 20000;
 
 const cleanupOldEventKeys = () => {
@@ -28,14 +83,17 @@ const cleanupOldEventKeys = () => {
   }
 };
 
-function isNotificationEventEnabled(preferences, event) {
+function isNotificationEventEnabled(
+  preferences: NotificationPreferencesSnapshot | null | undefined,
+  event: NotificationEventInput,
+): boolean {
   const prefEventKey = KIND_TO_PREF_KEY[event.kind];
   const eventEnabled = prefEventKey ? Boolean(preferences?.events?.[prefEventKey]) : true;
 
   return eventEnabled;
 }
 
-function isDuplicate(event) {
+function isDuplicate(event: NotificationEventInput): boolean {
   cleanupOldEventKeys();
   const key = event.dedupeKey || `${event.provider}:${event.kind || 'info'}:${event.code || 'generic'}:${event.sessionId || 'none'}`;
   if (recentEventKeys.has(key)) {
@@ -45,7 +103,10 @@ function isDuplicate(event) {
   return false;
 }
 
-function createNotificationEvent({
+//----------------- EVENT AND PAYLOAD BUILDING ------------
+
+/** Used by provider runtimes and Settings to create normalized notification events. */
+export function createNotificationEvent({
   provider,
   sessionId = null,
   kind = 'info',
@@ -54,7 +115,16 @@ function createNotificationEvent({
   severity = 'info',
   dedupeKey = null,
   requiresUserAction = false
-}) {
+}: {
+  provider: string;
+  sessionId?: string | null;
+  kind?: NotificationEvent['kind'];
+  code?: string;
+  meta?: Record<string, unknown>;
+  severity?: NotificationEvent['severity'];
+  dedupeKey?: string | null;
+  requiresUserAction?: boolean;
+}): NotificationEvent {
   return {
     provider,
     sessionId,
@@ -68,13 +138,13 @@ function createNotificationEvent({
   };
 }
 
-function normalizeErrorMessage(error) {
+function normalizeErrorMessage(error: unknown): string {
   if (typeof error === 'string') {
     return error;
   }
 
-  if (error && typeof error.message === 'string') {
-    return error.message;
+  if (error && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
   }
 
   if (error == null) {
@@ -84,7 +154,7 @@ function normalizeErrorMessage(error) {
   return String(error);
 }
 
-function normalizeSessionName(sessionName) {
+function normalizeSessionName(sessionName: unknown): string | null {
   if (typeof sessionName !== 'string') {
     return null;
   }
@@ -97,11 +167,19 @@ function normalizeSessionName(sessionName) {
   return normalized.length > 80 ? `${normalized.slice(0, 77)}...` : normalized;
 }
 
-function rowMatchesProvider(row, provider) {
-  return row && (!provider || row.provider === provider);
+//----------------- SESSION RESOLUTION ------------
+
+function rowMatchesProvider(
+  row: NonNullable<ReturnType<typeof sessionsDb.getSessionById>> | null,
+  provider: string,
+): row is NonNullable<ReturnType<typeof sessionsDb.getSessionById>> {
+  return row !== null && (!provider || row.provider === provider);
 }
 
-function resolveSessionRow(sessionId, provider) {
+function resolveSessionRow(
+  sessionId: string,
+  provider: string,
+): NonNullable<ReturnType<typeof sessionsDb.getSessionById>> | null {
   if (!sessionId) {
     return null;
   }
@@ -119,7 +197,7 @@ function resolveSessionRow(sessionId, provider) {
   return null;
 }
 
-function normalizeNotificationSession(event) {
+function normalizeNotificationSession<T extends NotificationEventInput>(event: T): T {
   if (!event?.sessionId || !event.provider || event.provider === 'system') {
     return event;
   }
@@ -135,7 +213,7 @@ function normalizeNotificationSession(event) {
   };
 }
 
-function resolveSessionName(event) {
+function resolveSessionName(event: NotificationEventInput): string | null {
   const explicitSessionName = normalizeSessionName(event.meta?.sessionName);
   if (explicitSessionName) {
     return explicitSessionName;
@@ -148,16 +226,21 @@ function resolveSessionName(event) {
   return normalizeSessionName(sessionsDb.getSessionName(event.sessionId, event.provider));
 }
 
-function buildNotificationPayload(event) {
+/** Used by notification tests and delivery workflows to create channel payloads. */
+export function buildNotificationPayload(event: NotificationEventInput): NotificationPayload {
   const normalizedEvent = normalizeNotificationSession(event);
-  const CODE_MAP = {
+  const CODE_MAP: Record<string, string> = {
     'permission.required': normalizedEvent.meta?.toolName
-      ? `Action Required: Tool "${normalizedEvent.meta.toolName}" needs approval`
+      ? `Action Required: Tool "${String(normalizedEvent.meta.toolName)}" needs approval`
       : 'Action Required: A tool needs your approval',
-    'run.stopped': normalizedEvent.meta?.stopReason || 'Run Stopped: The run has stopped',
+    'run.stopped': (normalizedEvent.meta?.stopReason || 'Run Stopped: The run has stopped') as string,
     'run.background_completed': 'Background work finished',
-    'run.failed': normalizedEvent.meta?.error ? `Run Failed: ${normalizedEvent.meta.error}` : 'Run Failed: The run encountered an error',
-    'agent.notification': normalizedEvent.meta?.message ? String(normalizedEvent.meta.message) : 'You have a new notification',
+    'run.failed': normalizedEvent.meta?.error
+      ? `Run Failed: ${String(normalizedEvent.meta.error)}`
+      : 'Run Failed: The run encountered an error',
+    'agent.notification': normalizedEvent.meta?.message
+      ? String(normalizedEvent.meta.message)
+      : 'You have a new notification',
     'push.enabled': 'Push notifications are now enabled!'
   };
   const providerLabel = PROVIDER_LABELS[normalizedEvent.provider] || 'Assistant';
@@ -177,7 +260,9 @@ function buildNotificationPayload(event) {
   };
 }
 
-function sendWebPushPayload(userId, payload) {
+//----------------- DELIVERY ------------
+
+function sendWebPushPayload(userId: string | number, payload: NotificationPayload): Promise<unknown> {
   const subscriptions = pushSubscriptionsDb.getSubscriptions(userId);
   if (!subscriptions.length) return Promise.resolve();
 
@@ -198,7 +283,7 @@ function sendWebPushPayload(userId, payload) {
   ).then((results) => {
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const statusCode = result.reason?.statusCode;
+        const statusCode = (result.reason as { statusCode?: unknown } | undefined)?.statusCode;
         if (statusCode === 410 || statusCode === 404) {
           pushSubscriptionsDb.removeSubscription(subscriptions[index].endpoint);
         }
@@ -207,7 +292,7 @@ function sendWebPushPayload(userId, payload) {
   });
 }
 
-const notificationChannels = [
+const notificationChannels: NotificationChannel[] = [
   {
     id: 'webPush',
     // TODO: Web push still uses push_subscriptions. Do not remove that table until
@@ -222,7 +307,14 @@ const notificationChannels = [
   }
 ];
 
-function notifyUserIfEnabled({ userId, event }) {
+/** Used by provider runtimes and the chat gateway to deliver events through enabled channels. */
+export function notifyUserIfEnabled({
+  userId,
+  event
+}: {
+  userId?: string | number | null;
+  event: NotificationEvent;
+}): void {
   if (!userId || !event) {
     return;
   }
@@ -247,10 +339,16 @@ function notifyUserIfEnabled({ userId, event }) {
   }
 }
 
-/**
- * @param {{ userId?: string | null, provider: string, sessionId?: string | null, stopReason?: string, sessionName?: string | null }} options
- */
-function notifyRunStopped({ userId, provider, sessionId = null, stopReason = 'completed', sessionName = null }) {
+//----------------- RUN OUTCOMES ------------
+
+/** Used by provider runtimes to report stopped or completed agent runs. */
+export function notifyRunStopped({
+  userId,
+  provider,
+  sessionId = null,
+  stopReason = 'completed',
+  sessionName = null
+}: NotificationTarget & { stopReason?: string }): void {
   notifyUserIfEnabled({
     userId,
     event: createNotificationEvent({
@@ -269,10 +367,18 @@ function notifyRunStopped({ userId, provider, sessionId = null, stopReason = 'co
  * Tells the user a tool or question is waiting for their answer. One place
  * serves every engine: the chat gateway calls it for any approval card a
  * provider raises, so an engine cannot forget to.
- *
- * @param {{ userId?: string | number | null, provider: string, sessionId?: string | null, toolName?: string | null, requestId: string, sessionName?: string | null }} options
  */
-function notifyPermissionRequired({ userId, provider, sessionId = null, toolName = null, requestId, sessionName = null }) {
+export function notifyPermissionRequired({
+  userId,
+  provider,
+  sessionId = null,
+  toolName = null,
+  requestId,
+  sessionName = null
+}: NotificationTarget & {
+  toolName?: string | null;
+  requestId: string;
+}): void {
   notifyUserIfEnabled({
     userId,
     event: createNotificationEvent({
@@ -295,9 +401,15 @@ function notifyPermissionRequired({ userId, provider, sessionId = null, toolName
  * than needing a new opt-in that would default to off. No explicit dedupeKey, so
  * the default composite key collapses repeats inside the dedupe window.
  *
- * @param {{ userId?: string | null, provider: string, sessionId?: string | null, sessionName?: string | null }} options
+ * Used by provider runtimes to report background work that finished after its
+ * turn ended.
  */
-function notifyBackgroundWorkCompleted({ userId, provider, sessionId = null, sessionName = null }) {
+export function notifyBackgroundWorkCompleted({
+  userId,
+  provider,
+  sessionId = null,
+  sessionName = null
+}: NotificationTarget): void {
   notifyUserIfEnabled({
     userId,
     event: createNotificationEvent({
@@ -311,10 +423,14 @@ function notifyBackgroundWorkCompleted({ userId, provider, sessionId = null, ses
   });
 }
 
-/**
- * @param {{ userId?: string | null, provider: string, sessionId?: string | null, error: unknown, sessionName?: string | null }} options
- */
-function notifyRunFailed({ userId, provider, sessionId = null, error, sessionName = null }) {
+/** Used by provider runtimes to report failed agent runs. */
+export function notifyRunFailed({
+  userId,
+  provider,
+  sessionId = null,
+  error,
+  sessionName = null
+}: NotificationTarget & { error: unknown }): void {
   const errorMessage = normalizeErrorMessage(error);
 
   notifyUserIfEnabled({
@@ -330,13 +446,3 @@ function notifyRunFailed({ userId, provider, sessionId = null, error, sessionNam
     })
   });
 }
-
-export {
-  buildNotificationPayload,
-  createNotificationEvent,
-  notifyUserIfEnabled,
-  notifyRunStopped,
-  notifyRunFailed,
-  notifyBackgroundWorkCompleted,
-  notifyPermissionRequired
-};
