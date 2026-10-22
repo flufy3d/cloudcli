@@ -170,9 +170,10 @@ export function useSlashCommands({
         : currentTextarea?.selectionStart ?? input.length;
       const textBeforeCommand = input.slice(0, insertionStart);
       const textAfterCommandStart = input.slice(insertionStart);
-      const spaceIndex = textAfterCommandStart.indexOf(' ');
-      const textAfterCommand = slashPosition >= 0 && spaceIndex !== -1
-        ? textAfterCommandStart.slice(spaceIndex).trimStart()
+      // The partial name ends at the first whitespace of any kind, line breaks included.
+      const whitespaceIndex = textAfterCommandStart.search(/\s/);
+      const textAfterCommand = slashPosition >= 0 && whitespaceIndex !== -1
+        ? textAfterCommandStart.slice(whitespaceIndex).trimStart()
         : input.slice(currentTextarea?.selectionEnd ?? insertionStart);
       const separator = textBeforeCommand && !/\s$/.test(textBeforeCommand) ? ' ' : '';
       const newInput = `${textBeforeCommand}${separator}${command.name}${textAfterCommand ? ` ${textAfterCommand}` : ' '}`;

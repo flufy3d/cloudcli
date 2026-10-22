@@ -734,9 +734,6 @@ function mapCliOptionsToSDK(options: ClaudeRunOptions = {}): ClaudeSdkOptions {
 }
 
 /**
- * Adds a session to the active sessions map. Used by this runtime only.
- */
-/**
  * Lets go of the process an earlier run left holding a session open, so the
  * next turn can take the session over.
  *
@@ -773,6 +770,9 @@ function releaseHeldSession(sessionId: string): void {
   held.releaseInput?.();
 }
 
+/**
+ * Adds a session to the active sessions map. Used by this runtime only.
+ */
 function addSession(
   sessionId: string,
   queryInstance: ClaudeQuery,

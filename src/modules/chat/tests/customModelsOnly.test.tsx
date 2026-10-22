@@ -57,31 +57,46 @@ const okJson = (data: unknown) => Promise.resolve({
   json: async () => data,
 });
 
+const modelsResponse = (provider: LLMProvider) => okJson({
+  success: true,
+  data: provider === 'claude' ? { models: MERGED_CATALOG } : null,
+});
+
+const setCustomModelsOnlyResponse = (provider: string, enabled: boolean) => {
+  toggleRequests.push({ provider, enabled });
+  const failure = toggleFailures.shift();
+  if (failure) {
+    return Promise.resolve({
+      ok: false,
+      json: async () => ({ success: false, error: { code: 'INTERNAL_ERROR', message: failure } }),
+    });
+  }
+  return okJson({
+    success: true,
+    data: { provider, models: enabled ? CUSTOM_ONLY_CATALOG : MERGED_CATALOG },
+  });
+};
+
 vi.mock('@/shared/api', () => ({
+  // The provider-state hook loads and toggles the catalog through authenticatedFetch.
+  authenticatedFetch: (url: string, init?: { body?: string }) => {
+    const match = url.match(/^\/api\/providers\/([^/]+)\/models(\/custom-only)?$/);
+    if (match?.[2]) {
+      return setCustomModelsOnlyResponse(match[1], (JSON.parse(init?.body ?? '{}') as { enabled: boolean }).enabled);
+    }
+    if (match) {
+      return modelsResponse(match[1] as LLMProvider);
+    }
+    return okJson({ success: true, data: null });
+  },
   api: {
     user: {
       preferences: () => okJson({ success: true, preferences: {} }),
       savePreferences: () => okJson({ success: true, preferences: {} }),
     },
     providers: {
-      models: (provider: LLMProvider) => okJson({
-        success: true,
-        data: provider === 'claude' ? { models: MERGED_CATALOG } : null,
-      }),
-      setCustomModelsOnly: (provider: string, enabled: boolean) => {
-        toggleRequests.push({ provider, enabled });
-        const failure = toggleFailures.shift();
-        if (failure) {
-          return Promise.resolve({
-            ok: false,
-            json: async () => ({ success: false, error: { code: 'INTERNAL_ERROR', message: failure } }),
-          });
-        }
-        return okJson({
-          success: true,
-          data: { provider, models: enabled ? CUSTOM_ONLY_CATALOG : MERGED_CATALOG },
-        });
-      },
+      models: (provider: LLMProvider) => modelsResponse(provider),
+      setCustomModelsOnly: (provider: string, enabled: boolean) => setCustomModelsOnlyResponse(provider, enabled),
       capabilities: () => okJson({ success: true, data: null }),
       sessionActiveModel: () => okJson({ success: true, data: null }),
       setSessionActiveModel: () => okJson({ success: true, data: null }),

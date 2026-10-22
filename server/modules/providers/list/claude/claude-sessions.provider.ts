@@ -36,7 +36,6 @@ import {
   isPlaceholderProviderModel,
   normalizeProjectPath,
   readObjectRecord,
-  readUsageNumber,
   removePathIfExists,
   sanitizeLeafDirectoryName,
   sliceTailPage,
@@ -1071,60 +1070,24 @@ function readTaskUsage(value: unknown): TaskUsage | undefined {
 }
 
 /**
- * Reads the latest assistant-message usage snapshot from a Claude JSONL.
+ * Reads the latest assistant-message usage snapshot from a Claude JSONL file.
  *
- * Claude appends cumulative per-assistant usage over time, so the scan walks
- * from the end and stops at the first readable assistant entry. Cache reads
- * and writes count toward the input total, matching how the CLI bills them.
+ * Only assistant rows that carry usage are kept, and the snapshot is picked by
+ * `summarizeClaudeTokenUsage` — the same rule the history reader applies — so
+ * a subagent turn or a `<synthetic>` all-zero row never becomes the newest turn.
  */
 async function readClaudeTokenUsage(
   filename: string,
   configuredContextWindow: string | undefined,
   reportedContextWindow?: number,
 ): Promise<ProviderTokenUsageResult> {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadTokens = 0;
-  let cacheCreationTokens = 0;
-
+  const usageRows: AnyRecord[] = [];
   for await (const entry of readJsonlRecords(filename)) {
-      const usage = entry.type === 'assistant' ? entry.message?.usage : null;
-      if (!usage) {
-        continue;
-      }
-
-      const directInputTokens = readUsageNumber(usage.input_tokens ?? usage.inputTokens);
-      cacheReadTokens = readUsageNumber(
-        usage.cache_read_input_tokens ?? usage.cacheReadInputTokens ?? usage.cacheReadTokens,
-      );
-      cacheCreationTokens = readUsageNumber(
-        usage.cache_creation_input_tokens
-          ?? usage.cacheCreationInputTokens
-          ?? usage.cacheCreationTokens,
-      );
-      inputTokens = directInputTokens + cacheReadTokens + cacheCreationTokens;
-      outputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens);
+    if (entry.type === 'assistant' && entry.message?.usage) {
+      usageRows.push({ type: entry.type, isSidechain: entry.isSidechain, message: { usage: entry.message.usage } });
+    }
   }
-
-  const parsedContextWindow = Number.parseInt(configuredContextWindow ?? '', 10);
-  const configuredOrDefaultContextWindow = Number.isFinite(parsedContextWindow) ? parsedContextWindow : 160_000;
-  // The window the run's SDK reported outranks the server-wide setting: it is
-  // the real window of the model that served the session.
-  const contextWindow = reportedContextWindow && reportedContextWindow > 0
-    ? reportedContextWindow
-    : configuredOrDefaultContextWindow;
-  const cacheTokens = cacheReadTokens + cacheCreationTokens;
-
-  return {
-    used: inputTokens + outputTokens,
-    total: contextWindow,
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    cacheCreationTokens,
-    cacheTokens,
-    breakdown: { input: inputTokens, output: outputTokens },
-  };
+  return summarizeClaudeTokenUsage(usageRows, configuredContextWindow, reportedContextWindow);
 }
 
 /**

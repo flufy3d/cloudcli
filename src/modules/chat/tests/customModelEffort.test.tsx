@@ -92,6 +92,14 @@ vi.mock('@/shared/api', () => ({
       setSessionActiveEffort: () => okJson({ success: true, data: null }),
     },
   },
+  // The provider-state hook loads the catalog through authenticatedFetch.
+  authenticatedFetch: (url: string) => {
+    const provider = url.match(/^\/api\/providers\/([^/]+)\/models$/)?.[1] as LLMProvider | undefined;
+    return okJson({
+      success: true,
+      data: provider && CATALOG[provider] ? { models: CATALOG[provider] } : null,
+    });
+  },
 }));
 
 const createActions = () => {

@@ -146,7 +146,8 @@ export function useFileMentions({ selectedProject, input, setInput, textareaRef 
     }
 
     const textAfterAt = textBeforeCursor.slice(lastAtIndex + 1);
-    if (textAfterAt.includes(' ')) {
+    // Any whitespace ends the query, a line break as much as a space.
+    if (/\s/.test(textAfterAt)) {
       setShowFileDropdown(false);
       setAtSymbolPosition(-1);
       return;
@@ -222,8 +223,8 @@ export function useFileMentions({ selectedProject, input, setInput, textareaRef 
     (file: MentionableFile) => {
       const textBeforeAt = input.slice(0, atSymbolPosition);
       const textAfterAtQuery = input.slice(atSymbolPosition);
-      const spaceIndex = textAfterAtQuery.indexOf(' ');
-      const textAfterQuery = spaceIndex !== -1 ? textAfterAtQuery.slice(spaceIndex) : '';
+      const whitespaceIndex = textAfterAtQuery.search(/\s/);
+      const textAfterQuery = whitespaceIndex !== -1 ? textAfterAtQuery.slice(whitespaceIndex) : '';
 
       const newInput = `${textBeforeAt}${file.path} ${textAfterQuery}`;
       const newCursorPosition = textBeforeAt.length + file.path.length + 1;

@@ -13,10 +13,8 @@ import { useDropzone } from 'react-dropzone';
 
 import { authenticatedFetch } from '@/shared/api';
 import { createClientRequestId } from '@/shared/utils';
-import type { BackgroundSendChoice, BackgroundSendPrompt, MarkSessionProcessing, SessionActivityMap } from '@/shared/types';
+import type { MarkSessionProcessing, SessionActivityMap } from '@/shared/types';
 import { uploadAttachmentFiles } from '@/modules/chat/utils/attachmentUpload';
-import { describeBackgroundTask, ownBackgroundTasks } from '@/modules/chat/utils/backgroundTasks';
-import { useTranslation } from 'react-i18next';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
 import {
   clearQueuedMessage,
@@ -316,7 +314,6 @@ export function useChatComposerState({
   >(null);
   const inputValueRef = useRef(input);
   const selectedProjectId = selectedProject?.projectId;
-  const { t } = useTranslation('chat');
   // Prefer the stable backend-allocated id (selectedSession.id) but fall back
   // to currentSessionId for a just-established session that hasn't been
   // handed back to the parent's `selectedSession` prop yet.
@@ -695,9 +692,12 @@ export function useChatComposerState({
   // backend accepting the message — uploading attachments and allocating the
   // session id both live there. The ref is the gate (readable synchronously,
   // so two clicks in the same tick cannot both pass); the state drives the
-  // button's spinner.
-  const submitInFlightRef = useRef(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  // button's spinner. Both are keyed by draft scope: a brand-new chat still
+  // waiting for its session id must not block a send from another session the
+  // user switched to meanwhile.
+  const submittingScopesRef = useRef(new Set<string>());
+  const [submittingScopes, setSubmittingScopes] = useState<ReadonlySet<string>>(() => new Set());
+  const isSubmitting = submittingScopes.has(draftScope ?? '');
 
   /**
    * Empties everything the composer shows about the message being submitted.
@@ -764,35 +764,6 @@ export function useChatComposerState({
     selectedSession,
   ]);
 
-  // Sending over background work asks first. The dialog is rendered by the
-  // composer; the submit awaits the user's choice through this resolver.
-  const [backgroundSendPrompt, setBackgroundSendPrompt] = useState<BackgroundSendPrompt | null>(null);
-  const backgroundSendResolverRef = useRef<((choice: BackgroundSendChoice) => void) | null>(null);
-
-  const askBeforeSendingOverBackgroundWork = useCallback(
-    (work: string[]) => new Promise<BackgroundSendChoice>((resolve) => {
-      // Only one prompt at a time: a stale one is answered "cancel".
-      backgroundSendResolverRef.current?.('cancel');
-      backgroundSendResolverRef.current = resolve;
-      setBackgroundSendPrompt({ work });
-    }),
-    [],
-  );
-
-  const resolveBackgroundSendPrompt = useCallback((choice: BackgroundSendChoice) => {
-    const resolve = backgroundSendResolverRef.current;
-    backgroundSendResolverRef.current = null;
-    setBackgroundSendPrompt(null);
-    resolve?.(choice);
-  }, []);
-
-  // An unmounted composer cannot answer; let the pending submit finish.
-  useEffect(() => () => {
-    backgroundSendResolverRef.current?.('cancel');
-    backgroundSendResolverRef.current = null;
-  }, []);
-
-
   /**
    * Submits the composer's message. Resolves to whether this call was taken:
    * `false` means nothing was sent (empty message, or another submit already
@@ -826,11 +797,17 @@ export function useChatComposerState({
       // duplicate re-ran the whole path, and because the session id is only
       // known once the first POST returns, each repeat allocated its own
       // conversation.
-      if (submitInFlightRef.current) {
+      // The scopes are captured, not re-read: a new chat's scope switches from
+      // `project:<id>` to its session id when the id lands mid-submit. That id
+      // joins the held scopes below, so the chat stays latched under its new
+      // scope too, and the release frees exactly what was taken.
+      const submitScope = draftScope ?? '';
+      if (submittingScopesRef.current.has(submitScope)) {
         return false;
       }
-      submitInFlightRef.current = true;
-      setIsSubmitting(true);
+      const heldScopes = [submitScope];
+      submittingScopesRef.current.add(submitScope);
+      setSubmittingScopes(new Set(submittingScopesRef.current));
       // The one send identity the backend dedupes on. It covers what the latch
       // cannot: a retried fetch, or a second tab replaying the same submit.
       const clientRequestId = createClientRequestId();
@@ -849,10 +826,12 @@ export function useChatComposerState({
         const commandInput = currentInput.trimEnd();
         const isHelpAlias = commandInput.trim().toLowerCase() === 'help';
         if (!submitOptions?.skipCommandInterception && (commandInput.startsWith('/') || isHelpAlias)) {
-          const firstSpace = commandInput.indexOf(' ');
+          // The name ends at the first whitespace of any kind, so "/cmd" followed
+          // by a line break still runs /cmd (the Claude Code CLI splits the same way).
+          const firstWhitespace = commandInput.search(/\s/);
           const commandName = isHelpAlias
             ? '/help'
-            : firstSpace > 0 ? commandInput.slice(0, firstSpace) : commandInput;
+            : firstWhitespace > 0 ? commandInput.slice(0, firstWhitespace) : commandInput;
           const matchedCommand =
             slashCommands.find((cmd: SlashCommand) => cmd.name === commandName) ||
             (commandName === '/help'
@@ -884,97 +863,77 @@ export function useChatComposerState({
             return true;
           }
 
-          // Background work keeps running under the CLI process a straight
-          // send would replace; a held turn (isLoading) just queues as before.
-          const backgroundActivity = !isLoading
-            ? processingSessionsRef.current?.get(sessionKey ?? '')
-            : undefined;
-          let sendAnyway = false;
-          if (backgroundActivity?.background) {
-            const work = ownBackgroundTasks(backgroundActivity.tasks ?? [])
-              .map((task) => describeBackgroundTask(task, t));
-            const choice = await askBeforeSendingOverBackgroundWork(work);
-            if (choice === 'cancel') {
-              restoreComposerAfterFailedSubmit(currentInput, currentAttachments);
-              return false;
-            }
-            sendAnyway = choice === 'send';
+          const queuedOptions = buildSendOptions(currentInput);
+          const queuedSessionKey = sessionKey;
+          let uploadedAttachments: unknown[] = [];
+          try {
+            uploadedAttachments = await uploadAttachmentFiles(currentAttachments);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : 'Unknown error';
+            console.error('Queued file upload failed:', error);
+            throw new ComposerSubmitError(`Failed to upload files: ${message}`);
           }
 
-          if (!sendAnyway) {
+          // If there is already a queued draft, append new content rather than silently overwriting it
+          const existingDraft = queuedDraft;
+          const mergedContent = existingDraft?.content
+            ? `${existingDraft.content}\n\n${currentInput}`
+            : currentInput;
+          const mergedAttachments = existingDraft?.attachments
+            ? [...existingDraft.attachments, ...currentAttachments]
+            : currentAttachments;
+          const mergedUploadedAttachments = existingDraft?.uploadedAttachments
+            ? [...existingDraft.uploadedAttachments, ...uploadedAttachments]
+            : uploadedAttachments;
 
-            const queuedOptions = buildSendOptions(currentInput);
-            const queuedSessionKey = sessionKey;
-            let uploadedAttachments: unknown[] = [];
-            try {
-              uploadedAttachments = await uploadAttachmentFiles(currentAttachments);
-            } catch (error) {
-              const message = error instanceof Error ? error.message : 'Unknown error';
-              console.error('Queued file upload failed:', error);
-              throw new ComposerSubmitError(`Failed to upload files: ${message}`);
-            }
+          const durableDraft: QueuedDraft = {
+            content: mergedContent,
+            attachments: mergedAttachments,
+            uploadedAttachments: mergedUploadedAttachments,
+            options: queuedOptions,
+          };
+          if (queuedSessionKey) {
+            // Write the claim ticket synchronously after upload; this closes the
+            // gap before React's persistence effect runs.
+            writeQueuedMessage(queuedSessionKey, {
+              content: durableDraft.content,
+              options: durableDraft.options,
+              attachments: durableDraft.uploadedAttachments,
+            });
+          }
 
-            // If there is already a queued draft, append new content rather than silently overwriting it
-            const existingDraft = queuedDraft;
-            const mergedContent = existingDraft?.content
-              ? `${existingDraft.content}\n\n${currentInput}`
-              : currentInput;
-            const mergedAttachments = existingDraft?.attachments
-              ? [...existingDraft.attachments, ...currentAttachments]
-              : currentAttachments;
-            const mergedUploadedAttachments = existingDraft?.uploadedAttachments
-              ? [...existingDraft.uploadedAttachments, ...uploadedAttachments]
-              : uploadedAttachments;
+          // Recorded under the session the message was queued FOR, and before
+          // the session-switch return below — the queued text must be
+          // recallable even when it dispatches without this composer.
+          recordSentMessage(currentInput, queuedSessionKey);
 
-            const durableDraft: QueuedDraft = {
-              content: mergedContent,
-              attachments: mergedAttachments,
-              uploadedAttachments: mergedUploadedAttachments,
-              options: queuedOptions,
-            };
-            if (queuedSessionKey) {
-              // Write the claim ticket synchronously after upload; this closes the
-              // gap before React's persistence effect runs.
-              writeQueuedMessage(queuedSessionKey, {
+          // The upload is asynchronous. If the user changed sessions while it
+          // was running, persist/send against the session where Queue was
+          // pressed rather than putting the draft into the newly opened chat.
+          if (queuedSessionKey && sessionKeyRef.current !== queuedSessionKey) {
+            if (
+              processingSessionsRef.current
+              && !processingSessionsRef.current.has(queuedSessionKey)
+            ) {
+              clearQueuedMessage(queuedSessionKey);
+              sendMessage({
+                type: 'chat.send',
+                sessionId: queuedSessionKey,
                 content: durableDraft.content,
-                options: durableDraft.options,
-                attachments: durableDraft.uploadedAttachments,
+                options: {
+                  ...(durableDraft.options ?? {}),
+                  attachments: durableDraft.uploadedAttachments ?? [],
+                },
               });
+              onSessionProcessing?.(queuedSessionKey, { statusText: null, canInterrupt: true });
             }
-
-            // Recorded under the session the message was queued FOR, and before
-            // the session-switch return below — the queued text must be
-            // recallable even when it dispatches without this composer.
-            recordSentMessage(currentInput, queuedSessionKey);
-
-            // The upload is asynchronous. If the user changed sessions while it
-            // was running, persist/send against the session where Queue was
-            // pressed rather than putting the draft into the newly opened chat.
-            if (queuedSessionKey && sessionKeyRef.current !== queuedSessionKey) {
-              if (
-                processingSessionsRef.current
-                && !processingSessionsRef.current.has(queuedSessionKey)
-              ) {
-                clearQueuedMessage(queuedSessionKey);
-                sendMessage({
-                  type: 'chat.send',
-                  sessionId: queuedSessionKey,
-                  content: durableDraft.content,
-                  options: {
-                    ...(durableDraft.options ?? {}),
-                    attachments: durableDraft.uploadedAttachments ?? [],
-                  },
-                });
-                onSessionProcessing?.(queuedSessionKey, { statusText: null, canInterrupt: true });
-              }
-              return true;
-            }
-
-            queuedDraftSessionRef.current = queuedSessionKey;
-            setQueuedDraft(durableDraft);
             return true;
           }
-          }
+
+          queuedDraftSessionRef.current = queuedSessionKey;
+          setQueuedDraft(durableDraft);
+          return true;
+        }
 
         const messageContent = currentInput;
 
@@ -1031,6 +990,10 @@ export function useChatComposerState({
           if (!targetSessionId) {
             throw new ComposerSubmitError('Failed to start a new session: no session id returned.');
           }
+
+          heldScopes.push(targetSessionId);
+          submittingScopesRef.current.add(targetSessionId);
+          setSubmittingScopes(new Set(submittingScopesRef.current));
 
           onSessionEstablished?.(targetSessionId, {
             provider,
@@ -1104,8 +1067,10 @@ export function useChatComposerState({
           timestamp: new Date(),
         });
       } finally {
-        submitInFlightRef.current = false;
-        setIsSubmitting(false);
+        for (const scope of heldScopes) {
+          submittingScopesRef.current.delete(scope);
+        }
+        setSubmittingScopes(new Set(submittingScopesRef.current));
       }
 
       return true;
@@ -1129,10 +1094,9 @@ export function useChatComposerState({
       selectedProject,
       sendMessage,
       sessionKey,
+      draftScope,
       addMessage,
       slashCommands,
-      askBeforeSendingOverBackgroundWork,
-      t,
     ],
   );
 
@@ -1553,8 +1517,6 @@ export function useChatComposerState({
     handleSubmit,
     /** True while a submitted message is being uploaded or allocated a session. */
     isSubmitting,
-    backgroundSendPrompt,
-    resolveBackgroundSendPrompt,
     queuedDraft,
     editQueuedDraft,
     deleteQueuedDraft,

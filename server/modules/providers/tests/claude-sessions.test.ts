@@ -2106,6 +2106,41 @@ test('claude: getTokenUsage reads the latest assistant usage snapshot', async ()
     await rm(tempDirectory, { recursive: true, force: true });
   }
 });
+test('claude: getTokenUsage skips subagent and synthetic all-zero rows like the history reader', async () => {
+  const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'claude-token-usage-skip-'));
+  const sessionFilePath = path.join(tempDirectory, 'provider-session.jsonl');
+  const usageRow = (
+    usage: Record<string, number>,
+    extra: { isSidechain?: boolean; model?: string } = {},
+  ) => JSON.stringify({
+    type: 'assistant',
+    ...(extra.isSidechain ? { isSidechain: true } : {}),
+    message: { ...(extra.model ? { model: extra.model } : {}), usage },
+  });
+
+  try {
+    await writeFile(sessionFilePath, [
+      usageRow({ input_tokens: 100, cache_read_input_tokens: 20, cache_creation_input_tokens: 5, output_tokens: 30 }),
+      // A subagent turn reports the subagent's own context, not this conversation's.
+      usageRow({ input_tokens: 9_000, output_tokens: 900 }, { isSidechain: true }),
+      // An interrupt / API error row carries an all-zero usage block.
+      usageRow({ input_tokens: 0, output_tokens: 0 }, { model: '<synthetic>' }),
+    ].join('\n'));
+
+    const usage = await new ClaudeSessionsProvider().getTokenUsage({
+      appSessionId: 'app-session',
+      nativeSessionId: 'provider-session',
+      jsonlPath: sessionFilePath,
+      projectPath: null,
+    });
+    assert.equal(usage.used, 155);
+    assert.equal(usage.inputTokens, 125);
+    assert.equal(usage.outputTokens, 30);
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // buildLookupMap
 // ---------------------------------------------------------------------------

@@ -18,7 +18,6 @@ import type { QueuedDraft } from '@/modules/chat/hooks/useChatComposerState';
 import type { LLMProvider, SessionActivity, ScheduledMessage } from '@/shared/types';
 import type { PendingPermissionRequest, PermissionMode } from '@/shared/types';
 import type { ProviderModelOption } from '@/shared/types';
-import type { BackgroundSendChoice, BackgroundSendPrompt } from '@/shared/types';
 import {
   PromptInput,
   PromptInputHeader,
@@ -37,7 +36,6 @@ import VoiceInputButton from '@/modules/chat/composer/VoiceInputButton';
 import PermissionRequestsBanner from '@/modules/chat/composer/PermissionRequestsBanner';
 import TokenUsageSummary from '@/modules/chat/composer/TokenUsageSummary';
 import QueuedMessageCard from '@/modules/chat/composer/QueuedMessageCard';
-import BackgroundSendDialog from '@/modules/chat/composer/BackgroundSendDialog';
 import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessagePopover';
 import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
 import BackgroundTaskIndicator from '@/modules/chat/composer/BackgroundTaskIndicator';
@@ -106,9 +104,6 @@ type ChatComposerProps = {
   queuedDraft: QueuedDraft | null;
   onEditQueuedDraft: () => void;
   /** True while the composer is editing an already-sent message (edit & resend). */
-  backgroundSendPrompt: BackgroundSendPrompt | null;
-  onResolveBackgroundSendPrompt: (choice: BackgroundSendChoice) => void;
-  /** Set while the composer is replacing an already-sent message. */
   isEditingSentMessage: boolean;
   onCancelEditMessage: () => void;
   scheduledMessages: ScheduledMessage[];
@@ -203,8 +198,6 @@ function ChatComposer({
   isDragActive,
   queuedDraft,
   onEditQueuedDraft,
-  backgroundSendPrompt,
-  onResolveBackgroundSendPrompt,
   isEditingSentMessage,
   onCancelEditMessage,
   scheduledMessages,
@@ -398,11 +391,6 @@ function ChatComposer({
           onAbort={backgroundTasks.every((task) => task.taskId) ? onAbortBackgroundTasks : undefined}
         />
       )}
-=======
-      <BackgroundSendDialog
-        prompt={backgroundSendPrompt}
-        onResolve={onResolveBackgroundSendPrompt}
-      />
 
       {queuedDraft && (
         <QueuedMessageCard
