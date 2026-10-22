@@ -94,7 +94,7 @@ export function startsBackgroundWork(message: unknown): boolean {
  * turn after their launching turn ends.
  */
 export function createBackgroundWorkTracker() {
-  const sessions = new Map<string, SessionWork>();
+  const sessions = new Map<string | null, SessionWork>();
 
   function settle(state: SessionWork, toolUseId: string): boolean {
     const record = state.records.get(toolUseId);
@@ -116,7 +116,7 @@ export function createBackgroundWorkTracker() {
   }
 
   return {
-    apply(sessionKey: string, raw: unknown): boolean {
+    apply(sessionKey: string | null, raw: unknown): boolean {
       const message = object(raw);
       if (!message) return false;
       let state = sessions.get(sessionKey);
@@ -208,7 +208,7 @@ export function createBackgroundWorkTracker() {
      * Whether a task event ends main-thread work the CLI then reports on in a
      * reply turn. Ask before `apply`, which forgets the settled record.
      */
-    settlesMainThreadWork(sessionKey: string, raw: unknown): boolean {
+    settlesMainThreadWork(sessionKey: string | null, raw: unknown): boolean {
       const message = object(raw);
       const state = sessions.get(sessionKey);
       if (!message || !state || message.type !== 'system' || typeof message.task_id !== 'string') return false;
@@ -220,7 +220,7 @@ export function createBackgroundWorkTracker() {
     },
 
     /** Called at each `result`: settles work whose triggered turn has now ended. */
-    endTurn(sessionKey: string): boolean {
+    endTurn(sessionKey: string | null): boolean {
       const state = sessions.get(sessionKey);
       if (!state) return false;
       let changed = false;
@@ -232,7 +232,7 @@ export function createBackgroundWorkTracker() {
       return changed;
     },
 
-    expireWakeups(sessionKey: string, now = Date.now()): boolean {
+    expireWakeups(sessionKey: string | null, now = Date.now()): boolean {
       const state = sessions.get(sessionKey);
       if (!state) return false;
       let changed = false;
@@ -242,36 +242,40 @@ export function createBackgroundWorkTracker() {
       return changed;
     },
 
-    nextWakeupAt(sessionKey: string): number | undefined {
+    nextWakeupAt(sessionKey: string | null): number | undefined {
       const deadlines = Array.from(sessions.get(sessionKey)?.records.values() ?? [])
         .flatMap((record) => record.wakeAt === undefined ? [] : [record.wakeAt]);
       return deadlines.length ? Math.min(...deadlines) : undefined;
     },
 
-    activeTasks(sessionKey: string): ActiveBackgroundTask[] {
+    activeTasks(sessionKey: string | null): ActiveBackgroundTask[] {
       return Array.from(sessions.get(sessionKey)?.records.values() ?? [])
         .flatMap((record) => record.card ? [record.card] : []);
     },
 
-    hasPending(sessionKey: string): boolean {
+    hasPending(sessionKey: string | null): boolean {
       return Boolean(sessions.get(sessionKey)?.records.size);
     },
 
-    hasOutstanding(sessionKey: string): boolean {
+    hasOutstanding(sessionKey: string | null): boolean {
       return Array.from(sessions.get(sessionKey)?.records.values() ?? []).some((record) => Boolean(record.summary));
     },
 
-    has(sessionKey: string, taskId: string): boolean {
+    has(sessionKey: string | null, taskId: string): boolean {
       const state = sessions.get(sessionKey);
       return Boolean(state && findCall(state, taskId));
     },
 
-    clear(sessionKey: string): void {
+    clear(sessionKey: string | null): void {
       sessions.delete(sessionKey);
     },
 
     list(): SessionBackgroundWork[] {
       return Array.from(sessions).flatMap(([sessionId, state]) => {
+        // Legacy direct-API runs track work under a null key until their
+        // provider id lands; no consumer can address a null session, so the
+        // public list leaves those out.
+        if (sessionId === null) return [];
         const tasks = Array.from(state.records.values()).flatMap((record) => record.summary ? [record.summary] : []);
         return tasks.length ? [{ sessionId, tasks }] : [];
       });

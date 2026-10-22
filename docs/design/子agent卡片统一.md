@@ -46,7 +46,7 @@ Antigravity 拆成多张卡是选定方案，原因是 `SubagentPanel` 一次只
 - `useChatMessages.ts`：判定 `isSubagentContainer` 改成用常量 `Agent`。
 - `toolConfigs.ts`：`Task` 那段子 agent 配置改挂到 `Agent` 上；`invoke_subagent` 的配置删掉。`Task` 只保留给任务清单类工具，如果没有任何引擎再发 `Task`，就把对应配置删掉。
 - `toolTaxonomy.ts`：`agent` 分类里的 `Task`、`invoke_subagent` 换成 `Agent`。
-- 历史遗留的 `Task`（`claude-runtime.provider.js` 的 `planModeTools`，`PermissionsContent.tsx` 的预设列表）：先核实 Claude 当前版本是否还接受 `Task` 这个名字，再改成 `Agent`，或者两个都保留。核实结果要写进提交信息。
+- 历史遗留的 `Task`（`claude-runtime.provider.ts` 的 `planModeTools`，`PermissionsContent.tsx` 的预设列表）：先核实 Claude 当前版本是否还接受 `Task` 这个名字，再改成 `Agent`，或者两个都保留。核实结果要写进提交信息。
 
 ## 本分支已有实现的修复
 

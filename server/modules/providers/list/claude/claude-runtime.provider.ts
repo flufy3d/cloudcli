@@ -18,6 +18,7 @@ import os from 'os';
 import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import type { EffortLevel, Options, PermissionMode, Query, SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
 import { createBackgroundWorkTracker } from '@/modules/providers/list/claude/claude-background-work.js';
 import { createSubagentOriginTracker } from '@/modules/providers/list/claude/claude-subagent-origin.js';
@@ -40,10 +41,192 @@ import {
 } from '@/modules/notifications/index.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
 import { canonicalClaudeSubagentToolName, createCompleteMessage, createNormalizedMessage, resolveModelEffort } from '@/shared/utils.js';
+import type {
+  ActiveBackgroundTask,
+  NormalizedMessage,
+  ProviderModelsDefinition,
+  ProviderRuntimeContext,
+  ProviderRuntimeWriter,
+  SessionBackgroundWork
+} from '@/shared/types.js';
 
 export { createBackgroundWorkTracker, extractBackgroundTasks, startsBackgroundWork } from '@/modules/providers/list/claude/claude-background-work.js';
 
-const activeSessions = new Map();
+//----------------- RUNTIME-LOCAL TYPES ------------
+
+/**
+ * The SDK's query handle, plus the session-title request the CLI ships but the
+ * SDK's types do not declare. `generateSessionTitle` resolves to the title
+ * string (or null/undefined when it declines); callers only test truthiness.
+ */
+type ClaudeQuery = Query & {
+  generateSessionTitle?: (description: string, options: { persist: boolean }) => unknown;
+};
+
+/**
+ * SDK options as this module builds them. `mapCliOptionsToSDK` always sets
+ * these fields, so consumers may read them without undefined checks.
+ */
+type ClaudeSdkOptions = Options & {
+  env: NonNullable<Options['env']>;
+  allowedTools: string[];
+  disallowedTools: string[];
+  model: string;
+  permissionMode: PermissionMode;
+};
+
+/**
+ * An SDK stream message with the loose fields the runtime reads across the
+ * union: the subagent marker, the uuid feed, and system task fields the SDK
+ * types only on some members.
+ */
+type ClaudeStreamMessage = SDKMessage & {
+  parent_tool_use_id?: string | null;
+  parentToolUseId?: string | null;
+  uuid?: string;
+  session_id?: string;
+  slash_commands?: string[];
+  status?: string;
+};
+
+/**
+ * The writer this runtime accepts: the shared provider contract plus the live
+ * reconnect hook the gateway's chat-session writer implements.
+ */
+type ClaudeWriter = ProviderRuntimeWriter & {
+  updateWebSocket?(newRawWs: unknown): void;
+};
+
+/** A client's answer to one tool-permission request; a cancellation carries none. */
+type ApprovalDecision = {
+  allow?: boolean;
+  cancelled?: boolean;
+  updatedInput?: unknown;
+  message?: string;
+  rememberEntry?: unknown;
+};
+
+/** Approval metadata the run stamps on its resolvers so lookups can filter by session. */
+type ApprovalRequestMetadata = {
+  _sessionId?: string | null;
+  _toolName?: string;
+  _input?: unknown;
+  _context?: unknown;
+  _runToken?: symbol;
+  _receivedAt?: Date;
+};
+
+/** The pending-approvals map entry: callable resolver plus its stamped metadata. */
+type ApprovalResolver = ((decision: ApprovalDecision) => void) & ApprovalRequestMetadata & {
+  _cancel?: (reason: string) => void;
+};
+
+/** Options `waitForToolApproval` accepts. */
+type ApprovalWaitOptions = {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  onCancel?: (reason: string) => void;
+  metadata?: ApprovalRequestMetadata;
+};
+
+/** A context-window budget as published on the `token_budget` status event. */
+type TokenBudget = {
+  used: number;
+  total: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  cacheTokens?: number;
+  breakdown: { input: number; output: number };
+};
+
+/** What a turn hands a held process so it can start there instead of a fresh one. */
+type ClaudeTurnPreparation = {
+  sdkOptions: ClaudeSdkOptions;
+  promptMessages: SDKUserMessage[];
+  baseAllowedTools: string[];
+  compatibilityKey: string;
+  configFingerprint: string;
+  modelTakesEffort: boolean;
+};
+
+/** A later turn queued onto the session's held process. */
+type HeldTurnRequest = {
+  command: string;
+  options: ClaudeRunOptions;
+  writer: ClaudeWriter;
+} & ClaudeTurnPreparation;
+
+type TurnResolve = (value: void | PromiseLike<void>) => void;
+
+/** A turn handed over but not yet written into the held process. */
+type PendingHeldTurn = HeldTurnRequest & {
+  resolve: TurnResolve;
+  starting?: boolean;
+};
+
+/** The hooks a run installs on its session entry for the rest of the host. */
+type ClaudeTurnHooks = {
+  isTurnInFlight: (() => boolean) | null;
+  continueTurn: ((next: HeldTurnRequest) => Promise<void> | null) | null;
+  withdrawPendingTurn: (() => boolean) | null;
+  isResidentIdle: (() => boolean) | null;
+  hasWork: (() => boolean) | null;
+  writtenByAnotherWhileIdle: (() => Promise<boolean>) | null;
+};
+
+/** One live CLI process entry in the session map. */
+type ActiveClaudeSession = {
+  instance: ClaudeQuery;
+  startTime: number;
+  status: 'active' | 'aborted';
+  writer: ClaudeWriter | null;
+  releaseInput: (() => void) | null;
+  /** Set while background work owes the session a follow-up reply. */
+  backgroundReplyPending?: boolean;
+} & ClaudeTurnHooks;
+
+/** The per-run options `queryClaudeSDK` accepts. */
+type ClaudeRunOptions = {
+  /** The app session id; the SDK only ever sees the provider-native one. */
+  sessionId?: string;
+  /** Session display name carried into notifications and held-turn handovers. */
+  sessionSummary?: string | null;
+  cwd?: string;
+  model?: string | null;
+  effort?: string | null;
+  effortModels?: ProviderModelsDefinition;
+  toolsSettings?: {
+    allowedTools?: string[];
+    disallowedTools?: string[];
+    skipPermissions?: boolean;
+  };
+  permissionMode?: PermissionMode;
+  images?: unknown;
+  files?: unknown;
+  /** Provider-native session id to resume; resolved by the caller for app sessions. */
+  providerSessionId?: string | null;
+  resumeAnchorId?: string;
+  resumeFromScratch?: boolean;
+  /** Internal: start a fresh process even when a held one could take the turn. */
+  skipHeldProcess?: boolean;
+  /** The caller drives this session's later turns through this runtime (the chat gateway). */
+  residentBetweenTurns?: boolean;
+  /** Internal: the idle-turn resend already ran once for this prompt. */
+  idleResendAttempt?: boolean;
+};
+
+/** The stdin wrapper that keeps a CLI process alive between and across turns. */
+type HeldPromptStream = {
+  stream: AsyncGenerator<SDKUserMessage, void>;
+  release: () => void;
+  push: (messages: SDKUserMessage[]) => void;
+};
+
+//----------------- PROCESS REGISTRY ------------
+
+const activeSessions = new Map<string, ActiveClaudeSession>();
 // Outstanding background tasks per live session, keyed like activeSessions. An
 // entry lives exactly as long as the map entry it shadows: cleared when the
 // session is removed, and reset when a newer run takes the key over.
@@ -51,22 +234,22 @@ const backgroundWork = createBackgroundWorkTracker();
 /** How long an approval request waits for the stream to show its tool call before going without an origin. */
 const SUBAGENT_ORIGIN_WAIT_MS = 1500;
 
-const pendingToolApprovals = new Map();
+const pendingToolApprovals = new Map<string, ApprovalResolver>();
 // Query instances cancelled via abort-session. The abort handler sends the
 // terminal `complete` (aborted: true) to the client, so the run loop must not
 // emit a second one when its generator winds down.
-const abortedInstances = new WeakSet();
+const abortedInstances = new WeakSet<object>();
 // Query instances interrupted because a newer run took over their session id
 // (see addSession). Their run loops must stay silent on wind-down: the map
 // entry, the abort flag, and all client-facing events belong to the new run.
-const supersededInstances = new WeakSet();
+const supersededInstances = new WeakSet<object>();
 // Query instances whose reply the user stopped while background work it
 // launched was still running. Like Esc in the CLI, only the turn is
 // interrupted: the process stays up for that work, and the interrupted
 // turn's `result` hands the run over to the usual post-turn hold.
 // Keyed by query instance; the value tells one stop's fallback timer from a
 // later stop's on the same process.
-const turnOnlyAbortTokens = new WeakMap();
+const turnOnlyAbortTokens = new WeakMap<object, symbol>();
 // How long a turn-only stop waits for the interrupted turn's `result` before
 // giving up on the process. The CLI answers interrupt() at once; this only
 // catches one that never does, so it cannot sit on stdin for ever.
@@ -81,7 +264,7 @@ const HELD_PROCESS_SWITCH_TIMEOUT_MS = 10_000;
 // CLIs keep matching.
 const PLAN_MODE_TOOLS = ['Read', 'Agent', 'Task', 'exit_plan_mode', 'TodoRead', 'TodoWrite', 'WebFetch', 'WebSearch'];
 
-const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEOUT_MS, 10) || 55000;
+const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEOUT_MS ?? '', 10) || 55000;
 
 // How long background work is allowed to keep running after a turn ends. This drives
 // two halves of the same behaviour:
@@ -114,13 +297,13 @@ const DEFAULT_RESIDENT_IDLE_MS = 10 * 60 * 1000;
 const DEFAULT_RESIDENT_MAX = 4;
 
 /** How long an idle process waits for the next turn; 0 turns residency off. */
-function residentIdleMs() {
+function residentIdleMs(): number {
   const value = Number.parseInt(process.env.CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS ?? '', 10);
   return Number.isFinite(value) && value >= 0 ? value : DEFAULT_RESIDENT_IDLE_MS;
 }
 
 /** How many idle processes stay alive at once; processes held for background work are not counted. */
-function residentMax() {
+function residentMax(): number {
   const value = Number.parseInt(process.env.CLOUDCLI_CLAUDE_RESIDENT_MAX ?? '', 10);
   return Number.isFinite(value) && value >= 0 ? value : DEFAULT_RESIDENT_MAX;
 }
@@ -128,25 +311,27 @@ function residentMax() {
 // Idle processes in the order they went idle, oldest first, so the oldest is
 // the one let go when there are too many. Keyed by session; the instance
 // tells a stale entry from the session's current process.
-const idleResidents = new Map();
+const idleResidents = new Map<string | null, { instance: ClaudeQuery; release: () => void }>();
 
-function registerIdleResident(sessionKey, instance, release) {
+function registerIdleResident(sessionKey: string | null, instance: ClaudeQuery, release: () => void): void {
   idleResidents.delete(sessionKey);
   idleResidents.set(sessionKey, { instance, release });
   while (idleResidents.size > residentMax()) {
-    const [oldestKey, oldest] = idleResidents.entries().next().value;
+    const oldest = idleResidents.entries().next();
+    if (oldest.done) break;
+    const [oldestKey, oldestEntry] = oldest.value;
     idleResidents.delete(oldestKey);
-    oldest.release();
+    oldestEntry.release();
   }
 }
 
-function unregisterIdleResident(sessionKey, instance) {
+function unregisterIdleResident(sessionKey: string | null, instance: ClaudeQuery): void {
   if (idleResidents.get(sessionKey)?.instance === instance) idleResidents.delete(sessionKey);
 }
 
 // Sessions being archived or deleted: no turn may start in them until the
 // action is over (see `closeSessionAdmission`).
-const closedAdmissions = new Set();
+const closedAdmissions = new Set<string>();
 
 /**
  * The modification times of the configuration a CLI process reads once, at
@@ -159,10 +344,8 @@ const closedAdmissions = new Set();
  * folder's own time changes only when a direct child is added or removed, so
  * editing `skills/deploy/SKILL.md` would otherwise go unseen. Files deeper
  * than that, and files a CLAUDE.md pulls in with `@path`, are not followed.
- * @param {string|undefined} cwd - The turn's working directory
- * @returns {Promise<string>} Comparable fingerprint
  */
-async function readClaudeConfigFingerprint(cwd) {
+async function readClaudeConfigFingerprint(cwd: string | undefined): Promise<string> {
   const userDir = path.join(os.homedir(), '.claude');
   const files = [
     path.join(userDir, 'settings.json'),
@@ -201,11 +384,8 @@ async function readClaudeConfigFingerprint(cwd) {
  * A config folder and what one level down in it can change: each entry, and
  * for a skills folder each entry's `inner` file. Sorted, so the fingerprint
  * does not depend on listing order. A missing folder lists only itself.
- * @param {string} folder - Folder to list
- * @param {string} [inner] - File inside each entry to include (`SKILL.md`)
- * @returns {Promise<string[]>} Paths to stat
  */
-async function listConfigFolder(folder, inner) {
+async function listConfigFolder(folder: string, inner?: string): Promise<string[]> {
   let names;
   try {
     names = await fs.readdir(folder);
@@ -224,12 +404,8 @@ async function listConfigFolder(folder, inner) {
  * `claude -p --resume` appends its turn to the same file, and the stream
  * reports the uuid of every assistant line the process itself writes; its
  * own prompt lines are written before the turn ends, so before `offset`.
- * @param {string} transcriptPath - The session's transcript
- * @param {number} offset - Byte length of the file when the process went idle
- * @param {Set<string>} ownUuids - Uuids the process reported on its stream
- * @returns {Promise<boolean>} True when another writer is evident
  */
-async function transcriptWrittenByAnother(transcriptPath, offset, ownUuids) {
+async function transcriptWrittenByAnother(transcriptPath: string, offset: number, ownUuids: Set<string>): Promise<boolean> {
   let content;
   try {
     const handle = await fs.open(transcriptPath, 'r');
@@ -244,7 +420,7 @@ async function transcriptWrittenByAnother(transcriptPath, offset, ownUuids) {
       await handle.close();
     }
   } catch (error) {
-    console.warn('[Claude SDK] Could not read the transcript to check for another writer:', error?.message || error);
+    console.warn('[Claude SDK] Could not read the transcript to check for another writer:', (error as { message?: string })?.message || error);
     return false;
   }
   for (const line of content.split('\n')) {
@@ -261,7 +437,7 @@ async function transcriptWrittenByAnother(transcriptPath, offset, ownUuids) {
   return false;
 }
 
-const TOOLS_REQUIRING_INTERACTION = new Set(['AskUserQuestion', 'ExitPlanMode']);
+const TOOLS_REQUIRING_INTERACTION = new Set<string>(['AskUserQuestion', 'ExitPlanMode']);
 
 // Ultracode is a session-scoped setting rather than an SDK effort level: it pairs xhigh
 // effort with standing dynamic-workflow orchestration, and the CLI only honours it when
@@ -269,13 +445,14 @@ const TOOLS_REQUIRING_INTERACTION = new Set(['AskUserQuestion', 'ExitPlanMode'])
 // selection is translated back into the two options the SDK actually understands here.
 const ULTRACODE_SDK_EFFORT = 'xhigh';
 
+/** An effort selection after catalog validation: a CLI level, or the ultracode session setting. */
+type ClaudeResolvedEffort = EffortLevel | typeof CLAUDE_ULTRACODE_EFFORT;
+
 /**
  * Writes the resolved effort choice onto the SDK options, expanding `ultracode` into the
  * xhigh effort level plus the session-scoped settings it requires.
- * @param {Object} sdkOptions - SDK options being built
- * @param {string|undefined} resolvedEffort - Catalog-validated effort selection
  */
-function applyClaudeEffort(sdkOptions, resolvedEffort) {
+function applyClaudeEffort(sdkOptions: ClaudeSdkOptions, resolvedEffort: ClaudeResolvedEffort | undefined): void {
   if (!resolvedEffort) {
     return;
   }
@@ -287,20 +464,20 @@ function applyClaudeEffort(sdkOptions, resolvedEffort) {
 
   sdkOptions.effort = ULTRACODE_SDK_EFFORT;
   sdkOptions.settings = {
-    ...(sdkOptions.settings || {}),
+    ...(sdkOptions.settings && typeof sdkOptions.settings === 'object' ? sdkOptions.settings : {}),
     ultracode: true,
     enableWorkflows: true
-  };
+  } as Options['settings'];
 }
 
-const CLAUDE_CLI_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const CLAUDE_CLI_EFFORT_LEVELS = new Set<string>(['low', 'medium', 'high', 'xhigh', 'max']);
 
 /**
  * The catalog entry whose effort tiers a model is checked against: the exact id, or the base
  * entry for a 1M alias an older session saved (`opus[1m]` -> `opus`), since the CLI's base
  * aliases now run at 1M context themselves.
  */
-function findEffortCatalogOption(model, catalog) {
+function findEffortCatalogOption(model: string | undefined, catalog: ProviderModelsDefinition | null | undefined) {
   const options = catalog?.OPTIONS || [];
   const exact = options.find((option) => option.value === model);
   if (exact || typeof model !== 'string' || !model.endsWith('[1m]')) return exact || null;
@@ -311,36 +488,51 @@ function findEffortCatalogOption(model, catalog) {
  * Validates the effort against the model's catalog entry. A model with no entry (an older
  * session's `opusplan`, a custom id) has no tiers to check, so a plain CLI level passes
  * through: measured on 2.1.303, `--effort high` with a model that has no tiers runs normally.
+ *
+ * Used by the models facet and `mapCliOptionsToSDK` when building a turn's SDK options.
  */
-export function resolveClaudeEffort(model, effort, catalog) {
+export function resolveClaudeEffort(
+  model: string | undefined,
+  effort: unknown,
+  catalog: ProviderModelsDefinition | null | undefined,
+): ClaudeResolvedEffort | undefined {
   const option = findEffortCatalogOption(model, catalog);
   if (option) {
-    return resolveModelEffort(option.value, effort, catalog);
+    // `resolveModelEffort` returns a catalog-validated tier string, which on
+    // Claude is always one of the CLI's effort levels or `ultracode`.
+    return resolveModelEffort(option.value, effort, catalog) as ClaudeResolvedEffort | undefined;
   }
-  return CLAUDE_CLI_EFFORT_LEVELS.has(effort) ? effort : undefined;
+  return typeof effort === 'string' && CLAUDE_CLI_EFFORT_LEVELS.has(effort)
+    ? effort as EffortLevel
+    : undefined;
 }
 
-function createRequestId() {
+function createRequestId(): string {
   if (typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
   return crypto.randomBytes(16).toString('hex');
 }
 
-function waitForToolApproval(requestId, options = {}) {
+/**
+ * Parks one tool-permission request until the client answers, the run cancels
+ * it, or the timeout fires (timeoutMs 0 = wait indefinitely, for interactive
+ * tools). Resolves null on timeout, `{ cancelled: true }` on abort.
+ */
+function waitForToolApproval(requestId: string, options: ApprovalWaitOptions = {}): Promise<ApprovalDecision | null> {
   const { timeoutMs = TOOL_APPROVAL_TIMEOUT_MS, signal, onCancel, metadata } = options;
 
   return new Promise(resolve => {
     let settled = false;
 
-    const finalize = (decision) => {
+    const finalize = (decision: ApprovalDecision | null) => {
       if (settled) return;
       settled = true;
       cleanup();
       resolve(decision);
     };
 
-    let timeout;
+    let timeout: NodeJS.Timeout | undefined;
 
     const cleanup = () => {
       pendingToolApprovals.delete(requestId);
@@ -372,7 +564,7 @@ function waitForToolApproval(requestId, options = {}) {
       signal.addEventListener('abort', abortHandler, { once: true });
     }
 
-    const resolver = (decision) => {
+    const resolver: ApprovalResolver = (decision) => {
       finalize(decision);
     };
     // Lets the run that raised this request take it down when its process ends.
@@ -394,7 +586,7 @@ function waitForToolApproval(requestId, options = {}) {
  * outlives the turn that spawned it; when the process exits nobody can answer,
  * and the page would keep the card for ever.
  */
-function cancelRunApprovals(runToken) {
+function cancelRunApprovals(runToken: symbol): void {
   for (const resolver of [...pendingToolApprovals.values()]) {
     if (resolver._runToken === runToken) {
       resolver._cancel?.('cancelled');
@@ -402,7 +594,8 @@ function cancelRunApprovals(runToken) {
   }
 }
 
-function resolveToolApproval(requestId, decision) {
+/** Settles one pending permission request with the client's answer. Used by the permission route through the runtime object. */
+export function resolveToolApproval(requestId: string, decision: ApprovalDecision): void {
   const resolver = pendingToolApprovals.get(requestId);
   if (resolver) {
     resolver(decision);
@@ -414,7 +607,7 @@ function resolveToolApproval(requestId, decision) {
 // used by the UI; it intentionally does not implement full glob semantics,
 // introduced to stay consistent with the UI's "Allow rule" format.
 /** Used by the tool-permission tests; the matcher itself only serves `canUseTool` below. */
-export function matchesToolPermission(entry, toolName, input) {
+export function matchesToolPermission(entry: string, toolName: string, input: unknown): boolean {
   if (!entry || !toolName) {
     return false;
   }
@@ -432,8 +625,8 @@ export function matchesToolPermission(entry, toolName, input) {
 
     if (typeof input === 'string') {
       command = input.trim();
-    } else if (input && typeof input === 'object' && typeof input.command === 'string') {
-      command = input.command.trim();
+    } else if (input && typeof input === 'object' && typeof (input as { command?: unknown }).command === 'string') {
+      command = ((input as { command: string }).command).trim();
     }
 
     if (!command) {
@@ -446,10 +639,11 @@ export function matchesToolPermission(entry, toolName, input) {
   return false;
 }
 
-function mapCliOptionsToSDK(options = {}) {
+/** Maps the runtime's run options onto the SDK's own options for one process. */
+function mapCliOptionsToSDK(options: ClaudeRunOptions = {}): ClaudeSdkOptions {
   const { providerSessionId, cwd, toolsSettings, permissionMode, effort, resumeAnchorId, resumeFromScratch } = options;
 
-  const sdkOptions = {};
+  const sdkOptions = {} as ClaudeSdkOptions;
 
   // Forward all host env vars (e.g. ANTHROPIC_BASE_URL) to the subprocess.
   // Since SDK 0.2.113, options.env replaces process.env instead of overlaying it.
@@ -536,19 +730,15 @@ function mapCliOptionsToSDK(options = {}) {
 }
 
 /**
- * Adds a session to the active sessions map
- * @param {string} sessionId - Session identifier
- * @param {Object} queryInstance - SDK query instance
- * @param {Object} writer - WebSocket writer for reconnect support
- * @param {Function} releaseInput - Closes the held stdin stream so the CLI can exit
- * @param {{ isTurnInFlight?: Function, continueTurn?: Function, withdrawPendingTurn?: Function,
- *   isResidentIdle?: Function, hasWork?: Function, writtenByAnotherWhileIdle?: Function }} turnHooks -
- *   Whether the current turn's reply is still running, how a later turn hands itself to this
- *   process, how a stop withdraws a handed-over turn not yet written into it, whether the
- *   process waits idle for the next turn, whether it has work that must not be reclaimed,
- *   and whether another process continued the conversation while it was idle
+ * Adds a session to the active sessions map. Used by this runtime only.
  */
-function addSession(sessionId, queryInstance, writer = null, releaseInput = null, turnHooks = {}) {
+function addSession(
+  sessionId: string,
+  queryInstance: ClaudeQuery,
+  writer: ClaudeWriter | null = null,
+  releaseInput: (() => void) | null = null,
+  turnHooks: Partial<ClaudeTurnHooks> = {},
+): void {
   const existing = activeSessions.get(sessionId);
   // A different live instance under the same key means an earlier run was
   // superseded without being stopped (e.g. an abort that raced run setup and
@@ -559,12 +749,12 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
   const superseding = Boolean(
     existing && existing.status === 'active' && existing.instance && existing.instance !== queryInstance
   );
-  if (superseding) {
+  if (superseding && existing) {
     supersededInstances.add(existing.instance);
     Promise.resolve()
       .then(() => existing.instance.interrupt())
       .catch((error) => {
-        console.error(`Error interrupting superseded run for session ${sessionId}:`, error?.message || error);
+        console.error(`Error interrupting superseded run for session ${sessionId}:`, (error as { message?: string })?.message || error);
       });
     existing.releaseInput?.();
     // Whatever the superseded process had outstanding dies with it and will
@@ -593,9 +783,8 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
 
 /**
  * Removes a session from the active sessions map
- * @param {string} sessionId - Session identifier
  */
-function removeSession(sessionId) {
+function removeSession(sessionId: string): void {
   activeSessions.delete(sessionId);
   // No process, no background work: anything still tracked was killed with it.
   backgroundWork.clear(sessionId);
@@ -605,28 +794,25 @@ function removeSession(sessionId) {
 }
 
 /**
- * Gets a session from the active sessions map
- * @param {string} sessionId - Session identifier
- * @returns {Object|undefined} Session data or undefined
+ * Gets a session from the active sessions map. Null keys come from legacy
+ * direct-API callers before their provider id is captured; no entry can ever
+ * exist under one.
  */
-function getSession(sessionId) {
-  return activeSessions.get(sessionId);
+function getSession(sessionId: string | null | undefined): ActiveClaudeSession | undefined {
+  return sessionId == null ? undefined : activeSessions.get(sessionId);
 }
 
 /**
  * Gets all active session IDs
- * @returns {Array<string>} Array of active session IDs
  */
-function getAllSessions() {
+function getAllSessions(): string[] {
   return Array.from(activeSessions.keys());
 }
 
 /**
  * Transforms SDK messages to WebSocket format expected by frontend
- * @param {Object} sdkMessage - SDK message object
- * @returns {Object} Transformed message ready for WebSocket
  */
-function transformMessage(sdkMessage) {
+function transformMessage(sdkMessage: ClaudeStreamMessage): ClaudeStreamMessage {
   // Extract parent_tool_use_id for subagent tool grouping
   if (sdkMessage.parent_tool_use_id) {
     return {
@@ -644,46 +830,36 @@ function transformMessage(sdkMessage) {
  * thread and stacks a second copy of the prompt right below the Agent tool card
  * that already displays it. It also disappears on reload, because the transcript
  * keeps that turn in the subagent's sidechain rather than the session file.
- * @param {Object} message - Normalized message about to be sent to the client
- * @returns {boolean}
+ * Used by this runtime's stream loop and the transcript tests.
  */
-export function isSubagentPromptEcho(message) {
-  return Boolean(message?.parentToolUseId) && message.role === 'user' && message.kind === 'text';
+export function isSubagentPromptEcho(message: unknown): boolean {
+  const candidate = message as {
+    role?: NormalizedMessage['role'];
+    kind?: NormalizedMessage['kind'];
+    parentToolUseId?: string | null;
+  } | null | undefined;
+  return Boolean(candidate?.parentToolUseId) && candidate?.role === 'user' && candidate?.kind === 'text';
 }
 
-function readNumber(value) {
+function readNumber(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
-
-/**
- * @typedef {Object} TokenBudget
- * @property {number} used
- * @property {number} total
- * @property {number} inputTokens
- * @property {number} outputTokens
- * @property {number} [cacheReadTokens]
- * @property {number} [cacheCreationTokens]
- * @property {number} [cacheTokens]
- * @property {{ input: number, output: number }} breakdown
- */
 
 /**
  * Builds a context-window budget from an Anthropic-shaped usage payload.
  *
  * `input_tokens + cache_read + cache_creation` is one request's whole prompt,
  * which is exactly what the context window holds at that moment.
- * @param {Object} messageUsage - Anthropic usage payload
- * @returns {TokenBudget} Token budget object
  */
-function buildTokenBudget(messageUsage) {
+function buildTokenBudget(messageUsage: Record<string, unknown>): TokenBudget {
   const directInputTokens = readNumber(messageUsage.input_tokens ?? messageUsage.inputTokens);
   const cacheCreationTokens = readNumber(messageUsage.cache_creation_input_tokens ?? messageUsage.cacheCreationInputTokens ?? messageUsage.cacheCreationTokens);
   const cacheReadTokens = readNumber(messageUsage.cache_read_input_tokens ?? messageUsage.cacheReadInputTokens ?? messageUsage.cacheReadTokens);
   const cacheTokens = cacheCreationTokens + cacheReadTokens;
   const inputTokens = directInputTokens + cacheTokens;
   const outputTokens = readNumber(messageUsage.output_tokens ?? messageUsage.outputTokens);
-  const contextWindow = parseInt(process.env.CONTEXT_WINDOW, 10) || 160000;
+  const contextWindow = parseInt(process.env.CONTEXT_WINDOW ?? '', 10) || 160000;
 
   return {
     used: inputTokens + outputTokens,
@@ -705,19 +881,19 @@ function buildTokenBudget(messageUsage) {
  *
  * Only assistant messages describe the context window: each one reports the
  * prompt its own request carried. The turn-ending `result` is deliberately not
- * a source here — see `extractCumulativeTokenBudget`.
- * @param {Object} sdkMessage - SDK stream message
- * @returns {TokenBudget|null} Token budget object or null
+ * a source here — see `extractCumulativeTokenBudget`. Used by the stream loop
+ * and the token-budget tests.
  */
-function extractTokenBudget(sdkMessage) {
+export function extractTokenBudget(sdkMessage: unknown): TokenBudget | null {
   if (!sdkMessage || typeof sdkMessage !== 'object') {
     return null;
   }
+  const streamMessage = sdkMessage as ClaudeStreamMessage;
 
   // Subagent traffic (parent_tool_use_id set) reports the subagent's own
   // context window, not this session's — surfacing it makes the counter drop
   // to the subagent's number and bounce back on the next main-thread event.
-  if (sdkMessage.parent_tool_use_id) {
+  if (streamMessage.parent_tool_use_id) {
     return null;
   }
 
@@ -725,11 +901,11 @@ function extractTokenBudget(sdkMessage) {
   // task_progress/task_notification events have a top-level `usage` too, but
   // shaped {total_tokens, tool_uses, duration_ms} — reading Anthropic keys
   // off it yields an all-zero budget that flashes "0" in the composer.
-  if (sdkMessage.type !== 'assistant') {
+  if (streamMessage.type !== 'assistant') {
     return null;
   }
 
-  const messageUsage = sdkMessage.message?.usage;
+  const messageUsage = streamMessage.message?.usage as unknown as Record<string, unknown> | undefined;
   if (!messageUsage || typeof messageUsage !== 'object') {
     return null;
   }
@@ -749,26 +925,28 @@ function extractTokenBudget(sdkMessage) {
  *
  * It is still the only usage an SDK build that reports none per assistant
  * message ever emits, so it stays available for the caller to use when a turn
- * produced no assistant budget at all.
- * @param {Object} sdkMessage - SDK stream message
- * @returns {TokenBudget|null} Token budget object or null
+ * produced no assistant budget at all. Used by the stream loop as that
+ * fallback and by the token-budget tests.
  */
-function extractCumulativeTokenBudget(sdkMessage) {
-  if (!sdkMessage || typeof sdkMessage !== 'object' || sdkMessage.type !== 'result') {
+export function extractCumulativeTokenBudget(sdkMessage: unknown): TokenBudget | null {
+  const streamMessage = sdkMessage as ClaudeStreamMessage | null | undefined;
+  if (!streamMessage || typeof streamMessage !== 'object' || streamMessage.type !== 'result') {
     return null;
   }
 
-  if (sdkMessage.usage && typeof sdkMessage.usage === 'object') {
-    return buildTokenBudget(sdkMessage.usage);
+  const usage = streamMessage.usage as unknown as Record<string, unknown> | undefined;
+  if (usage && typeof usage === 'object') {
+    return buildTokenBudget(usage);
   }
 
-  if (!sdkMessage.modelUsage || typeof sdkMessage.modelUsage !== 'object') {
+  const modelUsage = streamMessage.modelUsage as unknown as Record<string, Record<string, unknown>> | undefined;
+  if (!modelUsage || typeof modelUsage !== 'object') {
     return null;
   }
 
   // Fallback for older SDK messages with only modelUsage
-  const modelKey = Object.keys(sdkMessage.modelUsage)[0];
-  const modelData = sdkMessage.modelUsage[modelKey];
+  const modelKey = Object.keys(modelUsage)[0];
+  const modelData = modelUsage[modelKey];
 
   if (!modelData || typeof modelData !== 'object') {
     return null;
@@ -777,7 +955,7 @@ function extractCumulativeTokenBudget(sdkMessage) {
   const inputTokens = readNumber(modelData.cumulativeInputTokens ?? modelData.inputTokens);
   const outputTokens = readNumber(modelData.cumulativeOutputTokens ?? modelData.outputTokens);
   const totalUsed = inputTokens + outputTokens;
-  const contextWindow = parseInt(process.env.CONTEXT_WINDOW, 10) || 160000;
+  const contextWindow = parseInt(process.env.CONTEXT_WINDOW ?? '', 10) || 160000;
 
   return {
     used: totalUsed,
@@ -804,20 +982,20 @@ const NO_RESPONSE_PLACEHOLDER_RE = /^no response requested\.?$/i;
  * without a completion record (killed at teardown, orphaned across CLI
  * processes). Detecting it at the runtime layer (instead of relying on the
  * sessions normalizer) keeps the swallowed-prompt detection self-contained.
- * @param {Object} sdkMessage - SDK stream message
- * @returns {boolean}
+ * Used by the stream loop and the idle-resend tests.
  */
-export function isTaskNotificationUserMessage(sdkMessage) {
-  if (!sdkMessage || sdkMessage.type !== 'user') {
+export function isTaskNotificationUserMessage(sdkMessage: unknown): boolean {
+  const streamMessage = sdkMessage as ClaudeStreamMessage | null | undefined;
+  if (!streamMessage || streamMessage.type !== 'user') {
     return false;
   }
-  const content = sdkMessage.message?.content;
+  const content = streamMessage.message?.content;
   let text = '';
   if (typeof content === 'string') {
     text = content;
   } else if (Array.isArray(content)) {
     text = content
-      .filter((block) => block?.type === 'text')
+      .filter((block): block is Extract<typeof block, { type: 'text' }> => block?.type === 'text')
       .map((block) => block.text || '')
       .join('\n');
   }
@@ -828,10 +1006,8 @@ export function isTaskNotificationUserMessage(sdkMessage) {
  * True when a turn's whole assistant output is the notification placeholder.
  * Markdown emphasis wrappers are stripped so `*No response requested.*`
  * still matches.
- * @param {string} text - Concatenated assistant text of the turn
- * @returns {boolean}
  */
-function isNoResponsePlaceholder(text) {
+function isNoResponsePlaceholder(text: string): boolean {
   const stripped = String(text || '').trim().replace(/^[\s*_`]+|[\s*_`]+$/g, '');
   return NO_RESPONSE_PLACEHOLDER_RE.test(stripped);
 }
@@ -847,14 +1023,14 @@ function isNoResponsePlaceholder(text) {
  * reply"; with any tool call, the turn did act on something.
  *
  * Consumed by queryClaudeSDK to trigger its one-shot idle-turn resend.
- * @param {Object} signals - Turn signals collected across the stream
- * @param {boolean} signals.hasPrompt - The run was started with a non-empty prompt
- * @param {boolean} signals.sawTaskNotification - An injected task-notification was received
- * @param {string} signals.assistantText - All main-thread assistant text of the turn
- * @param {number} signals.toolUseCount - Main-thread tool calls made during the turn
- * @returns {boolean}
+ * Used by the runtime and the idle-resend tests.
  */
-export function shouldResendPromptForIdleTurn({ hasPrompt, sawTaskNotification, assistantText, toolUseCount }) {
+export function shouldResendPromptForIdleTurn({ hasPrompt, sawTaskNotification, assistantText, toolUseCount }: {
+  hasPrompt: boolean;
+  sawTaskNotification: boolean;
+  assistantText: string;
+  toolUseCount: number;
+}): boolean {
   return Boolean(
     hasPrompt
     && sawTaskNotification
@@ -872,14 +1048,8 @@ export function shouldResendPromptForIdleTurn({ hasPrompt, sawTaskNotification, 
  * text turns carry string content; turns with image attachments carry the
  * prompt text plus one base64 `image` block per attachment (read from the
  * global `~/.cloudcli/assets` folder).
- *
- * @param {string} command - User prompt
- * @param {Array} images - Image descriptors ({ path, name?, mimeType? })
- * @param {Array} files - Non-image attachment descriptors
- * @param {string} cwd - Project working directory attachment paths resolve against
- * @returns {Promise<Array<Object>>} SDKUserMessage records for the turn
  */
-async function buildPromptMessages(command, images, files, cwd) {
+async function buildPromptMessages(command: string, images: unknown, files: unknown, cwd: string | undefined): Promise<SDKUserMessage[]> {
   const promptWithFiles = appendFilesInputTag(command, files);
   const content = normalizeImageDescriptors(images).length === 0
     ? promptWithFiles
@@ -889,7 +1059,9 @@ async function buildPromptMessages(command, images, files, cwd) {
     type: 'user',
     message: {
       role: 'user',
-      content
+      // The SDK's MessageParam blocks are structurally compatible with the
+      // image-content blocks the shared attachment module builds.
+      content: content as SDKUserMessage['message']['content']
     },
     parent_tool_use_id: null,
     timestamp: new Date().toISOString()
@@ -908,12 +1080,8 @@ async function buildPromptMessages(command, images, files, cwd) {
  * either as the leading `[A-Za-z0-9:_-]` run or as the text up to the first
  * whitespace. Anything else, such as `/tmp 里面的日志` or an absolute path, is
  * kept as typed; so is every prompt when the process listed no commands.
- *
- * @param {unknown} command - The turn's prompt text
- * @param {Set<string>} slashCommands - Command names from the process's `init`
- * @returns {string|null} Description for `generateSessionTitle`
  */
-function sessionTitleSource(command, slashCommands) {
+function sessionTitleSource(command: unknown, slashCommands: Set<string>): string | null {
   if (typeof command !== 'string') return null;
   const text = command.trimStart();
   if (!text.startsWith('/')) return command.trim() || null;
@@ -936,23 +1104,20 @@ function sessionTitleSource(command, slashCommands) {
  * `push` writes a later turn's messages into the same stdin: the CLI takes
  * them as a new turn of the same process, so background work it is running
  * outlives the turn that started it.
- *
- * @param {Array<Object>} messages - SDKUserMessage records to send
- * @returns {{ stream: AsyncIterable, release: () => void, push: (messages: Array<Object>) => void }} Stream, its closer, and its writer
  */
-function createHeldPromptStream(messages) {
+function createHeldPromptStream(messages: SDKUserMessage[]): HeldPromptStream {
   const queue = [...messages];
-  let wake = null;
+  let wake: (() => void) | null = null;
   let released = false;
 
   const stream = (async function* () {
     for (;;) {
       while (queue.length > 0) {
-        yield queue.shift();
+        yield queue.shift()!;
       }
       // Keeps stdin open — the CLI stays alive until release() is called.
       if (released) return;
-      await new Promise((resolve) => { wake = resolve; });
+      await new Promise<void>((resolve) => { wake = resolve; });
       wake = null;
     }
   })();
@@ -969,7 +1134,12 @@ function createHeldPromptStream(messages) {
  * process with them. Shared by a fresh run and by the check whether a held
  * process can take the turn instead.
  */
-async function prepareTurnInputs(command, options, context, providerSessionId) {
+async function prepareTurnInputs(
+  command: string,
+  options: ClaudeRunOptions,
+  context: ProviderRuntimeContext,
+  providerSessionId: string | null,
+): Promise<ClaudeTurnPreparation> {
   const resolvedModel = await context.resolveResumeModel(options.sessionId, options.model);
   let effortModels = CLAUDE_PREDEFINED_MODELS;
   try {
@@ -1019,7 +1189,7 @@ async function prepareTurnInputs(command, options, context, providerSessionId) {
  * an idle-resident process: one held for background work keeps that work
  * running rather than restart for a CLAUDE.md edit.
  */
-function heldProcessCompatibilityKey(sdkOptions, baseAllowedTools) {
+function heldProcessCompatibilityKey(sdkOptions: ClaudeSdkOptions, baseAllowedTools: string[]): string {
   const {
     model: _model, permissionMode: _permissionMode, effort: _effort, allowedTools: _allowedTools,
     resume: _resume, env: _env, hooks: _hooks, canUseTool: _canUseTool, ...fixedAtStart
@@ -1031,17 +1201,15 @@ function heldProcessCompatibilityKey(sdkOptions, baseAllowedTools) {
 
 /**
  * Loads MCP server configurations from ~/.claude.json
- * @param {string} cwd - Current working directory for project-specific configs
- * @returns {Object|null} MCP servers object or null if none found
  */
-async function loadMcpConfig(cwd) {
+async function loadMcpConfig(cwd: string | undefined): Promise<Record<string, NonNullable<Options['mcpServers']>[string]> | null> {
   try {
     const claudeConfigPath = path.join(os.homedir(), '.claude.json');
 
     // Check if config file exists
     try {
       await fs.access(claudeConfigPath);
-    } catch (error) {
+    } catch {
       // File doesn't exist, return null
       // No config file
       return null;
@@ -1053,12 +1221,12 @@ async function loadMcpConfig(cwd) {
       const configContent = await fs.readFile(claudeConfigPath, 'utf8');
       claudeConfig = JSON.parse(configContent);
     } catch (error) {
-      console.error('Failed to parse ~/.claude.json:', error.message);
+      console.error('Failed to parse ~/.claude.json:', (error as { message?: string }).message);
       return null;
     }
 
     // Extract MCP servers (merge global and project-specific)
-    let mcpServers = {};
+    let mcpServers: Record<string, NonNullable<Options['mcpServers']>[string]> = {};
 
     // Add global MCP servers
     if (claudeConfig.mcpServers && typeof claudeConfig.mcpServers === 'object') {
@@ -1081,27 +1249,28 @@ async function loadMcpConfig(cwd) {
     }
     return mcpServers;
   } catch (error) {
-    console.error('Error loading MCP config:', error.message);
+    console.error('Error loading MCP config:', (error as { message?: string }).message);
     return null;
   }
 }
 
 /**
- * Executes a Claude query using the SDK
+ * Executes a Claude query using the SDK.
  *
  * Settles when the turn's process exits, or as soon as it goes idle-resident
  * after the turn: the process then waits for the session's next turn on its
- * own, and the caller has nothing more to wait for.
- * @param {string} command - User prompt/command
- * @param {Object} options - Query options
- * @param {Object} ws - WebSocket connection
- * @param {Object} context - Provider-scoped model, session, and auth lookups
- * @returns {Promise<void>}
+ * own, and the caller has nothing more to wait for. Used by the chat gateway
+ * through the provider registry (`claudeRuntime.run`) and the resident tests.
  */
-async function queryClaudeSDK(command, options = {}, ws, context) {
+export async function queryClaudeSDK(
+  command: string,
+  options: ClaudeRunOptions = {},
+  ws: ClaudeWriter,
+  context: ProviderRuntimeContext,
+): Promise<void> {
   if (refusedByClosedAdmission(options, ws)) return undefined;
-  let wentIdle;
-  const idle = new Promise((resolve) => { wentIdle = resolve; });
+  let wentIdle!: () => void;
+  const idle = new Promise<void>((resolve) => { wentIdle = resolve; });
   return Promise.race([runClaudeProcess(command, options, ws, context, wentIdle), idle]);
 }
 
@@ -1110,9 +1279,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
  * error and the run's terminal `complete`. Checked on entry and again right
  * before a new process would start, since a turn can wait on file reads in
  * between.
- * @returns {boolean} True when the turn was refused
  */
-function refusedByClosedAdmission(options, ws) {
+function refusedByClosedAdmission(options: ClaudeRunOptions, ws: ClaudeWriter): boolean {
   if (!options.sessionId || !closedAdmissions.has(options.sessionId)) return false;
   ws.send(createNormalizedMessage({ kind: 'error', content: 'The Claude conversation is being closed and cannot take another message.', sessionId: options.sessionId, provider: 'claude' }));
   ws.send(createCompleteMessage({ provider: 'claude', sessionId: options.sessionId, exitCode: 1 }));
@@ -1122,9 +1290,14 @@ function refusedByClosedAdmission(options, ws) {
 /**
  * Runs one turn on a new CLI process, or hands it to the session's held one,
  * and keeps that process going for as long as it is held or resident.
- * @param {Function} onResidentIdle - Called when the process goes idle-resident
  */
-async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
+async function runClaudeProcess(
+  command: string,
+  options: ClaudeRunOptions,
+  ws: ClaudeWriter,
+  context: ProviderRuntimeContext,
+  onResidentIdle: () => void,
+): Promise<void> {
   const { sessionId } = options;
   // Rebound, with `command`, `options` and `ws`, when a later turn of the
   // session continues on this run's held process (see `continueTurn`).
@@ -1136,25 +1309,24 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
   const providerSessionId = context.resolveProviderSessionId(sessionId);
   // Provider-native id as the SDK reports it (starts as the resume id, or is
   // captured from the stream for brand-new sessions).
-  let capturedSessionId = providerSessionId;
+  let capturedSessionId: string | null = providerSessionId;
   let sessionCreatedSent = false;
   // Process-map key: the app session id when the caller supplied one, else
   // the provider-native id once captured (legacy/direct API callers).
-  const sessionKey = () => sessionId || capturedSessionId || null;
+  const sessionKey = (): string | null => sessionId || capturedSessionId || null;
 
-  const emitNotification = (event) => {
+  const emitNotification = (event: ReturnType<typeof createNotificationEvent>) => {
     notifyUserIfEnabled({
       userId: ws?.userId || null,
-      writer: ws,
       event
     });
   };
 
   // Closes the held stdin stream so the CLI can wind down. Replaced once the
   // stream exists; the finally block calls it no matter how the run ends.
-  let releasePromptStream = () => {};
-  let idleReleaseTimer = null;
-  let wakeupCardTimer = null;
+  let releasePromptStream: () => void = () => {};
+  let idleReleaseTimer: NodeJS.Timeout | null = null;
+  let wakeupCardTimer: NodeJS.Timeout | null = null;
   // The client is told the turn is over as soon as `result` lands, even though
   // the process lingers, so the UI never waits out the idle hold.
   let turnCompleteSent = false;
@@ -1166,9 +1338,9 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
   // transcript's byte length when it went idle, for telling another writer's
   // lines from its own (`ownEntryUuids`, the uuids it reported on its stream).
   let residentIdle = false;
-  let residentIdleTimer = null;
-  let idleTranscriptOffset = null;
-  const ownEntryUuids = new Set();
+  let residentIdleTimer: NodeJS.Timeout | null = null;
+  let idleTranscriptOffset: number | null = null;
+  const ownEntryUuids = new Set<string>();
   // The idle process a turn was handed to, so a stop that withdraws that turn
   // before it is written can put the process back to idle.
   let idleBeforeHandover = false;
@@ -1190,8 +1362,8 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
   // end, and the continued turns' callers waiting for their `result`.
   let inputReleased = false;
   let cliTurnActive = false;
-  let pendingTurn = null;
-  const turnResolvers = [];
+  let pendingTurn: PendingHeldTurn | null = null;
+  const turnResolvers: TurnResolve[] = [];
   const resolveTurns = () => {
     for (const resolveTurn of turnResolvers.splice(0)) resolveTurn();
   };
@@ -1207,8 +1379,9 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
 
   // Otherwise a new turn supersedes any earlier one still holding this
   // session's process open, so held runs cannot stack up across a conversation.
-  if (sessionKey()) {
-    getSession(sessionKey())?.releaseInput?.();
+  const initialKey = sessionKey();
+  if (initialKey) {
+    getSession(initialKey)?.releaseInput?.();
   }
 
   let lastBroadcastHadTasks = false;
@@ -1216,10 +1389,11 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
   let lastBroadcastPending = false;
   const broadcastBackgroundTasks = () => {
     if (supersededInstances.has(queryInstance)) return;
-    const list = backgroundWork.activeTasks(sessionKey());
+    const key = sessionKey();
+    const list = backgroundWork.activeTasks(key);
     lastBroadcastHadTasks = list.length > 0;
-    lastBroadcastPending = backgroundWork.hasPending(sessionKey()) || backgroundReplyPending;
-    const session = getSession(sessionKey());
+    lastBroadcastPending = backgroundWork.hasPending(key) || backgroundReplyPending;
+    const session = getSession(key);
     if (session?.instance === queryInstance) session.backgroundReplyPending = backgroundReplyPending;
     ws?.send?.(createNormalizedMessage({
       kind: 'status',
@@ -1238,12 +1412,13 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
   const scheduleWakeupCardExpiry = () => {
     if (wakeupCardTimer) clearTimeout(wakeupCardTimer);
     wakeupCardTimer = null;
-    const deadline = backgroundWork.nextWakeupAt(sessionKey());
+    const key = sessionKey();
+    const deadline = backgroundWork.nextWakeupAt(key);
     if (deadline === undefined) return;
     wakeupCardTimer = setTimeout(() => {
       wakeupCardTimer = null;
       if (supersededInstances.has(queryInstance)) return;
-      if (backgroundWork.expireWakeups(sessionKey())) {
+      if (backgroundWork.expireWakeups(key)) {
         backgroundReplyPending = true;
         broadcastBackgroundTasks();
       }
@@ -1268,7 +1443,9 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
 
   // Hoisted above the try so the catch's cleanup can tell whether this run
   // still owns the activeSessions entry (or was superseded by a newer run).
-  let queryInstance = null;
+  // Only read once assigned inside the try, or in paths guarded by the
+  // superseded/aborted flags that imply assignment happened.
+  let queryInstance!: ClaudeQuery;
 
   // Ends idle residency: the process takes a turn again, or is going away.
   const leaveResidentIdle = () => {
@@ -1278,13 +1455,14 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       clearTimeout(residentIdleTimer);
       residentIdleTimer = null;
     }
-    unregisterIdleResident(sessionKey(), queryInstance);
+    const key = sessionKey();
+    unregisterIdleResident(key, queryInstance);
     // Idle means nothing was outstanding, so the run that follows starts
     // afresh as far as the history reader is concerned: an agent launched
     // before it can no longer report.
-    const session = getSession(sessionKey());
+    const session = getSession(key);
     if (session?.instance === queryInstance) session.startTime = Date.now();
-    sessionHistoryCache.invalidate(sessionKey());
+    if (key) sessionHistoryCache.invalidate(key);
   };
 
   try {
@@ -1300,7 +1478,8 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       Notification: [{
         matcher: '',
         hooks: [async (input) => {
-          const message = typeof input?.message === 'string' ? input.message : 'Claude requires your attention.';
+          const raw = input as { message?: unknown } | undefined;
+          const message = typeof raw?.message === 'string' ? raw.message : 'Claude requires your attention.';
           // Notifications are app-facing, so they carry the app session id.
           emitNotification(createNotificationEvent({
             provider: 'claude',
@@ -1324,7 +1503,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     // tools to a PreToolUse hook (runs before the mode check) if we need them
     // to work in those modes.
     const subagentOrigins = createSubagentOriginTracker();
-    sdkOptions.canUseTool = async (toolName, input, context) => {
+    sdkOptions.canUseTool = async (toolName, input, toolContext) => {
       const requiresInteraction = TOOLS_REQUIRING_INTERACTION.has(toolName);
 
       if (!requiresInteraction) {
@@ -1352,14 +1531,14 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       // stream told us which card the asking call was made under.
       // (Observed live: the stream leads by a millisecond or so, but the two
       // travel separately, so a request that wins the race waits briefly.)
-      await subagentOrigins.whenObserved(context?.toolUseID, SUBAGENT_ORIGIN_WAIT_MS);
-      const subagent = subagentOrigins.originOf(context?.toolUseID);
+      await subagentOrigins.whenObserved(toolContext?.toolUseID, SUBAGENT_ORIGIN_WAIT_MS);
+      const subagent = subagentOrigins.originOf(toolContext?.toolUseID);
       const requestContext = subagent ? { subagent } : undefined;
       ws.send(createNormalizedMessage({ kind: 'permission_request', requestId, toolName, input, context: requestContext, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
 
       const decision = await waitForToolApproval(requestId, {
         timeoutMs: requiresInteraction ? 0 : undefined,
-        signal: context?.signal,
+        signal: toolContext?.signal,
         metadata: {
           // Keyed by the app session id so `chat.subscribe` can look pending
           // approvals up directly; provider id only for legacy callers.
@@ -1398,15 +1577,21 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
             sdkOptions.disallowedTools = sdkOptions.disallowedTools.filter(entry => entry !== decision.rememberEntry);
           }
         }
-        return { behavior: 'allow', updatedInput: decision.updatedInput ?? input };
+        return { behavior: 'allow', updatedInput: (decision.updatedInput ?? input) as Record<string, unknown> };
       }
 
       return { behavior: 'deny', message: decision.message ?? 'User denied tool use' };
     };
 
     // The SDK's own `query`, unless the caller supplies one (tests script the
-    // stream to drive the hold logic below without a CLI process).
-    const createQuery = context.createQuery ?? query;
+    // stream to drive the hold logic below without a CLI process). The
+    // scripted handles declare only the methods the shared context type
+    // promises, so the cast is where they meet this runtime's fuller
+    // ClaudeQuery expectation.
+    const createQuery: (input: { prompt: AsyncIterable<SDKUserMessage>; options: ClaudeSdkOptions }) => ClaudeQuery =
+      context.createQuery
+        ? (input) => context.createQuery!(input) as ClaudeQuery
+        : query;
     let heldPrompt = createHeldPromptStream(promptMessages);
     releasePromptStream = () => { leaveResidentIdle(); inputReleased = true; heldPrompt.release(); };
     try {
@@ -1417,7 +1602,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     } catch (hookError) {
       // Older/newer SDK versions may not accept hook shapes yet.
       // Keep notification behavior operational via runtime events even if hook registration fails.
-      console.warn('Failed to initialize Claude query with hooks, retrying without hooks:', hookError?.message || hookError);
+      console.warn('Failed to initialize Claude query with hooks, retrying without hooks:', (hookError as { message?: string })?.message || hookError);
       delete sdkOptions.hooks;
       // Discard the abandoned stream and build a fresh one for the retry.
       heldPrompt.release();
@@ -1440,20 +1625,21 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     // from its arguments (see `sessionTitleSource`).
     let sessionTitleKnown = false;
     let sessionTitleRequested = false;
-    let slashCommands = new Set();
+    let slashCommands = new Set<string>();
     const requestSessionTitle = () => {
       if (sessionTitleKnown || sessionTitleRequested) return;
-      if (typeof queryInstance.generateSessionTitle !== 'function') return;
+      if (!queryInstance || typeof queryInstance.generateSessionTitle !== 'function') return;
       const description = sessionTitleSource(command, slashCommands);
       if (!description) return;
-      const reportFailure = (error) => {
+      const reportFailure = (error: unknown) => {
         // A process that exits before the title arrives drops the request;
         // the next turn asks again.
-        console.warn('[Claude SDK] Session title request failed:', error?.message || error);
+        console.warn('[Claude SDK] Session title request failed:', (error as { message?: string })?.message || error);
       };
       sessionTitleRequested = true;
       try {
-        Promise.resolve(queryInstance.generateSessionTitle(description, { persist: true })).then((title) => {
+        const titleRequest = queryInstance.generateSessionTitle(description, { persist: true });
+        Promise.resolve(titleRequest).then((title) => {
           if (title) sessionTitleKnown = true;
         }, reportFailure).finally(() => { sessionTitleRequested = false; });
       } catch (error) {
@@ -1467,7 +1653,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
 
     // A turn the process cannot take after all goes to a fresh process,
     // which supersedes this one as any new run does.
-    const moveTurnToFreshProcess = (next) => {
+    const moveTurnToFreshProcess = (next: PendingHeldTurn) => {
       next.resolve(queryClaudeSDK(next.command, { ...next.options, skipHeldProcess: true }, next.writer, context));
     };
     // The process can no longer take a turn: it is going away, so the run's
@@ -1485,14 +1671,15 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     const enterResidentIdle = () => {
       if (residentIdle) return;
       const idleMs = residentIdleMs();
+      const key = sessionKey();
       if (!options.residentBetweenTurns || idleMs <= 0 || residentMax() <= 0 || pendingIdleResend
-        || processGoingAway() || !sessionKey() || getSession(sessionKey())?.instance !== queryInstance) {
+        || processGoingAway() || !key || getSession(key)?.instance !== queryInstance) {
         releasePromptStream();
         return;
       }
       residentIdle = true;
       idleTranscriptOffset = null;
-      const transcriptPath = context.resolveTranscriptPath?.(sessionKey());
+      const transcriptPath = key ? context.resolveTranscriptPath?.(key) : undefined;
       if (transcriptPath) {
         // Read now, synchronously: a line another process appends a moment
         // later must land after the recorded length.
@@ -1507,21 +1694,23 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
         releasePromptStream();
       }, idleMs);
       residentIdleTimer.unref?.();
-      registerIdleResident(sessionKey(), queryInstance, () => releasePromptStream());
-      sessionHistoryCache.invalidate(sessionKey());
+      registerIdleResident(key, queryInstance, () => releasePromptStream());
+      sessionHistoryCache.invalidate(key);
       onResidentIdle();
     };
     // Whether another process continued the conversation while this one was
     // idle; it then holds a stale conversation and must not take the turn.
     const writtenByAnotherWhileIdle = async () => {
-      const transcriptPath = context.resolveTranscriptPath?.(sessionKey());
+      const key = sessionKey();
+      const transcriptPath = key ? context.resolveTranscriptPath?.(key) : undefined;
       if (!residentIdle || !transcriptPath || idleTranscriptOffset === null) return false;
       return transcriptWrittenByAnother(transcriptPath, idleTranscriptOffset, ownEntryUuids);
     };
 
     // Applies a continued turn's model, permission mode and effort to the
     // live process. Measured: each takes effect from the next turn's request.
-    const switchProcessFor = async (next) => {
+    const switchProcessFor = async (next: PendingHeldTurn) => {
+      if (!queryInstance) return;
       if (next.sdkOptions.model !== sdkOptions.model) {
         await queryInstance.setModel(next.sdkOptions.model);
         sdkOptions.model = next.sdkOptions.model;
@@ -1557,7 +1746,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       if (!next || next.starting) return;
       next.starting = true;
       try {
-        let switchTimer;
+        let switchTimer: NodeJS.Timeout | undefined;
         await Promise.race([
           switchProcessFor(next),
           new Promise((_resolve, reject) => {
@@ -1568,7 +1757,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       } catch (error) {
         if (pendingTurn !== next) return;
         pendingTurn = null;
-        console.warn('[Claude SDK] Held process could not switch to the next turn\'s settings; starting a fresh one:', error?.message || error);
+        console.warn('[Claude SDK] Held process could not switch to the next turn\'s settings; starting a fresh one:', (error as { message?: string })?.message || error);
         moveTurnToFreshProcess(next);
         return;
       }
@@ -1596,7 +1785,8 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
         idleReleaseTimer = null;
       }
       turnResolvers.push(next.resolve);
-      const session = getSession(sessionKey());
+      const key = sessionKey();
+      const session = getSession(key);
       if (session?.instance === queryInstance) session.writer = ws;
       if (capturedSessionId && typeof ws.setSessionId === 'function') ws.setSessionId(capturedSessionId);
       // The new turn's writer starts from the strip as it stands.
@@ -1625,7 +1815,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     // CLI is inside a turn — relaying a finished task, or ending the reply
     // the user just stopped — waits for that turn's `result`, so it is never
     // folded into it.
-    const continueTurn = (next) => {
+    const continueTurn = (next: HeldTurnRequest): Promise<void> | null => {
       const awaitingStoppedResult = turnOnlyAbortTokens.has(queryInstance);
       if ((!turnCompleteSent && !awaitingStoppedResult) || pendingTurn || processGoingAway()
         || next.compatibilityKey !== compatibilityKey
@@ -1637,7 +1827,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
         || (startedWithEffort && next.sdkOptions.effort === undefined && next.modelTakesEffort)) {
         return null;
       }
-      return new Promise((resolve) => {
+      return new Promise<void>((resolve) => {
         pendingTurn = { ...next, resolve };
         // Out of the idle timer and the eviction order while the turn goes in.
         idleBeforeHandover = residentIdle;
@@ -1647,7 +1837,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     };
     // A stop that arrives while a handed-over turn still waits to be written
     // withdraws just that turn.
-    const withdrawPendingTurn = () => {
+    const withdrawPendingTurn = (): boolean => {
       const next = pendingTurn;
       if (!next) return false;
       pendingTurn = null;
@@ -1658,28 +1848,34 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       }
       return true;
     };
-    const isResidentIdle = () => residentIdle;
+    const isResidentIdle = (): boolean => residentIdle;
     // Work that must not be reclaimed: a reply in flight, background work or
     // the reply it owes, or a turn handed over and not yet written.
-    const hasWork = () => !turnCompleteSent || cliTurnActive || Boolean(pendingTurn) || pendingIdleResend
-      || backgroundReplyPending || backgroundWork.hasPending(sessionKey());
-    const turnHooks = {
+    const hasWork = (): boolean => {
+      const key = sessionKey();
+      return !turnCompleteSent || cliTurnActive || Boolean(pendingTurn) || pendingIdleResend
+        || backgroundReplyPending || Boolean(key && backgroundWork.hasPending(key));
+    };
+    const turnHooks: ClaudeTurnHooks = {
       isTurnInFlight, continueTurn, withdrawPendingTurn, isResidentIdle, hasWork, writtenByAnotherWhileIdle,
     };
     // Track the query instance for abort capability
-    if (sessionKey()) {
-      addSession(sessionKey(), queryInstance, ws, releasePromptStream, turnHooks);
+    const mapKey = sessionKey();
+    if (mapKey) {
+      addSession(mapKey, queryInstance, ws, releasePromptStream, turnHooks);
     }
     // The new owner clears stale cards even if its turn starts no background work.
     broadcastBackgroundTasks();
 
     // Process streaming messages
     console.log('Starting async generator loop for session:', capturedSessionId || 'NEW');
-    for await (const message of queryInstance) {
+    for await (const rawMessage of queryInstance) {
+      const message = rawMessage as ClaudeStreamMessage;
       subagentOrigins.observe(message);
       // Late output from an interrupted run must never mutate the new run's
       // task state or clear its cards on the shared session stream.
-      const current = getSession(sessionKey());
+      const loopKey = sessionKey();
+      const current = getSession(loopKey);
       if (current && current.instance !== queryInstance) supersededInstances.add(queryInstance);
       if (supersededInstances.has(queryInstance)
         || (!current && abortedInstances.has(queryInstance))) break;
@@ -1694,7 +1890,10 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       if (message.session_id && !capturedSessionId) {
 
         capturedSessionId = message.session_id;
-        addSession(sessionKey(), queryInstance, ws, releasePromptStream, turnHooks);
+        const capturedKey = sessionKey();
+        if (capturedKey) {
+          addSession(capturedKey, queryInstance, ws, releasePromptStream, turnHooks);
+        }
 
         // Set session ID on writer
         if (ws.setSessionId && typeof ws.setSessionId === 'function') {
@@ -1761,9 +1960,9 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
 
       // Nested and untracked tasks report elsewhere, so only main-thread work
       // waits for a reply; the check must precede `apply`, which drops the record.
-      const expectsBackgroundReply = backgroundWork.settlesMainThreadWork(sessionKey(), message);
-      const taskCardsChanged = backgroundWork.apply(sessionKey(), message);
-      const wakeupsExpired = backgroundWork.expireWakeups(sessionKey());
+      const expectsBackgroundReply = backgroundWork.settlesMainThreadWork(loopKey, message);
+      const taskCardsChanged = backgroundWork.apply(loopKey, message);
+      const wakeupsExpired = backgroundWork.expireWakeups(loopKey);
       if (wakeupsExpired || expectsBackgroundReply) backgroundReplyPending = true;
       if (taskCardsChanged || wakeupsExpired || expectsBackgroundReply) broadcastBackgroundTasks();
       scheduleWakeupCardExpiry();
@@ -1779,7 +1978,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
         && message.type === 'system'
         && message.subtype === 'task_notification'
         && message.status === 'stopped'
-        && !backgroundWork.hasPending(sessionKey())
+        && !backgroundWork.hasPending(loopKey)
         && !backgroundReplyPending
         && !pendingTurn
       ) {
@@ -1809,11 +2008,11 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
           });
         }
         backgroundReplyPending = false;
-        const workLapsed = backgroundWork.endTurn(sessionKey());
-        if (workLapsed || (lastBroadcastPending && !backgroundWork.hasPending(sessionKey()))) broadcastBackgroundTasks();
+        const workLapsed = backgroundWork.endTurn(loopKey);
+        if (workLapsed || (lastBroadcastPending && !backgroundWork.hasPending(loopKey))) broadcastBackgroundTasks();
         // The turn is done as far as the client is concerned.
-        const abortPending = sessionKey() ? abortedInstances.has(queryInstance) : false;
-        const stillOutstanding = backgroundWork.hasPending(sessionKey());
+        const abortPending = loopKey ? abortedInstances.has(queryInstance) : false;
+        const stillOutstanding = backgroundWork.hasPending(loopKey);
         if (!turnCompleteSent && !abortPending) {
           pendingIdleResend = shouldResendPromptForIdleTurn({
             hasPrompt: typeof command === 'string' && command.trim().length > 0,
@@ -1884,8 +2083,9 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     // Clean up session on completion — only while this run still owns the map
     // entry. A superseding run may have replaced it, and deleting here would
     // strand that run.
-    if (sessionKey() && getSession(sessionKey())?.instance === queryInstance) {
-      removeSession(sessionKey());
+    const endKey = sessionKey();
+    if (endKey && getSession(endKey)?.instance === queryInstance) {
+      removeSession(endKey);
     }
 
     // A superseded run winds down silently: the map entry, the abort flag,
@@ -1895,7 +2095,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session, and
     // for runs that already reported completion when their `result` arrived.
-    const wasAborted = !superseded && sessionKey() ? abortedInstances.delete(queryInstance) : false;
+    const wasAborted = !superseded && endKey ? abortedInstances.delete(queryInstance) : false;
 
     // The turn only acknowledged the injected task-notification and swallowed
     // the user's prompt. Re-run the prompt once on a fresh CLI process: the
@@ -1940,8 +2140,9 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
 
     // Clean up session on error — only while this run still owns the map entry
     // (a superseding run may have replaced it).
-    if (sessionKey() && getSession(sessionKey())?.instance === queryInstance) {
-      removeSession(sessionKey());
+    const errorKey = sessionKey();
+    if (errorKey && getSession(errorKey)?.instance === queryInstance) {
+      removeSession(errorKey);
     }
 
     if (supersededInstances.has(queryInstance)) {
@@ -1950,7 +2151,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       return;
     }
 
-    const wasAborted = sessionKey() ? abortedInstances.delete(queryInstance) : false;
+    const wasAborted = errorKey ? abortedInstances.delete(queryInstance) : false;
     if (wasAborted) {
       // The abort already produced the terminal complete; a generator throw
       // caused by interrupt() is expected noise, not a user-facing error.
@@ -1960,7 +2161,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     // An idle-resident process that dies (killed, out of memory) failed no
     // turn: the last one completed long ago, and the next starts afresh.
     if (residentIdle) {
-      console.warn(`[Claude SDK] Idle process for session ${sessionKey()} exited:`, error?.message || error);
+      console.warn(`[Claude SDK] Idle process for session ${errorKey} exited:`, (error as { message?: string })?.message || error);
       return;
     }
 
@@ -1968,7 +2169,7 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     const installed = await context.isProviderInstalled();
     const errorContent = !installed
       ? 'Claude Code is not installed. Please install it first: https://docs.anthropic.com/en/docs/claude-code'
-      : error.message;
+      : (error as { message?: string }).message;
 
     // Send error to WebSocket, then the terminal complete. A run that already
     // reported completion and then failed during its post-turn hold still
@@ -1992,10 +2193,11 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
       idleReleaseTimer = null;
     }
     if (wakeupCardTimer) clearTimeout(wakeupCardTimer);
+    const finallyKey = sessionKey();
     if (!supersededInstances.has(queryInstance)
-      && (!getSession(sessionKey()) || getSession(sessionKey())?.instance === queryInstance)) {
+      && (!getSession(finallyKey) || getSession(finallyKey)?.instance === queryInstance)) {
       backgroundReplyPending = false;
-      backgroundWork.clear(sessionKey());
+      backgroundWork.clear(finallyKey);
       if (lastBroadcastHadTasks || lastBroadcastPending) broadcastBackgroundTasks();
     }
     releasePromptStream();
@@ -2003,10 +2205,10 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
     // Continued turns end with the process. One still waiting to go in never
     // reached it, so it runs on a fresh process instead.
     resolveTurns();
-    if (pendingTurn) {
-      const next = pendingTurn;
+    const leftoverTurn = pendingTurn as PendingHeldTurn | null;
+    if (leftoverTurn) {
       pendingTurn = null;
-      next.resolve(queryClaudeSDK(next.command, { ...next.options, skipHeldProcess: true }, next.writer, context));
+      leftoverTurn.resolve(queryClaudeSDK(leftoverTurn.command, { ...leftoverTurn.options, skipHeldProcess: true }, leftoverTurn.writer, context));
     }
   }
 }
@@ -2018,7 +2220,13 @@ async function runClaudeProcess(command, options, ws, context, onResidentIdle) {
  * there is no such process or it cannot take this turn, and the caller starts
  * a fresh one.
  */
-async function continueOnHeldProcess(command, options, writer, context, providerSessionId) {
+async function continueOnHeldProcess(
+  command: string,
+  options: ClaudeRunOptions,
+  writer: ClaudeWriter,
+  context: ProviderRuntimeContext,
+  providerSessionId: string | null,
+): Promise<{ turn: Promise<void> } | null> {
   const sessionId = options.sessionId;
   if (!sessionId || options.skipHeldProcess || options.resumeAnchorId || options.resumeFromScratch) {
     return null;
@@ -2027,7 +2235,7 @@ async function continueOnHeldProcess(command, options, writer, context, provider
   if (!held?.continueTurn) {
     return null;
   }
-  let prepared;
+  let prepared: ClaudeTurnPreparation;
   try {
     prepared = await prepareTurnInputs(command, options, context, providerSessionId);
   } catch {
@@ -2053,11 +2261,9 @@ async function continueOnHeldProcess(command, options, writer, context, provider
 }
 
 /**
- * Aborts an active SDK session
- * @param {string} sessionId - Session identifier
- * @returns {boolean} True if session was aborted, false if not found
+ * Aborts an active SDK session. Used by the stop route and the runtime object.
  */
-async function abortClaudeSDKSession(sessionId) {
+export async function abortClaudeSDKSession(sessionId: string): Promise<boolean> {
   const session = getSession(sessionId);
 
   if (!session) {
@@ -2137,10 +2343,9 @@ async function abortClaudeSDKSession(sessionId) {
  * A session stays here after its turn's `result` for as long as the process
  * is held open for the work — which is exactly the window in which nothing
  * else (the chat run registry marks the run completed at `result`) knows the
- * session is still busy.
- * @returns {Array<{ sessionId: string, tasks: Array<import('@/shared/types.js').BackgroundTaskSummary> }>}
+ * session is still busy. Used by the chat off-screen queue's activity snapshot.
  */
-function listClaudeSDKBackgroundWork() {
+export function listClaudeSDKBackgroundWork(): SessionBackgroundWork[] {
   const entries = backgroundWork.list();
   const listed = new Set(entries.map((entry) => entry.sessionId));
   // Waiting wakeups and follow-up replies are busy sessions without a live
@@ -2156,12 +2361,10 @@ function listClaudeSDKBackgroundWork() {
 /**
  * Stops one outstanding background task through the SDK, which then emits a
  * `task_notification` with status `stopped` — the same event that drops the
- * task from the tracker and settles its card.
- * @param {string} sessionId - Session identifier
- * @param {string} taskId - The task's `task_id` as reported on `task_started`
- * @returns {Promise<boolean>} False when no live process is tracking the task
+ * task from the tracker and settles its card. Used by the background-task stop
+ * route. Returns false when no live process is tracking the task.
  */
-async function stopClaudeSDKTask(sessionId, taskId) {
+export async function stopClaudeSDKTask(sessionId: string, taskId: string): Promise<boolean> {
   const session = getSession(sessionId);
   if (!session || !backgroundWork.has(sessionId, taskId)) {
     return false;
@@ -2171,11 +2374,9 @@ async function stopClaudeSDKTask(sessionId, taskId) {
 }
 
 /**
- * Checks if an SDK session is currently active
- * @param {string} sessionId - Session identifier
- * @returns {boolean} True if session is active
+ * Checks if an SDK session is currently active. Used by the run registry.
  */
-function isClaudeSDKSessionActive(sessionId) {
+export function isClaudeSDKSessionActive(sessionId: string): boolean {
   const session = getSession(sessionId);
   return Boolean(session && session.status === 'active');
 }
@@ -2186,11 +2387,9 @@ function isClaudeSDKSessionActive(sessionId) {
  * The history reader uses this to tell a background agent launched by the
  * live process (still able to report back) from one launched by an earlier
  * process that has since exited (never will): a launch row older than the
- * live run cannot belong to it.
- * @param {string} sessionId - Session identifier
- * @returns {number|null} Epoch milliseconds the live run started, or null
+ * live run cannot belong to it. Used by the Claude sessions history reader.
  */
-function getClaudeSDKSessionStartTime(sessionId) {
+export function getClaudeSDKSessionStartTime(sessionId: string): number | null {
   const session = getSession(sessionId);
   // An idle-resident process has nothing outstanding: an agent that never
   // reported back can no longer report, so it reads as stopped.
@@ -2203,26 +2402,31 @@ function getClaudeSDKSessionStartTime(sessionId) {
  * background work, so none outlives the host. The server entrypoint calls it
  * at shutdown.
  */
-function closeClaudeResidentSessions() {
+export function closeClaudeResidentSessions(): void {
   for (const session of activeSessions.values()) {
     session.releaseInput?.();
   }
 }
 
 /**
- * Gets all active SDK session IDs
- * @returns {Array<string>} Array of active session IDs
+ * Gets all active SDK session IDs. Used by the run registry's diagnostics.
  */
-function getActiveClaudeSDKSessions() {
+export function getActiveClaudeSDKSessions(): string[] {
   return getAllSessions();
 }
 
 /**
- * Get pending tool approvals for a specific session.
- * @param {string} sessionId - The session ID
- * @returns {Array} Array of pending permission request objects
+ * Get pending tool approvals for a specific session. Used by the
+ * `chat.subscribe` replay to re-raise open permission prompts.
  */
-function getPendingApprovalsForSession(sessionId) {
+export function getPendingApprovalsForSession(sessionId: string): Array<{
+  requestId: string;
+  toolName: string;
+  input: unknown;
+  context: unknown;
+  sessionId: string;
+  receivedAt: Date;
+}> {
   const pending = [];
   for (const [requestId, resolver] of pendingToolApprovals.entries()) {
     if (resolver._sessionId === sessionId) {
@@ -2242,11 +2446,9 @@ function getPendingApprovalsForSession(sessionId) {
 /**
  * Reconnect a session's WebSocketWriter to a new raw WebSocket.
  * Called when client reconnects (e.g. page refresh) while SDK is still running.
- * @param {string} sessionId - The session ID
- * @param {Object} newRawWs - The new raw WebSocket connection
- * @returns {boolean} True if writer was successfully reconnected
+ * Returns true if writer was successfully reconnected.
  */
-function reconnectSessionWriter(sessionId, newRawWs) {
+export function reconnectSessionWriter(sessionId: string, newRawWs: unknown): boolean {
   const session = getSession(sessionId);
   if (!session?.writer?.updateWebSocket) return false;
   session.writer.updateWebSocket(newRawWs);
@@ -2255,14 +2457,17 @@ function reconnectSessionWriter(sessionId, newRawWs) {
 }
 
 /**
- * Gets currently active background tasks for a session.
- * @param {string} sessionId - Session identifier
- * @returns {Array<import('../../../../shared/types.js').ActiveBackgroundTask>} Active background task records
+ * Gets currently active background tasks for a session. Used by the runtime
+ * object's `backgroundTasks.list` and the session status surface.
  */
-function getBackgroundTasksForSession(sessionId) {
+export function getBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
   return getSession(sessionId) ? backgroundWork.activeTasks(sessionId) : [];
 }
 
+/**
+ * The Claude runtime the provider registry drives: one turn runner, abort,
+ * permissions, background work, admission and release.
+ */
 export const claudeRuntime = {
   run: queryClaudeSDK,
   abort: abortClaudeSDKSession,
@@ -2272,36 +2477,21 @@ export const claudeRuntime = {
   },
   backgroundTasks: {
     list: getBackgroundTasksForSession,
-    isPending: (sessionId) => Boolean(getSession(sessionId)
-      && (backgroundWork.hasPending(sessionId) || getSession(sessionId).backgroundReplyPending)),
+    isPending: (sessionId: string) => {
+      const session = getSession(sessionId);
+      return Boolean(session
+        && (backgroundWork.hasPending(sessionId) || session.backgroundReplyPending));
+    },
     // A message sent during background work becomes a turn of the held process.
     queuesInput: () => false,
   },
   listBackgroundWork: listClaudeSDKBackgroundWork,
   stopBackgroundTask: stopClaudeSDKTask,
   /** Whether the session has work that must not be reclaimed; an idle-resident process has none. */
-  hasSessionWork: (sessionId) => Boolean(getSession(sessionId)?.hasWork?.()),
+  hasSessionWork: (sessionId: string) => Boolean(getSession(sessionId)?.hasWork?.()),
   /** Refuses new turns while the session is archived or deleted. */
-  closeSessionAdmission: (sessionId) => { closedAdmissions.add(sessionId); },
-  openSessionAdmission: (sessionId) => { closedAdmissions.delete(sessionId); },
+  closeSessionAdmission: (sessionId: string) => { closedAdmissions.add(sessionId); },
+  openSessionAdmission: (sessionId: string) => { closedAdmissions.delete(sessionId); },
   /** Lets the session's process go, such as an idle-resident one. */
-  releaseSession: (sessionId) => { getSession(sessionId)?.releaseInput?.(); },
-};
-
-// Export public API
-export {
-  queryClaudeSDK,
-  abortClaudeSDKSession,
-  listClaudeSDKBackgroundWork,
-  stopClaudeSDKTask,
-  isClaudeSDKSessionActive,
-  getClaudeSDKSessionStartTime,
-  closeClaudeResidentSessions,
-  getActiveClaudeSDKSessions,
-  resolveToolApproval,
-  getPendingApprovalsForSession,
-  getBackgroundTasksForSession,
-  reconnectSessionWriter,
-  extractTokenBudget,
-  extractCumulativeTokenBudget
+  releaseSession: (sessionId: string) => { getSession(sessionId)?.releaseInput?.(); },
 };

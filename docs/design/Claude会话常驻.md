@@ -125,7 +125,7 @@ PM2 管理的进程不读 shell 配置，环境变量要写进 `~/.pm2/ecosystem
 
 ## 改动范围
 
-后端：`claude-runtime.provider.js`（空闲常驻状态、计时、上限与淘汰、配置指纹、外部写入检查、生命周期接口、关机入口）、`chat-websocket.service.ts`（聊天网关带 `residentBetweenTurns: true` 开启常驻；`/api/agent` 与提交信息生成这两个一次性调用方不带，避免进程白等，`/api/agent` 还会在返回后删掉进程的工作目录）、`server/shared/types.ts`（运行时 context 增加 `resolveTranscriptPath`）、`provider-runtime.service.ts` 与 `sessions.service.ts`（按会话行的 `jsonl_path` 提供这个路径）、`providers/index.ts` 与 `server/index.ts`（关机时关 Claude 进程）。生命周期接口直接挂在 `claudeRuntime` 上，`claude.provider.ts` 不用改；历史读取的判断由 runtime 返回 null 解决，`claude-sessions.provider.ts` 不用改。
+后端：`claude-runtime.provider.ts`（空闲常驻状态、计时、上限与淘汰、配置指纹、外部写入检查、生命周期接口、关机入口）、`chat-websocket.service.ts`（聊天网关带 `residentBetweenTurns: true` 开启常驻；`/api/agent` 与提交信息生成这两个一次性调用方不带，避免进程白等，`/api/agent` 还会在返回后删掉进程的工作目录）、`server/shared/types.ts`（运行时 context 增加 `resolveTranscriptPath`）、`provider-runtime.service.ts` 与 `sessions.service.ts`（按会话行的 `jsonl_path` 提供这个路径）、`providers/index.ts` 与 `server/index.ts`（关机时关 Claude 进程）。生命周期接口直接挂在 `claudeRuntime` 上，`claude.provider.ts` 不用改；历史读取的判断由 runtime 返回 null 解决，`claude-sessions.provider.ts` 不用改。
 文档：`docs/core/providers.md`（Claude 进程生命周期）、`docs/core/chat.md`（`residentBetweenTurns`）、`docs/core/overview.md`（关机流程）。
 探针：`scripts/probe/claude-resident.probe.mjs`（引擎行为）、`scripts/probe/claude-resident-runtime.probe.ts`（经 runtime 的耗时对比）。
 前端：不改。

@@ -75,13 +75,13 @@ ZCode 回合结束后的排队按 2026-10-19 的决定保留，不在本稿范�
 
 ## 改动范围
 
-后端：`claude-runtime.provider.js`（主体）、`shared/interfaces.ts`、`provider-runtime.service.ts`、`chat-websocket.service.ts`、`shared/protocol/frames.ts`。
+后端：`claude-runtime.provider.ts`（主体）、`shared/interfaces.ts`、`provider-runtime.service.ts`、`chat-websocket.service.ts`、`shared/protocol/frames.ts`。
 前端：`sessionTimelineStore.ts`、`useChatComposerState.ts`、`useChatSessionState.ts`、`ChatComposer.tsx`、`BackgroundTaskIndicator.tsx`、`QueuedMessageCard.tsx`，以及 en / zh-CN / zh-TW 三份 `chat.json` 文案（其余语种按约定回退英文）。
 文档：`docs/core/providers.md`（Claude 后台任务生命周期）、`docs/core/chat.md`（后台任务与输入排队）。
 
 ## 代价与风险
 
-- **`claude-runtime.provider.js` 的消息循环要动刀。** 把按轮次计的状态收进可换绑对象，会碰到空闲重发、权限请求撤回、通知、被接替运行的静默这些已有逻辑。现有 34 个驻留相关测试是护栏。
+- **`claude-runtime.provider.ts` 的消息循环要动刀。** 把按轮次计的状态收进可换绑对象，会碰到空闲重发、权限请求撤回、通知、被接替运行的静默这些已有逻辑。现有 34 个驻留相关测试是护栏。
 - **长时间驻留的进程会累积上下文。** 这和 CLI 一样，不是新问题；会话本来就靠 resume 续上同一段上下文。
 - **什么情况下反而更亏**：如果 SDK 的中途切换不可靠，续轮会让用户在切换后仍在旧模型、旧权限或旧档位下跑。2026-10-19 已实测三者都在下一轮生效；切换超时或被拒时这一轮改起新进程，后台工作随之结束。
 - **残留时序窗口**：后台任务恰好在新一轮写入的同一刻完成时，CLI 可能先跑汇报轮再处理新消息，页面会先看到这一轮结束、再看到它的回复。窗口是毫秒级，不丢消息。
