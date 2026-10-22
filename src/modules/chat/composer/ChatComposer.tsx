@@ -156,13 +156,11 @@ type ChatComposerProps = {
 /**
  * Whether the composer offers the "send later" (定时发送) trigger.
  *
- * Off for now: the button sat right next to Send, and the scheduled-message
- * flow was not used. The popover, the scheduling hook and the server-side
- * dispatcher are all still in place, so flipping this back to `true` restores
- * the entry point. Messages scheduled before it was switched off still show
- * in the list above the input and are still sent on time.
+ * The popover, the scheduling hook and the server-side dispatcher all live in
+ * this same flow, so messages scheduled before any switch-off still show in
+ * the list above the input and are still sent on time.
  */
-const SHOW_SCHEDULE_TRIGGER = false;
+const SHOW_SCHEDULE_TRIGGER = true;
 
 function ChatComposer({
   pendingPermissionRequests,
