@@ -625,6 +625,39 @@ test('a failed turn surfaces the error and exits non-zero', async (t) => {
   assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
 });
 
+/**
+ * The failure row is named after the turn it belongs to.
+ *
+ * The rollout records the same failure on the turn's closing record, and the
+ * history read turns it into a row with this id. Both sides must agree, or
+ * the transcript shows the failure twice — once live, once from the file —
+ * and the client cannot tell them apart.
+ */
+test('a failed turn names its error row after the turn', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    fake.handlers.onNotification?.('error', {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      error: { message: 'usage limit reached' },
+      willRetry: false,
+    });
+    fake.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'failed', error: { message: 'usage limit reached' } },
+    });
+  });
+  const messages: any[] = [];
+
+  await codexRuntime.run('hey there', {
+    sessionId: 'app-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const errors = messages.filter((message) => message.kind === 'error');
+  assert.equal(errors.length, 1, 'the failure is reported once');
+  assert.equal(errors[0].id, `${TURN_ID}_error`);
+});
+
 test('an interrupted turn surfaces as an error, not a silent success', async (t) => {
   // Codex reports a usage-limit, user, or engine-internal interrupt as status
   // "interrupted" rather than "failed" — on codex 0.155 a spawned agent

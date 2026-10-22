@@ -426,11 +426,18 @@ id 必须字节相同。** 这条有两道闸门守着：
 | 引擎 | 行身份 | 依据 |
 | --- | --- | --- |
 | claude | 落盘 `uuid` | 实时 SDK 消息与落盘行的 `uuid` 同值，两路归一化出的 id 逐行相同 |
-| codex | ThreadItem 的 `id`（`msg_…`/`rs_…`/`exec-<uuid>`/`call_…`），一项多行时后缀 `_<n>` / `_result` | 两路读的是同一个 ThreadItem：app-server 实时推 `item/started`+`item/completed`，rollout 把同一项写进 `event_msg`→`item_completed`，id 逐字相同 |
+| codex | ThreadItem 的 `id`（`msg_…`/`rs_…`/`exec-<uuid>`/`call_…`），一项多行时后缀 `_<n>` / `_result`；失败回合的错误行取 `turn_id` 加后缀 `_error` | 两路读的是同一个 ThreadItem：app-server 实时推 `item/started`+`item/completed`，rollout 把同一项写进 `event_msg`→`item_completed`，id 逐字相同。失败回合的原因两路各报一次（实时 `error` 通知与 `turn/completed`，落盘 `task_complete`），报的是同一个回合，回合 id 同值，所以错误行两路同名 |
 | antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id |
 | zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
 | cursor | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
 | opencode | `${消息id}_text_${n}` / `${消息id}_reasoning_${n}`（每类型在消息内从 0 计数）、工具调用 id | SSE 事件的 `ordinal` 与落盘 `content` 块按同一规则编号（v2.0.31 的计数器每条消息每类型归零，从引擎二进制源码核实），历史读侧按同规则重编号；`session.text.ended` 带全文，翻译器据此发正式正文行，流式占位行被就地顶替。工具行 id 两路仍不同，靠原生 call id（`toolId`）配对 |
+
+**失败回合的原因只写在关回合的那条记录上。** codex 为一次失败的回合写
+`task_complete`（带 `error`），不为它写任何 item——只读 item 流的读取器会留下
+"一句提问、没有回答、也没有原因"。实时流报的是同一件事（`error` 通知加
+`turn/completed` 的 `failed`），两路的回合 id 同值，于是错误行的 id 取 `turn_id`
+加后缀 `_error`（规则在 `codex-turn-error.ts`）：刷新时持久化的那一份顶替实时的那一份，
+而不是变成两条。引擎没记原因的回合（用户自己停的、进程被杀的）没有这一行。
 
 **引擎同时提供「原始记录」和「组装好的记录」时，两路都读组装的那一份。** codex 的 rollout 里
 既有 Responses API 的原始条目（`response_item`：`custom_tool_call` 及其输出、`function_call`、

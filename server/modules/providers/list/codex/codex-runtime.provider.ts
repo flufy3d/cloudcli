@@ -56,6 +56,10 @@ import {
   readCodexSubagentLabel,
   type CodexThreadItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
+import {
+  codexTurnFailureRowId,
+  readCodexFailureMessage,
+} from '@/modules/providers/list/codex/codex-turn-error.js';
 import { createBackgroundTasksStatusMessage, createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
 import { codexSessionTitleService } from '@/modules/providers/services/codex-session-title.service.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
@@ -591,10 +595,13 @@ function handleCodexSessionEvent(
     }
 
     case 'error': {
-      const error = readObjectRecord(params.error);
-      const message = readNonEmptyString(error?.message)?.trim() || readNonEmptyString(params.message)?.trim();
+      const message = readCodexFailureMessage({ error: params.error, message: params.message });
+      const turnId = readNonEmptyString(params.turnId);
       if (message) {
         target.deliver(createNormalizedMessage({
+          // The turn id names the failure on both transports, so the row the
+          // history read returns replaces this one.
+          ...(turnId ? { id: codexTurnFailureRowId(turnId) } : {}),
           kind: 'error',
           content: message,
           sessionId,
@@ -790,13 +797,17 @@ async function queryCodex(
   const currentSession = () => runSession;
 
   // Both `error` and `turn/completed` can report the same terminal cause.
-  const surfaceFailure = (message: string): void => {
+  const surfaceFailure = (message: string, turnId?: string | null): void => {
     if (errorSurfaced && terminalFailure?.message === message) {
       return;
     }
     terminalFailure = { message };
     errorSurfaced = true;
     sendMessage(ws, createNormalizedMessage({
+      // A failure belongs to a turn, and the engine names that turn. The row
+      // id is derived from it so the copy the history read returns replaces
+      // this one instead of the transcript showing the failure twice.
+      ...(turnId ? { id: codexTurnFailureRowId(turnId) } : {}),
       kind: 'error',
       content: message,
       sessionId: capturedSessionId || sessionId || null,
@@ -1206,9 +1217,7 @@ async function queryCodex(
       }
 
       case 'error': {
-        const error = readObjectRecord(params.error);
-        const message = readNonEmptyString(error?.message)?.trim()
-          || readNonEmptyString(params.message)?.trim()
+        const message = readCodexFailureMessage({ error: params.error, message: params.message })
           || 'Codex reported an error.';
         // A recoverable stream error is progress, not a failed turn. Keep
         // its cause in logs without adding a permanent chat error row.
@@ -1216,7 +1225,7 @@ async function queryCodex(
           console.warn('[Codex] Retrying turn:', message);
           return;
         }
-        surfaceFailure(message);
+        surfaceFailure(message, readNonEmptyString(params.turnId));
         return;
       }
 
@@ -1231,9 +1240,8 @@ async function queryCodex(
               ? 'interrupted'
               : 'unknown';
         if (turn?.status === 'failed') {
-          const error = readObjectRecord(turn.error);
-          const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
-          surfaceFailure(message);
+          const message = readCodexFailureMessage({ error: turn.error }) || terminalFailure?.message || 'Turn failed';
+          surfaceFailure(message, readNonEmptyString(turn?.id) ?? engineTurnId);
           notifyRunFailed({
             userId: normalizedUserId,
             provider: 'codex',
@@ -1253,7 +1261,7 @@ async function queryCodex(
           // as a success. A stop the user asked for (`abort` already flagged
           // the session) arrives as the same status and must stay silent.
           const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
-          surfaceFailure(message);
+          surfaceFailure(message, readNonEmptyString(turn?.id) ?? engineTurnId);
           notifyRunFailed({
             userId: normalizedUserId,
             provider: 'codex',

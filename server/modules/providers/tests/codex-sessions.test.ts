@@ -585,6 +585,70 @@ test('Codex history closes a still-running subagent when its turn was aborted', 
   }
 });
 
+/**
+ * A turn the engine refused to run.
+ *
+ * The rollout records the cause on the record that closes the turn and
+ * nowhere else: no item carries it, so a reader that only walks the item
+ * stream keeps the prompt and loses the reason. The live stream showed the
+ * failure, and the transcript has to show it too — under the id the live row
+ * carries, so the persisted copy replaces it instead of doubling it.
+ */
+test('Codex history keeps the reason a turn failed', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-failed-turn-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-failed-turn-1';
+    const turnId = '01a0c4d2-a3fe-7330-bb87-5a99871777d0';
+    const failure = 'You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro).';
+    const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
+
+    await writeFile(transcriptPath, `${[
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } }),
+      JSON.stringify({ type: 'turn_context', payload: { turn_id: turnId } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: turnId,
+          item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'say hi' }] },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: turnId, error: { message: failure } },
+      }),
+    ].join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-failed-turn-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-failed-turn-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-failed-turn-1');
+      const errorRows = history.messages.filter((message) => message.kind === 'error');
+
+      assert.equal(errorRows.length, 1, 'the failure is one row of the transcript');
+      assert.equal(errorRows[0]?.content, failure, 'the engine\'s own words are the row');
+      assert.equal(
+        errorRows[0]?.id,
+        `${turnId}_error`,
+        'the row is named after the turn, so the live row of the same turn is replaced by this one',
+      );
+      assert.ok(
+        history.messages.some((message) => message.kind === 'text' && message.role === 'user'),
+        'the prompt the failed turn answered stays in the transcript',
+      );
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 /** Writes a rollout whose only agent has a start record and no end record. */
 async function writeUnfinishedAgentRollout(tempRoot: string, workspacePath: string, providerSessionId: string): Promise<void> {
   const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);

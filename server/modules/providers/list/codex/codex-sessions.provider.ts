@@ -14,6 +14,10 @@ import {
   readCodexProposedPlan,
   readCodexRolloutItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
+import {
+  codexTurnFailureRowId,
+  readCodexFailureMessage,
+} from '@/modules/providers/list/codex/codex-turn-error.js';
 import { parseFilesInputTag, toImageAttachments } from '@/shared/image-attachments.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import { prepareTranscriptMessages } from '@/shared/message-unification.js';
@@ -1239,10 +1243,12 @@ async function readCodexTokenUsage(filename: string): Promise<ProviderTokenUsage
  * identity and one shape no matter which side produced it, which is what
  * stops a reply rendering once live and once again from history.
  *
- * Two records are read outside the item stream because nothing in it carries
+ * Three records are read outside the item stream because nothing in it carries
  * them: `token_count` (the context budget) and a spawned agent's
  * `agent_message`, whose FINAL_ANSWER never becomes an item and is folded
- * into the result of the `Agent` row that started the agent.
+ * into the result of the `Agent` row that started the agent, and the
+ * `task_complete` that closes a failed turn with the cause the engine
+ * reports.
  */
 async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryResult> {
   const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
@@ -1374,6 +1380,27 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
           ? 'Turn interrupted'
           : `Turn aborted (${String(payload.reason ?? 'unknown')})`,
       });
+      continue;
+    }
+
+    if (payload.type === 'task_complete') {
+      // A turn that failed records its cause here and nowhere else: the engine
+      // writes no item for it, so nothing in the item stream carries it. Read
+      // it, or the transcript keeps a prompt with no answer and no reason and
+      // the failure the live stream reported is gone after the next read.
+      const message = readCodexFailureMessage({ error: payload.error });
+      const turnId = readNonEmptyString(payload.turn_id);
+      if (message && turnId) {
+        messages.push({
+          // The turn id is the engine's own name for the turn, and the live
+          // error row carries the same one: the persisted copy replaces the
+          // live copy instead of the transcript showing the failure twice.
+          uuid: codexTurnFailureRowId(turnId),
+          type: 'error',
+          timestamp,
+          content: message,
+        });
+      }
       continue;
     }
 
@@ -1619,6 +1646,24 @@ export class CodexSessionsProvider implements IProviderSessions {
         kind: 'task_notification',
         summary: raw.content,
         status: 'info',
+      })];
+    }
+
+    if (raw.type === 'error') {
+      // A turn that failed. The engine's own words are the whole row: they
+      // say what went wrong (an exhausted quota, a rejected request), and the
+      // live stream showed the same text.
+      const content = typeof raw.content === 'string' ? raw.content : '';
+      if (!content.trim()) {
+        return [];
+      }
+      return [createNormalizedMessage({
+        id: baseId,
+        sessionId,
+        timestamp: ts,
+        provider: PROVIDER,
+        kind: 'error',
+        content,
       })];
     }
 
