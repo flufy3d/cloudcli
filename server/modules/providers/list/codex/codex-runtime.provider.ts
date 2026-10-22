@@ -1683,6 +1683,28 @@ async function queryCodex(
 }
 
 /**
+ * Stops the work a conversation still runs after its round ended.
+ *
+ * The engine names no agent it could stop, and it never reports the end of
+ * an agent whose parent turn failed, so the process is closed: closing it
+ * settles the agents as stopped through the session's disposal. The next
+ * message resumes the thread in a new process.
+ */
+function stopCodexBackgroundWork(sessionId: string): boolean {
+  const activity = readCodexResidentSessionActivity(sessionId);
+  // Without a live process there is nothing to close; a short connection
+  // settles its agents when its round ends.
+  if (!activity || (!activity.reporting && !codexBackgroundWork.hasSession(sessionId))) {
+    return false;
+  }
+  console.log(`[Codex] Stopping the background work of session ${sessionId} by closing its process.`);
+  // The same release as an archive, so a helper process of the conversation
+  // cannot keep holding its thread.
+  releaseCodexResidentSessionResources(sessionId);
+  return true;
+}
+
+/**
  * Cancels an active Codex session.
  *
  * `turn/interrupt` is the graceful stop — it lets the server close the turn
@@ -1692,10 +1714,16 @@ async function queryCodex(
 async function abortCodexSession(sessionId: string): Promise<boolean> {
   const session = activeCodexSessions.get(sessionId);
 
-  // A session whose round is over has nothing to stop: the entry stays for
-  // the diagnostics, but a stop must not report success for a round that
-  // already ended.
-  if (!session || session.status !== 'running') {
+  // A session whose round is over has no turn to interrupt, but its resident
+  // process may still run agents or a report of its own; that is stopped
+  // instead. Otherwise there is nothing to stop, and a stop must not report
+  // success for a round that already ended.
+  if (!session || session.status === 'completed') {
+    return stopCodexBackgroundWork(sessionId);
+  }
+  // A stop already waits for the engine to confirm the interrupt; a repeated
+  // press must not cut that short by closing the process.
+  if (session.status !== 'running') {
     return false;
   }
 

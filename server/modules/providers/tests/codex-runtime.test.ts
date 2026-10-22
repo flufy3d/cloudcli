@@ -1520,6 +1520,99 @@ test('an unconfirmed withdrawal remains unknown after a user stop', async (t) =>
   }
 });
 
+test('a stop with no round in flight closes the process that still holds agents and settles them', async (t) => {
+  // The round fails (here on the usage limit) while its agents are still
+  // tracked. A resident process keeps them past the round, and the engine
+  // never reports their end, so the strip's stop is the only way out.
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'failed', error: { message: 'You’ve hit your usage limit.' } },
+    });
+  });
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  const published: any[] = [];
+  const context = { ...runtimeContext(false), publishSessionEvent: (_sessionId: string, message: any) => published.push(message) };
+  try {
+    await codexRuntime.run('go', { sessionId: 'stop-held-agents' }, { send() {} }, context);
+    assert.equal(server.closed, false, 'the resident process outlives the failed round');
+    assert.deepEqual(codexRuntime.listBackgroundWork().map((entry) => entry.sessionId), ['stop-held-agents']);
+
+    assert.equal(await codexRuntime.abort('stop-held-agents'), true);
+
+    assert.equal(server.closed, true, 'the stop closes the process the agents run in');
+    assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+    const stopped = published.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+    assert.deepEqual(stopped.map((message) => [message.taskId, message.status]), [['thread_child_1', 'stopped']]);
+    assert.equal(await codexRuntime.abort('stop-held-agents'), false, 'a second stop has nothing left to stop');
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
+});
+
+test('a second stop while the first waits for the engine does not close the process', async (t) => {
+  // The turn runs with an agent, and the engine never confirms the interrupt.
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+  });
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    const running = codexRuntime.run('go', { sessionId: 'stop-twice' }, { send() {} }, runtimeContext(false));
+    await waitFor(() => server.calls.find((call) => call.method === 'thread/queue/add'));
+    await waitFor(() => codexRuntime.listBackgroundWork().length > 0 || undefined);
+
+    const first = codexRuntime.abort('stop-twice');
+    await waitFor(() => server.calls.find((call) => call.method === 'turn/interrupt'));
+    assert.equal(await codexRuntime.abort('stop-twice'), false, 'the first stop still owns the turn');
+    assert.equal(server.closed, false, 'the graceful interrupt is not cut short');
+
+    server.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'interrupted', error: null },
+    } as any);
+    assert.equal(await first, true);
+    await running;
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
+});
+
+test('a stop during a report the engine started by itself closes the process, and the next message resumes', async (t) => {
+  const server = installFakeAppServer(t);
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('first', { sessionId: 'stop-report' }, { send() {} }, runtimeContext(false));
+    server.handlers.onNotification?.('turn/started', { threadId: THREAD_ID, turn: { id: 'engine-report' } } as any);
+    assert.deepEqual(codexRuntime.listBackgroundWork().map((entry) => entry.sessionId), ['stop-report']);
+
+    assert.equal(await codexRuntime.abort('stop-report'), true);
+    assert.equal(server.closed, true);
+    assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+
+    server.closed = false;
+    const messages: any[] = [];
+    await codexRuntime.run('second', { sessionId: 'stop-report' }, { send: (message) => messages.push(message) }, runtimeContext(true));
+    assert.ok(server.calls.some((call) => call.method === 'thread/resume'), 'the next message resumes the thread in a new process');
+    assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 0));
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
+});
+
 test('a session approval survives the next round and is retracted when its process closes', async (t) => {
   const server = installFakeAppServer(t);
   const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
