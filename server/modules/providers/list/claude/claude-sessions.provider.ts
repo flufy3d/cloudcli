@@ -27,6 +27,7 @@ import {
   AppError,
   createNormalizedMessage,
   generateMessageId,
+  isClaudeApiRequestLogRow,
   isPlaceholderProviderModel,
   normalizeProjectPath,
   readObjectRecord,
@@ -128,6 +129,9 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
 
       try {
         const entry = JSON.parse(line) as AnyRecord;
+        if (isClaudeApiRequestLogRow(entry)) {
+          continue;
+        }
         const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
         if (timestamp && !transcript.startedAt) {
           transcript.startedAt = timestamp;
@@ -489,7 +493,7 @@ async function readTranscriptRows(jsonlPath: string, providerSessionId: string):
     }
     try {
       const entry = JSON.parse(line) as AnyRecord;
-      if (entry.sessionId === providerSessionId) {
+      if (entry.sessionId === providerSessionId && !isClaudeApiRequestLogRow(entry)) {
         rows.push(entry);
       }
     } catch {

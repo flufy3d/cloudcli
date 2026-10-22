@@ -1328,6 +1328,22 @@ export function readJsonRecord(value: unknown): AnyRecord | null {
 }
 
 // ---------------------------
+//----------------- CLAUDE TRANSCRIPT ROW UTILITIES ------------
+/**
+ * True for a Claude Code JSONL row that only logs an outgoing API request.
+ *
+ * Claude Code 2.1.30x writes `api-request`, `api-request-shape` and
+ * `api-request-blob` rows beside the conversation. A blob carries a full
+ * `message` with a `user` or `assistant` role — a re-sent copy of rows already
+ * in the transcript — so anything that reads `message.role` would render or
+ * index every prompt, reply and tool call twice. Readers of Claude transcripts
+ * (history, subagent activity, conversation search) skip these rows first.
+ */
+export function isClaudeApiRequestLogRow(entry: AnyRecord): boolean {
+  return typeof entry.type === 'string' && entry.type.startsWith('api-request');
+}
+
+// ---------------------------
 //----------------- AUTH AND CREDENTIAL UTILITIES ------------
 /**
  * Decodes a JWT token string without verification and extracts the user email.

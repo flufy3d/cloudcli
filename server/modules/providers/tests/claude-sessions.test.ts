@@ -227,6 +227,41 @@ test('an assistant reply sent as a plain string is cited the same way', () => {
   assert.deepEqual(message.memoryCitations, [{ source: 'notes.md' }]);
 });
 
+test('Claude history ignores the api-request log rows the CLI writes beside the conversation', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-api-request-rows-'));
+  const sessionId = 'api-request-session';
+  const prompt = { role: 'user', content: '做一个网页 PPT' };
+  const reply = { role: 'assistant', content: [{ type: 'text', text: '好的，开始。' }] };
+
+  try {
+    const jsonlPath = path.join(tempRoot, `${sessionId}.jsonl`);
+    const rows = [
+      { type: 'user', uuid: 'u1', parentUuid: null, sessionId, timestamp: '2026-10-22T14:06:34.000Z', message: prompt },
+      { type: 'api-request-shape', sessionId, shapeHash: 'h', shape: '{}' },
+      // A blob is the request body re-logged: same message, real role, no uuid.
+      { type: 'api-request-blob', sessionId, hash: 'b1', message: prompt },
+      { type: 'api-request', sessionId, id: 'r1', tail: ['b1'] },
+      { type: 'assistant', uuid: 'a1', parentUuid: 'u1', sessionId, timestamp: '2026-10-22T14:06:40.000Z', message: { ...reply, id: 'msg_1' } },
+      { type: 'api-request-blob', sessionId, hash: 'b2', message: reply },
+    ];
+    await writeFile(jsonlPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(sessionId, 'claude', tempRoot, 'Api request rows', now, now, jsonlPath);
+
+      const history = await new ClaudeSessionsProvider().fetchHistory(sessionId, { providerSessionId: sessionId });
+      const texts = history.messages
+        .filter((message) => message.kind === 'text')
+        .map((message) => message.content);
+
+      assert.deepEqual(texts, ['做一个网页 PPT', '好的，开始。']);
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('Claude history attaches a subagent transcript stored under the session directory', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-subagent-'));
 
