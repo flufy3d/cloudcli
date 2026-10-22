@@ -203,10 +203,10 @@ export const TRANSCRIPT_ROW_KINDS = [
 /**
  * `error` is deliberately absent. Most error frames are produced by the
  * gateway or a runtime about a run in flight and are never read back, so
- * there is no engine record to derive an id from. zcode is the one engine
- * that persists error rows; its live and history paths derive the same id
- * from the engine's own event id, which is what the join needs — the
- * requirement just cannot be stated for the kind as a whole.
+ * there is no engine record to derive an id from. zcode and codex are the
+ * engines that persist error rows; both derive the row id from the engine's
+ * own record (zcode's event id, codex's turn id), which is what the join
+ * needs — the requirement just cannot be stated for the kind as a whole.
  */
 
 /** A kind whose rows are persisted and therefore need a deterministic id. */

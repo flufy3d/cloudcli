@@ -23,6 +23,7 @@ import {
 import { closeCodexResidentSessions, listCodexResidentSessions } from '@/modules/providers/list/codex/codex-session-manager.js';
 import type { ProviderRuntimeContext } from '@/shared/index.js';
 
+import { isVolatileMessageId } from '../../../../shared/protocol/messageKinds.js';
 import { codexSessionTitleService } from '../services/codex-session-title.service.js';
 
 test.beforeEach((t) => { if ('mock' in t) t.mock.method(codexSessionTitleService, 'enqueue', async () => {}); });
@@ -621,7 +622,14 @@ test('a failed turn surfaces the error and exits non-zero', async (t) => {
     cwd: process.cwd(),
   }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
 
-  assert.ok(messages.some((message) => message.kind === 'error' && message.content === 'usage limit reached'));
+  const errors = messages.filter((message) => message.kind === 'error');
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].content, 'usage limit reached');
+  assert.equal(
+    errors[0].id,
+    `${TURN_ID}_error`,
+    'the failure row is named after the turn, so the persisted copy replaces it',
+  );
   assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
 });
 
@@ -633,17 +641,19 @@ test('a failed turn surfaces the error and exits non-zero', async (t) => {
  * the transcript shows the failure twice — once live, once from the file —
  * and the client cannot tell them apart.
  */
-test('a failed turn names its error row after the turn', async (t) => {
+test('the failure notification names its row after the turn', async (t) => {
   installFakeAppServer(t, (fake) => {
     fake.handlers.onNotification?.('error', {
       threadId: THREAD_ID,
       turnId: TURN_ID,
-      error: { message: 'usage limit reached' },
+      error: { message: 'connection failed' },
       willRetry: false,
     });
+    // The closing report carries no cause of its own, so the row can only
+    // have come from the notification.
     fake.handlers.onNotification?.('turn/completed', {
       threadId: THREAD_ID,
-      turn: { id: TURN_ID, status: 'failed', error: { message: 'usage limit reached' } },
+      turn: { id: TURN_ID, status: 'failed', error: null },
     });
   });
   const messages: any[] = [];
@@ -655,6 +665,7 @@ test('a failed turn names its error row after the turn', async (t) => {
 
   const errors = messages.filter((message) => message.kind === 'error');
   assert.equal(errors.length, 1, 'the failure is reported once');
+  assert.equal(errors[0].content, 'connection failed');
   assert.equal(errors[0].id, `${TURN_ID}_error`);
 });
 
@@ -679,6 +690,14 @@ test('an interrupted turn surfaces as an error, not a silent success', async (t)
 
   assert.ok(messages.some((message) => message.kind === 'error' && /interrupted/i.test(String(message.content))));
   assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
+
+  // An interrupted turn is recorded as an abort, and an abort carries no
+  // cause: there is no persisted failure row to replace the live one. The live
+  // row must therefore not claim the turn's identity.
+  const errors = messages.filter((message) => message.kind === 'error');
+  assert.equal(errors.length, 1);
+  assert.notEqual(errors[0].id, `${TURN_ID}_error`, 'an abort is not a recorded failure');
+  assert.ok(isVolatileMessageId(errors[0].id), 'the row belongs to this run alone');
 });
 
 test('a stop the user asked for stays silent when codex reports the interrupt back', async (t) => {

@@ -59,6 +59,7 @@ import {
 import {
   codexTurnFailureRowId,
   readCodexFailureMessage,
+  readCodexReportedTurnId,
 } from '@/modules/providers/list/codex/codex-turn-error.js';
 import { createBackgroundTasksStatusMessage, createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
 import { codexSessionTitleService } from '@/modules/providers/services/codex-session-title.service.js';
@@ -596,7 +597,14 @@ function handleCodexSessionEvent(
 
     case 'error': {
       const message = readCodexFailureMessage({ error: params.error, message: params.message });
-      const turnId = readNonEmptyString(params.turnId);
+      const turnId = readCodexReportedTurnId(params);
+      if (params.willRetry === true) {
+        // A recoverable error is progress, not a failed turn — the engine is
+        // still trying. The round's handler says the same about the round's
+        // own notifications, and a row here would outlive the retry.
+        console.warn('[Codex] Retrying turn:', message);
+        return;
+      }
       if (message) {
         target.deliver(createNormalizedMessage({
           // The turn id names the failure on both transports, so the row the
@@ -1225,7 +1233,7 @@ async function queryCodex(
           console.warn('[Codex] Retrying turn:', message);
           return;
         }
-        surfaceFailure(message, readNonEmptyString(params.turnId));
+        surfaceFailure(message, readCodexReportedTurnId(params));
         return;
       }
 
@@ -1241,7 +1249,7 @@ async function queryCodex(
               : 'unknown';
         if (turn?.status === 'failed') {
           const message = readCodexFailureMessage({ error: turn.error }) || terminalFailure?.message || 'Turn failed';
-          surfaceFailure(message, readNonEmptyString(turn?.id) ?? engineTurnId);
+          surfaceFailure(message, readCodexReportedTurnId(params) ?? engineTurnId);
           notifyRunFailed({
             userId: normalizedUserId,
             provider: 'codex',
@@ -1261,7 +1269,10 @@ async function queryCodex(
           // as a success. A stop the user asked for (`abort` already flagged
           // the session) arrives as the same status and must stay silent.
           const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
-          surfaceFailure(message, readNonEmptyString(turn?.id) ?? engineTurnId);
+          // No turn id here: an interrupted turn is recorded as an abort, and
+          // an abort carries no cause for a failure row to be named after — a
+          // row named after it would claim a join the transcript cannot make.
+          surfaceFailure(message);
           notifyRunFailed({
             userId: normalizedUserId,
             provider: 'codex',

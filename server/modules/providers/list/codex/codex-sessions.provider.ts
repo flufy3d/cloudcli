@@ -1264,6 +1264,8 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
   const turns = createCodexTurnTracker();
   /** Turns whose prompt already carries the anchor, so only the first does. */
   const anchoredTurnIds = new Set<string>();
+  /** The failure rows already written, so one failure is one row. */
+  const failureRowIds = new Set<string>();
 
   /**
    * Every spawned agent's `Agent` row, indexed by each handle it can later be
@@ -1389,17 +1391,25 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       // it, or the transcript keeps a prompt with no answer and no reason and
       // the failure the live stream reported is gone after the next read.
       const message = readCodexFailureMessage({ error: payload.error });
-      const turnId = readNonEmptyString(payload.turn_id);
-      if (message && turnId) {
-        messages.push({
-          // The turn id is the engine's own name for the turn, and the live
-          // error row carries the same one: the persisted copy replaces the
-          // live copy instead of the transcript showing the failure twice.
-          uuid: codexTurnFailureRowId(turnId),
-          type: 'error',
-          timestamp,
-          content: message,
-        });
+      if (message) {
+        const turnId = readNonEmptyString(payload.turn_id);
+        // The turn id is the engine's own name for the turn, and the live
+        // error row carries the same one: the persisted copy replaces the
+        // live copy instead of the transcript showing the failure twice. A
+        // record without one still shows the reason — the file's own
+        // position names that row, the way an aborted turn's note is named.
+        const uuid = turnId
+          ? codexTurnFailureRowId(turnId)
+          : typeof entry.ordinal === 'number' ? `ord_${entry.ordinal}` : `line_${messages.length}`;
+        if (!failureRowIds.has(uuid)) {
+          failureRowIds.add(uuid);
+          messages.push({
+            uuid,
+            type: 'error',
+            timestamp,
+            content: message,
+          });
+        }
       }
       continue;
     }

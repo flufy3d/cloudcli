@@ -11,13 +11,16 @@
  * copy instead of showing the failure twice.
  *
  * A turn that ended without a cause (the user stopped it, the engine was
- * killed) has nothing to report and no row here: the engine never recorded a
- * failure, so there is nothing to read back.
+ * killed, the host lost track of which turn answered) has nothing to report
+ * and no row here: the engine never recorded a failure, so there is nothing
+ * to read back, and a row named after that turn would claim a join the
+ * transcript cannot make.
  *
  * Consumers: `codex-runtime.provider.ts` (live run) and
  * `codex-sessions.provider.ts` (history read).
  */
 
+import type { AnyRecord } from '@/shared/types.js';
 import { readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
 /**
@@ -35,11 +38,30 @@ export function codexTurnFailureRowId(turnId: string): string {
 }
 
 /**
+ * Reads the turn id an engine report carries, whichever field it arrives in.
+ *
+ * The engine names a turn three ways: `turn.id` on a `turn/completed`,
+ * `turnId` on an `error` notification, `turn_id` on a rollout record. One
+ * reader for all three keeps the row id from quietly degrading into a
+ * throwaway one — which would leave the live row and the persisted row as
+ * two different rows.
+ *
+ * Consumers: `codex-runtime.provider.ts` (live run).
+ */
+export function readCodexReportedTurnId(params: AnyRecord): string | undefined {
+  const turn = readObjectRecord(params.turn);
+  return readOptionalString(turn?.id)
+    ?? readOptionalString(params.turnId)
+    ?? readOptionalString(params.turn_id);
+}
+
+/**
  * Reads the engine's own words for a failure.
  *
  * Two shapes reach this reader: the error object the engines send
- * (`{ message }`) and the flat message older engines put beside it. Either
- * one carries the cause; the reader returns whichever is there.
+ * (`{ message }`) and the flat message the live notification puts beside it
+ * when it sends no error object. Either one carries the cause; the reader
+ * returns whichever is there.
  *
  * Consumers: `codex-runtime.provider.ts` and `codex-sessions.provider.ts`.
  */
