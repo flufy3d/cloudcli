@@ -1613,6 +1613,171 @@ test('a stop during a report the engine started by itself closes the process, an
   }
 });
 
+// An agent works in turns on its own thread, and the parent can wake it for
+// another turn later. The engine reports an agent's end only through the
+// parent's records, which a failed parent turn never writes, so the agent's
+// own turn decides whether it runs.
+const AGENT_THREAD = 'thread_child_1';
+const AGENT_TURN = 'agent-turn-1';
+
+async function withResidentCodex(run: () => Promise<void>): Promise<void> {
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await run();
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
+}
+
+test('an agent whose own turn fails on the usage limit stops running with that cause', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/started', { threadId: AGENT_THREAD, turn: { id: AGENT_TURN, status: 'inProgress' } });
+    notify('turn/completed', {
+      threadId: AGENT_THREAD,
+      turn: { id: AGENT_TURN, status: 'failed', error: { message: 'You’ve hit your usage limit.' } },
+    });
+    notify('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'failed', error: { message: 'You’ve hit your usage limit.' } },
+    });
+  });
+  await withResidentCodex(async () => {
+    const messages: any[] = [];
+    await codexRuntime.run('go', { sessionId: 'agent-usage-limit' }, { send: (message) => messages.push(message) }, runtimeContext(false));
+
+    assert.deepEqual(codexRuntime.listBackgroundWork(), [], 'nothing is left running behind the failed round');
+    const ended = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+    assert.deepEqual(ended.map((message) => [message.taskId, message.toolUseId, message.status]), [
+      ['thread_child_1', 'call_spawn_1', 'failed'],
+    ]);
+    assert.match(ended[0].summary ?? '', /usage limit/);
+  });
+});
+
+test('an agent the parent wakes again runs on its card again, and idles when its turn ends', async (t) => {
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/started', { threadId: AGENT_THREAD, turn: { id: AGENT_TURN, status: 'inProgress' } });
+    notify('turn/completed', { threadId: AGENT_THREAD, turn: { id: AGENT_TURN, status: 'completed', error: null } });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  await withResidentCodex(async () => {
+    const published: any[] = [];
+    const context = { ...runtimeContext(false), publishSessionEvent: (_sessionId: string, message: any) => published.push(message) };
+    await codexRuntime.run('go', { sessionId: 'agent-woken' }, { send() {} }, context);
+    assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+
+    // With no round in flight, the engine wakes the agent for another turn.
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: AGENT_THREAD, turn: { id: 'agent-turn-2', status: 'inProgress' } });
+    assert.deepEqual(
+      codexRuntime.listBackgroundWork().map((entry) => [entry.sessionId, entry.tasks.map((task) => task.taskId)]),
+      [['agent-woken', ['thread_child_1']]],
+    );
+    const revived = published.find((message) => message.kind === 'task_status' && message.event === 'started');
+    assert.equal(revived?.toolUseId, 'call_spawn_1', 'the woken agent runs on the card it was spawned with');
+
+    notify('turn/completed', { threadId: AGENT_THREAD, turn: { id: 'agent-turn-2', status: 'completed', error: null } });
+    assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+    const ended = published.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+    assert.deepEqual(ended.map((message) => message.status), ['completed']);
+  });
+});
+
+test('an agent stopped with its process runs on its card again when the next process wakes it', async (t) => {
+  let spawn = true;
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    if (spawn) notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  await withResidentCodex(async () => {
+    const published: any[] = [];
+    const context = { ...runtimeContext(false), publishSessionEvent: (_sessionId: string, message: any) => published.push(message) };
+    await codexRuntime.run('go', { sessionId: 'agent-stopped-woken' }, { send() {} }, context);
+    assert.equal(await codexRuntime.abort('agent-stopped-woken'), true);
+    assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+
+    spawn = false;
+    await codexRuntime.run('again', { sessionId: 'agent-stopped-woken' }, { send() {} }, { ...context, ...runtimeContext(true), publishSessionEvent: context.publishSessionEvent });
+    server.handlers.onNotification?.('turn/started', { threadId: AGENT_THREAD, turn: { id: 'agent-turn-2', status: 'inProgress' } } as any);
+    assert.deepEqual(
+      codexRuntime.listBackgroundWork().map((entry) => [entry.sessionId, entry.tasks.map((task) => task.toolUseId)]),
+      [['agent-stopped-woken', ['call_spawn_1']]],
+    );
+  });
+});
+
+test('a wake the parent records before or after the agent\'s own turn leaves the card in step with that turn', async (t) => {
+  const server = installFakeAppServer(t);
+  await withResidentCodex(async () => {
+    const context = { ...runtimeContext(false), publishSessionEvent: () => {} };
+    await codexRuntime.run('go', { sessionId: 'agent-wake-order' }, { send() {} }, context);
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    const running = () => codexRuntime.listBackgroundWork().filter((entry) => entry.tasks.length > 0)
+      .map((entry) => [entry.sessionId, entry.tasks.map((task) => task.taskId)]);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: 'engine-turn', status: 'inProgress' } });
+
+    // The agent's turn runs and ends before the parent's spawn record arrives.
+    notify('turn/started', { threadId: AGENT_THREAD, turn: { id: AGENT_TURN, status: 'inProgress' } });
+    notify('turn/completed', { threadId: AGENT_THREAD, turn: { id: AGENT_TURN, status: 'completed', error: null } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: 'engine-turn', item: spawnActivity });
+    assert.deepEqual(running(), [], 'a spawn record after the turn ended does not leave the agent running');
+
+    // The parent records a wake before the agent's next turn starts: the card
+    // runs again from the turn's start and settles at its end.
+    notify('item/completed', { threadId: THREAD_ID, turnId: 'engine-turn', item: { ...spawnActivity, id: 'call_spawn_2' } });
+    notify('turn/started', { threadId: AGENT_THREAD, turn: { id: 'agent-turn-2', status: 'inProgress' } });
+    assert.deepEqual(running(), [['agent-wake-order', ['thread_child_1']]]);
+    notify('turn/completed', { threadId: AGENT_THREAD, turn: { id: 'agent-turn-2', status: 'completed', error: null } });
+    assert.deepEqual(running(), []);
+  });
+});
+
+test('a resident run without an app session leaves no agent behind', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  await withResidentCodex(async () => {
+    await codexRuntime.run('go', { cwd: process.cwd() }, { send() {} }, runtimeContext(false));
+    assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+  });
+});
+
+test('an agent whose turn ends before the parent records its spawn is not left running', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('turn/started', { threadId: AGENT_THREAD, turn: { id: AGENT_TURN, status: 'inProgress' } });
+    notify('turn/completed', {
+      threadId: AGENT_THREAD,
+      turn: { id: AGENT_TURN, status: 'failed', error: { message: 'You’ve hit your usage limit.' } },
+    });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  await withResidentCodex(async () => {
+    const messages: any[] = [];
+    await codexRuntime.run('go', { sessionId: 'agent-early-end' }, { send: (message) => messages.push(message) }, runtimeContext(false));
+
+    assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+    const ended = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+    assert.deepEqual(ended.map((message) => [message.taskId, message.status]), [['thread_child_1', 'failed']]);
+  });
+});
+
 test('a session approval survives the next round and is retracted when its process closes', async (t) => {
   const server = installFakeAppServer(t);
   const previous = process.env.CLOUDCLI_CODEX_RESIDENT;

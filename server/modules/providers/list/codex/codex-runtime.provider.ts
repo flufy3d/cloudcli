@@ -83,7 +83,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
-import type { NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
+import type { BackgroundTaskSummary, NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
 
 const TASK_MCP_NAME = CODEX_TASK_MCP_NAME;
 const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
@@ -422,6 +422,12 @@ function emitCodexSubagentActivity(
       broadcastCodexBackgroundTasks(target, backgroundWorkKey);
     }
     target.deliver(codexTaskStatus(messageSessionId, taskId, item.id, { event: 'started', description }));
+    // An agent that fails at once (the usage limit, say) can end its turn
+    // before the parent records the spawn.
+    const ended = codexAgentTurns.get(taskId)?.ended;
+    if (backgroundWorkKey && ended?.sessionKey === backgroundWorkKey) {
+      settleCodexAgentTurn(target, backgroundWorkKey, taskId, ended);
+    }
     return;
   }
 
@@ -434,10 +440,132 @@ function emitCodexSubagentActivity(
   if (!backgroundWorkKey || !tracked) {
     return;
   }
+  retireCodexAgent(backgroundWorkKey, tracked);
   broadcastCodexBackgroundTasks(target, backgroundWorkKey);
   target.deliver(codexTaskStatus(messageSessionId, tracked.taskId, tracked.toolUseId, {
     event: 'notification',
     status: item.activity === 'completed' ? 'completed' : 'stopped',
+  }));
+}
+
+/** How an agent's last turn ended, as its card shows it. */
+type CodexAgentTurnEnd = { status: 'completed' | 'failed' | 'stopped'; summary?: string };
+
+/**
+ * What each agent thread's own turns last did, keyed by agent thread id.
+ *
+ * An agent works in turns on its own thread, and the parent can wake it for
+ * another turn after the last one ended. `ended` is the outcome of the
+ * agent's last turn, cleared when its next turn starts; `retired` is the card
+ * of an agent that is idle, kept so a woken agent runs on the card it was
+ * spawned with. The parent's spawn record often arrives after the agent's
+ * own turn already ended (a resident session holds the parent's events until
+ * it knows their round, and an agent's events go out at once), so a spawn
+ * record that finds `ended` settles the card at once. When the parent records
+ * a wake before the agent's turn starts, the card settles and runs again at
+ * the turn's start. One slot per thread is enough: an agent thread belongs
+ * to the parent thread that spawned it, and so to one conversation. Bounded,
+ * because nothing reports that an agent is gone for good.
+ */
+const codexAgentTurns = new Map<string, {
+  ended?: CodexAgentTurnEnd & { sessionKey: string };
+  retired?: { sessionKey: string; task: BackgroundTaskSummary };
+}>();
+const MAX_TRACKED_CODEX_AGENT_THREADS = 500;
+
+function rememberCodexAgentTurn(agentThreadId: string, state: NonNullable<ReturnType<typeof codexAgentTurns.get>>): void {
+  codexAgentTurns.delete(agentThreadId);
+  codexAgentTurns.set(agentThreadId, state);
+  if (codexAgentTurns.size > MAX_TRACKED_CODEX_AGENT_THREADS) {
+    const oldest = codexAgentTurns.keys().next().value;
+    if (oldest !== undefined) codexAgentTurns.delete(oldest);
+  }
+}
+
+/** Keeps the card of an agent that went idle, so waking it can revive the card. */
+function retireCodexAgent(sessionKey: string, task: BackgroundTaskSummary): void {
+  rememberCodexAgentTurn(task.taskId, { ...codexAgentTurns.get(task.taskId), retired: { sessionKey, task } });
+}
+
+/** Ends a tracked agent whose own turn ended, and settles its card with that outcome. */
+function settleCodexAgentTurn(
+  target: CodexEventTarget,
+  backgroundWorkKey: string,
+  agentThreadId: string,
+  ended: CodexAgentTurnEnd,
+): void {
+  const tracked = codexBackgroundWork.end(backgroundWorkKey, agentThreadId);
+  if (!tracked) {
+    return;
+  }
+  retireCodexAgent(backgroundWorkKey, tracked);
+  broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+  target.deliver(codexTaskStatus(target.threadId() || target.appSessionId || null, tracked.taskId, tracked.toolUseId, {
+    event: 'notification',
+    status: ended.status,
+    ...(ended.summary ? { summary: ended.summary } : {}),
+  }));
+}
+
+/**
+ * Follows the turns an agent runs on its own thread.
+ *
+ * The engine reports an agent's end only in the parent's records, written when
+ * the parent waits on it; a parent turn that fails first (the usage limit, for
+ * one) never writes them, and the agent would show as running forever. The
+ * agent's own turn is what says whether it runs: the end of the turn settles
+ * the card with the turn's outcome, and a later turn of the same agent runs
+ * on that card again.
+ */
+function trackCodexAgentTurn(
+  target: CodexEventTarget,
+  method: string,
+  params: AnyRecord,
+  agentThreadId: string,
+  backgroundWorkKey: string | null | undefined,
+): void {
+  if (method !== 'turn/started' && method !== 'turn/completed') {
+    return;
+  }
+  const turn = readObjectRecord(params.turn);
+  if (method === 'turn/completed') {
+    const status = turn?.status === 'failed' ? 'failed' : turn?.status === 'interrupted' ? 'stopped' : 'completed';
+    const summary = readNonEmptyString(readObjectRecord(turn?.error)?.message);
+    console.log(`[Codex] Agent thread ${agentThreadId} ended a turn (${String(turn?.status ?? 'unknown')}).`);
+    const ended: CodexAgentTurnEnd = { status, ...(summary ? { summary } : {}) };
+    if (!backgroundWorkKey) {
+      return;
+    }
+    rememberCodexAgentTurn(agentThreadId, {
+      ...codexAgentTurns.get(agentThreadId),
+      ended: { ...ended, sessionKey: backgroundWorkKey },
+    });
+    const owner = codexBackgroundWork.find(agentThreadId);
+    if (owner?.sessionKey === backgroundWorkKey) {
+      settleCodexAgentTurn(target, backgroundWorkKey, agentThreadId, ended);
+    }
+    return;
+  }
+
+  console.log(`[Codex] Agent thread ${agentThreadId} started a turn.`);
+  const state = codexAgentTurns.get(agentThreadId);
+  if (!state) {
+    return;
+  }
+  const retired = state.retired;
+  // A new turn makes the end of the last one stale.
+  rememberCodexAgentTurn(agentThreadId, retired ? { retired } : {});
+  if (!retired || !backgroundWorkKey || retired.sessionKey !== backgroundWorkKey
+    || codexBackgroundWork.get(backgroundWorkKey, agentThreadId)) {
+    return;
+  }
+  codexAgentTurns.delete(agentThreadId);
+  const { taskId, toolUseId, taskType, description } = retired.task;
+  codexBackgroundWork.start(backgroundWorkKey, { taskId, toolUseId, taskType, description });
+  broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+  target.deliver(codexTaskStatus(target.threadId() || target.appSessionId || null, taskId, toolUseId, {
+    event: 'started',
+    description,
   }));
 }
 
@@ -545,6 +673,7 @@ function handleCodexSessionEvent(
     if (method === 'item/completed') {
       emitCodexAgentItem(target, eventThreadId, params.item, new Date().toISOString(), backgroundWorkKey);
     }
+    trackCodexAgentTurn(target, method, params, eventThreadId, backgroundWorkKey);
     return;
   }
 
@@ -638,6 +767,7 @@ function settleCodexSessionAgents(
   if (outstanding.length === 0) {
     return;
   }
+  for (const task of outstanding) retireCodexAgent(appSessionId, task);
   deliver(createBackgroundTasksStatusMessage(
     { provider: 'codex', sessionId: appSessionId },
     codexBackgroundWork.listStripTasks(appSessionId),
@@ -903,6 +1033,7 @@ async function queryCodex(
     if (outstanding.length === 0) {
       return;
     }
+    for (const task of outstanding) retireCodexAgent(backgroundWorkKey, task);
     broadcastBackgroundTasks(backgroundWorkKey);
     for (const task of outstanding) {
       sendMessage(ws, codexTaskStatus(capturedSessionId || sessionId || null, task.taskId, task.toolUseId, {
@@ -1157,6 +1288,7 @@ async function queryCodex(
       if (method === 'item/completed') {
         emitAgentItem(eventThreadId, params.item, new Date().toISOString());
       }
+      trackCodexAgentTurn(roundTarget, method, params, eventThreadId, sessionId || capturedSessionId);
       return;
     }
 
@@ -1654,7 +1786,10 @@ async function queryCodex(
         releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
       } else if (!appSessionId && residentGeneration !== null) {
         // A run without an app session has no conversation to stay resident
-        // for, so its process is closed with the round.
+        // for, so its process is closed with the round. Its agents are
+        // tracked under the native thread id, which the disposal does not
+        // clear, so they are settled here.
+        settleOutstandingAgents();
         releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
       } else if (residentGeneration !== null) {
         releaseCodexResidentSession(residentKey, { generation: residentGeneration });

@@ -1048,6 +1048,8 @@ type CodexSubagentTranscript = {
   nickname?: string;
   agentPath?: string;
   model?: string;
+  /** How the agent's last turn ended; absent while that turn has no end. */
+  lastTurnEnd?: 'completed' | 'failed' | 'stopped';
 };
 
 /**
@@ -1101,6 +1103,19 @@ async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubag
 
     if (entry.type === 'turn_context') {
       transcript.model = readNonEmptyString(payload.model) ?? transcript.model;
+      continue;
+    }
+
+    if (entry.type === 'event_msg' && payload.type === 'task_started') {
+      transcript.lastTurnEnd = undefined;
+      continue;
+    }
+    if (entry.type === 'event_msg' && payload.type === 'task_complete') {
+      transcript.lastTurnEnd = readObjectRecord(payload.error) ? 'failed' : 'completed';
+      continue;
+    }
+    if (entry.type === 'event_msg' && payload.type === 'turn_aborted') {
+      transcript.lastTurnEnd = 'stopped';
       continue;
     }
 
@@ -1523,20 +1538,26 @@ async function attachCodexSubagentTranscripts(
     const subagent: SubagentInfo = {
       id: record.agentThreadId ?? record.toolCallId,
       description: readNonEmptyString(parsedInput.description as string | undefined) ?? agentName,
-      // An agent with no end record is running only while the runtime still
-      // tracks it (its turn is in flight); otherwise the app-server that ran it
-      // is gone and it can never report, so the card must not spin forever.
       status: record.isComplete
         ? (record.wasStopped ? 'stopped' : 'completed')
         : record.reportedComplete
           ? 'completed'
           : codexBackgroundWork.has(record.agentThreadId ?? record.toolCallId) ? 'running' : 'stopped',
     };
+    // An agent with no end record in the parent's rollout is running only
+    // while the runtime tracks it. Otherwise its own last turn says how it
+    // ended, the same turn the live card settled from; with no ended turn the
+    // app-server that ran it is gone and it can never report, so the card
+    // must not spin forever.
+    const readsOwnLastTurn = subagent.status === 'stopped' && !record.isComplete;
 
     if (record.agentThreadId) {
       const rolloutPath = await findCodexSubagentRollout(parentFilePath, record.agentThreadId);
       if (rolloutPath) {
         const transcript = await readCodexSubagentTranscript(rolloutPath);
+        if (readsOwnLastTurn && transcript.lastTurnEnd) {
+          subagent.status = transcript.lastTurnEnd;
+        }
         if (transcript.activity.length > 0) {
           record.message.subagentTools = transcript.activity
             .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)

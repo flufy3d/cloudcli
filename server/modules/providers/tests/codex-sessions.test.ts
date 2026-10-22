@@ -809,6 +809,46 @@ test('Codex history reads an agent with no end record as running while the runti
   }
 });
 
+// The parent writes no end record when its own turn fails first; the agent's
+// own rollout still says how its last turn ended, and the live card settles
+// from that same turn.
+for (const [lastTurn, expected] of [
+  [{ type: 'task_complete', error: { message: 'You’ve hit your usage limit.', codex_error_info: 'usage_limit_exceeded' } }, 'failed'],
+  [{ type: 'task_complete', last_agent_message: 'done' }, 'completed'],
+  [{ type: 'turn_aborted', reason: 'interrupted' }, 'stopped'],
+] as const) {
+  test(`Codex history reads an untracked agent with no end record from its own last turn (${expected})`, { concurrency: false }, async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-last-turn-'));
+    const workspacePath = await createWorkspaceFixture();
+    const restoreHomeDir = patchHomeDir(tempRoot);
+
+    try {
+      await writeUnfinishedAgentRollout(tempRoot, workspacePath, 'codex-parent-last-turn');
+      // Beside the parent rollout, where `writeCodexTranscript` puts it.
+      const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+      await writeFile(path.join(sessionsDir, 'rollout-2026-07-07T00-00-00-codex-agent-open.jsonl'), `${[
+        JSON.stringify({ type: 'session_meta', payload: { id: 'codex-agent-open', agent_nickname: 'Open' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'agent-turn-1' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'agent-turn-1', last_agent_message: 'first' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'agent-turn-2' } }),
+        JSON.stringify({ type: 'event_msg', payload: { ...lastTurn, turn_id: 'agent-turn-2' } }),
+      ].join('\n')}\n`, 'utf8');
+      await withIsolatedDatabase(async () => {
+        sessionsDb.createAppSession('app-parent-last-turn', 'codex', workspacePath);
+        sessionsDb.assignProviderSessionId('app-parent-last-turn', 'codex-parent-last-turn');
+        await new CodexSessionSynchronizer().synchronize();
+
+        const history = await new CodexSessionsProvider().fetchHistory('app-parent-last-turn');
+        const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
+        assert.equal(task?.subagent?.status, expected);
+      });
+    } finally {
+      restoreHomeDir();
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+}
+
 test('Codex memory citations are lifted out of the reply they trail', () => {
   const reply = [
     'Here is the answer.',
