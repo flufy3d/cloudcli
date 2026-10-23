@@ -413,6 +413,7 @@ function SidebarSessionItem({
           className={cn(
             buttonVariants({ variant: 'ghost' }),
             'h-auto w-full justify-start rounded-md border bg-card p-2 text-left font-normal transition-all duration-150',
+            isEditing && 'hidden',
             isSelecting ? 'pr-2' : 'pr-11',
             isSelected ? 'border-primary/20 bg-primary/5' : 'border-border/30',
             !isSelected && isProcessing

@@ -99,7 +99,15 @@ export default function SessionOptions({
   };
 
   return (
-    <div ref={containerRef} className={cn('flex items-center gap-1', className)}>
+    <div
+      ref={containerRef}
+      className={cn(
+        'flex items-center gap-1',
+        className,
+        // 输入框独占整行，操作按钮换到下方，避免挤压长标题。
+        isEditing && 'relative left-auto right-auto top-auto bottom-auto min-w-0 w-full translate-y-0 flex-wrap justify-end gap-1.5 rounded-md border border-primary/20 bg-card p-2',
+      )}
+    >
       {isEditing ? (
         <>
           <input
@@ -115,28 +123,29 @@ export default function SessionOptions({
               }
             }}
             onClick={(event) => event.stopPropagation()}
-            className="w-32 rounded border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+            aria-label={t('sessions.renameSession')}
+            className="h-9 w-full min-w-0 flex-none rounded-md border border-border bg-background px-2 text-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
             autoFocus
           />
           <button
-            className="flex h-6 w-6 items-center justify-center rounded bg-green-50 hover:bg-green-100 dark:bg-green-900/20 dark:hover:bg-green-900/40"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-green-50 hover:bg-green-100 dark:bg-green-900/20 dark:hover:bg-green-900/40"
             onClick={(event) => {
               event.stopPropagation();
               saveRename();
             }}
             title={t('tooltips.save')}
           >
-            <Check className="h-3 w-3 text-green-600 dark:text-green-400" />
+            <Check className="h-4 w-4 text-green-600 dark:text-green-400" />
           </button>
           <button
-            className="flex h-6 w-6 items-center justify-center rounded bg-gray-50 hover:bg-gray-100 dark:bg-gray-900/20 dark:hover:bg-gray-900/40"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-gray-50 hover:bg-gray-100 dark:bg-gray-900/20 dark:hover:bg-gray-900/40"
             onClick={(event) => {
               event.stopPropagation();
               onCancelEditingSession();
             }}
             title={t('tooltips.cancel')}
           >
-            <X className="h-3 w-3 text-gray-600 dark:text-gray-400" />
+            <X className="h-4 w-4 text-gray-600 dark:text-gray-400" />
           </button>
         </>
       ) : (

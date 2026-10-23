@@ -158,6 +158,7 @@ export default function SidebarRecentConversations({
                 data-testid="recent-conversation-row"
                 className={cn(
                   'flex min-w-0 items-center gap-2 rounded-lg px-2 py-2 pr-11 text-left transition-colors',
+                  sessionRename !== null && 'hidden',
                   isSelected
                     ? 'bg-primary/10 text-foreground'
                     : 'text-foreground hover:bg-accent/60',
