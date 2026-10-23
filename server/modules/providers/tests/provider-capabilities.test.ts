@@ -47,6 +47,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
     supportsMessageEditing: true,
     supportsSessionForking: true,
+    supportsCompaction: true,
     mcp: {
       scopes: ['user', 'local', 'project'],
       transports: ['stdio', 'http', 'sse'],
@@ -69,6 +70,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     effortLevels: [],
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    supportsCompaction: false,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -96,6 +98,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // plus a new prompt, which is how Codex's own IDE clients do it.
     supportsMessageEditing: true,
     supportsSessionForking: true,
+    supportsCompaction: true,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -120,6 +123,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    supportsCompaction: true,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -149,6 +153,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // provider today.
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    supportsCompaction: true,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],
@@ -171,6 +176,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     effortLevels: ['low', 'medium', 'high'],
     supportsMessageEditing: false,
     supportsSessionForking: false,
+    supportsCompaction: true,
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http', 'sse'],

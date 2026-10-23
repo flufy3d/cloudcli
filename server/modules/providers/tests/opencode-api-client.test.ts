@@ -43,6 +43,10 @@ const withFakeService = async (
         reply(200, { data: { id: 'msg_fake', sessionID: 'ses_fake', type: 'user' } });
         return;
       }
+      if (request.method === 'POST' && path.endsWith('/compact')) {
+        reply(200, { data: { id: 'msg_compaction', sessionID: 'ses_fake', type: 'compaction', payload: {}, delivery: 'steer' } });
+        return;
+      }
       if (request.method === 'POST' && path.endsWith('/interrupt')) {
         reply(200, { interrupted: true });
         return;
@@ -169,5 +173,16 @@ test('turns non-2xx answers into OpenCodeApiError carrying status and message', 
         && error.status === 404
         && error.message.includes('Session ses_missing not found'),
     );
+  });
+});
+
+test('compact posts to the session compaction endpoint and returns the queued input id', async () => {
+  await withFakeService(async ({ client, requests }) => {
+    const result = await client.compact('ses_fake');
+    assert.deepEqual(result, { inputId: 'msg_compaction' });
+    const request = requests.at(-1);
+    assert.equal(request?.method, 'POST');
+    assert.equal(request?.path, '/api/session/ses_fake/compact');
+    assert.deepEqual(request?.body, {});
   });
 });

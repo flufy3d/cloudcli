@@ -195,7 +195,7 @@ Codex、ZCode、Antigravity、OpenCode 共用 `shared/background-work/background
 `server/modules/providers/services/provider-capabilities.service.ts`：
 
 - `deriveCapabilities` 从注册表里的切面**推导**能力——`runtime.permissions` 存在 ⇒ `supportsPermissionRequests`；`sessions.resolveEditAnchor` 存在 ⇒ `supportsMessageEditing`；`fork` 存在 ⇒ `supportsSessionForking`；`sessions.getTokenUsage` 存在 ⇒ `supportsTokenUsage`。
-- 静态部分（权限模式列表、图片/文件/中止/effort）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
+- 静态部分（权限模式列表、图片/文件/中止/effort/压缩）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
 - `provider-capabilities.test.ts` 把推导结果钉在显式基线上：切面增删会以"评审过的测试差异"呈现，而不是静默改能力。
 - **前端零 provider 分支**：composer/设置页完全按 `GET /api/providers/capabilities` 渲染。首屏与请求失败时的回退镜像在 `src/shared/providerCatalogFallback.ts`（`PROVIDER_FALLBACK_CATALOG`），由跨树 parity 测试（`server/modules/providers/tests/provider-catalog-parity.test.ts`）钉住与后端目录一致；**其 key 顺序就是全应用的引擎规范顺序**。
 
@@ -283,7 +283,7 @@ opencode 的自动命名由引擎自己做，CloudCLI 只负责不挡路。引�
 1. **类型**：`shared/protocol/chatEvents.ts` 扩展 `LLMProvider` 联合类型（全仓类型联动会指出所有必改点）。**只需改这一处**——前后端都从这里 re-export。
 2. **目录**：新建 `server/modules/providers/list/<name>/`，尽量复用基类（`AbstractProvider` / `McpProvider` / `SkillsProvider` / `SqliteSessionSynchronizer` / `cli-engine-path`），写 `<name>.provider.ts` 组装七切面。
 3. **注册**：`provider.registry.ts` 的 `providers` 记录加一行（漏了编译报错）。同步器声明 `getSessionWatchTarget()` 后，`sessions-watcher.service.ts` 自动纳管，**不需要改 watcher**。
-4. **能力**：`services/provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG` 补静态目录（权限模式、默认模型、images/files/abort/effort）；可选能力靠切面自动推导（要报账号配额就给 auth 切面加 `getQuota`，并在载荷里声明 `partitioning`）。同步更新前端镜像 `src/shared/providerCatalogFallback.ts`（parity 测试会强制）。
+4. **能力**：`services/provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG` 补静态目录（权限模式、默认模型、images/files/abort/effort/compaction）；可选能力靠切面自动推导（要报账号配额就给 auth 切面加 `getQuota`，并在载荷里声明 `partitioning`）。同步更新前端镜像 `src/shared/providerCatalogFallback.ts`（parity 测试会强制）。
 5. **接线**：需要被 agent/git 等模块直接拿 runner 时，在 `server/index.ts` 用 `providerRuntimeService.getRunner(...)` 注入；需要登录流则更新 `src/modules/provider-auth/ProviderLoginModal.tsx`。
 6. **前端外观**：`src/shared/ui/LLMProviderLogo.tsx` 加 Logo、`src/shared/providerDisplay.ts` 加显示名。composer 无需改动——它按能力矩阵渲染。
 
@@ -332,6 +332,14 @@ claude 的 `/limit-reset` 端点存在但无可验证的卡，暂未接入）。
 前端为首屏与请求失败保留一份镜像 `src/shared/mcpCapabilitiesFallback.ts`，
 由 `provider-catalog-parity.test.ts` 跨树钉住——这正是它此前缺的：
 旧的三张散表没有守卫，Cursor 明明会写 `cwd`，表里却写着不支持，工作目录字段因此对 Cursor 用户一直不可见。
+
+**会话压缩（`/compact`）是静态能力 `supportsCompaction`**：前端只在为真时往斜杠菜单里加 `/compact`，
+它和技能一样作为消息文本发给引擎，不走 cloudcli 内置命令。各家怎么压缩的差异收在运行时里：
+claude、zcode、antigravity 的引擎自己从提示词里认出 `/compact`，原样透传；
+codex 和 opencode 的引擎只认专门的调用，运行时用 `readCompactCommand` 认出命令后改调
+`thread/compact/start`（codex，应答不带回合 id，常驻会话先把这一轮标成已领取，下一个宣布的回合就是压缩）
+和 `POST /api/session/:id/compact`（opencode，压缩失败时执行照样报成功，失败只能从 `session.compaction.failed` 显示）。
+这两家不接受附加说明，`/compact <说明>` 直接报错，不把说明丢掉。cursor 不支持。
 
 ## 差异吃在适配器里，不漏给前端
 

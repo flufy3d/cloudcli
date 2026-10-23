@@ -2028,3 +2028,73 @@ test('the turn a start returns is the round turn even when a report starts right
     closeCodexResidentSessions();
   }
 });
+
+test('a compaction round starts the engine compaction and owns the turn it announces', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    const engineEvents: string[] = [];
+    await acquireCodexResidentSession({
+      appSessionId: 'app-compact',
+      nativeThreadId: THREAD_ID,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: (method) => engineEvents.push(method),
+    });
+
+    const roundEvents: string[] = [];
+    await submitCodexResidentRound({
+      appSessionId: 'app-compact',
+      input: [],
+      compact: true,
+      onEvent: (method) => roundEvents.push(method),
+      onRequest: () => undefined,
+    });
+
+    const methods = server.calls.map((call) => call.method);
+    assert.ok(methods.includes('thread/compact/start'));
+    assert.ok(!methods.includes('thread/queue/add'));
+    assert.ok(!methods.includes('turn/start'));
+    assert.equal(server.calls.find((call) => call.method === 'thread/compact/start')?.params.threadId, THREAD_ID);
+
+    // The engine answers the call with an empty object and names no turn; the
+    // turn it announces next is the compaction.
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'compact-turn', status: 'inProgress' } });
+    notify(server, 'item/started', { threadId: THREAD_ID, turnId: 'compact-turn', item: { type: 'contextCompaction', id: 'c-1' } });
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'compact-turn', status: 'completed' } });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.deepEqual(roundEvents, ['turn/started', 'item/started', 'turn/completed']);
+    assert.deepEqual(engineEvents, []);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a compaction round is refused while the engine is still reporting', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-compact-busy',
+      nativeThreadId: THREAD_ID,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: () => {},
+    });
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'engine-report', status: 'inProgress' } });
+
+    await assert.rejects(submitCodexResidentRound({
+      appSessionId: 'app-compact-busy',
+      input: [],
+      compact: true,
+      onEvent: () => {},
+      onRequest: () => undefined,
+    }), /busy/i);
+    assert.ok(!server.calls.some((call) => call.method === 'thread/compact/start'));
+  } finally {
+    closeCodexResidentSessions();
+  }
+});

@@ -35,6 +35,7 @@ import type { NormalizedMessage } from '@/shared/types.js';
 import {
   compactProviderPayload,
   createNormalizedMessage,
+  generateMessageId,
   hasVisibleText,
   readObjectRecord,
   readOptionalString,
@@ -346,6 +347,28 @@ export class OpenCodeSessionEventTranslator {
         }
         const notice = readBackgroundNotice(readObjectRecord(item?.payload)?.metadata);
         return notice ? { frames: [], notice } : { frames: [] };
+      }
+
+      case 'session.compaction.ended':
+      case 'session.compaction.failed': {
+        // Manual (`/compact`) and automatic compactions alike. A failed one
+        // still ends its execution as succeeded, so the failure is shown here
+        // or nowhere.
+        const id = `${readOptionalString(data.inputID) ?? generateMessageId(PROVIDER)}_compaction`;
+        if (event.type === 'session.compaction.ended') {
+          return {
+            frames: [createNormalizedMessage({
+              id, sessionId: this.sessionId, timestamp, provider: PROVIDER,
+              kind: 'task_notification', summary: 'Context compacted', status: 'info',
+            })],
+          };
+        }
+        return {
+          frames: [createNormalizedMessage({
+            id, sessionId: this.sessionId, timestamp, provider: PROVIDER,
+            kind: 'error', content: `Compaction failed: ${readErrorMessage(data.error)}`, isError: true,
+          })],
+        };
       }
 
       case 'session.execution.started':

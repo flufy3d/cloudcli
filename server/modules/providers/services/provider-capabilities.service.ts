@@ -54,6 +54,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     effortLevels: [...catalog.effortLevels],
     supportsMessageEditing: typeof provider.sessions?.resolveEditAnchor === 'function',
     supportsSessionForking: provider.fork !== undefined,
+    supportsCompaction: catalog.supportsCompaction,
     mcp: provider.mcp.capabilities,
   };
 }

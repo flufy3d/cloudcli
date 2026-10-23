@@ -195,6 +195,21 @@ export class OpenCodeApiClient {
     return { messageId: typeof messageId === 'string' ? messageId : null };
   }
 
+  /**
+   * `POST /api/session/:id/compact` — queues a manual compaction of the
+   * session. It runs as an execution of its own and reports
+   * `session.compaction.*` events; returns the queued input's id.
+   */
+  async compact(sessionId: string): Promise<{ inputId: string | null }> {
+    const result = await this.request<{ data?: { id?: unknown } }>(
+      'POST',
+      `/api/session/${encodeURIComponent(sessionId)}/compact`,
+      {},
+    );
+    const inputId = result?.data?.id;
+    return { inputId: typeof inputId === 'string' ? inputId : null };
+  }
+
   /** `POST /api/session/:id/interrupt` — true when a run was actually stopped. */
   async interrupt(sessionId: string): Promise<boolean> {
     const result = await this.request<{ interrupted?: unknown }>(

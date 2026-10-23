@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { api } from '@/shared/api';
+import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabilities';
 import type { LLMProvider, Project, SlashCommand } from '@/shared/types';
 
 type ProviderSkill = {
@@ -30,6 +31,19 @@ type UseProjectSlashCommandsResult = {
   commands: SlashCommand[];
   isLoading: boolean;
   error: boolean;
+};
+
+/**
+ * `/compact`, offered to providers whose capability matrix says it compacts.
+ * The composer sends it to the engine as message text; the backend runtime
+ * makes the engine's own compaction out of it.
+ */
+const COMPACT_COMMAND: SlashCommand = {
+  name: '/compact',
+  description: 'Summarize the conversation to free up the context window',
+  namespace: 'builtin',
+  type: 'engine',
+  metadata: { type: 'engine' },
 };
 
 const dedupeProviderSkills = (skills: ProviderSkill[]): ProviderSkill[] => {
@@ -153,5 +167,18 @@ export function useProjectSlashCommands(
     };
   }, [enabled, selectedProject, provider]);
 
-  return { commands, isLoading, error };
+  const { capabilities } = useProviderCapabilitiesMap();
+  const supportsCompaction = Boolean(capabilities?.[provider]?.supportsCompaction);
+  // Engine commands sit right after the built-ins. A command of the same name
+  // the project or user defined keeps the name, as it did before.
+  const commandsWithEngine = useMemo(() => {
+    if (!supportsCompaction || commands.length === 0
+      || commands.some((command) => command.name === COMPACT_COMMAND.name)) {
+      return commands;
+    }
+    const builtInCount = commands.filter((command) => command.type === 'built-in').length;
+    return [...commands.slice(0, builtInCount), COMPACT_COMMAND, ...commands.slice(builtInCount)];
+  }, [commands, supportsCompaction]);
+
+  return { commands: commandsWithEngine, isLoading, error };
 }

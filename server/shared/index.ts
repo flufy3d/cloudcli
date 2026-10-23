@@ -6,6 +6,7 @@ export {
   isClaudeConversationRecord,
   resolveCodexExecutionPolicy,
   resolveModelEffort,
+  readCompactCommand,
   getCodexHome,
   AppError,
   readObjectRecord,

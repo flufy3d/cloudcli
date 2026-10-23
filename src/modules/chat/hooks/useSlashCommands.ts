@@ -4,7 +4,7 @@ import type { Dispatch, KeyboardEvent, RefObject, SetStateAction } from 'react';
 import { safeLocalStorage } from '@/modules/chat/utils/chatStorage';
 import { useProjectSlashCommands } from '@/shared/hooks/useProjectSlashCommands';
 import type { LLMProvider, Project, SlashCommand } from '@/shared/types';
-import { isSkillCommand } from '@/shared/utils';
+import { isEnginePromptCommand } from '@/shared/utils';
 
 const COMMAND_QUERY_DEBOUNCE_MS = 150;
 
@@ -190,7 +190,7 @@ export function useSlashCommands({
     [input, resetCommandMenuState, setInput, slashPosition, textareaRef],
   );
 
-  const executeNonSkillCommand = useCallback(
+  const executeCloudcliCommand = useCallback(
     (command: SlashCommand) => {
       const executionResult = onExecuteCommand(command);
       if (isPromiseLike(executionResult)) {
@@ -212,14 +212,14 @@ export function useSlashCommands({
 
   const selectCommandFromKeyboard = useCallback(
     (command: SlashCommand) => {
-      if (isSkillCommand(command)) {
+      if (isEnginePromptCommand(command)) {
         insertCommandIntoInput(command);
         return;
       }
 
-      executeNonSkillCommand(command);
+      executeCloudcliCommand(command);
     },
-    [executeNonSkillCommand, insertCommandIntoInput],
+    [executeCloudcliCommand, insertCommandIntoInput],
   );
 
   const handleCommandSelect = useCallback(
@@ -234,14 +234,14 @@ export function useSlashCommands({
       }
 
       trackCommandUsage(command);
-      if (isSkillCommand(command)) {
+      if (isEnginePromptCommand(command)) {
         insertCommandIntoInput(command);
         return;
       }
 
-      executeNonSkillCommand(command);
+      executeCloudcliCommand(command);
     },
-    [selectedProject, trackCommandUsage, insertCommandIntoInput, executeNonSkillCommand],
+    [selectedProject, trackCommandUsage, insertCommandIntoInput, executeCloudcliCommand],
   );
 
   const handleToggleCommandMenu = useCallback(() => {

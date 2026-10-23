@@ -116,6 +116,12 @@ function installFakeAppServer(
         if (method === 'thread/queue/list') {
           return { data: [...server.queue.values()], nextCursor: null };
         }
+        if (method === 'thread/compact/start') {
+          // codex-cli 0.163.0 answers with an empty object, then runs the
+          // compaction as a turn of its own.
+          queueMicrotask(() => replayCompaction(server));
+          return {};
+        }
         if (method === 'thread/queue/start') {
           // A busy engine refuses to start a queued input, and an input the
           // engine already took is no longer there to start.
@@ -157,6 +163,15 @@ function replayOneTurn(server: FakeServer): void {
     turnId: TURN_ID,
     tokenUsage: { total: { totalTokens: 15620, inputTokens: 15614, outputTokens: 6 }, modelContextWindow: 258400 },
   });
+  notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+}
+
+/** The notification sequence of a compaction turn, as captured from codex-cli 0.163.0. */
+function replayCompaction(server: FakeServer): void {
+  const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+  notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+  notify('item/started', { threadId: THREAD_ID, turnId: TURN_ID, item: { type: 'contextCompaction', id: 'compaction-1' } });
+  notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: { type: 'contextCompaction', id: 'compaction-1' } });
   notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
 }
 
@@ -1905,4 +1920,41 @@ test('successful tool output continuation never submits a title job', async (t) 
   const enqueue = t.mock.method(codexSessionTitleService, 'enqueue', async () => {});
   await codexRuntime.run('', { sessionId: 'title-tool', toolOutput: { name: 'cloudcli_task_result', output: 'done' } }, { send() {} }, runtimeContext(true));
   assert.equal(enqueue.mock.callCount(), 0);
+});
+
+for (const resident of [true, false]) {
+  test(`/compact compacts the thread instead of sending text to the model (${resident ? 'resident' : 'short connection'})`, async (t) => {
+    const server = installFakeAppServer(t);
+    const messages: any[] = [];
+    process.env.CLOUDCLI_CODEX_RESIDENT = resident ? '1' : '0';
+    try {
+      await codexRuntime.run('/compact', {
+        sessionId: 'compact-session',
+        cwd: process.cwd(),
+      }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+      const compacted = server.calls.find((call) => call.method === 'thread/compact/start');
+      assert.ok(compacted, 'the thread must be compacted');
+      assert.equal(compacted.params.threadId, THREAD_ID);
+      assert.ok(!server.calls.some((call) => call.method === 'turn/start' || call.method === 'thread/queue/add'));
+      assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 0));
+      assert.ok(!messages.some((message) => message.kind === 'error'));
+    } finally {
+      process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+      closeCodexResidentSessions();
+    }
+  });
+}
+
+test('/compact with instructions is refused, because Codex compacts without them', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  await codexRuntime.run('/compact keep the API notes', {
+    sessionId: 'compact-session',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  assert.ok(!server.calls.some((call) => ['thread/compact/start', 'turn/start', 'thread/queue/add'].includes(call.method)));
+  assert.ok(messages.some((message) => message.kind === 'error' && /without instructions/.test(message.content)));
+  assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 1));
 });

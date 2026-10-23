@@ -684,7 +684,8 @@ export type SlashCommand = {
   description?: string;
   namespace?: string;
   path?: string;
-  type?: 'built-in' | 'custom' | 'skill' | string;
+  /** `engine` commands (such as `/compact`) are sent to the engine as message text. */
+  type?: 'built-in' | 'custom' | 'skill' | 'engine' | string;
   metadata?: Record<string, unknown>;
   [key: string]: unknown;
 };

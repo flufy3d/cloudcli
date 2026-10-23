@@ -80,5 +80,11 @@ export type ProviderCapabilities = {
   supportsMessageEditing: boolean;
   /** Whether a session's transcript can be branched into an independent one. */
   supportsSessionForking: boolean;
+  /**
+   * Whether the `/compact` chat command summarizes the conversation and frees
+   * up the engine's context window. The composer offers the command only when
+   * this is true.
+   */
+  supportsCompaction: boolean;
   mcp: ProviderMcpCapabilities;
 };

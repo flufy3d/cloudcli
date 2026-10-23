@@ -12,7 +12,7 @@ import type {
 import { useDropzone } from 'react-dropzone';
 
 import { authenticatedFetch } from '@/shared/api';
-import { createClientRequestId } from '@/shared/utils';
+import { createClientRequestId, isEnginePromptCommand } from '@/shared/utils';
 import type { MarkSessionProcessing, SessionActivityMap } from '@/shared/types';
 import { uploadAttachmentFiles } from '@/modules/chat/utils/attachmentUpload';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
@@ -842,7 +842,8 @@ export function useChatComposerState({
                   metadata: { type: 'builtin' },
                 } as SlashCommand)
               : undefined);
-          if (matchedCommand && matchedCommand.type !== 'skill') {
+          // Skills and engine commands such as `/compact` go to the engine as text.
+          if (matchedCommand && !isEnginePromptCommand(matchedCommand)) {
             executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput);
             recordSentMessage(currentInput);
             return true;

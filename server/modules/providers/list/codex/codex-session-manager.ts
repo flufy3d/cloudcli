@@ -337,6 +337,13 @@ export type CodexResidentRoundOptions = {
   input: AnyRecord[];
   /** Native tool result input; the engine queue only accepts user input. */
   toolOutput?: AnyRecord;
+  /**
+   * Compacts the thread instead of submitting input.
+   *
+   * The engine only compacts through `thread/compact/start`, which runs the
+   * compaction as a turn of its own; `input` is ignored.
+   */
+  compact?: boolean;
   /** The model the round runs with. */
   model?: string;
   /** The reasoning effort the round runs with. */
@@ -592,6 +599,15 @@ function deliverRoundEvent(round: ResidentRound, method: string, params: AnyReco
     round.stopTimer = null;
   }
   round.onEvent(method, params);
+}
+
+/**
+ * Whether the engine still runs work of its own on the thread: a turn it
+ * started, a turn whose owner is undecided, or a request waiting for an
+ * answer. Input that bypasses the queue is refused meanwhile.
+ */
+function hasUnfinishedEngineWork(session: ResidentSession): boolean {
+  return session.engineTurns.size > 0 || session.pendingTurns.size > 0 || session.pendingRequests > 0 || session.isBusy();
 }
 
 /** One activity predicate shared by archive checks and both reclaim paths. */
@@ -1156,7 +1172,7 @@ export async function submitCodexResidentRound(
     clientUserMessageId,
     queuedItemId: null,
     submitted,
-    directSubmission: Boolean(options.toolOutput),
+    directSubmission: Boolean(options.toolOutput || options.compact),
     stopping: null,
     stopTimer: null,
     terminalSeen: false,
@@ -1187,10 +1203,27 @@ export async function submitCodexResidentRound(
       });
     }
 
+    if (options.compact) {
+      // Compaction bypasses the queue, so a turn the engine runs on its own
+      // could not be told apart from the compaction's: refuse while it reports.
+      if (hasUnfinishedEngineWork(session)) {
+        throw new AppError('The Codex thread is busy reporting; the conversation was not compacted.', {
+          code: 'CODEX_SESSION_BUSY', statusCode: 409,
+        });
+      }
+      // The call answers with an empty object, not the turn it starts, so the
+      // round is armed first: the next announced turn is the compaction, even
+      // when its announcement overtakes the answer.
+      round.armed = true;
+      await session.connection.call('thread/compact/start', { threadId: session.threadId });
+      if (session.disposed || session.round !== round) throw new Error('The Codex conversation is closed.');
+      return { clientUserMessageId };
+    }
+
     if (options.toolOutput) {
       // This protocol only queues user input. Refuse known engine work before
       // injecting a native tool result, and bind only the returned turn id.
-      if (session.engineTurns.size > 0 || session.pendingTurns.size > 0 || session.pendingRequests > 0 || session.isBusy()) {
+      if (hasUnfinishedEngineWork(session)) {
         throw new AppError('The Codex thread is busy reporting; the tool result was not submitted.', {
           code: 'CODEX_SESSION_BUSY', statusCode: 409,
         });

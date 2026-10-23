@@ -1376,6 +1376,32 @@ export function normalizeSessionName(rawValue: string | undefined, fallback: str
 }
 
 // ---------------------------
+//----------------- CONVERSATION COMPACTION COMMAND ------------
+/**
+ * Reads a chat prompt as the `/compact` command, or returns null when it is an
+ * ordinary message.
+ *
+ * `/compact` asks the engine to summarize the conversation so far and free up
+ * its context window. Claude, ZCode and Antigravity parse the command out of
+ * the prompt text themselves; Codex and OpenCode only compact through a
+ * dedicated protocol call, so their runtimes use this to recognize the command
+ * and make that call instead of sending the text to the model.
+ *
+ * The command is the exact, case-sensitive word `/compact` after leading
+ * whitespace, ended by whitespace or the end of the text. Whatever follows is
+ * returned as `instructions`, trimmed, line breaks kept; a bare command yields
+ * an empty string. `/compacted`, `/Compact` or text that merely mentions the
+ * command are ordinary messages.
+ */
+export function readCompactCommand(command: unknown): { instructions: string } | null {
+  if (typeof command !== 'string') {
+    return null;
+  }
+  const match = command.trimStart().match(/^\/compact(?=\s|$)([\s\S]*)$/);
+  return match ? { instructions: match[1].trim() } : null;
+}
+
+// ---------------------------
 //----------------- PROVIDER SESSION VALUE NORMALIZATION UTILITIES ------------
 /**
  * Converts provider-native timestamps into ISO strings.
