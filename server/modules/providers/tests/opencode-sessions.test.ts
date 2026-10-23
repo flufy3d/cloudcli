@@ -943,12 +943,13 @@ test('v2 compactions stay in history as the same rows the live stream showed', {
     const provider = new OpenCodeSessionsProvider();
     const history = await provider.fetchHistory('ses_cmp');
     assert.deepEqual(
-      history.messages.map((row) => [row.kind, row.summary ?? row.content]),
+      history.messages.map((row) => [row.kind, row.content, row.compact?.phase ?? null, row.isCompactSummary ?? false]),
       [
-        ['text', 'remember banana'],
-        ['task_notification', 'Context compacted'],
-        ['error', 'Compaction failed: Free usage limit reached.'],
-        ['text', 'ok'],
+        ['text', 'remember banana', null, false],
+        ['text', 'Compacted · manual', 'done', false],
+        ['text', '## Objective\n- remember banana', null, true],
+        ['text', 'Compaction failed: Free usage limit reached.', 'failed', false],
+        ['text', 'ok', null, false],
       ],
     );
 
@@ -960,12 +961,12 @@ test('v2 compactions stay in history as the same rows the live stream showed', {
     }).frames[0];
     const ended = live('session.compaction.ended', { inputID: 'msg_ok' });
     const failed = live('session.compaction.failed', { inputID: 'msg_bad', error: { type: 'provider.quota', message: 'Free usage limit reached.' } });
-    const historyNote = history.messages.find((row) => row.kind === 'task_notification');
-    const historyError = history.messages.find((row) => row.kind === 'error');
-    assert.equal(historyNote?.id, ended?.id);
-    assert.equal(historyNote?.summary, ended?.summary);
-    assert.equal(historyError?.id, failed?.id);
-    assert.equal(historyError?.content, failed?.content);
+    const historyDone = history.messages.find((row) => row.compact?.phase === 'done');
+    const historyFailed = history.messages.find((row) => row.compact?.phase === 'failed');
+    assert.equal(historyDone?.id, ended?.id);
+    assert.equal(historyDone?.content, ended?.content);
+    assert.equal(historyFailed?.id, failed?.id);
+    assert.equal(historyFailed?.content, failed?.content);
   } finally {
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });

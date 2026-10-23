@@ -852,12 +852,14 @@ test('AntigravitySessionsProvider fetchHistory renders replies and tool results 
     const sessions = new AntigravitySessionsProvider();
     const result = await sessions.fetchHistory(sessionId, {});
 
-    assert.equal(result.total, 7);
+    assert.equal(result.total, 9);
 
     const [
       userMsg,
       toolMsg,
       assistantMsg,
+      compactionMsg,
+      compactSummaryMsg,
       failedToolMsg,
       okToolMsg,
       assistantWithoutStep,
@@ -886,6 +888,11 @@ test('AntigravitySessionsProvider fetchHistory renders replies and tool results 
       },
     }, sessionId)[0];
     assert.equal(matchingLiveReply?.providerRowKey, assistantMsg?.providerRowKey);
+
+    // The checkpoint is a compaction: the shared row and its summary.
+    assert.equal(compactionMsg?.compact?.phase, 'done');
+    assert.equal(compactSummaryMsg?.isCompactSummary, true);
+    assert.equal(compactSummaryMsg?.content, '{{ CHECKPOINT 0 }}');
 
     // Result entries pair with pending tool_uses in call order.
     assert.equal(failedToolMsg?.toolName, 'grep_search');
@@ -1758,4 +1765,40 @@ test('the live spawn call is not drawn as a tool row beside its Agent cards, so 
     step_update: { step_index: 4, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'ls' } } },
   }, 'live-spawn');
   assert.equal(other[0]?.toolName, 'run_command');
+});
+
+test('an Antigravity checkpoint is a compaction: the shared row and its summary, named alike live and from history', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-checkpoint-'));
+  const sessionId = 'checkpoint-session';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(transcriptDir, { recursive: true });
+  await fs.writeFile(path.join(transcriptDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: '2026-10-23T14:54:15Z', content: '<USER_REQUEST>\n/compact\n</USER_REQUEST>' }),
+    JSON.stringify({ step_index: 3, source: 'SYSTEM', type: 'CHECKPOINT', status: 'DONE', created_at: '2026-10-23T14:54:21Z', content: '# Resuming from a compaction\n\n<summary>remember banana</summary>' }),
+  ].join('\n'));
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    const sessions = new AntigravitySessionsProvider();
+    const { messages } = await sessions.fetchHistory(sessionId, {});
+    const rows = messages.filter((message) => message.compact || message.isCompactSummary);
+    assert.deepEqual(rows.map((row) => [row.id, row.content, row.compact?.phase ?? null, row.isCompactSummary ?? false]), [
+      [`msg_${sessionId}_3_compact`, 'Compacted', 'done', false],
+      [`msg_${sessionId}_3_summary`, '# Resuming from a compaction\n\n<summary>remember banana</summary>', null, true],
+    ]);
+
+    const live = (state: string) => sessions.normalizeMessage({
+      event: 'step_update',
+      step_update: { conversation_id: sessionId, step_index: 3, state, step_type: 'checkpoint' },
+    }, sessionId);
+    const [running] = live('ACTIVE');
+    assert.equal(running.id, `msg_${sessionId}_3_compact`);
+    assert.equal(running.compact?.phase, 'running');
+    const [done] = live('DONE');
+    assert.equal(done.id, rows[0].id);
+    assert.equal(done.content, 'Compacted');
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
 });

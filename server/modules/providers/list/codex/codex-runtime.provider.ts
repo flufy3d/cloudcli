@@ -217,6 +217,7 @@ const pendingCodexApprovals = new Map<string, PendingCodexApproval>();
  * reasoning) or is already complete when announced.
  */
 const PROGRESSIVE_CODEX_ITEM_TYPES = new Set([
+  'contextCompaction',
   'commandExecution',
   'fileChange',
   'mcpToolCall',
@@ -612,7 +613,10 @@ function emitCodexItem(
     emitCodexSubagentActivity(target, item, timestamp, backgroundWorkKey);
     return;
   }
-  for (const row of codexThreadItemToRows(item, timestamp)) {
+  for (const itemRow of codexThreadItemToRows(item, timestamp)) {
+    // A compaction that has started but not finished is the running row its
+    // completion replaces (same id).
+    const row = source === 'started' && itemRow.type === 'compaction' ? { ...itemRow, phase: 'running' } : itemRow;
     if (row.type === 'tool_use' && !target.approvalSubjects.has(item.id)) {
       target.approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
     }

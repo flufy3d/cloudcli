@@ -1939,6 +1939,10 @@ for (const resident of [true, false]) {
       assert.ok(!server.calls.some((call) => call.method === 'turn/start' || call.method === 'thread/queue/add'));
       assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 0));
       assert.ok(!messages.some((message) => message.kind === 'error'));
+      // The compaction item is one row (this context passes rows through
+      // unnormalized): running while it works, then the finished row.
+      const compactionRows = messages.filter((message) => message.type === 'compaction');
+      assert.deepEqual(compactionRows.map((row) => [row.uuid, row.phase ?? 'done']), [['compaction-1', 'running'], ['compaction-1', 'done']]);
     } finally {
       process.env.CLOUDCLI_CODEX_RESIDENT = '0';
       closeCodexResidentSessions();

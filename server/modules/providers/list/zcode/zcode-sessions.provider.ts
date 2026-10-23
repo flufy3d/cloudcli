@@ -39,6 +39,8 @@ import { zcodeBackgroundWork } from './zcode-background-work.js';
 import { getZCodeAgentSidecarDir, getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
 import {
   buildZCodeTextRowKey,
+  createZCodeCompactionMessage,
+  createZCodeCompactSummaryMessage,
   isZCodeCancelledEngineError,
   readZCodeTokenUsedCount,
   ZCodeLiveEventNormalizer,
@@ -618,6 +620,23 @@ export class ZCodeSessionsProvider implements IProviderSessions {
       const messageInfo = compactProviderPayload(readJsonRecord(row.message_data));
       const messageRole = readOptionalString(messageInfo?.role);
 
+      // A compaction summary is written for the model, so the engine marks it
+      // hidden like any injection, but the user asked for it: its text is the
+      // summary the client folds into the compaction row. Its own `compaction`
+      // part repeats the boundary the visible timeline row already draws.
+      const isCompactSummary = messageRole === 'user'
+        && (readOptionalString(readObjectRecord(messageInfo?.semantics)?.kind) === 'compact_summary'
+          || Boolean(readObjectRecord(messageInfo?.summary)));
+      if (isCompactSummary) {
+        const summaryPart = readJsonRecord(row.part_data);
+        const content = readOptionalString(summaryPart?.type) === 'text' ? extractText(summaryPart) : '';
+        if (content.trim() && !emittedSummaryMessages.has(row.message_id)) {
+          emittedSummaryMessages.add(row.message_id);
+          normalized.push(createZCodeCompactSummaryMessage(row.message_id, sessionId, timestamp, content));
+        }
+        continue;
+      }
+
       // Model-only injections are skipped entirely, including their parts.
       if (messageRole === 'user' && isEngineHiddenUserMessage(messageInfo)) {
         continue;
@@ -686,29 +705,16 @@ export class ZCodeSessionsProvider implements IProviderSessions {
 
       const partType = readOptionalString(partData.type);
 
+      // The compaction operation on the visible timeline message: the row
+      // the live updates of the same part drew.
+      if (partType === 'compaction' && readOptionalString(partData.timelineStatus)) {
+        normalized.push(createZCodeCompactionMessage(partData, row.part_id, sessionId, timestamp));
+        continue;
+      }
+
       // Handle text parts
       if (partType === 'text') {
         const content = extractText(partData);
-
-        // A compaction summary persists as a user message carrying a
-        // structured `summary` field. Surfacing it as assistant-authored
-        // summary text (the shape claude uses) keeps it out of a user bubble.
-        if (readObjectRecord(messageInfo?.summary)) {
-          if (content.trim() && !emittedSummaryMessages.has(row.message_id)) {
-            emittedSummaryMessages.add(row.message_id);
-            normalized.push(createNormalizedMessage({
-              id: baseId,
-              sessionId,
-              timestamp,
-              provider: PROVIDER,
-              kind: 'text',
-              role: 'assistant',
-              content,
-              isCompactSummary: true,
-            }));
-          }
-          continue;
-        }
 
         if (content.trim()) {
           normalized.push(createNormalizedMessage({

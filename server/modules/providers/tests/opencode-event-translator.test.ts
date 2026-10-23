@@ -359,14 +359,19 @@ test('a subagent call the run ended on is settled as stopped', () => {
   assert.deepEqual(translator.settleOpenSubagents(), [], 'settling twice sends nothing new');
 });
 
-test('a finished compaction becomes a status note named after its input', () => {
+test('a compaction is one row named after its input: running, then done', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
-  assert.deepEqual(translator.translate(event('session.compaction.started', { reason: 'manual', inputID: 'msg_compact' })).frames, []);
-  const ended = translator.translate(event('session.compaction.ended', { reason: 'manual', inputID: 'msg_compact' }));
+  const [running] = translator.translate(event('session.compaction.started', { reason: 'manual', inputID: 'msg_compact' })).frames;
+  assert.equal(running.id, 'msg_compact_compaction');
+  assert.equal(running.content, 'Compacting conversation…');
+  assert.deepEqual(running.compact, { phase: 'running', trigger: 'manual' });
+
+  const ended = translator.translate(event('session.compaction.ended', { reason: 'auto', inputID: 'msg_compact' }));
   assert.equal(ended.frames.length, 1);
-  assert.equal(ended.frames[0].kind, 'task_notification');
   assert.equal(ended.frames[0].id, 'msg_compact_compaction');
-  assert.equal(ended.frames[0].summary, 'Context compacted');
+  assert.equal(ended.frames[0].kind, 'text');
+  assert.equal(ended.frames[0].role, 'assistant');
+  assert.equal(ended.frames[0].content, 'Compacted · auto');
   assert.equal(ended.terminal, undefined);
 });
 
@@ -378,7 +383,7 @@ test('a failed compaction surfaces its error, because the execution still report
     error: { type: 'provider.quota', message: 'Free usage limit reached.' },
   }));
   assert.equal(failed.frames.length, 1);
-  assert.equal(failed.frames[0].kind, 'error');
   assert.equal(failed.frames[0].id, 'msg_compact_compaction');
-  assert.match(String(failed.frames[0].content), /Compaction failed: Free usage limit reached\./);
+  assert.equal(failed.frames[0].content, 'Compaction failed: Free usage limit reached.');
+  assert.deepEqual(failed.frames[0].compact, { phase: 'failed', trigger: 'manual', error: 'Free usage limit reached.' });
 });

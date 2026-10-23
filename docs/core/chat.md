@@ -211,6 +211,11 @@ flowchart LR
 
 **已知缺口（不伪造，写在这里）**：zcode 的 thinking 行两路 id 不同（实时是开段事件的 `${id}_reasoning`，落盘是 `(message_id, part_id)`），目前仍靠 `sessionThinkingRows.ts` 的整段正文相等来判重。要彻底收口需要引擎在 reasoning 事件上带出 part id——它的 `tool_result` 事件已经带了 `resultPartId`，文本与推理事件没有对应字段。zcode 的 assistant **正文**不受此影响：两路都发布 `zcode-message:<message_id>` 作为 `providerRowKey`，走身份对账。
 
+**压缩行在转换之后统一折叠。** 各引擎的压缩行（带 `compact`）与摘要行（`isCompactSummary`）见 [providers.md](./providers.md)。
+`normalizedToChatMessages` 逐行转换完后由 `foldCompactionRows` 走一遍：摘要折进紧邻的压缩行（历史里摘要在后、实时可能在前，两种顺序都折），
+结束行顶替紧邻上方的进行中行并带走已折入的摘要，另丢掉摘要的未标记副本（只看 assistant 行）和有真压缩行时 CLI 的单词 `Compacted`。
+折叠放在转换之后而不是逐行做，是因为逐行缓存的输出会被复用，跨行改写只能产出新对象。
+
 ### 渲染性能优化
 
 - 思考块按稳定 id 归组 upsert（`src/modules/chat/utils/sessionThinkingRows.ts`）。

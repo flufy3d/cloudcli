@@ -1103,8 +1103,9 @@ test('/compact compacts the session through its endpoint instead of prompting th
     assert.ok(!service.requests.some((request) => request.path.endsWith('/prompt')));
     const compact = service.requests.find((request) => request.path.endsWith('/compact'));
     assert.equal(compact?.path, '/api/session/ses_new/compact');
-    const note = frames.find((frame) => frame.kind === 'task_notification');
-    assert.equal(note?.summary, 'Context compacted');
+    const rows = frames.filter((frame) => frame.compact);
+    assert.deepEqual(rows.map((row) => row.compact?.phase), ['running', 'done']);
+    assert.equal(rows[1].content, 'Compacted · manual');
     assert.equal(frames.at(-1)?.kind, 'complete');
     assert.equal(frames.at(-1)?.exitCode, 0);
   });

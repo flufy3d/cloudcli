@@ -748,6 +748,88 @@ test('fetchHistory hides model-only injections and surfaces compaction summaries
   });
 });
 
+test('fetchHistory draws a compaction as the shared row with its hidden summary, named as live names them', async () => {
+  // Engine 0.16.x: the compaction is a visible `timeline_event` message whose
+  // `compaction` part carries the numbers; the summary is a user message the
+  // engine marks hidden (it is for the model), with its own `compaction` part.
+  await withZCodeStorage(async (storageDir) => {
+    await createFixtureDatabase(storageDir, 'sess_cmp');
+    const db = new Database(path.join(storageDir, 'cli', 'db', 'db.sqlite'));
+    try {
+      const insertMessage = db.prepare(
+        'INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      const insertPart = db.prepare(
+        'INSERT INTO part (id, message_id, session_id, time_created, time_updated, data, sequence) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      );
+      insertMessage.run('msg_timeline', 'sess_cmp', 4000, 4000, JSON.stringify({
+        role: 'assistant',
+        semantics: { origin: 'system', kind: 'timeline_event', uiVisibility: 'visible', providerVisibility: 'hidden', transcriptVisibility: 'visible' },
+      }), 5);
+      insertPart.run('part_timeline', 'msg_timeline', 'sess_cmp', 4000, 4000, JSON.stringify({
+        timelineType: 'context_compaction', display: 'separator', status: 'completed', operationId: 'cmp_1',
+      }), 0);
+      insertPart.run('part_op', 'msg_timeline', 'sess_cmp', 4000, 4000, JSON.stringify({
+        type: 'compaction', auto: false, trigger: 'manual', operationId: 'cmp_1', timelineStatus: 'completed',
+        summaryMessageId: 'msg_sum', preCompactTokenCount: 333557, postCompactTokenCount: 391799,
+        truePostCompactTokenCount: 18730, time: { start: 1792769598568, end: 1792769739038 },
+      }), 1);
+      insertMessage.run('msg_sum', 'sess_cmp', 4100, 4100, JSON.stringify({
+        role: 'user',
+        summary: { title: 'Compact summary', diffs: [] },
+        semantics: { origin: 'agent_runtime', kind: 'compact_summary', uiVisibility: 'hidden', providerVisibility: 'visible', transcriptVisibility: 'hidden' },
+      }), 6);
+      insertPart.run('part_sum_text', 'msg_sum', 'sess_cmp', 4100, 4100, JSON.stringify({
+        type: 'text', text: 'This session is being continued. Summary: banana.',
+      }), 0);
+      insertPart.run('part_sum_boundary', 'msg_sum', 'sess_cmp', 4100, 4100, JSON.stringify({
+        type: 'compaction', auto: false, trigger: 'manual', compactBoundary: { boundaryId: 'compact_1' }, operationId: 'cmp_1',
+      }), 1);
+      insertMessage.run('msg_running', 'sess_cmp', 4200, 4200, JSON.stringify({
+        role: 'assistant', semantics: { origin: 'system', kind: 'timeline_event', uiVisibility: 'visible' },
+      }), 7);
+      insertPart.run('part_op_running', 'msg_running', 'sess_cmp', 4200, 4200, JSON.stringify({
+        type: 'compaction', auto: true, trigger: 'auto', operationId: 'cmp_2', timelineStatus: 'started',
+      }), 0);
+    } finally {
+      db.close();
+    }
+
+    const result = await new ZCodeSessionsProvider().fetchHistory('sess_cmp');
+    const rows = result.messages.filter((message) => message.compact || message.isCompactSummary);
+    assert.deepEqual(rows.map((row) => [row.id, row.content, row.compact?.phase ?? null, row.isCompactSummary ?? false]), [
+      ['part_op_compact', 'Compacted · manual · 334k → 19k tokens · 2m 20s', 'done', false],
+      ['msg_sum_summary', 'This session is being continued. Summary: banana.', null, true],
+      ['part_op_running_compact', 'Compacting conversation…', 'running', false],
+    ]);
+    assert.equal(rows[1].role, 'assistant');
+  });
+});
+
+test('live compaction updates become the same rows, the summary arriving with the finished row', () => {
+  const provider = new ZCodeSessionsProvider();
+  const update = (payload: Record<string, unknown>) => provider.normalizeMessage({
+    type: 'session.updated', sessionId: 'sess_live', timestamp: 1792770222113, eventId: `evt_${Math.random()}`, payload,
+  }, 'app-live');
+  const operation = { operationId: 'cmp_9', messageId: 'msg_tl', partId: 'part_op', trigger: 'manual', phase: 'standalone_turn', compactReason: 'user_requested', display: 'separator', preCompactTokenCount: 10250, startedAt: 1792770222100 };
+
+  const [running] = update({ ...operation, status: 'started' });
+  assert.equal(running.id, 'part_op_compact');
+  assert.equal(running.content, 'Compacting conversation…');
+
+  assert.deepEqual(update({ content: 'Summary: kiwi.', stopReason: 'stop', querySource: 'compact', toolCallCount: 0 }), []);
+  assert.deepEqual(update({ boundaryId: 'compact_9', trigger: 'manual', preCompactTokenCount: 10250, summaryMessageIds: ['msg_sum'] }), []);
+
+  const finished = update({ ...operation, status: 'completed', summaryMessageId: 'msg_sum', postCompactTokenCount: 12147, truePostCompactTokenCount: 11499, endedAt: 1792770277716 });
+  assert.deepEqual(finished.map((row) => [row.id, row.content, row.isCompactSummary ?? false]), [
+    ['part_op_compact', 'Compacted · manual · 10k → 11k tokens · 56s', false],
+    ['msg_sum_summary', 'Summary: kiwi.', true],
+  ]);
+
+  // Model-request telemetry also arrives as session.updated and draws nothing.
+  assert.deepEqual(update({ baseURL: 'https://example', querySource: 'compact', modelId: 'GLM-5.3' }), []);
+});
+
 test('fetchHistory replays cancelled request errors as quiet notifications, real errors as error cards', async () => {
   await withZCodeStorage(async (storageDir) => {
     await createFixtureDatabase(storageDir, 'sess_cancel_hist');

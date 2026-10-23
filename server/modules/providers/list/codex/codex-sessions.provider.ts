@@ -37,6 +37,7 @@ import {
   readJsonlRecords,
   parseProviderJson,
   AppError,
+  createCompactionMessage,
   createNormalizedMessage,
   generateMessageId,
   readObjectRecord,
@@ -1667,6 +1668,16 @@ export class CodexSessionsProvider implements IProviderSessions {
   private normalizeHistoryEntry(raw: AnyRecord, sessionId: string | null): NormalizedMessage[] {
     const ts = raw.timestamp || new Date().toISOString();
     const baseId = raw.uuid || generateMessageId('codex');
+
+    if (raw.type === 'compaction') {
+      return [createCompactionMessage({
+        id: baseId,
+        sessionId,
+        timestamp: ts,
+        provider: PROVIDER,
+        phase: raw.phase === 'running' ? 'running' : 'done',
+      })];
+    }
 
     if (raw.type === 'status_note' && typeof raw.content === 'string') {
       return [createNormalizedMessage({

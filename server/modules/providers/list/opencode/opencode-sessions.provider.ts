@@ -250,7 +250,13 @@ function* flattenOpenCodeV2HistoryRows(
           message_data: JSON.stringify({ role: 'compaction' }),
           part_id: 'compaction',
           part_time_created: messageRow.time_updated ?? messageRow.time_created,
-          part_data: JSON.stringify({ type: 'compaction', status, error: compaction?.error ?? null }),
+          part_data: JSON.stringify({
+            type: 'compaction',
+            status,
+            reason: compaction?.reason ?? null,
+            error: compaction?.error ?? null,
+            summary: typeof compaction?.summary === 'string' ? compaction.summary : null,
+          }),
         };
       }
       continue;
@@ -915,9 +921,24 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
           inputId: row.message_id,
           sessionId,
           timestamp,
-          failed: partData.status === 'failed',
+          phase: partData.status === 'failed' ? 'failed' : 'done',
+          reason: partData.reason,
           error: partData.error,
         });
+        // The summary the compaction wrote, which the client folds into the row.
+        const summary = readOptionalString(partData.summary);
+        if (summary && hasVisibleText(summary)) {
+          yield createNormalizedMessage({
+            id: `${row.message_id}_summary`,
+            sessionId,
+            timestamp,
+            provider: PROVIDER,
+            kind: 'text',
+            role: 'assistant',
+            content: summary,
+            isCompactSummary: true,
+          });
+        }
         continue;
       }
 

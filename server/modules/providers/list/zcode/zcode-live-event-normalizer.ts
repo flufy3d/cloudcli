@@ -5,6 +5,7 @@ import {
 import type { AnyRecord, NormalizedMessage, TaskUsage } from '@/shared/types.js';
 import {
   compactProviderPayload,
+  createCompactionMessage,
   createNormalizedMessage,
   generateMessageId,
   normalizeProviderTimestamp,
@@ -302,7 +303,84 @@ function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): Normali
  * here. The module owns all per-session reasoning and tool-input state, while
  * callers only submit an event or reset a terminal session.
  */
+const readPositiveNumber = (value: unknown): number | undefined => (
+  typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+);
+
+/**
+ * The compaction row of one compaction operation, as the shared row every
+ * provider draws (`createCompactionMessage`).
+ *
+ * The operation is the `compaction` part of the visible timeline message the
+ * engine writes when a compaction starts; its live updates name the same part
+ * (`partId`), so both transports derive the row id from that part and the
+ * persisted row replaces the live one. `fields` is either the persisted part
+ * (`timelineStatus`, `time.start/end`) or a live update's payload (`status`,
+ * `startedAt/endedAt`). Consumers: this normalizer (live) and the ZCode
+ * sessions provider (history).
+ */
+export function createZCodeCompactionMessage(
+  fields: AnyRecord,
+  partId: string,
+  sessionId: string | null,
+  timestamp: string,
+): NormalizedMessage {
+  const status = readOptionalString(fields.timelineStatus) ?? readOptionalString(fields.status);
+  const phase = status === 'completed' ? 'done' : status === 'failed' ? 'failed' : 'running';
+  const trigger = readOptionalString(fields.trigger);
+  const time = readObjectRecord(fields.time);
+  const startedAt = readPositiveNumber(time?.start) ?? readPositiveNumber(fields.startedAt);
+  const endedAt = readPositiveNumber(time?.end) ?? readPositiveNumber(fields.endedAt);
+  const errorRecord = readObjectRecord(fields.error);
+  return createCompactionMessage({
+    id: `${partId}_compact`,
+    sessionId,
+    timestamp,
+    provider: PROVIDER,
+    phase,
+    ...(trigger === 'manual' || trigger === 'auto' ? { trigger } : {}),
+    preTokens: readPositiveNumber(fields.preCompactTokenCount),
+    // `postCompactTokenCount` counts more than the context the model sees
+    // next; the engine's own "true" count is the one that shrank.
+    postTokens: readPositiveNumber(fields.truePostCompactTokenCount) ?? readPositiveNumber(fields.postCompactTokenCount),
+    durationMs: startedAt && endedAt && endedAt > startedAt ? endedAt - startedAt : undefined,
+    ...(phase === 'failed'
+      ? { error: readOptionalString(errorRecord?.message) ?? readOptionalString(fields.error) ?? null }
+      : {}),
+  });
+}
+
+/**
+ * The summary a compaction wrote, as the row the client folds into the
+ * compaction row. Named after the summary message, which the live update that
+ * ends the compaction names too. Consumers: this normalizer and the ZCode
+ * sessions provider.
+ */
+export function createZCodeCompactSummaryMessage(
+  summaryMessageId: string,
+  sessionId: string | null,
+  timestamp: string,
+  content: string,
+): NormalizedMessage {
+  return createNormalizedMessage({
+    id: `${summaryMessageId}_summary`,
+    sessionId,
+    timestamp,
+    provider: PROVIDER,
+    kind: 'text',
+    role: 'assistant',
+    content,
+    isCompactSummary: true,
+  });
+}
+
 export class ZCodeLiveEventNormalizer {
+  /**
+   * The summary text of the compaction running in each session. The engine
+   * streams it before the update that ends the compaction, and only that
+   * update names the summary message the row is called after.
+   */
+  private readonly compactionSummaries = new Map<string, string>();
   private readonly reasoningBlockIds = new Map<string, string>();
   /**
    * Per-toolCallId parameter streams, keyed by session first. The engine
@@ -327,6 +405,12 @@ export class ZCodeLiveEventNormalizer {
     }
 
     const { payload, sessionId: eventSessionId, timestamp, id: baseId, type: normalizedType } = event;
+
+    // The engine forwards its internal compaction events under the generic
+    // `session.updated` type, so they are told apart by their payload.
+    if (normalizedType === 'session.updated') {
+      return this.normalizeCompactionUpdate(payload, eventSessionId, timestamp);
+    }
 
     if (normalizedType === 'model_streaming') {
       return this.normalizeStreamingKind(payload, eventSessionId, timestamp, baseId);
@@ -404,6 +488,39 @@ export class ZCodeLiveEventNormalizer {
   }
 
   /**
+   * One `session.updated` payload of a compaction: the operation's progress
+   * (`operationId` `cmp_…` with `status` and `partId`) or the summary text the
+   * compaction model returned (`querySource: 'compact'` with `content`).
+   * Everything else under that type (model-request telemetry, message
+   * counts) draws nothing.
+   */
+  private normalizeCompactionUpdate(payload: AnyRecord, sessionId: string | null, timestamp: string): NormalizedMessage[] {
+    const stateKey = sessionId ?? '';
+    if (readOptionalString(payload.querySource) === 'compact' && typeof payload.content === 'string' && !payload.baseURL) {
+      this.compactionSummaries.set(stateKey, payload.content);
+      return [];
+    }
+
+    const operationId = readOptionalString(payload.operationId);
+    const partId = readOptionalString(payload.partId);
+    if (!operationId?.startsWith('cmp_') || !partId || !readOptionalString(payload.status)) {
+      return [];
+    }
+
+    const rows = [createZCodeCompactionMessage(payload, partId, sessionId, timestamp)];
+    const status = readOptionalString(payload.status);
+    if (status === 'completed' || status === 'failed') {
+      const summary = this.compactionSummaries.get(stateKey);
+      this.compactionSummaries.delete(stateKey);
+      const summaryMessageId = readOptionalString(payload.summaryMessageId);
+      if (status === 'completed' && summary?.trim() && summaryMessageId) {
+        rows.push(createZCodeCompactSummaryMessage(summaryMessageId, sessionId, timestamp, summary));
+      }
+    }
+    return rows;
+  }
+
+  /**
    * Drops incomplete state for one terminal ZCode session. It is safe to call
    * after a normal completion because both maps are already empty then.
    */
@@ -412,6 +529,7 @@ export class ZCodeLiveEventNormalizer {
     this.reasoningBlockIds.delete(stateKey);
     this.toolInputStreams.delete(stateKey);
     this.textRowMessageIds.delete(stateKey);
+    this.compactionSummaries.delete(stateKey);
   }
 
   private normalizeScheduledTool(

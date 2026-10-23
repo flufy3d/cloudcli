@@ -339,9 +339,22 @@ claude、zcode、antigravity 的引擎自己从提示词里认出 `/compact`，�
 codex 和 opencode 的引擎只认专门的调用，运行时用 `readCompactCommand` 认出命令后改调
 `thread/compact/start`（codex，应答不带回合 id，常驻会话先把这一轮标成已领取，下一个宣布的回合就是压缩）
 和 `POST /api/session/:id/compact`（opencode，压缩失败时执行照样报成功，失败只能从 `session.compaction.failed` 显示）。
-opencode 的压缩（手动和自动）在时间线上是一行「Context compacted」或压缩失败的错误：实时读 `session.compaction.ended/failed`，
-历史读 `compaction` 类型的 session_message，两边由 `createOpenCodeCompactionFrame` 按压缩输入 id 生成同一行，刷新后不消失也不重复。
 这两家不接受附加说明，`/compact <说明>` 直接报错，不把说明丢掉。cursor 不支持。
+zcode 不需要另发 `session/compact`：引擎的这个方法内部也是 `submitPrompt("/compact")`，落盘结果与 ZCode app 手动压缩一致。
+antigravity 的 `-p` 模式会先让模型回一轮，再生成压缩检查点，这是 agy 自身行为。
+
+**压缩在时间线上只有一种行**：五家都用 `createCompactionMessage`（`server/shared/utils.ts`）生成 assistant `text` 行，
+`content` 是一句话（`Compacted · manual · 334k → 19k tokens · 2m 20s` / `Compacting conversation…` / `Compaction failed: …`），
+`compact` 字段带阶段、触发方式与数字；引擎留下的摘要另成一行 `isCompactSummary`，由前端折进压缩行。
+进行中与结束用同一个 id，实时与历史由同一条引擎记录推导 id：
+
+| 引擎 | 压缩行来源（实时 / 历史） | id | 摘要 |
+| --- | --- | --- | --- |
+| claude | `status: compacting`、`compact_boundary` | `${行}_compact` | `isCompactSummary` 记录 |
+| codex | `contextCompaction` 项开始 / 完成 | 项 id | 无 |
+| opencode | `session.compaction.started/ended/failed` / `compaction` 消息 | `${压缩输入 id}_compaction` | 历史读消息的 `summary` |
+| zcode | `session.updated` 里 `operationId: cmp_…` 的进度（引擎把内部事件统一转成 `session.updated`，只能按载荷认）/ 时间线消息的 `compaction` part | `${part id}_compact` | 实时取 `querySource: compact` 的正文、历史取被引擎标成 hidden 的 `compact_summary` 消息，id `${摘要消息 id}_summary` |
+| antigravity | `step_update` 的 `checkpoint` / `CHECKPOINT` 步骤 | `msg_${会话}_${步}_compact` | 历史读步骤正文 |
 
 ## 差异吃在适配器里，不漏给前端
 

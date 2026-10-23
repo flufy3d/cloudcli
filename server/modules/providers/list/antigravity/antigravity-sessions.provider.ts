@@ -31,6 +31,7 @@ import {
   readJsonlRecords,
   compactProviderPayload,
   AppError,
+  createCompactionMessage,
   createNormalizedMessage,
   generateMessageId,
   normalizeProjectPath,
@@ -314,6 +315,18 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       const textDelta = readOptionalString(step.text_delta);
       const stepIndex = typeof step.step_index === 'number' ? step.step_index : undefined;
 
+      // A checkpoint is Antigravity's compaction: running while it summarizes,
+      // done once the summary is in. The summary itself only reaches the
+      // transcript, so history adds it.
+      if (stepType === 'checkpoint' && stepIndex !== undefined && (state === 'ACTIVE' || state === 'DONE' || state === 'ERROR')) {
+        messages.push(createCompactionMessage({
+          id: `msg_${sessionId}_${stepIndex}_compact`,
+          sessionId,
+          provider: PROVIDER,
+          phase: state === 'ACTIVE' ? 'running' : state === 'ERROR' ? 'failed' : 'done',
+        }));
+      }
+
       // Agent streaming text delta
       if (stepType === 'agent_response' && textDelta) {
         messages.push(createNormalizedMessage({
@@ -468,6 +481,32 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                 content: parsedFiles.text,
                 images: parsedImages.attachments.length > 0 ? parsedImages.attachments : undefined,
                 files: parsedFiles.attachments.length > 0 ? parsedFiles.attachments : undefined,
+                sequence: stepIndex,
+              }));
+            }
+            continue;
+          }
+
+          // A checkpoint is a compaction; its content is the summary the
+          // conversation continues from, folded into the row by the client.
+          if (type === 'CHECKPOINT') {
+            normalizedMessages.push(createCompactionMessage({
+              id: `${baseId}_compact`,
+              sessionId,
+              timestamp: createdAt,
+              provider: PROVIDER,
+              phase: readOptionalString(entry.status) === 'ERROR' ? 'failed' : 'done',
+            }));
+            if (rawContent.trim()) {
+              normalizedMessages.push(createNormalizedMessage({
+                id: `${baseId}_summary`,
+                sessionId,
+                timestamp: createdAt,
+                provider: PROVIDER,
+                kind: 'text',
+                role: 'assistant',
+                content: rawContent,
+                isCompactSummary: true,
                 sequence: stepIndex,
               }));
             }

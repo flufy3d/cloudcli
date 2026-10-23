@@ -307,7 +307,72 @@ export function normalizedToChatMessages(
     converted.push(...outputs);
   }
 
-  return converted;
+  return foldCompactionRows(converted);
+}
+
+/** The CLI acknowledges a compaction in the stream with the bare word. */
+const COMPACTION_NOTICE = /^Compacted\.?$/;
+
+/**
+ * Draws each compaction as one row, whichever order its parts arrive in.
+ *
+ * Every provider reports a compaction as a row carrying `compact` (running,
+ * done or failed) plus, when the engine keeps one, its summary as a separate
+ * `isCompactSummary` row. History puts the summary after the row and the live
+ * stream may put it before; either way the reader wants one row with the
+ * summary folded into it. Also dropped: an unflagged second copy of a summary
+ * (assistant rows only) and the CLI's bare `Compacted` acknowledgement, the
+ * latter only beside a real row, since against a server that reports none it
+ * is the only trace there is.
+ *
+ * Runs after the per-row conversion so the projection cache stays per row;
+ * every row it changes is a copy, because cached rows are shared across
+ * renders and a memoized row that keeps its identity does not redraw.
+ */
+function foldCompactionRows(rows: ChatMessage[]): ChatMessage[] {
+  const hasCompactionRow = rows.some((row) => row.compact);
+  const summaryTexts = new Set(
+    rows.filter((row) => row.isCompactSummary).map((row) => (row.content || '').trim()).filter(Boolean),
+  );
+  if (!hasCompactionRow && summaryTexts.size === 0) {
+    return rows;
+  }
+
+  const folded: ChatMessage[] = [];
+  for (const row of rows) {
+    const text = (row.content || '').trim();
+    const isPlainAssistant = row.type === 'assistant' && !row.compact && !row.isCompactSummary;
+    if (isPlainAssistant && (summaryTexts.has(text) || (hasCompactionRow && COMPACTION_NOTICE.test(text)))) {
+      continue;
+    }
+
+    const previous = folded[folded.length - 1];
+    if (row.isCompactSummary) {
+      if (previous?.compact && !previous.compactSummary) {
+        folded[folded.length - 1] = { ...previous, compactSummary: row.content };
+      } else {
+        // A summary with no row of its own yet (the live order, or a session
+        // compacted before its engine reported compactions) still gets one.
+        folded.push({ ...row, content: '', isCompactSummary: false, compact: { phase: 'done' }, compactSummary: row.content });
+      }
+      continue;
+    }
+
+    if (row.compact) {
+      // Only the row directly above is superseded: a running row, now that
+      // the compaction ended, or the summary-only row a summary made when it
+      // arrived first. Its summary comes along.
+      const supersedes = Boolean(previous?.compact) && (previous.compact?.phase === 'running' || !previous.content);
+      if (supersedes) {
+        folded.pop();
+      }
+      folded.push({ ...row, compactSummary: (supersedes ? previous.compactSummary : undefined) ?? row.compactSummary });
+      continue;
+    }
+
+    folded.push(row);
+  }
+  return folded;
 }
 
 function convertRow(
@@ -328,6 +393,7 @@ function convertRow(
       isLocalCommandStdout: msg.isLocalCommandStdout,
       isCompactSummary: msg.isCompactSummary,
       transcriptAnchorId: msg.transcriptAnchorId,
+      compact: msg.compact,
     };
 
     switch (msg.kind) {

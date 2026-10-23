@@ -7,7 +7,6 @@ import readline from 'node:readline';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import type {
   AnyRecord,
-  CompactionInfo,
   FetchHistoryOptions,
   FetchHistoryResult,
   NormalizedMessage,
@@ -30,6 +29,7 @@ import {
   compactProviderPayload,
   AppError,
   canonicalClaudeSubagentToolName,
+  createCompactionMessage,
   createNormalizedMessage,
   generateMessageId,
   isClaudeNonTurnMessageRow,
@@ -53,20 +53,6 @@ import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations
 import { isClaudeConversationRecord } from '@/shared/index.js';
 
 const PROVIDER = 'claude';
-
-/** Tokens the way the CLI writes them: 725k rather than 724,871. */
-const formatTokenCount = (tokens: number): string => {
-  if (tokens >= 1_000_000) {
-    return `${(tokens / 1_000_000).toFixed(1)}M`;
-  }
-  return tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : `${tokens}`;
-};
-
-/** A duration the way the CLI writes one: `2m 22s`. */
-const formatDuration = (milliseconds: number): string => {
-  const seconds = Math.round(milliseconds / 1_000);
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-};
 
 type ClaudeToolResult = {
   content: unknown;
@@ -1361,56 +1347,29 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     // assistant row, so a client that knows nothing of `compact` still reads
     // the sentence, while one that does can draw it as a row of its own.
     if (raw.type === 'system' && (raw.subtype === 'compact_boundary' || raw.subtype === 'status')) {
-      const compactionRow = (content: string, compact: CompactionInfo): NormalizedMessage[] => [
-        createNormalizedMessage({
-          id: `${baseId}_compact`,
-          sessionId,
-          timestamp: ts,
-          provider: PROVIDER,
-          kind: 'text',
-          role: 'assistant',
-          content,
-          compact,
-        }),
-      ];
+      const compaction = { id: `${baseId}_compact`, sessionId, timestamp: ts, provider: PROVIDER } as const;
 
       if (raw.subtype === 'compact_boundary') {
         // `compact_metadata` live, `compactMetadata` on disk.
         const metadata = readObjectRecord(raw.compact_metadata ?? raw.compactMetadata) ?? {};
-        const trigger = metadata.trigger === 'manual' ? 'manual' : 'auto';
-        const preTokens = Number(metadata.pre_tokens ?? metadata.preTokens) || 0;
-        const postTokens = Number(metadata.post_tokens ?? metadata.postTokens) || 0;
-        const durationMs = Number(metadata.duration_ms ?? metadata.durationMs) || 0;
-        const said = ['Compacted', trigger];
-        if (preTokens) {
-          said.push(postTokens
-            ? `${formatTokenCount(preTokens)} → ${formatTokenCount(postTokens)} tokens`
-            : `${formatTokenCount(preTokens)} tokens`);
-        }
-        if (durationMs) {
-          said.push(formatDuration(durationMs));
-        }
-
-        return compactionRow(said.join(' · '), {
+        return [createCompactionMessage({
+          ...compaction,
           phase: 'done',
-          trigger,
-          preTokens,
-          postTokens,
-          durationMs,
-        });
+          trigger: metadata.trigger === 'manual' ? 'manual' : 'auto',
+          preTokens: Number(metadata.pre_tokens ?? metadata.preTokens) || 0,
+          postTokens: Number(metadata.post_tokens ?? metadata.postTokens) || 0,
+          durationMs: Number(metadata.duration_ms ?? metadata.durationMs) || 0,
+        })];
       }
 
       // A status message reports several things, and compaction is the only one
       // with anything to say: every other turn sends `requesting` or nothing.
       if (raw.status === 'compacting') {
-        return compactionRow('Compacting conversation…', { phase: 'running' });
+        return [createCompactionMessage({ ...compaction, phase: 'running' })];
       }
       if (raw.compact_result === 'failed') {
         const error = typeof raw.compact_error === 'string' ? raw.compact_error : null;
-        return compactionRow(`Compaction failed${error ? `: ${error}` : ''}`, {
-          phase: 'failed',
-          error,
-        });
+        return [createCompactionMessage({ ...compaction, phase: 'failed', error })];
       }
 
       return [];
