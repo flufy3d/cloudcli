@@ -25,6 +25,18 @@
  * started on its own consumes nothing, so it never arms a round and is
  * reported as engine work.
  *
+ * ## Why a queued round is also started by hand
+ *
+ * The engine does not always drain its queue by itself. After a turn is
+ * interrupted it holds every queued input until a client names one with
+ * `thread/queue/start` (codex-cli 0.163.0: an input queued right after
+ * `turn/interrupt` was still queued 20 s later, and started at once on
+ * `thread/queue/start`). Without that call, the first message after a stop
+ * waits in the queue for good. So whenever the round's input is still queued
+ * while the thread runs no turn, the host starts it. A thread that is not held
+ * consumes the input before it answers `thread/queue/add`, so no start is
+ * sent there; the hold ends with the one turn started by hand.
+ *
  * Consumers: `codex-runtime.provider.ts` (the Codex chat runtime) borrows a
  * resident session per app session and submits its rounds through it;
  * `codex-thread-title.ts` borrows an ephemeral thread of that session to
@@ -110,8 +122,13 @@ type ResidentRound = {
   terminalSeen: boolean;
   /** Set once the engine consumed the queued input. */
   armed: boolean;
+  /** The `thread/queue/start` in flight for this round; a stop waits for it. */
+  startRequest: Promise<void> | null;
   /** The engine turn this round owns, once the engine started it. */
   turnId: string | null;
+  /** Resolves once `turnId` is set; a stop of a consumed input waits for it. */
+  turnBound: Promise<void>;
+  bindTurn: (turnId: string | null) => void;
   /** Events of this round's own turn. */
   onEvent: (method: string, params: AnyRecord) => void;
   /** Server-to-client requests this round has to answer, such as approvals. */
@@ -524,6 +541,49 @@ async function refreshRoundArmedState(session: ResidentSession): Promise<QueueAr
   return 'unreadable';
 }
 
+/**
+ * Starts the round's queued input when the thread runs no turn.
+ *
+ * See "Why a queued round is also started by hand" at the top of the file. A
+ * thread with a turn of its own refuses the start, so the round then keeps
+ * waiting and is started again when that turn ends. A refusal is logged and
+ * the round keeps waiting; the user can still stop it, which withdraws it.
+ */
+function startQueuedRoundIfIdle(session: ResidentSession): void {
+  const round = session.round;
+  if (session.disposed || !round || round.directSubmission || round.armed || round.turnId
+    || round.terminalSeen || round.stopping || round.startRequest || !round.queuedItemId
+    || session.engineTurns.size > 0 || session.pendingTurns.size > 0) {
+    return;
+  }
+  round.startRequest = session.connection.call('thread/queue/start', {
+    threadId: session.threadId,
+    queuedSubmissionId: round.queuedItemId,
+  }, { timeoutMs: STOP_CONFIRMATION_MS })
+    .then((result) => {
+      if (session.disposed || session.round !== round) return;
+      // The engine consumed the input and names the turn it became, so the
+      // round binds that turn instead of whichever turn is announced next.
+      round.armed = true;
+      const turnId = readEventTurnId((result ?? {}) as AnyRecord);
+      if (turnId && !round.turnId) round.bindTurn(turnId);
+    })
+    .catch((error: unknown) => {
+      if (session.disposed || session.round !== round || round.armed || round.turnId) {
+        return;
+      }
+      const reason = error instanceof Error ? error.message : String(error);
+      if (/active or pending turn/i.test(reason)) {
+        console.info(`[Codex] The engine kept the queued input of ${session.appSessionId} waiting: ${reason}`);
+      } else {
+        console.warn(`[Codex] Starting the queued input of ${session.appSessionId} failed; it waits for the next turn to end:`, error);
+      }
+    })
+    .finally(() => {
+      round.startRequest = null;
+    });
+}
+
 /** Live and buffered own-turn events acknowledge the same stop deadline. */
 function deliverRoundEvent(round: ResidentRound, method: string, params: AnyRecord): void {
   if (method === 'turn/completed') {
@@ -549,6 +609,10 @@ function deliverEngineEvent(session: ResidentSession, method: string, params: An
   session.lastUsedAt = Date.now();
   session.onEngineEvent(method, params, session.threadId);
   scheduleResidentReclaim(session);
+  if (method === 'turn/completed') {
+    // A thread that was busy ahead of the round may not drain by itself.
+    queueMicrotask(() => startQueuedRoundIfIdle(session));
+  }
 }
 
 /**
@@ -568,7 +632,7 @@ function routeResidentNotification(session: ResidentSession, method: string, par
     }
     if (round && !round.turnId) {
       if (round.armed) {
-        round.turnId = turnId;
+        round.bindTurn(turnId);
         deliverRoundEvent(round, method, params);
         return;
       }
@@ -646,8 +710,10 @@ async function resolvePendingTurn(session: ResidentSession, key: string): Promis
   // turn is the one the round's own input produced; an earlier one is the
   // engine reporting on its own.
   const isLatestWaitingTurn = session.latestPendingTurnKey === key;
-  if (armed === 'armed' && round && !round.turnId && isLatestWaitingTurn) {
-    round.turnId = pending.turnId;
+  // A turn already bound by the start that produced it is the round's too.
+  const isBoundTurn = Boolean(pending.turnId && round?.turnId === pending.turnId);
+  if (round && (isBoundTurn || (armed === 'armed' && !round.turnId && isLatestWaitingTurn))) {
+    if (!round.turnId) round.bindTurn(pending.turnId);
     for (const event of pending.events) {
       deliverRoundEvent(round, event.method, event.params);
     }
@@ -1084,6 +1150,8 @@ export async function submitCodexResidentRound(
   const clientUserMessageId = randomUUID();
   let finishSubmission!: () => void;
   const submitted = new Promise<void>((resolve) => { finishSubmission = resolve; });
+  let finishTurnBinding!: () => void;
+  const turnBound = new Promise<void>((resolve) => { finishTurnBinding = resolve; });
   const round: ResidentRound = {
     clientUserMessageId,
     queuedItemId: null,
@@ -1093,7 +1161,13 @@ export async function submitCodexResidentRound(
     stopTimer: null,
     terminalSeen: false,
     armed: false,
+    startRequest: null,
     turnId: null,
+    turnBound,
+    bindTurn: (turnId) => {
+      round.turnId = turnId;
+      finishTurnBinding();
+    },
     onEvent: options.onEvent,
     onRequest: options.onRequest,
   };
@@ -1130,7 +1204,7 @@ export async function submitCodexResidentRound(
         session.onRoundEnded('unknown');
         throw new Error('Codex could not identify an independent tool-result turn.');
       }
-      round.turnId = turnId;
+      round.bindTurn(turnId);
       const waiting = [...session.pendingTurns.values()];
       session.pendingTurns.clear();
       for (const pending of waiting) {
@@ -1150,7 +1224,9 @@ export async function submitCodexResidentRound(
     const queuedItemId = typeof added?.queuedSubmission?.id === 'string' ? added.queuedSubmission.id : null;
     round.queuedItemId = queuedItemId;
     // The engine may have consumed the item while the request was in flight.
-    await refreshRoundArmedState(session);
+    if (await refreshRoundArmedState(session) === 'queued') {
+      startQueuedRoundIfIdle(session);
+    }
     return { clientUserMessageId };
   } catch (error) {
     session.round = null;
@@ -1214,7 +1290,28 @@ async function stopResidentRound(session: ResidentSession, round: ResidentRound)
   } finally {
     clearTimeout(deadline);
   }
+  // A start the host asked for decides whether the input is still queued.
+  await round.startRequest;
   if (session.disposed || session.round !== round) return 'not-found';
+  if (round.armed && !round.turnId) {
+    // The engine took the input and is about to announce its turn; that turn
+    // is what the stop interrupts. Withdrawing the input is no longer possible.
+    let turnDeadline: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        round.turnBound,
+        new Promise<never>((_resolve, reject) => {
+          turnDeadline = setTimeout(() => reject(new Error('The started input announced no turn before stopping.')), STOP_CONFIRMATION_MS);
+        }),
+      ]);
+    } catch (error) {
+      forceUnknownStop(session, round, error, 'stop');
+      return 'unknown';
+    } finally {
+      clearTimeout(turnDeadline);
+    }
+    if (session.disposed || session.round !== round) return 'not-found';
+  }
   if (round.turnId) return interruptResidentRound(session, round);
   if (round.queuedItemId) {
     try {

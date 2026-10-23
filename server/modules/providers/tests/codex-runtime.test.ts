@@ -116,6 +116,11 @@ function installFakeAppServer(
         if (method === 'thread/queue/list') {
           return { data: [...server.queue.values()], nextCursor: null };
         }
+        if (method === 'thread/queue/start') {
+          // A busy engine refuses to start a queued input, and an input the
+          // engine already took is no longer there to start.
+          throw new Error('thread already has an active or pending turn');
+        }
         if (method === 'thread/queue/delete') {
           for (const [key, item] of server.queue) {
             if (item.id === params.queuedSubmissionId) {
