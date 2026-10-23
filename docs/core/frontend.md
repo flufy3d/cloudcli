@@ -141,6 +141,8 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 6. **WS 帧**：任何新功能不得在帧回调里直接 setState；进 store，靠 notify 批量提交。
 7. **滚动的验收只看行，不看 `scrollTop`**：`scripts/perf/chat-scroll-up-stability.mjs` 断言屏幕上的行走了多远（`visualProgress`）、有没有逆向漂移（`visualBacktrack`）。虚拟化会主动改写 `scrollTop` 来让行不动，因此基于 `scrollTop` 的断言两头不准——既放过了旧实现的卡顿，又会把新实现的正常补偿报成故障。
 8. **Git 变更面板按需取 diff**：`useGitPanelController` 只负责 `fetch` 单个文件的 diff，status 刷新时只清掉已不在变更列表里的缓存；`ChangesView` 在某行展开时才请求，`FileChangeItem` 折叠时**不挂载** `GitDiffViewer`。几百个变更文件若一次性预取并常驻 DOM（每行 diff 一个节点），移动端浏览器会被内存打死。
+9. **折叠体首次展开才挂载**：`CollapsibleContent`（thinking、工具输出共用）从未展开过就不渲染内容，展开过一次后保持挂载，用于收起动画；原生 `<details>` 导出形态始终保留内容。贴底打开会话时，视口内的折叠 thinking 不应为了隐藏而解析 markdown。
+10. **Markdown 解析预算**：micromark 解析强调标记的耗时，与单个行内文本块的长度成平方关系。`MarkdownBody` 在最长的行内文本块（不计围栏代码，表格逐行计算）超过 `INLINE_RUN_PARSE_LIMIT`（10,000 字符）时，原样输出纯文本。模型复读出来的 190KB 单行 thinking 曾让页面卡死近一分钟。
 
 ## i18n
 

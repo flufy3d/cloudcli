@@ -112,6 +112,39 @@ const MATH_DELIMITER = /\$\$/;
 
 const EMPTY_PLUGINS: never[] = [];
 
+// micromark resolves emphasis in time quadratic in the length of one inline
+// run (a paragraph), so a degenerate model output — a single 190KB line of
+// `**`/「 fragments — took a minute to parse and froze the tab. Past this many
+// characters a run is rendered verbatim instead; at the limit a degenerate run
+// still parses in ~0.1s on desktop. Real prose paragraphs stay far below it.
+const INLINE_RUN_PARSE_LIMIT = 10_000;
+
+const FENCE_LINE = /^\s*(```|~~~)/;
+
+// Length of the longest stretch the inline parser would treat as one run.
+// Fenced code is literal (no emphasis pass), and each table row is parsed per
+// cell, so neither counts toward a run.
+const longestInlineRun = (text: string): number => {
+  let longest = 0;
+  let run = 0;
+  let inFence = false;
+  for (const line of text.split('\n')) {
+    if (FENCE_LINE.test(line)) {
+      inFence = !inFence;
+      run = 0;
+      continue;
+    }
+    const trimmed = line.trim();
+    if (inFence || !trimmed || trimmed.startsWith('|')) {
+      run = 0;
+      continue;
+    }
+    run += line.length + 1;
+    if (run > longest) longest = run;
+  }
+  return longest;
+};
+
 type CodeBlockProps = {
   node?: any;
   className?: string;
@@ -504,6 +537,7 @@ export const MarkdownBody = memo(function MarkdownBody({ children, breaks = fals
   // render, and almost no assistant message contains math. Only wire the two
   // plugins up when the text has a delimiter they could act on.
   const hasMath = useMemo(() => MATH_DELIMITER.test(content), [content]);
+  const exceedsParseBudget = useMemo(() => longestInlineRun(content) > INLINE_RUN_PARSE_LIMIT, [content]);
   const remarkPlugins = useMemo(
     () => (breaks
       ? [remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkBreaks]
@@ -580,6 +614,12 @@ export const MarkdownBody = memo(function MarkdownBody({ children, breaks = fals
     }),
     [openFileInEditor, t],
   );
+
+  if (exceedsParseBudget) {
+    // Verbatim text keeps every character readable and copyable; only the
+    // formatting is lost, and only for text the parser could not handle.
+    return <div className="whitespace-pre-wrap break-words">{children}</div>;
+  }
 
   return (
     <ReactMarkdown

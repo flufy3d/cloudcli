@@ -115,6 +115,12 @@ CollapsibleTrigger.displayName = 'CollapsibleTrigger';
 export const CollapsibleContent = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
   ({ className, children, ...props }, ref) => {
     const { open, native } = useCollapsible();
+    // Latches on the first open: a never-opened body is not mounted, so a
+    // transcript's hundreds of folded thinking blocks and tool outputs don't
+    // parse their markdown just to stay hidden. Once opened it stays mounted,
+    // letting the fold animate closed and keeping the body's own state.
+    const [hasOpened, setHasOpened] = React.useState(open);
+    if (open && !hasOpened) setHasOpened(true);
 
     // The enclosing <details> owns visibility, so this is a plain wrapper —
     // no animation grid, which would fight the native fold.
@@ -138,7 +144,7 @@ export const CollapsibleContent = React.forwardRef<HTMLDivElement, React.HTMLAtt
         {...props}
       >
         <div className="overflow-hidden">
-          {children}
+          {open || hasOpened ? children : null}
         </div>
       </div>
     );
