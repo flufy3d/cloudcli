@@ -64,7 +64,7 @@ import {
   readTrackedAgentIds,
   readAgentReports,
   readInvokedAgentSpecs,
-  SPAWN_RECEIPT_MARKER,
+  SPAWN_RECEIPT_PATTERN,
 } from './antigravity-subagent.js';
 import { readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
 
@@ -506,11 +506,9 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                 // Both transports must name this call the same way, or the
                 // live card and the persisted one render side by side. Live
                 // reports the tool at its own step, which is the step after
-                // the planner entry that declared it (verified across two
-                // real sessions: 830/830 and 798/807 calls are followed by
-                // their GENERIC output one step later, and no planner entry
-                // has ever carried more than one call). `t` keeps the formula
-                // total should that ever change.
+                // the planner entry that declared it, plus this call's
+                // position when a planner entry batches several tools. This
+                // also binds an agent receipt after neighboring tool results.
                 const toolId = buildAntigravityToolId(nativeStepIndex, t);
 
                 if (toolName === ANTIGRAVITY_SPAWN_TOOL) {
@@ -554,7 +552,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
             const spawnCall = nativeStepIndex === undefined
               ? undefined
               : spawnCalls.get(buildAntigravityToolId(nativeStepIndex, null));
-            if (spawnCall && !spawnCall.receipt && rawContent.includes(SPAWN_RECEIPT_MARKER)) {
+            if (spawnCall && !spawnCall.receipt && SPAWN_RECEIPT_PATTERN.test(rawContent)) {
               spawnCall.receipt = rawContent;
               continue;
             }

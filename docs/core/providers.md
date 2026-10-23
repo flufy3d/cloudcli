@@ -477,6 +477,8 @@ id 必须字节相同。** 这条有两道闸门守着：
 
   stream-json 模式下，`agy` 自己等子代理和后台 `run_command` 全部结束才发出 `result`：后台命令的 `tool` step 一直保持 `ACTIVE` 直到命令退出，子代理回报只是一条不带正文的 `system_message` step。runtime 在子代理运行期间定期读取主会话的原始记录，收到 `system_message` 时也立即对账；正文省略的实时通知本身不表示某个子代理完成。只有记录中带发送者 ID 的正式 `<SYSTEM_MESSAGE>` 回报能提前结算对应子代理：先送达它的最后工作内容，再发 `task_status: completed`，从登记簿移除并更新输入框卡片。普通正文、用户输入和子代理中间的 DONE 回复不会触发提前结算。主会话继续运行，其他子代理不受影响；重复启动与回报不重复结算。记录未变化时只检查文件元数据，compact 与 full 记录分别追踪。`result` 是整轮的终点，runtime 收到它后停止回报对账，把仍登记的子代理按自身记录结算为完成、失败或停止，清空输入框卡片、关 stdin、发 `complete`；进程退出或中断时，未结算的子代理按停止收尾。子代理取自 `invoke_subagent` 的 DONE step（`step_type: "subagent"`，`subagent_info.subagents[].conversation_id`），每个 agent 一张 `Agent` 卡，输入框卡片通过 `backgroundTasks.list(sessionId)` 切面从登记簿推出。
 
+  历史中的 `invoke_subagent` 同时支持单 Agent 的平铺参数和批量 `Subagents` 数组；启动回执支持单数 `Created the following subagent:` 与复数形式。每个调用按 planner 步号和工具位置绑定自己的回执，再用回执中的会话 ID 构建与实时一致的 Agent 卡片身份；刷新和重新进入会话保留状态、回报与内部工作记录。缺少或损坏回执时不猜测会话 ID，也不把启动回执当成相邻工具的输出。
+
   **绝不能给 agy 传 `--print-timeout`**：它限制的是整轮时长，到点时 agy 会在子代理仍在运行时提前吐出 `status: SUCCESS` 的 `result`，runtime 一关 stdin，agy 就把子代理连同工作一起掐掉，前端还显示完成。agy 的默认值 0 表示等这一轮跑完。防卡死由服务端负责：stdin 由我们持有，`result` 一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住，所以 runtime 自带一个**以 stdout 活动续期的看门狗**（`idleTimeout` / `CLOUDCLI_ANTIGRAVITY_IDLE_TIMEOUT`，默认 30 分钟），到期 SIGTERM 并按失败收尾。主 agent 等子代理期间主流完全静默，所以一个连续 30 分钟没有任何输出的子代理也会被看门狗结束。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 或发 `complete` 都会让前端以为这轮结束、甚至掐死异步工作，所以只有真正的 result 才收尾。
 
   接新的 CLI 引擎时先问两句：它的非交互模式在主循环 idle 之后如何处置未完成的后台任务；以及谁为「进程永远不退」兜底。

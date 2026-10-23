@@ -181,21 +181,26 @@ export function extractAntigravitySubagents(step: AnyRecord): AntigravityLiveSub
 
 /**
  * The agent specs a persisted `invoke_subagent` call declares, in the order
- * the engine created them.
+ * the engine created them. agy persists either one flat spec or a Subagents
+ * array; the sessions provider uses both to recreate the live cards.
  */
 export function readInvokedAgentSpecs(args: unknown): AntigravityAgentSpec[] {
-  const subagents = readObjectRecord(args)?.Subagents;
-  if (!Array.isArray(subagents)) {
-    return [];
+  const record = readObjectRecord(args);
+  if (!record) return [];
+  if (!('Subagents' in record)) {
+    const role = readOptionalString(record.Role);
+    const prompt = readOptionalString(record.Prompt);
+    return role || prompt ? [{ role, prompt }] : [];
   }
-  return subagents.map((entry) => {
+  if (!Array.isArray(record.Subagents)) return [];
+  return record.Subagents.map((entry) => {
     const spec = readObjectRecord(entry);
     return { role: readOptionalString(spec?.Role), prompt: readOptionalString(spec?.Prompt) };
   });
 }
 
-/** The text a finished `invoke_subagent` call's receipt starts its agent list with. */
-export const SPAWN_RECEIPT_MARKER = 'Created the following subagents';
+/** Singular and batch receipt headers used by the sessions provider to bind spawn results. */
+export const SPAWN_RECEIPT_PATTERN = /(?:^|\r?\n)Created the following subagents?:/;
 
 /**
  * The conversation ids the live run tracks for one call, in creation order,
