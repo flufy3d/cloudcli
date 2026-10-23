@@ -405,7 +405,7 @@ export async function consumeCodexQuotaReset(
   try {
     await runCodexAppServerSession(dependencies.startAppServer, async (call) => {
       const snapshot = await call({ id: QUOTA_READ_ID, method: 'account/rateLimits/read', params: null });
-      const card = pickAvailableResetCredit(extractCodexResetCredits(snapshot), input.resetType);
+      const card = pickAvailableResetCredit(extractCodexResetCredits(snapshot), input.resetType, dependencies.now());
       if (!card) {
         consumeResult = { outcome: 'noCardAvailable' };
         return;

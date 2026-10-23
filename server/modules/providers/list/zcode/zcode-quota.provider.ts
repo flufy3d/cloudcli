@@ -393,7 +393,7 @@ export async function consumeZCodeQuotaReset(
     };
   }
 
-  const card = pickAvailableResetCredit(credits, input.resetType);
+  const card = pickAvailableResetCredit(credits, input.resetType, deps.now());
   if (!card) {
     return { ok: false, code: 'noCard', message: 'No available quota reset card for this request.' };
   }
