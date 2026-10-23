@@ -24,7 +24,7 @@ export default function SidebarFooter({
   t,
 }: SidebarFooterProps) {
   return (
-    <div className="flex-shrink-0" style={{ paddingBottom: 'env(safe-area-inset-bottom, 0)' }}>
+    <div className="flex-shrink-0" style={{ paddingBottom: 'var(--safe-area-inset-bottom)' }}>
       {/* Restart-required banner: the running server version differs from the
           installed/frontend version (updated but not restarted). */}
       {restartRequired && (

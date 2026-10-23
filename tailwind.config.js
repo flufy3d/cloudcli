@@ -59,8 +59,8 @@ export default {
         sm: "calc(var(--radius) - 4px)",
       },
       spacing: {
-        'safe-area-inset-bottom': 'env(safe-area-inset-bottom)',
-        'mobile-nav': 'var(--mobile-nav-total)',
+        // Clamped in index.css :root — iOS 26 standalone over-reports the raw env() value.
+        'safe-area-inset-bottom': 'var(--safe-area-inset-bottom)',
       },
       keyframes: {
         shimmer: {
