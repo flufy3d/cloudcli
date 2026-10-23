@@ -38,8 +38,9 @@ export const ANTIGRAVITY_SPAWN_TOOL = 'invoke_subagent';
 
 /**
  * Agents the session still waits on, keyed by app session id and conversation
- * id. The runtime fills it from the live `subagent` step and empties it when
- * the turn result arrives or the process ends; the history reader consults it
+ * id. The runtime fills it from the live `subagent` step, retires each agent
+ * when its report arrives, and clears leftovers when the turn or process ends;
+ * the history reader consults it
  * to tell an agent whose process is alive from one that was cut off.
  *
  * Process-wide by design: the agents are children of this server's `agy`

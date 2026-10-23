@@ -664,7 +664,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         const report = conversationId ? reports.get(conversationId.toLowerCase()) : undefined;
         // One judgement for live and history: a report or the agent's own
         // transcript says how it ended; an agent this server's `agy` still
-        // tracks is running until the turn result settles it.
+        // tracks is running until its report or the turn result settles it.
         const status: SubagentInfo['status'] = !conversationId
           ? 'stopped'
           : report !== undefined
