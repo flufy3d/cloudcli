@@ -142,6 +142,33 @@ const readErrorMessage = (error: unknown): string => {
 };
 
 /**
+ * The timeline row of a finished compaction: a "Context compacted" notice, or
+ * the error of a failed one.
+ *
+ * The engine persists a compaction as a `compaction` session message whose id
+ * is the `inputID` its live events carry, so naming the row after it gives
+ * the live stream and the history read the same row. Consumers: this
+ * translator (live) and the OpenCode sessions provider (history).
+ */
+export function createOpenCodeCompactionFrame(input: {
+  inputId: string | null | undefined;
+  sessionId: string | null;
+  timestamp: string;
+  failed: boolean;
+  error?: unknown;
+}): NormalizedMessage {
+  const base = {
+    id: `${input.inputId ?? generateMessageId(PROVIDER)}_compaction`,
+    sessionId: input.sessionId,
+    timestamp: input.timestamp,
+    provider: PROVIDER,
+  } as const;
+  return input.failed
+    ? createNormalizedMessage({ ...base, kind: 'error', content: `Compaction failed: ${readErrorMessage(input.error)}`, isError: true })
+    : createNormalizedMessage({ ...base, kind: 'task_notification', summary: 'Context compacted', status: 'info' });
+}
+
+/**
  * Per-session translator. One instance lives for the life of a run (or a
  * session's attachment) because tool names and reasoning block ids are
  * remembered across events.
@@ -350,26 +377,19 @@ export class OpenCodeSessionEventTranslator {
       }
 
       case 'session.compaction.ended':
-      case 'session.compaction.failed': {
+      case 'session.compaction.failed':
         // Manual (`/compact`) and automatic compactions alike. A failed one
         // still ends its execution as succeeded, so the failure is shown here
         // or nowhere.
-        const id = `${readOptionalString(data.inputID) ?? generateMessageId(PROVIDER)}_compaction`;
-        if (event.type === 'session.compaction.ended') {
-          return {
-            frames: [createNormalizedMessage({
-              id, sessionId: this.sessionId, timestamp, provider: PROVIDER,
-              kind: 'task_notification', summary: 'Context compacted', status: 'info',
-            })],
-          };
-        }
         return {
-          frames: [createNormalizedMessage({
-            id, sessionId: this.sessionId, timestamp, provider: PROVIDER,
-            kind: 'error', content: `Compaction failed: ${readErrorMessage(data.error)}`, isError: true,
+          frames: [createOpenCodeCompactionFrame({
+            inputId: readOptionalString(data.inputID),
+            sessionId: this.sessionId,
+            timestamp,
+            failed: event.type === 'session.compaction.failed',
+            error: data.error,
           })],
         };
-      }
 
       case 'session.execution.started':
         return { frames: [], executionStarted: true };

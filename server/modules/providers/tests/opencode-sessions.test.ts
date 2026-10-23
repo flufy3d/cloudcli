@@ -899,6 +899,79 @@ test('v2 history rows carry the same ids the live translator produces for the sa
   }
 });
 
+test('v2 compactions stay in history as the same rows the live stream showed', { concurrency: false }, async () => {
+  // A compaction persists as a `compaction` session_message whose id is the
+  // `inputID` its live events carry. The history reader must draw the same
+  // notice under the same id, or the row the user saw vanishes on reload.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-v2-compaction-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY, project_id text NOT NULL, slug text NOT NULL,
+          directory text NOT NULL, title text, version text NOT NULL,
+          tokens_input integer DEFAULT 0 NOT NULL, tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL, tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL, time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,
+          seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+          VALUES ('ses_cmp', 'proj_1', 's', '/tmp/proj', 'S', '2.0.31', 1000, 2000);
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_u', 'ses_cmp', 'user', 1, 1100, 1100, '{"text":"remember banana"}'),
+          ('msg_ok', 'ses_cmp', 'compaction', 2, 1200, 1300,
+            '{"time":{"created":1200},"status":"completed","reason":"manual","summary":"## Objective\\n- remember banana"}'),
+          ('msg_bad', 'ses_cmp', 'compaction', 3, 1400, 1400,
+            '{"time":{"created":1400},"status":"failed","reason":"manual","error":{"type":"provider.quota","message":"Free usage limit reached."}}'),
+          ('msg_run', 'ses_cmp', 'compaction', 4, 1500, 1500, '{"time":{"created":1500},"reason":"auto"}'),
+          ('msg_a', 'ses_cmp', 'assistant', 5, 1600, 1700, '{"time":{"created":1600},"content":[{"type":"text","text":"ok"}]}');
+      `);
+    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const history = await provider.fetchHistory('ses_cmp');
+    assert.deepEqual(
+      history.messages.map((row) => [row.kind, row.summary ?? row.content]),
+      [
+        ['text', 'remember banana'],
+        ['task_notification', 'Context compacted'],
+        ['error', 'Compaction failed: Free usage limit reached.'],
+        ['text', 'ok'],
+      ],
+    );
+
+    const translator = new OpenCodeSessionEventTranslator('app-session');
+    const live = (type: string, data: Record<string, unknown>) => translator.translate({
+      id: `evt_${type}`, created: 1792203579833, type,
+      location: { directory: '/tmp/proj' },
+      data: { sessionID: 'ses_cmp', reason: 'manual', ...data },
+    }).frames[0];
+    const ended = live('session.compaction.ended', { inputID: 'msg_ok' });
+    const failed = live('session.compaction.failed', { inputID: 'msg_bad', error: { type: 'provider.quota', message: 'Free usage limit reached.' } });
+    const historyNote = history.messages.find((row) => row.kind === 'task_notification');
+    const historyError = history.messages.find((row) => row.kind === 'error');
+    assert.equal(historyNote?.id, ended?.id);
+    assert.equal(historyNote?.summary, ended?.summary);
+    assert.equal(historyError?.id, failed?.id);
+    assert.equal(historyError?.content, failed?.content);
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Subagent cards: OpenCode's `subagent` tool is the client's `Agent` card.
 // ---------------------------------------------------------------------------

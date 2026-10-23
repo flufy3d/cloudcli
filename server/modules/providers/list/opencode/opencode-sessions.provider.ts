@@ -39,7 +39,7 @@ import {
   readBackgroundNotice,
   type OpenCodeBackgroundOutcome,
 } from './opencode-background-work.js';
-import { formatToolOutput } from './opencode-event-translator.js';
+import { createOpenCodeCompactionFrame, formatToolOutput } from './opencode-event-translator.js';
 import {
   getOpenCodeDatabasePath,
   openOpenCodeDatabase,
@@ -216,8 +216,10 @@ const readOpenCodeSessionColumnTokenUsage = (
  * v2 event-sources one row per message and carries its content blocks inline
  * (`user` rows hold the prompt text; `assistant` rows hold a `content` array
  * of text/reasoning/tool blocks), so each row expands into one virtual
- * message plus one virtual part per block. Compaction, idle, and system rows
- * carry no user-visible transcript content and are skipped.
+ * message plus one virtual part per block. A finished compaction becomes one
+ * `compaction` part, so the notice the live stream showed stays after a
+ * reload; idle, system and other rows carry no user-visible transcript
+ * content and are skipped.
  */
 function* flattenOpenCodeV2HistoryRows(
   db: Database.Database,
@@ -237,6 +239,22 @@ function* flattenOpenCodeV2HistoryRows(
   }>;
 
   for (const messageRow of messageRows) {
+    if (messageRow.type === 'compaction') {
+      // Only a finished compaction draws a row; one still running has none.
+      const compaction = readJsonRecord(messageRow.data);
+      const status = readOptionalString(compaction?.status);
+      if (status === 'completed' || status === 'failed') {
+        yield {
+          message_id: messageRow.id,
+          message_time_created: messageRow.time_created,
+          message_data: JSON.stringify({ role: 'compaction' }),
+          part_id: 'compaction',
+          part_time_created: messageRow.time_updated ?? messageRow.time_created,
+          part_data: JSON.stringify({ type: 'compaction', status, error: compaction?.error ?? null }),
+        };
+      }
+      continue;
+    }
     if (messageRow.type !== 'user' && messageRow.type !== 'assistant') {
       continue;
     }
@@ -889,6 +907,17 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         }
 
         yield toolMessage;
+        continue;
+      }
+
+      if (partType === 'compaction') {
+        yield createOpenCodeCompactionFrame({
+          inputId: row.message_id,
+          sessionId,
+          timestamp,
+          failed: partData.status === 'failed',
+          error: partData.error,
+        });
         continue;
       }
 
