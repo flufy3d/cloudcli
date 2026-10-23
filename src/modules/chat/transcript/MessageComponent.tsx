@@ -171,34 +171,50 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
         </div>
       ) : message.compact ? (
         /* A compaction: one row, its numbers, and its summary folded into it */
-        <div className="w-full">
-          <div className="flex items-center gap-2 py-0.5">
-            <span
-              className={`inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${
-                message.compact.phase === 'running'
-                  ? 'animate-pulse bg-amber-400 dark:bg-amber-500'
-                  : message.compact.phase === 'failed'
-                    ? 'bg-red-400 dark:bg-red-500'
-                    : 'bg-gray-400 dark:bg-gray-500'
-              }`}
-            />
+        (() => {
+          const dotClassName = `inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${
+            message.compact.phase === 'running'
+              ? 'animate-pulse bg-amber-400 dark:bg-amber-500'
+              : message.compact.phase === 'failed'
+                ? 'bg-red-400 dark:bg-red-500'
+                : 'bg-gray-400 dark:bg-gray-500'
+          }`;
+          const label = (
             <span className="text-xs text-gray-500 dark:text-gray-400">
               {message.content || t('chat:misc.compacted', 'Compacted')}
             </span>
-          </div>
-          {message.compactSummary && (
-            <details className="ml-3.5 mt-0.5">
-              <summary className="cursor-pointer text-xs text-gray-500 hover:text-foreground dark:text-gray-400">
-                {t('chat:misc.compactionSummary', 'full summary')}
-              </summary>
-              <div className="mt-1">
-                <Markdown className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">
-                  {message.compactSummary}
-                </Markdown>
+          );
+          if (!message.compactSummary) {
+            return (
+              <div className="flex w-full items-center gap-2 py-0.5">
+                <span className={dotClassName} />
+                {label}
               </div>
-            </details>
-          )}
-        </div>
+            );
+          }
+          // The same disclosure as the conversation-summary and thinking rows:
+          // the whole line toggles, a chevron at its end turns.
+          return (
+            <Collapsible className="w-full" nativeDetails={isExporting}>
+              <CollapsibleTrigger
+                className="group flex w-full cursor-pointer items-center gap-2 py-0.5 text-left"
+                aria-label={t('chat:misc.compactionSummary', 'full summary')}
+                title={t('chat:misc.compactionSummary', 'full summary')}
+              >
+                <span className={dotClassName} />
+                {label}
+                <ChevronDownIcon className="h-3 w-3 flex-shrink-0 text-gray-400 transition-transform group-data-[state=open]:rotate-180" />
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="ml-3.5 mt-1 border-l-2 border-gray-200 pl-3 dark:border-gray-700">
+                  <Markdown className="prose prose-sm max-w-none font-serif dark:prose-invert">
+                    {message.compactSummary}
+                  </Markdown>
+                </div>
+              </CollapsibleContent>
+            </Collapsible>
+          );
+        })()
       ) : message.isTaskNotification ? (
         /* Compact task notification on the left */
         <div className="w-full">
