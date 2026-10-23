@@ -20,13 +20,14 @@ import {
 
 import { readDecryptedZCodeIndividualPlanApiKey, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
+import { readZCodeStartPlanCatalog } from './zcode-start-plan-catalog.js';
 import { resolveZCodeProviderApiType } from './zcode-provider-config.js';
 
 export const ZCODE_START_PLAN_PROVIDER_ID = 'account:bigmodel-start-plan';
 /** Used by the send model resolver and runtime header bridge to keep account identity consistent. */
 export const ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID = 'account:bigmodel-individual-coding-plan';
+/** Fallback start-plan entry for when the billing catalog cannot be read. */
 const ZCODE_START_PLAN_MODEL_ID = 'GLM-5.3-Flash';
-const ZCODE_START_PLAN_MODEL_VALUE = `${ZCODE_START_PLAN_PROVIDER_ID}/${ZCODE_START_PLAN_MODEL_ID}`;
 const ZCODE_GROUP_PERSONAL = 'BigModel (个人)';
 const ZCODE_GROUP_START_PLAN = 'BigModel (体验)';
 const ZCODE_PERSONAL_MODELS_WHITELIST = new Set(['GLM-5.3', 'GLM-5.3-Flash']);
@@ -64,49 +65,57 @@ const REASONING_EFFORT_ORDER: Record<string, number> = {
   max: 40,
 };
 
-function appendStartPlanModelIfEligible(options: ProviderModelOption[]): ProviderModelOption[] {
+/**
+ * Appends the start-plan (体验套餐) models granted by the account's billing
+ * entitlements, so event plans surface exactly the models the server currently
+ * allows. Falls back to the pinned Flash entry when the catalog cannot be read
+ * (network failure, empty payload) so the group never disappears entirely.
+ */
+async function appendStartPlanModelOptions(options: ProviderModelOption[]): Promise<ProviderModelOption[]> {
   const jwtToken = readDecryptedZCodeJwtToken();
-  if (!jwtToken || options.some((opt) => opt.value === ZCODE_START_PLAN_MODEL_VALUE)) {
+  if (!jwtToken) {
     return options;
   }
-  return [
-    ...options,
-    {
-      value: ZCODE_START_PLAN_MODEL_VALUE,
-      label: ZCODE_START_PLAN_MODEL_ID,
+  const entitled = await readZCodeStartPlanCatalog();
+  const models = entitled && entitled.length > 0
+    ? entitled
+    : [{ modelId: ZCODE_START_PLAN_MODEL_ID, label: ZCODE_START_PLAN_MODEL_ID }];
+  const existingValues = new Set(options.map((option) => option.value));
+  const additions = models
+    .map((model) => ({ value: `${ZCODE_START_PLAN_PROVIDER_ID}/${model.modelId}`, label: model.label }))
+    .filter((option) => !existingValues.has(option.value))
+    .map((option) => ({
+      ...option,
       group: ZCODE_GROUP_START_PLAN,
       description: 'ZCode 体验套餐专享模型',
       effort: {
-        default: 'max',
+        default: 'max' as const,
         values: [
           { value: 'low', description: EFFORT_DESCRIPTIONS.low },
           { value: 'high', description: EFFORT_DESCRIPTIONS.high },
           { value: 'max', description: EFFORT_DESCRIPTIONS.max },
         ],
       },
-    },
-  ];
+    }));
+  return [...options, ...additions];
 }
 
 /**
  * Reads ZCode's user-facing provider config to extract model definitions.
- * 0.16.9 stores the active catalog in `cli/config.json`; the older v2 path is
- * retained as a fallback for installations that have not rewritten it yet.
+ * ZCode 0.16.9+ stores the active catalog in `cli/config.json`; the legacy
+ * `v2/config.json` is not consulted because engines old enough to rely on it
+ * cannot be driven by this integration anyway.
  */
 const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
   let baseDefinition: ProviderModelsDefinition = ZCODE_BUILTIN_MODELS;
   try {
     let config: Record<string, unknown> | null = null;
-    for (const configPath of [
-      path.join(getZCodeStorageDir(), 'cli', 'config.json'),
-      path.join(getZCodeStorageDir(), 'v2', 'config.json'),
-    ]) {
-      try {
-        config = readObjectRecord(JSON.parse(await readFile(configPath, 'utf8')));
-        if (readObjectRecord(config?.provider)) break;
-      } catch {
-        // Try the next supported config location.
-      }
+    try {
+      config = readObjectRecord(JSON.parse(
+        await readFile(path.join(getZCodeStorageDir(), 'cli', 'config.json'), 'utf8')
+      ));
+    } catch {
+      // Missing or unreadable engine config: fall through to the builtin catalog.
     }
 
     const providers = readObjectRecord(config?.provider);
@@ -212,7 +221,7 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
       ? { ...option, value: `${ZCODE_INDIVIDUAL_PLAN_PROVIDER_ID}/${option.value}` }
       : option)
     : baseDefinition.OPTIONS;
-  const optionsWithStartPlan = appendStartPlanModelIfEligible(personalOptions);
+  const optionsWithStartPlan = await appendStartPlanModelOptions(personalOptions);
   return {
     OPTIONS: optionsWithStartPlan,
     DEFAULT: optionsWithStartPlan[0]?.value ?? baseDefinition.DEFAULT,
@@ -337,17 +346,12 @@ export function resolveZCodeModelRef(
 
   // Look up enabled provider in config if possible. The app-server engine
   // resolves provider ids against its own cli/config.json, so that file is
-  // consulted first; the App's v2 config only serves as a fallback because
-  // its provider ids (builtin:*) may not exist in the engine's config.
-  for (const configPath of [
-    path.join(getZCodeStorageDir(), 'cli', 'config.json'),
-    path.join(getZCodeStorageDir(), 'v2', 'config.json'),
-  ]) {
-    try {
-      const content = fsSync.readFileSync(configPath, 'utf8');
-      const config = readObjectRecord(JSON.parse(content));
-      const providers = readObjectRecord(config?.provider);
-      if (!providers) continue;
+  // what gets consulted here.
+  try {
+    const content = fsSync.readFileSync(path.join(getZCodeStorageDir(), 'cli', 'config.json'), 'utf8');
+    const config = readObjectRecord(JSON.parse(content));
+    const providers = readObjectRecord(config?.provider);
+    if (providers) {
       for (const [providerId, providerConfig] of Object.entries(providers)) {
         if (providerId.startsWith('builtin:') || providerId.startsWith('account:')) continue;
         const providerRecord = readObjectRecord(providerConfig);
@@ -376,9 +380,9 @@ export function resolveZCodeModelRef(
           };
         }
       }
-    } catch {
-      // Config read failed, try the next config source
     }
+  } catch {
+    // Missing or unreadable engine config: fall through to the default resolution.
   }
 
   return {

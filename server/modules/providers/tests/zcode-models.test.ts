@@ -8,6 +8,10 @@ import Database from 'better-sqlite3';
 
 import { encryptZCodeCredentialValue } from '@/modules/providers/list/zcode/zcode-credentials.js';
 import {
+  readZCodeStartPlanCatalog,
+  resetZCodeStartPlanCatalogCache,
+} from '@/modules/providers/list/zcode/zcode-start-plan-catalog.js';
+import {
   ZCodeProviderModels,
   buildZCodeSendModelParams,
   resolveZCodeModelRef,
@@ -45,12 +49,12 @@ test('getSupportedModels falls back to the builtin catalog without a config', as
   });
 });
 
-test('getSupportedModels parses the v2 config provider catalog', async () => {
+test('getSupportedModels parses the cli config provider catalog', async () => {
   await withZCodeStorage(async (storageDir) => {
-    const v2Dir = path.join(storageDir, 'v2');
-    await mkdir(v2Dir, { recursive: true });
+    const cliDir = path.join(storageDir, 'cli');
+    await mkdir(cliDir, { recursive: true });
     await writeFile(
-      path.join(v2Dir, 'config.json'),
+      path.join(cliDir, 'config.json'),
       JSON.stringify({
         provider: {
           'builtin:bigmodel-coding-plan': {
@@ -83,10 +87,10 @@ test('getSupportedModels parses the v2 config provider catalog', async () => {
 
 test('getSupportedModels ignores disabled providers and deduplicates model options', async () => {
   await withZCodeStorage(async (storageDir) => {
-    const v2Dir = path.join(storageDir, 'v2');
-    await mkdir(v2Dir, { recursive: true });
+    const cliDir = path.join(storageDir, 'cli');
+    await mkdir(cliDir, { recursive: true });
     await writeFile(
-      path.join(v2Dir, 'config.json'),
+      path.join(cliDir, 'config.json'),
       JSON.stringify({
         provider: {
           'builtin:disabled-provider': {
@@ -155,10 +159,10 @@ test('resolveZCodeModelRef parses full ref and bare model key', async () => {
 
   // Case 3: Bare model with config and variant
   await withZCodeStorage(async (storageDir) => {
-    const v2Dir = path.join(storageDir, 'v2');
-    await mkdir(v2Dir, { recursive: true });
+    const cliDir = path.join(storageDir, 'cli');
+    await mkdir(cliDir, { recursive: true });
     await writeFile(
-      path.join(v2Dir, 'config.json'),
+      path.join(cliDir, 'config.json'),
       JSON.stringify({
         provider: {
           'custom-provider': {
@@ -290,6 +294,7 @@ test('readZCodeSessionModelInfoFromDb returns model and variant from latest mess
 
 test('getSupportedModels includes BigModel (体验) start-plan model when zcodejwttoken is present', async () => {
   await withZCodeStorage(async (storageDir) => {
+    resetZCodeStartPlanCatalogCache();
     const cliDir = path.join(storageDir, 'cli');
     const v2Dir = path.join(storageDir, 'v2');
     await mkdir(cliDir, { recursive: true });
@@ -335,6 +340,118 @@ test('getSupportedModels includes BigModel (体验) start-plan model when zcodej
     assert.equal(startPlan.effort?.default, 'max');
     assert.deepEqual(
       startPlan.effort?.values.map((v) => v.value),
+      ['low', 'high', 'max']
+    );
+  });
+});
+
+test('getSupportedModels falls back to the builtin catalog when only the legacy v2 config exists', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(v2Dir, { recursive: true });
+    await writeFile(
+      path.join(v2Dir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'builtin:bigmodel-coding-plan': {
+            kind: 'anthropic',
+            models: {
+              'GLM-5.3': { reasoning: { variants: ['low', 'high', 'max'] } },
+              'GLM-5.2': {},
+            },
+          },
+        },
+      }),
+      'utf8'
+    );
+
+    const models = new ZCodeProviderModels();
+    const definition = await models.getSupportedModels();
+
+    // The v2 path is no longer consulted; the builtin catalog wins.
+    assert.deepEqual(
+      definition.OPTIONS.map((opt) => opt.value),
+      ['GLM-5.3']
+    );
+  });
+});
+
+test('getSupportedModels lists billing-entitled start-plan models', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    resetZCodeStartPlanCatalogCache();
+    const cliDir = path.join(storageDir, 'cli');
+    const v2Dir = path.join(storageDir, 'v2');
+    await mkdir(cliDir, { recursive: true });
+    await mkdir(v2Dir, { recursive: true });
+
+    await writeFile(
+      path.join(cliDir, 'config.json'),
+      JSON.stringify({
+        provider: {
+          'bigmodel-coding-plan': {
+            kind: 'anthropic',
+            models: {
+              'GLM-5.3': { reasoning: { variants: ['low', 'high', 'max'], defaultLevel: 'max' } },
+              'GLM-5.3-Flash': { reasoning: { variants: ['low', 'high', 'max'], defaultLevel: 'max' } },
+            },
+          },
+        },
+      }),
+      'utf8'
+    );
+
+    await writeFile(
+      path.join(v2Dir, 'credentials.json'),
+      JSON.stringify({ zcodejwttoken: 'mock-jwt-token' }),
+      'utf8'
+    );
+
+    // Pre-warm the shared catalog cache with an entitlement-driven read; the
+    // models provider then consumes it through its default dependencies. The
+    // JWT-shaped override is required because the fixture credential above is
+    // a placeholder the real loader's shape guard would refuse.
+    await readZCodeStartPlanCatalog({
+      readJwtToken: () => 'header.payload.signature',
+      fetchImpl: (async () => new Response(JSON.stringify({
+        code: 0,
+        data: {
+          server_time: 1_800_000_000,
+          plans: [{
+            plan_id: 'zcode-v3-start-plan-1024',
+            status: 'active',
+            ends_at: 1_800_100_000,
+            entitlements: [
+              { show_name: 'GLM-5.3-Flash', capabilities: ['model:glm-5.3-flash'] },
+              { show_name: 'GLM-5.3', capabilities: ['model:glm-5.3'] },
+            ],
+          }],
+        },
+      }), { status: 200 })) as typeof fetch,
+    });
+
+    const models = new ZCodeProviderModels();
+    const definition = await models.getSupportedModels();
+
+    // 2 personal + 2 entitled start-plan models, no duplicates
+    assert.equal(definition.OPTIONS.length, 4);
+    assert.equal(definition.OPTIONS[0].value, 'GLM-5.3');
+    assert.equal(definition.OPTIONS[0].group, 'BigModel (个人)');
+    assert.equal(definition.OPTIONS[1].value, 'GLM-5.3-Flash');
+    assert.equal(definition.DEFAULT, 'GLM-5.3');
+
+    const startPlanOptions = definition.OPTIONS.slice(2);
+    assert.deepEqual(
+      startPlanOptions.map((opt) => opt.value),
+      [
+        'account:bigmodel-start-plan/GLM-5.3-Flash',
+        'account:bigmodel-start-plan/GLM-5.3',
+      ]
+    );
+    assert.ok(startPlanOptions.every((opt) => opt.group === 'BigModel (体验)'));
+    assert.equal(startPlanOptions[1].label, 'GLM-5.3');
+    assert.equal(startPlanOptions[1].effort?.default, 'max');
+    assert.deepEqual(
+      startPlanOptions[1].effort?.values.map((v) => v.value),
       ['low', 'high', 'max']
     );
   });
