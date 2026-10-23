@@ -28,11 +28,12 @@ type SidebarHeaderProps = {
   isRefreshing: boolean;
   onCreateProject: () => void;
   onCollapseSidebar: () => void;
+  currentVersion: string;
   t: TFunction;
 };
 
 /** Module-level, not a nested render function, so the wordmark is not remounted on every SidebarHeader render. */
-function LogoBlock({ t }: { t: TFunction }) {
+function LogoBlock({ t, currentVersion }: { t: TFunction; currentVersion: string }) {
   return (
     <div className="flex min-w-0 items-center gap-2.5">
       <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg bg-primary/90 shadow-sm">
@@ -46,6 +47,11 @@ function LogoBlock({ t }: { t: TFunction }) {
       >
         {t('app.title')}
       </h1>
+      {!IS_PLATFORM && (
+        <span className="flex-shrink-0 text-[10px] font-normal text-muted-foreground/50">
+          ({`v${currentVersion}`})
+        </span>
+      )}
     </div>
   );
 }
@@ -68,6 +74,7 @@ export default function SidebarHeader({
   isRefreshing,
   onCreateProject,
   onCollapseSidebar,
+  currentVersion,
   t,
 }: SidebarHeaderProps) {
   const showSearchTools = (projectsCount > 0 || runningSessionsCount > 0 || archivedSessionsCount > 0 || isArchivedSessionsLoading) && !isLoading;
@@ -93,10 +100,10 @@ export default function SidebarHeader({
               className="flex min-w-0 items-center gap-2.5 transition-opacity hover:opacity-80"
               title={t('tooltips.viewEnvironments')}
             >
-              <LogoBlock t={t} />
+              <LogoBlock t={t} currentVersion={currentVersion} />
             </a>
           ) : (
-            <LogoBlock t={t} />
+            <LogoBlock t={t} currentVersion={currentVersion} />
           )}
 
           <div className="flex flex-shrink-0 items-center gap-0.5">
@@ -194,10 +201,10 @@ export default function SidebarHeader({
               className="flex min-w-0 items-center gap-2.5 transition-opacity active:opacity-70"
               title={t('tooltips.viewEnvironments')}
             >
-              <LogoBlock t={t} />
+              <LogoBlock t={t} currentVersion={currentVersion} />
             </a>
           ) : (
-            <LogoBlock t={t} />
+            <LogoBlock t={t} currentVersion={currentVersion} />
           )}
 
           <div className="flex flex-shrink-0 gap-1.5">

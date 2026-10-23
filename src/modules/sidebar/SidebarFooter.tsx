@@ -1,8 +1,6 @@
 import { Settings, ArrowUpCircle, AlertTriangle } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
-import { BUILD_INFO, GITHUB_REPO_URL } from '@/shared/constants';
-import { IS_PLATFORM } from '@/shared/utils';
 import type { ReleaseInfo } from '@/shared/types';
 
 type SidebarFooterProps = {
@@ -10,7 +8,6 @@ type SidebarFooterProps = {
   restartRequired: boolean;
   releaseInfo: ReleaseInfo | null;
   latestVersion: string | null;
-  currentVersion: string;
   onShowVersionModal: () => void;
   onShowSettings: () => void;
   t: TFunction;
@@ -22,7 +19,6 @@ export default function SidebarFooter({
   restartRequired,
   releaseInfo,
   latestVersion,
-  currentVersion,
   onShowVersionModal,
   onShowSettings,
   t,
@@ -119,27 +115,6 @@ export default function SidebarFooter({
           <span className="text-sm font-normal text-foreground">{t('actions.settings')}</span>
         </button>
       </div>
-
-      {/* Version brand line, all layouts: the one always-visible version readout —
-          the full `git describe` identity (v2.0.0-14-g273e294), which already
-          carries the tag/version, so no separate version number next to it.
-          It intentionally does not open the version modal — that is reserved
-          for the update banner, which only appears when the update check
-          actually finds a newer release. */}
-      {!IS_PLATFORM && (
-        <div className="px-3 pb-3 pt-1 text-center md:py-2">
-          <a
-            href={GITHUB_REPO_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-[10px] text-muted-foreground/40 transition-colors hover:text-muted-foreground"
-          >
-            {BUILD_INFO.describe && BUILD_INFO.describe !== 'unknown'
-              ? BUILD_INFO.describe
-              : `v${currentVersion}`}
-          </a>
-        </div>
-      )}
     </div>
   );
 }
