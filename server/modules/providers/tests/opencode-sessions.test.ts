@@ -572,7 +572,7 @@ const seedOpenCodeSession = async (
   }
 };
 
-test('OpenCode synchronizer preserves the title assigned when CloudCLI creates a session', { concurrency: false }, async () => {
+test('the engine title outranks a first-sentence name, and a user rename outranks both', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-app-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
@@ -591,7 +591,10 @@ test('OpenCode synchronizer preserves the title assigned when CloudCLI creates a
 
       await new OpenCodeSessionSynchronizer().synchronize();
 
-      assert.equal(sessionsDb.getSessionById('app-1')?.custom_name, 'Fix the checkout crash');
+      // The engine names its own sessions now; a name CloudCLI derived from
+      // the first sentence grows into the engine title, while a user rename
+      // (`name_locked`) is what no sync may overwrite.
+      assert.equal(sessionsDb.getSessionById('app-1')?.custom_name, 'OpenCode generated title');
     });
   } finally {
     restoreHomeDir();

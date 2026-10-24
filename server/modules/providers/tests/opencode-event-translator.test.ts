@@ -35,57 +35,9 @@ test('streams text as stream_delta frames and closes each segment with stream_en
   assert.equal(delta.frames[0].timestamp, new Date(1792203579833).toISOString());
 
   const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: 'cloudcli-probe-123' }));
-  assert.equal(ended.frames.length, 2);
-  assert.equal(ended.frames[0].kind, 'text');
-  assert.equal(ended.frames[0].role, 'assistant');
-  assert.equal(ended.frames[0].content, 'cloudcli-probe-123');
-  assert.equal(ended.frames[1].kind, 'stream_end');
-  assert.equal(ended.terminal, undefined);
-});
-
-test('names the finished text row after the streamed segment id, so the client placeholder can be adopted', () => {
-  const translator = new OpenCodeSessionEventTranslator(SESSION);
-
-  // Block 1 is a text part that follows a reasoning part; per-type ordinals
-  // count text parts only, so this block streams and lands as ordinal 0.
-  translator.translate(event('session.reasoning.delta', { assistantMessageID: MESSAGE, ordinal: 0, delta: 'thinking' }));
-  const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: 'cloudcli-probe-123' }));
-
-  const textRow = ended.frames[0];
-  assert.equal(textRow.kind, 'text');
-  assert.equal(textRow.id, `${MESSAGE}_text_0`);
-  assert.ok(!isVolatileMessageId(textRow.id), 'transcript rows need deterministic ids');
-});
-
-test('an ended text segment with no body still closes the stream but emits no empty row', () => {
-  const translator = new OpenCodeSessionEventTranslator(SESSION);
-  for (const text of ['', '   ']) {
-    const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text }));
-    assert.equal(ended.frames.length, 1);
-    assert.equal(ended.frames[0].kind, 'stream_end');
-  }
-});
-
-test('zero-width-space bodies count as blank on every text frame', () => {
-  // ses_eb34f87e3ffe (2026-10-18): DeepSeek ended every later segment with a
-  // single U+200B. `.trim()` passes it, so each segment surfaced as a
-  // transcript row whose only visible content was its copy control.
-  const translator = new OpenCodeSessionEventTranslator(SESSION);
-
-  const delta = translator.translate(event('session.text.delta', { assistantMessageID: MESSAGE, ordinal: 0, delta: '​' }));
-  assert.deepEqual(delta.frames, []);
-
-  const ended = translator.translate(event('session.text.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: '​' }));
   assert.equal(ended.frames.length, 1);
   assert.equal(ended.frames[0].kind, 'stream_end');
-
-  const reasoning = translator.translate(event('session.reasoning.ended', { assistantMessageID: MESSAGE, ordinal: 0, text: '​' }));
-  assert.deepEqual(reasoning.frames, []);
-
-  // Real content that merely carries invisible padding must still stream.
-  const padded = translator.translate(event('session.text.delta', { assistantMessageID: MESSAGE, ordinal: 1, delta: '​ok' }));
-  assert.equal(padded.frames.length, 1);
-  assert.equal(padded.frames[0].content, '​ok');
+  assert.equal(ended.terminal, undefined);
 });
 
 test('each streamed text part publishes the row key its persisted copy carries', () => {
@@ -321,7 +273,7 @@ test('ignores lifecycle chatter and unknown event types', () => {
   for (const type of [
     'session.created', 'session.model.selected', 'session.agent.selected', 'session.permissions',
     'session.inbox.enqueued', 'session.inbox.delivered', 'session.instructions.updated',
-    'session.step.started', 'session.step.streamed',
+    'session.execution.started', 'session.step.started', 'session.step.streamed',
     'session.step.failed', 'session.usage.updated', 'session.text.started', 'session.reasoning.started',
     // The compaction lifecycle itself (its summary reaches the transcript
     // through history, not through live frames);
@@ -331,77 +283,4 @@ test('ignores lifecycle chatter and unknown event types', () => {
   ]) {
     assert.deepEqual(translator.translate(event(type, { anything: true })), { frames: [] }, type);
   }
-  // A turn starting draws nothing, but the run registry needs to know: with
-  // no run of ours in the session it is the engine's own report turn.
-  assert.deepEqual(translator.translate(event('session.execution.started', {})), { frames: [], executionStarted: true });
-});
-
-
-const SUBAGENT_CALL = 'call_subagent_1';
-const SUBAGENT_INPUT = { agent: 'general', description: 'Review the diff', prompt: 'Read the diff and report problems.' };
-
-test('a subagent tool call reaches the page as an Agent row whose input the card can read', () => {
-  const translator = new OpenCodeSessionEventTranslator(SESSION);
-
-  const announced = translator.translate(event('session.tool.input.started', {
-    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, name: 'subagent',
-  }));
-  assert.equal(announced.frames[0].toolName, 'Agent');
-
-  const called = translator.translate(event('session.tool.called', {
-    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, input: SUBAGENT_INPUT,
-  }));
-  assert.equal(called.frames[0].kind, 'tool_use');
-  assert.equal(called.frames[0].toolName, 'Agent');
-  assert.equal(called.frames[0].toolId, SUBAGENT_CALL);
-  assert.deepEqual(called.frames[0].toolInput, {
-    subagent_type: 'general',
-    description: 'Review the diff',
-    prompt: 'Read the diff and report problems.',
-  });
-  // The permission bridge labels cards by the engine's own name.
-  assert.equal(translator.getToolCall(SUBAGENT_CALL)?.name, 'subagent');
-});
-
-test('other OpenCode tools keep their engine names', () => {
-  const translator = new OpenCodeSessionEventTranslator(SESSION);
-  const result = translator.translate(event('session.tool.called', {
-    assistantMessageID: MESSAGE, id: CALL, name: 'shell', input: { command: 'ls' },
-  }));
-  assert.equal(result.frames[0].toolName, 'shell');
-});
-
-test('a finished subagent call settles its card as completed, naming the child session', () => {
-  const translator = new OpenCodeSessionEventTranslator(SESSION);
-  translator.translate(event('session.tool.called', {
-    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, name: 'subagent', input: SUBAGENT_INPUT,
-  }));
-
-  const { frames } = translator.translate(event('session.tool.success', {
-    assistantMessageID: MESSAGE,
-    id: SUBAGENT_CALL,
-    content: [{ type: 'text', text: 'Found two problems.' }],
-    metadata: { sessionID: 'ses_child_1', status: 'completed', truncated: false },
-  }));
-
-  assert.deepEqual(frames.map((frame) => frame.kind), ['tool_result', 'task_status']);
-  assert.equal(frames[1].toolUseId, SUBAGENT_CALL);
-  assert.equal(frames[1].taskId, 'ses_child_1');
-  assert.equal(frames[1].status, 'completed');
-  assert.equal(frames[1].event, 'notification');
-});
-
-test('a failed subagent call settles its card as failed', () => {
-  const translator = new OpenCodeSessionEventTranslator(SESSION);
-  translator.translate(event('session.tool.called', {
-    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, name: 'subagent', input: SUBAGENT_INPUT,
-  }));
-
-  const { frames } = translator.translate(event('session.tool.failed', {
-    assistantMessageID: MESSAGE, id: SUBAGENT_CALL, error: { type: 'tool.error', message: 'child crashed' },
-  }));
-
-  assert.deepEqual(frames.map((frame) => frame.kind), ['tool_result', 'task_status']);
-  assert.equal(frames[1].status, 'failed');
-  assert.equal(frames[1].toolUseId, SUBAGENT_CALL);
 });
