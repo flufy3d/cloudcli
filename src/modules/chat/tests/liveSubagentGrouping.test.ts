@@ -32,10 +32,12 @@ function message(
   };
 }
 
+// The spawn row carries the engine-neutral name every adapter translates to;
+// a legacy Claude `Task` row is canonicalized to this before it reaches the page.
 const taskRow = (overrides: Partial<NormalizedMessage> = {}) => message('task', {
   kind: 'tool_use',
   toolId: 'task-1',
-  toolName: 'Task',
+  toolName: 'Agent',
   toolInput: { description: 'demo', prompt: 'do things' },
   ...overrides,
 });
