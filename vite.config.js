@@ -180,11 +180,11 @@ export default defineConfig(({ mode }) => {
             if (id.includes('/src/modules/settings/')) {
               return 'module-settings';
             }
-            // task-master keeps its own chunk: in this fork, folding it into
-            // module-settings makes module-settings import-cycle with
-            // module-mcp / module-skills / module-plugins (bundleNoCycles).
+            // task-master shares the settings chunk: on its own it import-cycles
+            // with module-settings through the shared UI/helper modules Rollup
+            // hoists into whichever chunk claims them first (bundleNoCycles).
             if (id.includes('/src/modules/task-master/')) {
-              return 'module-task-master';
+              return 'module-settings';
             }
             if (id.includes('/src/modules/git-panel/')) {
               return 'module-git';
