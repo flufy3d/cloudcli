@@ -20,6 +20,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
+// A stalled install or build must fail the update, not leave it "running"
+// forever. The default is generous for a cold npm install on Windows; tests
+// and unusual hosts can override it with SELF_UPDATE_COMMAND_TIMEOUT_MS.
+const COMMAND_TIMEOUT_MS = (() => {
+  const override = Number(process.env.SELF_UPDATE_COMMAND_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : 30 * 60 * 1000;
+})();
 const [phase, ...rawOptions] = process.argv.slice(2);
 const options = parseOptions(rawOptions);
 
@@ -87,18 +94,18 @@ try {
     // are only reinstalled with the server stopped. Dev dependencies are
     // forced in: the build needs vite and tsc even when PM2 sets NODE_ENV.
     step('stop');
-    runShell(`pm2 stop ${appName}`);
+    await runShell(`pm2 stop ${appName}`);
     progress.stopped = true;
     step('install');
-    runShell('npm install --include=dev');
+    await runShell('npm install --include=dev');
   }
 
   step('build-client');
   fs.rmSync(path.join(root, 'dist.next'), { recursive: true, force: true });
-  runShell('npm run build:client -- --outDir dist.next --emptyOutDir');
+  await runShell('npm run build:client -- --outDir dist.next --emptyOutDir');
 
   step('build-server');
-  runShell('npm run build:server');
+  await runShell('npm run build:server');
   progress.serverPromoted = true;
 
   step('promote-client');
@@ -108,31 +115,31 @@ try {
   // The new server settles this state on boot; see the system module.
   writeState({ state: 'restarting', step: 'restart', targetCommit });
   log(`build ready at ${targetCommit}; restarting ${appName}`);
-  runShell(pm2RestartCommand());
+  await runShell(pm2RestartCommand());
   log('restart issued');
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   log(`FAILED: ${message}`);
-  rollBack();
+  await rollBack();
   writeState({ state: 'failed', step: null, error: message, finishedAt: new Date().toISOString() });
 } finally {
   fs.closeSync(logFd);
 }
 
-function rollBack() {
+async function rollBack() {
   fs.rmSync(path.join(root, 'dist.next'), { recursive: true, force: true });
   if (progress.merged && fromCommit) {
-    attempt('reset checkout', () => run('git', ['reset', '--keep', fromCommit]));
+    await attempt('reset checkout', () => run('git', ['reset', '--keep', fromCommit]));
     if (progress.depsChanged) {
-      attempt('reinstall previous dependencies', () => runShell('npm install --include=dev'));
+      await attempt('reinstall previous dependencies', () => runShell('npm install --include=dev'));
     }
     if (progress.serverPromoted) {
       // The new server build already replaced dist-server; rebuild the old code.
-      attempt('rebuild previous version', () => runShell('npm run build'));
+      await attempt('rebuild previous version', () => runShell('npm run build'));
     }
   }
   if (progress.stopped) {
-    attempt(`restart ${appName}`, () => runShell(pm2RestartCommand()));
+    await attempt(`restart ${appName}`, () => runShell(pm2RestartCommand()));
   }
 }
 
@@ -196,9 +203,9 @@ function renameWithRetry(from, to) {
   }
 }
 
-function attempt(label, action) {
+async function attempt(label, action) {
   try {
-    action();
+    await action();
   } catch (error) {
     log(`rollback step "${label}" failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -216,30 +223,108 @@ function run(command, args) {
     env: childEnvironment,
     stdio: ['ignore', logFd, logFd],
     windowsHide: true,
+    timeout: COMMAND_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
   });
+  throwIfTimedOut(result, `${command} ${args.join(' ')}`);
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} exited with code ${result.status}`);
 }
 
 // npm and pm2 are .cmd shims on Windows, which only a shell can launch.
+// spawnSync cannot run a timer while it waits, so this uses async spawn. On
+// timeout the whole tree must die: killing cmd.exe alone would orphan npm.
 function runShell(commandLine) {
   log(`$ ${commandLine}`);
-  const result = spawnSync(commandLine, {
-    cwd: root,
-    env: childEnvironment,
-    stdio: ['ignore', logFd, logFd],
-    shell: true,
-    windowsHide: true,
+  return new Promise((resolve, reject) => {
+    const child = spawn(commandLine, {
+      cwd: root,
+      env: childEnvironment,
+      stdio: ['ignore', logFd, logFd],
+      shell: true,
+      windowsHide: true,
+      // POSIX needs a dedicated process group so a timeout can kill children.
+      detached: process.platform !== 'win32',
+    });
+    let settled = false;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      log(`TIMEOUT after ${formatDuration(COMMAND_TIMEOUT_MS)}: ${commandLine}`);
+      killProcessTree(child.pid);
+      // The tree kill should end the shell, but make sure `close` fires even
+      // when taskkill is unavailable or the direct child already exited.
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    }, COMMAND_TIMEOUT_MS);
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    child.on('error', (error) => {
+      finish(timedOut ? new Error(`${commandLine} timed out after ${formatDuration(COMMAND_TIMEOUT_MS)}`) : error);
+    });
+    child.on('close', (code, signal) => {
+      if (timedOut) {
+        finish(new Error(`${commandLine} timed out after ${formatDuration(COMMAND_TIMEOUT_MS)}`));
+        return;
+      }
+      if (code !== 0) {
+        finish(new Error(`${commandLine} exited with code ${code}${signal ? ` (signal ${signal})` : ''}`));
+        return;
+      }
+      finish();
+    });
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`${commandLine} exited with code ${result.status}`);
 }
 
 function capture(command, args) {
-  const result = spawnSync(command, args, { cwd: root, env: childEnvironment, encoding: 'utf8', windowsHide: true });
+  const result = spawnSync(command, args, {
+    cwd: root,
+    env: childEnvironment,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: COMMAND_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+  });
+  throwIfTimedOut(result, `${command} ${args.join(' ')}`);
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} exited with code ${result.status}: ${result.stderr}`);
   return result.stdout.trim();
+}
+
+function throwIfTimedOut(result, label) {
+  if (result.error?.code === 'ETIMEDOUT') {
+    throw new Error(`${label} timed out after ${formatDuration(COMMAND_TIMEOUT_MS)}`);
+  }
+}
+
+function formatDuration(milliseconds) {
+  return milliseconds >= 60000 ? `${Math.round(milliseconds / 60000)}m` : `${milliseconds}ms`;
+}
+
+// Windows' child.kill() only reaps cmd.exe; npm and pm2 run as grandchildren.
+function killProcessTree(pid) {
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    if (result.error) log(`taskkill failed: ${result.error.message}`);
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch (error) {
+    log(`process-group kill failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function log(line) {

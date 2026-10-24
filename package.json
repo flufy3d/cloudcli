@@ -281,10 +281,12 @@
     ]
   },
   "allowScripts": {
-    "better-sqlite3@12.11.1": true,
-    "bcrypt@6.0.0": true,
-    "esbuild@0.28.2": true,
-    "node-pty@1.2.0-beta.15": true,
-    "unrs-resolver@1.12.2": true
+    "@vscode/ripgrep": true,
+    "bcrypt": true,
+    "better-sqlite3": true,
+    "electron-winstaller": true,
+    "esbuild": true,
+    "node-pty": true,
+    "unrs-resolver": true
   }
 }
