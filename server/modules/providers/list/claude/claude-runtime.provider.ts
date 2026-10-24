@@ -49,6 +49,7 @@ export { createContextWindowCapture } from '@/modules/providers/services/claude-
 import { canonicalClaudeSubagentToolName, createCompleteMessage, createNormalizedMessage, resolveModelEffort } from '@/shared/utils.js';
 import type {
   ActiveBackgroundTask,
+  AnyRecord,
   NormalizedMessage,
   ProviderModelsDefinition,
   ProviderRuntimeContext,
@@ -2531,6 +2532,15 @@ export function getBackgroundTasksForSession(sessionId: string): ActiveBackgroun
 export const claudeRuntime = {
   run: queryClaudeSDK,
   abort: abortClaudeSDKSession,
+  /**
+   * Compacts the conversation through the CLI's own `/compact` local command,
+   * fed into the same held input stream a normal turn uses.
+   */
+  compact: (
+    options: AnyRecord,
+    writer: ProviderRuntimeWriter,
+    context: ProviderRuntimeContext,
+  ) => queryClaudeSDK('/compact', options, writer, context),
   permissions: {
     resolve: resolveToolApproval,
     listPending: getPendingApprovalsForSession,

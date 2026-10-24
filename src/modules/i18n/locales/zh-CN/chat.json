@@ -1,4 +1,17 @@
 {
+  "replay": {
+    "recoveryFailed": "聊天同步失败，正在自动重试，已有内容已保留。也可以刷新页面重试。"
+  },
+  "misc": {
+    "outputAssets": "结果附件（{{count}}）",
+    "fullOutput": "完整输出.txt",
+    "needsInput": "{{provider}} 需要你的输入",
+    "selectAllThatApply": "可多选",
+    "other": "其他…",
+    "back": "上一步",
+    "next": "下一步",
+    "submit": "提交"
+  },
   "codeBlock": {
     "copy": "复制",
     "copied": "已复制",
@@ -58,6 +71,22 @@
     "viewContent": "查看文件内容",
     "viewFullOutput": "查看完整输出（{{count}} 个字符）",
     "contentDisplayed": "文件内容显示在上面的差异视图中"
+  },
+  "bashEditDiff": {
+    "created": "已创建",
+    "updated": "已更新",
+    "deleted": "已删除",
+    "emptyFile": "空文件",
+    "moreLines_other": "… 还有 {{count}} 行",
+    "moreFiles_other": "… 另有 {{count}} 个文件已更改",
+    "filesNotShown_other": "{{count}} 个文件已更改（二进制、仅模式变更或过大无法显示）",
+    "filesUnavailable_other": "{{count}} 个文件已更改（无法获取差异）",
+    "filesChanged_other": "{{count}} 个文件已更改",
+    "morePaths_other": "另有 {{count}} 个",
+    "diffUnavailable": "（无法获取此命令的文件差异）",
+    "partUnavailable": "（部分差异无法获取）",
+    "skipped": "（已跳过此 git 命令的文件差异）",
+    "shared": "（同一时间有另一个命令在此仓库中运行；任一命令所做的更改都可能显示在任一结果下）"
   },
   "thinking": {
     "title": "思考中...",
@@ -136,7 +165,10 @@
       "label": "已排队",
       "willSend": "将在当前完成后发送",
       "edit": "编辑排队消息",
-      "delete": "删除排队消息"
+      "delete": "删除排队消息",
+      "willSendAfterBackground": "后台任务完成后将自动发送",
+      "forceSend": "立即发送，后台任务继续运行",
+      "forceSendButton": "立即发送"
     },
     "compactQueued": {
       "label": "压缩已排队",
@@ -161,7 +193,8 @@
       "opencode": "准备好使用带有 {{model}} 的 OpenCode。请在下方开始输入您的消息。",
       "default": "请在上方选择一个提供者以开始"
     },
-    "pressToSearch": "按 <kbd>{{shortcut}}</kbd> 搜索会话、文件和提交"
+    "pressToSearch": "按 <kbd>{{shortcut}}</kbd> 搜索会话、文件和提交",
+    "chooseModelDescriptionCustomOnly": "{{providers, list}} 仅列出您的模型"
   },
   "session": {
     "continue": {
@@ -184,7 +217,8 @@
     "status": {
       "newSession": "新会话",
       "initializing": "初始化中...",
-      "restarting": "重启中..."
+      "restarting": "重启中...",
+      "themeRestartHint": "重启以将新主题应用到 Claude Code"
     },
     "actions": {
       "disconnect": "断开连接",
@@ -231,6 +265,18 @@
     },
     "providers": {
       "assistant": "Assistant"
+    },
+    "queuedInEngine": "排队中——等引擎空闲",
+    "cancelQueued": "取消排队中的消息",
+    "cancelQueuedShort": "取消",
+    "queuedReporting": "排队中——引擎正在汇报，它结束后这一轮自动开始",
+    "backgroundWork": "后台工作",
+    "reportingBackground": "正在汇报后台结果",
+    "backgroundTask": {
+      "workflow": "工作流 {{name}}",
+      "agent": "子代理 {{description}}",
+      "command": "命令 {{description}}",
+      "count": "{{count}} 个任务"
     }
   },
   "projectSelection": {
@@ -248,17 +294,20 @@
     "editing": {
       "title": "正在替换先前的消息",
       "filesNotReverted": "已修改的文件不会被还原",
-      "filesReverted": "已修改的文件也会一并还原",
-      "cancel": "取消"
+      "cancel": "取消",
+      "filesReverted": "已修改的文件也会一并还原"
+    },
+    "backgroundTasks": {
+      "title": "后台任务运行中 ({{count}})",
+      "hint": "发送消息将排队，任务完成后自动发送",
+      "hintShort": "发送将排队",
+      "hintTurn": "发送消息将排队，本轮结束后发送",
+      "hintTurnShort": "本轮结束后发送",
+      "abort": "中止后台任务",
+      "abortButton": "中止",
+      "hintContinue": "可直接发送，后台任务继续运行",
+      "hintContinueShort": "可继续发送"
     }
-  },
-  "misc": {
-    "needsInput": "{{provider}} 需要你的输入",
-    "selectAllThatApply": "可多选",
-    "other": "其他…",
-    "back": "上一步",
-    "next": "下一步",
-    "submit": "提交"
   },
   "export": {
     "trigger": "导出对话",
@@ -298,9 +347,6 @@
     "inputTokens": "输入用量",
     "outputTokens": "输出用量",
     "contextWindow": "上下文窗口",
-    "contextUsage": "上下文占用",
-    "usedPercent": "已用 {{percent}}%",
-    "cumulativeTokens": "累计用量",
     "quotaTitle": "账号配额与速率限额",
     "updatedAt": "更新于 {{time}}",
     "refresh": "刷新",
@@ -316,7 +362,6 @@
     "expand": "展开查看",
     "fiveHourWindow": "5 小时滑动窗口限额",
     "weeklyWindow": "周配额",
-    "monthlyWindow": "月度配额",
     "cycleWindow": "周期调用限额",
     "cycleCallsDesc": "总计 {{total}} 次，剩余 {{remaining}} 次",
     "cycleGeneralDesc": "周期内模型与工具调用配额",
@@ -353,7 +398,11 @@
     "resetCardUnknown": "重置请求未确认，请先点「刷新」确认额度是否已恢复，请勿直接重试",
     "resetCardUnavailable": "{{count}} 张已使用或已过期",
     "resetCardRefreshing": "正在刷新配额…",
-    "resetCardWeeklyAlso5h": "重置周额度时会同步恢复 5 小时额度，不额外消耗 5 小时重置卡"
+    "resetCardWeeklyAlso5h": "重置周额度时会同步恢复 5 小时额度，不额外消耗 5 小时重置卡",
+    "contextUsage": "上下文占用",
+    "usedPercent": "已用 {{percent}}%",
+    "cumulativeTokens": "累计用量",
+    "monthlyWindow": "月度配额"
   },
   "localProxy": {
     "linkHint": "这个地址只存在于服务器本机，CloudCLI 将通过本地代理打开。",
@@ -362,5 +411,36 @@
   "memory": {
     "used_one": "引用了 {{count}} 条记忆",
     "used_other": "引用了 {{count}} 条记忆"
+  },
+  "subagent": {
+    "status": {
+      "running": "运行中",
+      "done": "完成",
+      "failed": "失败",
+      "noResult": "无结果"
+    },
+    "noResultHint": "这个 agent 结束时没有交回结果，停止前可能已经改动了部分文件。",
+    "tools_one": "{{count}} 次工具调用",
+    "tools_other": "{{count}} 次工具调用",
+    "task": "任务",
+    "result": "结果",
+    "steps_one": "{{count}} 步",
+    "steps_other": "{{count}} 步",
+    "showMore_one": "再显示 {{count}} 步",
+    "showMore_other": "再显示 {{count}} 步",
+    "showEarlier_one": "显示更早的 {{count}} 步",
+    "showEarlier_other": "显示更早的 {{count}} 步",
+    "notIncluded_one": "更早的 {{count}} 步未包含",
+    "notIncluded_other": "更早的 {{count}} 步未包含",
+    "askedBy": "来自子 agent：{{description}}"
+  },
+  "modelLibrary": {
+    "effortLevels": "推理级别",
+    "effortLevelsHint": "选择此模型支持的推理强度级别。若未选择任何级别，将无法在输入框中为此模型选择级别。",
+    "effortSummary": "推理：{{levels}}",
+    "customModelsOnly": "仅使用我的模型",
+    "customModelsOnlyHint": "在所有模型选择器中隐藏 {{provider}} 的内置模型，并将您的第一个模型设为默认模型。在您添加模型之前，内置模型仍会显示。",
+    "builtInModelsHidden": "开启“仅使用我的模型”时，这些模型不会出现在模型选择器中。",
+    "customModelsOnlyFailed": "无法更改此设置。"
   }
 }

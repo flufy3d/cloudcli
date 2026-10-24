@@ -596,6 +596,167 @@ test('Codex history closes a still-running subagent when its turn was aborted', 
   }
 });
 
+/**
+ * A turn the engine refused to run.
+ *
+ * The rollout records the cause on the record that closes the turn and
+ * nowhere else: no item carries it, so a reader that only walks the item
+ * stream keeps the prompt and loses the reason. The live stream showed the
+ * failure, and the transcript has to show it too — under the id the live row
+ * carries, so the persisted copy replaces it instead of doubling it.
+ */
+test('Codex history keeps the reason a turn failed', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-failed-turn-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-failed-turn-1';
+    const turnId = '01a0c4d2-a3fe-7330-bb87-5a99871777d0';
+    const failure = 'You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro).';
+    const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
+
+    await writeFile(transcriptPath, `${[
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } }),
+      JSON.stringify({ type: 'turn_context', payload: { turn_id: turnId } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: turnId,
+          item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'say hi' }] },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: turnId, error: { message: failure } },
+      }),
+    ].join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-failed-turn-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-failed-turn-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-failed-turn-1');
+      const errorRows = history.messages.filter((message) => message.kind === 'error');
+
+      assert.equal(errorRows.length, 1, 'the failure is one row of the transcript');
+      assert.equal(errorRows[0]?.content, failure, 'the engine\'s own words are the row');
+      assert.equal(
+        errorRows[0]?.id,
+        `${turnId}_error`,
+        'the row is named after the turn, so the live row of the same turn is replaced by this one',
+      );
+      assert.ok(
+        history.messages.some((message) => message.kind === 'text' && message.role === 'user'),
+        'the prompt the failed turn answered stays in the transcript',
+      );
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+/**
+ * One failure is one row.
+ *
+ * The engine closes a turn once, but a rollout can hold the same failure
+ * twice (a turn recorded again by a resumed process). Two rows with the same
+ * id would be two cards for one failure.
+ */
+test('Codex history writes one row for a failure recorded twice', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-failed-twice-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-failed-turn-3';
+    const turnId = '01a0c4d2-a3fe-7330-bb87-5a99871777d1';
+    const failure = 'You’ve hit your usage limit.';
+    const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
+
+    await writeFile(transcriptPath, `${[
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: turnId, error: { message: failure } },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: turnId, error: { message: failure } },
+      }),
+    ].join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-failed-turn-3', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-failed-turn-3', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-failed-turn-3');
+      const errorRows = history.messages.filter((message) => message.kind === 'error');
+
+      assert.equal(errorRows.length, 1, 'one failure is one row');
+      assert.equal(errorRows[0]?.id, `${turnId}_error`);
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A failure the engine recorded without naming the turn.
+ *
+ * The reason is the point of the row; the turn id only makes it joinable with
+ * the live copy. A record without one must still show the reason — a
+ * transcript that keeps the prompt and drops the reason is the very failure
+ * this row exists to prevent.
+ */
+test('Codex history keeps a failure that names no turn', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-failed-turn-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-failed-turn-2';
+    const failure = 'Selected model is at capacity. Please try a different model.';
+    const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
+
+    await writeFile(transcriptPath, `${[
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: { type: 'UserMessage', id: 'item-u2', content: [{ type: 'text', text: 'say hi' }] },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'task_complete', error: { message: failure } },
+      }),
+    ].join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-failed-turn-2', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-failed-turn-2', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-failed-turn-2');
+      const errorRows = history.messages.filter((message) => message.kind === 'error');
+
+      assert.equal(errorRows.length, 1, 'the reason survives even without a turn to name it');
+      assert.equal(errorRows[0]?.content, failure);
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 /** Writes a rollout whose only agent has a start record and no end record. */
 async function writeUnfinishedAgentRollout(tempRoot: string, workspacePath: string, providerSessionId: string): Promise<void> {
   const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
@@ -658,6 +819,46 @@ test('Codex history reads an agent with no end record as running while the runti
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+// The parent writes no end record when its own turn fails first; the agent's
+// own rollout still says how its last turn ended, and the live card settles
+// from that same turn.
+for (const [lastTurn, expected] of [
+  [{ type: 'task_complete', error: { message: 'You’ve hit your usage limit.', codex_error_info: 'usage_limit_exceeded' } }, 'failed'],
+  [{ type: 'task_complete', last_agent_message: 'done' }, 'completed'],
+  [{ type: 'turn_aborted', reason: 'interrupted' }, 'stopped'],
+] as const) {
+  test(`Codex history reads an untracked agent with no end record from its own last turn (${expected})`, { concurrency: false }, async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-last-turn-'));
+    const workspacePath = await createWorkspaceFixture();
+    const restoreHomeDir = patchHomeDir(tempRoot);
+
+    try {
+      await writeUnfinishedAgentRollout(tempRoot, workspacePath, 'codex-parent-last-turn');
+      // Beside the parent rollout, where `writeCodexTranscript` puts it.
+      const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+      await writeFile(path.join(sessionsDir, 'rollout-2026-07-07T00-00-00-codex-agent-open.jsonl'), `${[
+        JSON.stringify({ type: 'session_meta', payload: { id: 'codex-agent-open', agent_nickname: 'Open' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'agent-turn-1' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'agent-turn-1', last_agent_message: 'first' } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'agent-turn-2' } }),
+        JSON.stringify({ type: 'event_msg', payload: { ...lastTurn, turn_id: 'agent-turn-2' } }),
+      ].join('\n')}\n`, 'utf8');
+      await withIsolatedDatabase(async () => {
+        sessionsDb.createAppSession('app-parent-last-turn', 'codex', workspacePath);
+        sessionsDb.assignProviderSessionId('app-parent-last-turn', 'codex-parent-last-turn');
+        await new CodexSessionSynchronizer().synchronize();
+
+        const history = await new CodexSessionsProvider().fetchHistory('app-parent-last-turn');
+        const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
+        assert.equal(task?.subagent?.status, expected);
+      });
+    } finally {
+      restoreHomeDir();
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+}
 
 test('Codex memory citations are lifted out of the reply they trail', () => {
   const reply = [

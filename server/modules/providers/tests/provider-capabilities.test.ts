@@ -45,6 +45,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: false,
     supportsEffort: true,
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
     supportsMessageEditing: true,
     supportsSessionForking: true,
     // The Agent SDK processes `/compact` from the held input stream, which is
@@ -75,6 +76,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: false,
     supportsQuotaReset: false,
     supportsEffort: false,
+    effortLevels: [],
     supportsMessageEditing: false,
     supportsSessionForking: false,
     supportsCompaction: false,
@@ -102,6 +104,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: true,
     supportsEffort: true,
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     // `thread/fork` copies a thread up to a chosen turn; editing is that fork
     // plus a new prompt, which is how Codex's own IDE clients do it.
     supportsMessageEditing: true,
@@ -133,6 +136,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: false,
     supportsEffort: true,
+    effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
     // The service-client runtime carries no edit/rewind or fork path yet, so
     // neither capability is derived for this provider.
     supportsMessageEditing: false,
@@ -167,6 +171,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: true,
     supportsEffort: true,
+    effortLevels: ['low', 'high', 'max'],
     // No resolveEditAnchor/fork facets: transcripts are append-only for this
     // provider today.
     supportsMessageEditing: false,
@@ -196,6 +201,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuota: true,
     supportsQuotaReset: false,
     supportsEffort: true,
+    effortLevels: ['low', 'medium', 'high'],
     supportsMessageEditing: false,
     supportsSessionForking: false,
     // Verified against agy 1.1.x: print mode passes `/compact` through to the

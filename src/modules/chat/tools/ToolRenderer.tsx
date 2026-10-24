@@ -4,6 +4,7 @@ import type { DiffLine, Project,ToolStatus } from '@/shared/types';
 import { extractToolResultText, formatToolDisplayName, getMcpExecHint, getToolConfig, shouldHideToolResult } from '@/modules/chat/tools/configs/toolConfigs';
 import { OneLineDisplay } from '@/modules/chat/tools/OneLineDisplay';
 import { BashCommandDisplay } from '@/modules/chat/tools/BashCommandDisplay';
+import { BashEditDiff } from '@/modules/chat/tools/BashEditDiff';
 import { CollapsibleDisplay } from '@/modules/chat/tools/CollapsibleDisplay';
 import { ToolDiffViewer } from '@/modules/chat/tools/ToolDiffViewer';
 import { MarkdownContent } from '@/modules/chat/tools/ContentRenderers/MarkdownContent';
@@ -127,13 +128,23 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
         ? String(toolResult.content)
         : '';
     return (
-      <BashCommandDisplay
-        command={command}
-        description={description}
-        output={output}
-        isError={Boolean(toolResult?.isError)}
-        status={toolStatus !== 'completed' ? toolStatus : undefined}
-      />
+      <>
+        <BashCommandDisplay
+          command={command}
+          description={description}
+          output={output}
+          isError={Boolean(toolResult?.isError)}
+          status={toolStatus !== 'completed' ? toolStatus : undefined}
+          // Commands stay collapsed by default — including failures; the status
+          // badge marks errors and the output expands via the chevron.
+          defaultOpen={false}
+        />
+        <BashEditDiff
+          toolUseResult={toolResult?.toolUseResult}
+          onFileOpen={onFileOpen}
+          projectRoot={selectedProject?.fullPath}
+        />
+      </>
     );
   }
 

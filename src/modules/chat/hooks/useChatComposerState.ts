@@ -201,6 +201,17 @@ class ComposerSubmitError extends Error {}
  */
 const SESSION_TITLE_SOURCE_CHARS = 200;
 
+type SubmitOptions = {
+  /**
+   * Send the text as a chat message even when it starts with "/" (or is
+   * "help"). Set only for the re-submit of a custom command's expanded body:
+   * like the Claude Code CLI, that body is never read as a command again, so a
+   * body that opens with its own or another command's name cannot loop or
+   * run that command instead of being sent.
+   */
+  skipCommandInterception?: boolean;
+};
+
 const createFakeSubmitEvent = () => {
   return { preventDefault: () => undefined } as unknown as FormEvent<HTMLFormElement>;
 };
@@ -321,6 +332,7 @@ export function useChatComposerState({
       event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
       queuedSubmission?: QueuedDraft,
       isForced?: boolean,
+      submitOptions?: SubmitOptions,
     ) => Promise<boolean>) | null
   >(null);
   const inputValueRef = useRef(input);
@@ -481,9 +493,10 @@ export function useChatComposerState({
     updateInput(commandContent);
 
     // Defer submit to next tick so the command text is reflected in UI before dispatching.
+    // The expanded body is the message itself: it skips slash-command interception.
     setTimeout(() => {
       if (handleSubmitRef.current) {
-        handleSubmitRef.current(createFakeSubmitEvent());
+        handleSubmitRef.current(createFakeSubmitEvent(), undefined, undefined, { skipCommandInterception: true });
       }
     }, 0);
   }, [addMessage, updateInput]);
@@ -542,9 +555,17 @@ export function useChatComposerState({
 
       try {
         const effectiveInput = rawInput ?? input;
-        const commandMatch = effectiveInput.match(new RegExp(`${escapeRegExp(command.name)}\\s*(.*)`));
-        const args =
-          commandMatch && commandMatch[1] ? commandMatch[1].trim().split(/\s+/) : [];
+        // Everything typed after the command name is its argument text, line
+        // breaks included (`[\s\S]`, unlike `.`), trimmed as the Claude Code CLI
+        // does. `$ARGUMENTS` gets it verbatim; `$1`, `$2`, … get its tokens.
+        // The name must open the input and end at whitespace or the end: a pick
+        // from the slash menu passes the whole composer, where the name may
+        // appear later or inside a longer word ("see /echo2 …" has no arguments).
+        const commandMatch = effectiveInput
+          .trimStart()
+          .match(new RegExp(`^${escapeRegExp(command.name)}(?=\\s|$)([\\s\\S]*)`));
+        const rawArgs = commandMatch ? commandMatch[1].trim() : '';
+        const args = rawArgs ? rawArgs.split(/\s+/) : [];
 
         // The `/api/commands/execute` context sends `projectId` now instead of
         // a folder-derived project name; the path is still included verbatim.
@@ -566,6 +587,9 @@ export function useChatComposerState({
             commandName: command.name,
             commandPath: command.path,
             args,
+            // Multi-line argument text verbatim, so `$ARGUMENTS` keeps the
+            // line breaks the split tokens lose.
+            rawArgs,
             context,
           }),
         });
@@ -763,9 +787,12 @@ export function useChatComposerState({
   // backend accepting the message — uploading attachments and allocating the
   // session id both live there. The ref is the gate (readable synchronously,
   // so two clicks in the same tick cannot both pass); the state drives the
-  // button's spinner.
-  const submitInFlightRef = useRef(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  // button's spinner. Both are keyed by draft scope: a brand-new chat still
+  // waiting for its session id must not block a send from another session the
+  // user switched to meanwhile.
+  const submittingScopesRef = useRef(new Set<string>());
+  const [submittingScopes, setSubmittingScopes] = useState<ReadonlySet<string>>(() => new Set());
+  const isSubmitting = submittingScopes.has(draftScope ?? '');
 
   /**
    * Empties everything the composer shows about the message being submitted.
@@ -843,6 +870,7 @@ export function useChatComposerState({
       event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
       queuedSubmission?: QueuedDraft,
       isForced?: boolean,
+      submitOptions?: SubmitOptions,
     ): Promise<boolean> => {
       event.preventDefault();
       const currentInput = queuedSubmission?.content ?? inputValueRef.current;
@@ -864,11 +892,17 @@ export function useChatComposerState({
       // duplicate re-ran the whole path, and because the session id is only
       // known once the first POST returns, each repeat allocated its own
       // conversation.
-      if (submitInFlightRef.current) {
+      // The scopes are captured, not re-read: a new chat's scope switches from
+      // `project:<id>` to its session id when the id lands mid-submit. That id
+      // joins the held scopes below, so the chat stays latched under its new
+      // scope too, and the release frees exactly what was taken.
+      const submitScope = draftScope ?? '';
+      if (submittingScopesRef.current.has(submitScope)) {
         return false;
       }
-      submitInFlightRef.current = true;
-      setIsSubmitting(true);
+      const heldScopes = [submitScope];
+      submittingScopesRef.current.add(submitScope);
+      setSubmittingScopes(new Set(submittingScopesRef.current));
       // The one send identity the backend dedupes on. It covers what the latch
       // cannot: a retried fetch, or a second tab replaying the same submit.
       const clientRequestId = createClientRequestId();
@@ -886,11 +920,13 @@ export function useChatComposerState({
         // Pure local commands (built-in modals, help, etc.) execute immediately without queueing.
         const commandInput = currentInput.trimEnd();
         const isHelpAlias = commandInput.trim().toLowerCase() === 'help';
-        if (commandInput.startsWith('/') || isHelpAlias) {
-          const firstSpace = commandInput.indexOf(' ');
+        if (!submitOptions?.skipCommandInterception && (commandInput.startsWith('/') || isHelpAlias)) {
+          // The name ends at the first whitespace of any kind, so "/cmd" followed
+          // by a line break still runs /cmd (the Claude Code CLI splits the same way).
+          const firstWhitespace = commandInput.search(/\s/);
           const commandName = isHelpAlias
             ? '/help'
-            : firstSpace > 0 ? commandInput.slice(0, firstSpace) : commandInput;
+            : firstWhitespace > 0 ? commandInput.slice(0, firstWhitespace) : commandInput;
           const matchedCommand =
             slashCommands.find((cmd: SlashCommand) => cmd.name === commandName) ||
             (commandName === '/help'
@@ -1050,6 +1086,10 @@ export function useChatComposerState({
             throw new ComposerSubmitError('Failed to start a new session: no session id returned.');
           }
 
+          heldScopes.push(targetSessionId);
+          submittingScopesRef.current.add(targetSessionId);
+          setSubmittingScopes(new Set(submittingScopesRef.current));
+
           onSessionEstablished?.(targetSessionId, {
             provider,
             project: selectedProject,
@@ -1122,8 +1162,10 @@ export function useChatComposerState({
           timestamp: new Date(),
         });
       } finally {
-        submitInFlightRef.current = false;
-        setIsSubmitting(false);
+        for (const scope of heldScopes) {
+          submittingScopesRef.current.delete(scope);
+        }
+        setSubmittingScopes(new Set(submittingScopesRef.current));
       }
 
       return true;
@@ -1145,6 +1187,7 @@ export function useChatComposerState({
       selectedProject,
       sendMessage,
       sessionKey,
+      draftScope,
       addMessage,
       slashCommands,
     ],

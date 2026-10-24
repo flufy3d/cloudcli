@@ -71,6 +71,12 @@ export type ProviderCatalogEntry = {
    * by the capability tests).
    */
   inputWhileBusy: ProviderInputWhileBusy;
+  /**
+   * Reasoning-effort levels the runtime can pass on, weakest first, and so the
+   * levels a custom model-library entry may declare. Empty exactly when
+   * `supportsEffort` is false.
+   */
+  effortLevels: readonly string[];
 };
 
 export const PROVIDER_CATALOG = {
@@ -87,6 +93,7 @@ export const PROVIDER_CATALOG = {
     supportsNativeScheduling: true,
     editRevertsFiles: false,
     inputWhileBusy: 'background',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -99,6 +106,7 @@ export const PROVIDER_CATALOG = {
     supportsNativeScheduling: false,
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
+    effortLevels: [],
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -111,6 +119,7 @@ export const PROVIDER_CATALOG = {
     supportsNativeScheduling: false,
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
   },
   opencode: {
     // Mapped by the runtime onto the service: the read-only `plan` agent
@@ -129,6 +138,9 @@ export const PROVIDER_CATALOG = {
     // composer never opens the edit flow for this provider.
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
+    // Passed on as OpenCode's `--variant`. `thinking` (MiniMax's on/off
+    // variant, paired with `none`) is not a strength, so it sorts last.
+    effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
   },
   zcode: {
     // Mapped by the runtime onto ZCode's session/setMode modes: build
@@ -148,6 +160,7 @@ export const PROVIDER_CATALOG = {
     supportsNativeScheduling: false,
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
+    effortLevels: ['low', 'high', 'max'],
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -160,5 +173,6 @@ export const PROVIDER_CATALOG = {
     supportsNativeScheduling: false,
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
+    effortLevels: ['low', 'medium', 'high'],
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;

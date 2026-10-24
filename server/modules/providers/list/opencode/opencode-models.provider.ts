@@ -148,8 +148,28 @@ const readConnectedOpenCodeProviderIds = async (): Promise<Set<string> | null> =
     }
   }
 
+  const configs: Array<Record<string, unknown> | null> = [];
   for (const configFile of OPENCODE_CONFIG_FILES) {
-    const config = await readOpenCodeJsonFile(path.join(configDir, configFile));
+    configs.push(await readOpenCodeJsonFile(path.join(configDir, configFile)));
+  }
+
+  // Custom config passed through OPENCODE_CONFIG (a file path) or
+  // OPENCODE_CONFIG_CONTENT (inline JSON) is read too, so providers declared
+  // there are not filtered out of the CLI listing.
+  const customConfigPath = readOptionalString(process.env.OPENCODE_CONFIG);
+  if (customConfigPath) {
+    configs.push(await readOpenCodeJsonFile(customConfigPath));
+  }
+  const inlineConfig = readOptionalString(process.env.OPENCODE_CONFIG_CONTENT);
+  if (inlineConfig) {
+    try {
+      configs.push(readObjectRecord(JSON.parse(inlineConfig)));
+    } catch {
+      // Malformed inline config contributes nothing, like an unreadable file.
+    }
+  }
+
+  for (const config of configs) {
     for (const providerId of Object.keys(readObjectRecord(config?.provider) ?? {})) {
       providerIds.add(providerId);
     }

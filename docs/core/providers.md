@@ -363,3 +363,9 @@ id 必须字节相同。** 这条有两道闸门守着：
 - **全仓散落的引擎清单**：除上述契约点外，历史上有过 6 处硬编码 6 家列表/能力表的地方（MCP scopes、公开 API 文档 `public/api-docs.html` 的 `PROVIDER_ORDER` 等）。新增引擎后 `grep -rn "antigravity" src server public --include='*.ts' --include='*.tsx' --include='*.html' -l` 扫一遍清单类常量，防止新引擎被隐藏。
 - `sessions`（运行时事件归一化/历史分页）与 `sessionSynchronizer`（落盘索引）是两个关注点，别混在一个类里。
 - 归一化消息 id 必须唯一：一个原生事件拆多个 part 时要加判别后缀；分页契约 `limit: null` = 全量、`limit: 0` = 空页。
+
+## 模型库：推理档位与"只用我的模型"
+
+`effortLevels` 是每家引擎能透传的推理档位（弱→强，空数组当且仅当 `supportsEffort` 为 false），也是自定义模型条目可声明的档位集合——`provider-capabilities.test.ts` 钉住"预定义模型声明过的档位都在集合内"。目录本身仍由各引擎提供（`codex-models.provider.ts` 读 app-server、`opencode-models.provider.ts` 发现已连接 provider 的模型、其余静态表），`provider-models.service.ts` 把用户自定义模型合并上去：同 id 只显示一项（保留自定义名称并继承引擎推理强度），删除仅存在于自定义记录里的型号才切回默认。
+
+"只用我的模型"（`setCustomModelsOnly`，存 `provider_models` 配置键）把内置型号从所有选择器里隐藏，并让第一份自定义模型成为默认值；在添加任何自定义模型之前内置型号照旧列出。`resolveResumeModel` 还会把会话行里丢过前缀的裸模型 id（`deepseek-v4.1-flash`）按目录唯一后缀还原成 `<provider>/<model>`，否则 `--model` 会被引擎当成 provider id 读而直接失败。

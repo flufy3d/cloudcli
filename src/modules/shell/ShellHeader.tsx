@@ -1,4 +1,4 @@
-import { RotateCcw, Shield, ShieldOff, X } from 'lucide-react';
+import { Palette, RotateCcw, Shield, ShieldOff, X } from 'lucide-react';
 
 type ShellHeaderProps = {
   isConnected: boolean;
@@ -11,6 +11,8 @@ type ShellHeaderProps = {
   statusNewSessionText: string;
   statusInitializingText: string;
   statusRestartingText: string;
+  showThemeRestartHint: boolean;
+  themeRestartHintText: string;
   disconnectLabel: string;
   disconnectTitle: string;
   restartLabel: string;
@@ -23,7 +25,7 @@ type ShellHeaderProps = {
   bypassTitle: string;
 };
 
-/** Rendered by Shell above the terminal to show connection status and the restart/disconnect actions. */
+/** Rendered by Shell above the terminal to show connection status, the restart/disconnect actions and the theme restart hint. */
 export default function ShellHeader({
   isConnected,
   isInitialized,
@@ -35,6 +37,8 @@ export default function ShellHeader({
   statusNewSessionText,
   statusInitializingText,
   statusRestartingText,
+  showThemeRestartHint,
+  themeRestartHintText,
   disconnectLabel,
   disconnectTitle,
   restartLabel,
@@ -75,8 +79,8 @@ export default function ShellHeader({
               aria-pressed={bypassEnabled}
               className={`inline-flex h-8 flex-shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-3 text-xs font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 ${
                 bypassEnabled
-                  ? 'border-orange-500/70 bg-orange-600/80 text-white hover:bg-orange-700 focus:ring-orange-400/70'
-                  : 'border-gray-600/80 bg-gray-700/70 text-gray-100 hover:border-orange-400/70 hover:bg-orange-600/60 hover:text-white focus:ring-orange-400/70'
+                  ? 'border-orange-700 bg-orange-700 text-white hover:bg-orange-800 focus:ring-orange-400/70 dark:border-orange-500/70 dark:bg-orange-600/80 dark:hover:bg-orange-700'
+                  : 'border-input bg-background text-foreground shadow-sm hover:border-orange-700 hover:bg-orange-700 hover:text-white focus:ring-orange-400/70 dark:hover:border-orange-400/70 dark:hover:bg-orange-600/60'
               }`}
               title={bypassTitle}
             >
@@ -113,6 +117,14 @@ export default function ShellHeader({
           </button>
         </div>
       </div>
+
+      {/* A running Claude CLI keeps the theme it was launched in; Restart applies the new one. */}
+      {showThemeRestartHint && (
+        <p role="status" className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Palette className="h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
+          <span>{themeRestartHintText}</span>
+        </p>
+      )}
     </div>
   );
 }

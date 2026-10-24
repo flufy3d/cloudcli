@@ -62,6 +62,7 @@ describe('Shell i18n provider interpolation', () => {
       isConnected: false,
       isInitialized: true,
       isConnecting: true,
+        isClaudeThemeOutdated: false,
       connectToShell: vi.fn(),
       disconnectFromShell: vi.fn(),
     });
@@ -86,6 +87,7 @@ describe('Shell i18n provider interpolation', () => {
       isConnected: false,
       isInitialized: true,
       isConnecting: false,
+        isClaudeThemeOutdated: false,
       connectToShell: vi.fn(),
       disconnectFromShell: vi.fn(),
     });

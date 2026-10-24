@@ -56,6 +56,11 @@ import {
   readCodexSubagentLabel,
   type CodexThreadItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
+import {
+  codexTurnFailureRowId,
+  readCodexFailureMessage,
+  readCodexReportedTurnId,
+} from '@/modules/providers/list/codex/codex-turn-error.js';
 import { createBackgroundTasksStatusMessage, createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
 import { codexSessionTitleService } from '@/modules/providers/services/codex-session-title.service.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
@@ -78,7 +83,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
-import type { NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
+import type { BackgroundTaskSummary, NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
 
 const TASK_MCP_NAME = CODEX_TASK_MCP_NAME;
 const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
@@ -433,6 +438,12 @@ function emitCodexSubagentActivity(
       broadcastCodexBackgroundTasks(target, backgroundWorkKey);
     }
     target.deliver(codexTaskStatus(messageSessionId, taskId, item.id, { event: 'started', description }));
+    // An agent that fails at once (the usage limit, say) can end its turn
+    // before the parent records the spawn.
+    const ended = codexAgentTurns.get(taskId)?.ended;
+    if (backgroundWorkKey && ended?.sessionKey === backgroundWorkKey) {
+      settleCodexAgentTurn(target, backgroundWorkKey, taskId, ended);
+    }
     return;
   }
 
@@ -445,10 +456,132 @@ function emitCodexSubagentActivity(
   if (!backgroundWorkKey || !tracked) {
     return;
   }
+  retireCodexAgent(backgroundWorkKey, tracked);
   broadcastCodexBackgroundTasks(target, backgroundWorkKey);
   target.deliver(codexTaskStatus(messageSessionId, tracked.taskId, tracked.toolUseId, {
     event: 'notification',
     status: item.activity === 'completed' ? 'completed' : 'stopped',
+  }));
+}
+
+/** How an agent's last turn ended, as its card shows it. */
+type CodexAgentTurnEnd = { status: 'completed' | 'failed' | 'stopped'; summary?: string };
+
+/**
+ * What each agent thread's own turns last did, keyed by agent thread id.
+ *
+ * An agent works in turns on its own thread, and the parent can wake it for
+ * another turn after the last one ended. `ended` is the outcome of the
+ * agent's last turn, cleared when its next turn starts; `retired` is the card
+ * of an agent that is idle, kept so a woken agent runs on the card it was
+ * spawned with. The parent's spawn record often arrives after the agent's
+ * own turn already ended (a resident session holds the parent's events until
+ * it knows their round, and an agent's events go out at once), so a spawn
+ * record that finds `ended` settles the card at once. When the parent records
+ * a wake before the agent's turn starts, the card settles and runs again at
+ * the turn's start. One slot per thread is enough: an agent thread belongs
+ * to the parent thread that spawned it, and so to one conversation. Bounded,
+ * because nothing reports that an agent is gone for good.
+ */
+const codexAgentTurns = new Map<string, {
+  ended?: CodexAgentTurnEnd & { sessionKey: string };
+  retired?: { sessionKey: string; task: BackgroundTaskSummary };
+}>();
+const MAX_TRACKED_CODEX_AGENT_THREADS = 500;
+
+function rememberCodexAgentTurn(agentThreadId: string, state: NonNullable<ReturnType<typeof codexAgentTurns.get>>): void {
+  codexAgentTurns.delete(agentThreadId);
+  codexAgentTurns.set(agentThreadId, state);
+  if (codexAgentTurns.size > MAX_TRACKED_CODEX_AGENT_THREADS) {
+    const oldest = codexAgentTurns.keys().next().value;
+    if (oldest !== undefined) codexAgentTurns.delete(oldest);
+  }
+}
+
+/** Keeps the card of an agent that went idle, so waking it can revive the card. */
+function retireCodexAgent(sessionKey: string, task: BackgroundTaskSummary): void {
+  rememberCodexAgentTurn(task.taskId, { ...codexAgentTurns.get(task.taskId), retired: { sessionKey, task } });
+}
+
+/** Ends a tracked agent whose own turn ended, and settles its card with that outcome. */
+function settleCodexAgentTurn(
+  target: CodexEventTarget,
+  backgroundWorkKey: string,
+  agentThreadId: string,
+  ended: CodexAgentTurnEnd,
+): void {
+  const tracked = codexBackgroundWork.end(backgroundWorkKey, agentThreadId);
+  if (!tracked) {
+    return;
+  }
+  retireCodexAgent(backgroundWorkKey, tracked);
+  broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+  target.deliver(codexTaskStatus(target.threadId() || target.appSessionId || null, tracked.taskId, tracked.toolUseId, {
+    event: 'notification',
+    status: ended.status,
+    ...(ended.summary ? { summary: ended.summary } : {}),
+  }));
+}
+
+/**
+ * Follows the turns an agent runs on its own thread.
+ *
+ * The engine reports an agent's end only in the parent's records, written when
+ * the parent waits on it; a parent turn that fails first (the usage limit, for
+ * one) never writes them, and the agent would show as running forever. The
+ * agent's own turn is what says whether it runs: the end of the turn settles
+ * the card with the turn's outcome, and a later turn of the same agent runs
+ * on that card again.
+ */
+function trackCodexAgentTurn(
+  target: CodexEventTarget,
+  method: string,
+  params: AnyRecord,
+  agentThreadId: string,
+  backgroundWorkKey: string | null | undefined,
+): void {
+  if (method !== 'turn/started' && method !== 'turn/completed') {
+    return;
+  }
+  const turn = readObjectRecord(params.turn);
+  if (method === 'turn/completed') {
+    const status = turn?.status === 'failed' ? 'failed' : turn?.status === 'interrupted' ? 'stopped' : 'completed';
+    const summary = readNonEmptyString(readObjectRecord(turn?.error)?.message);
+    console.log(`[Codex] Agent thread ${agentThreadId} ended a turn (${String(turn?.status ?? 'unknown')}).`);
+    const ended: CodexAgentTurnEnd = { status, ...(summary ? { summary } : {}) };
+    if (!backgroundWorkKey) {
+      return;
+    }
+    rememberCodexAgentTurn(agentThreadId, {
+      ...codexAgentTurns.get(agentThreadId),
+      ended: { ...ended, sessionKey: backgroundWorkKey },
+    });
+    const owner = codexBackgroundWork.find(agentThreadId);
+    if (owner?.sessionKey === backgroundWorkKey) {
+      settleCodexAgentTurn(target, backgroundWorkKey, agentThreadId, ended);
+    }
+    return;
+  }
+
+  console.log(`[Codex] Agent thread ${agentThreadId} started a turn.`);
+  const state = codexAgentTurns.get(agentThreadId);
+  if (!state) {
+    return;
+  }
+  const retired = state.retired;
+  // A new turn makes the end of the last one stale.
+  rememberCodexAgentTurn(agentThreadId, retired ? { retired } : {});
+  if (!retired || !backgroundWorkKey || retired.sessionKey !== backgroundWorkKey
+    || codexBackgroundWork.get(backgroundWorkKey, agentThreadId)) {
+    return;
+  }
+  codexAgentTurns.delete(agentThreadId);
+  const { taskId, toolUseId, taskType, description } = retired.task;
+  codexBackgroundWork.start(backgroundWorkKey, { taskId, toolUseId, taskType, description });
+  broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+  target.deliver(codexTaskStatus(target.threadId() || target.appSessionId || null, taskId, toolUseId, {
+    event: 'started',
+    description,
   }));
 }
 
@@ -556,6 +689,7 @@ function handleCodexSessionEvent(
     if (method === 'item/completed') {
       emitCodexAgentItem(target, eventThreadId, params.item, new Date().toISOString(), backgroundWorkKey);
     }
+    trackCodexAgentTurn(target, method, params, eventThreadId, backgroundWorkKey);
     return;
   }
 
@@ -607,10 +741,20 @@ function handleCodexSessionEvent(
     }
 
     case 'error': {
-      const error = readObjectRecord(params.error);
-      const message = readNonEmptyString(error?.message)?.trim() || readNonEmptyString(params.message)?.trim();
+      const message = readCodexFailureMessage({ error: params.error, message: params.message });
+      const turnId = readCodexReportedTurnId(params);
+      if (params.willRetry === true) {
+        // A recoverable error is progress, not a failed turn — the engine is
+        // still trying. The round's handler says the same about the round's
+        // own notifications, and a row here would outlive the retry.
+        console.warn('[Codex] Retrying turn:', message);
+        return;
+      }
       if (message) {
         target.deliver(createNormalizedMessage({
+          // The turn id names the failure on both transports, so the row the
+          // history read returns replaces this one.
+          ...(turnId ? { id: codexTurnFailureRowId(turnId) } : {}),
           kind: 'error',
           content: message,
           sessionId,
@@ -639,6 +783,7 @@ function settleCodexSessionAgents(
   if (outstanding.length === 0) {
     return;
   }
+  for (const task of outstanding) retireCodexAgent(appSessionId, task);
   deliver(createBackgroundTasksStatusMessage(
     { provider: 'codex', sessionId: appSessionId },
     codexBackgroundWork.listStripTasks(appSessionId),
@@ -806,13 +951,17 @@ async function queryCodex(
   const currentSession = () => runSession;
 
   // Both `error` and `turn/completed` can report the same terminal cause.
-  const surfaceFailure = (message: string): void => {
+  const surfaceFailure = (message: string, turnId?: string | null): void => {
     if (errorSurfaced && terminalFailure?.message === message) {
       return;
     }
     terminalFailure = { message };
     errorSurfaced = true;
     sendMessage(ws, createNormalizedMessage({
+      // A failure belongs to a turn, and the engine names that turn. The row
+      // id is derived from it so the copy the history read returns replaces
+      // this one instead of the transcript showing the failure twice.
+      ...(turnId ? { id: codexTurnFailureRowId(turnId) } : {}),
       kind: 'error',
       content: message,
       sessionId: capturedSessionId || sessionId || null,
@@ -900,6 +1049,7 @@ async function queryCodex(
     if (outstanding.length === 0) {
       return;
     }
+    for (const task of outstanding) retireCodexAgent(backgroundWorkKey, task);
     broadcastBackgroundTasks(backgroundWorkKey);
     for (const task of outstanding) {
       sendMessage(ws, codexTaskStatus(capturedSessionId || sessionId || null, task.taskId, task.toolUseId, {
@@ -1154,6 +1304,7 @@ async function queryCodex(
       if (method === 'item/completed') {
         emitAgentItem(eventThreadId, params.item, new Date().toISOString());
       }
+      trackCodexAgentTurn(roundTarget, method, params, eventThreadId, sessionId || capturedSessionId);
       return;
     }
 
@@ -1222,9 +1373,7 @@ async function queryCodex(
       }
 
       case 'error': {
-        const error = readObjectRecord(params.error);
-        const message = readNonEmptyString(error?.message)?.trim()
-          || readNonEmptyString(params.message)?.trim()
+        const message = readCodexFailureMessage({ error: params.error, message: params.message })
           || 'Codex reported an error.';
         // A recoverable stream error is progress, not a failed turn. Keep
         // its cause in logs without adding a permanent chat error row.
@@ -1232,7 +1381,7 @@ async function queryCodex(
           console.warn('[Codex] Retrying turn:', message);
           return;
         }
-        surfaceFailure(message);
+        surfaceFailure(message, readCodexReportedTurnId(params));
         return;
       }
 
@@ -1247,9 +1396,8 @@ async function queryCodex(
               ? 'interrupted'
               : 'unknown';
         if (turn?.status === 'failed') {
-          const error = readObjectRecord(turn.error);
-          const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
-          surfaceFailure(message);
+          const message = readCodexFailureMessage({ error: turn.error }) || terminalFailure?.message || 'Turn failed';
+          surfaceFailure(message, readCodexReportedTurnId(params) ?? engineTurnId);
           notifyRunFailed({
             userId: normalizedUserId,
             provider: 'codex',
@@ -1269,6 +1417,9 @@ async function queryCodex(
           // as a success. A stop the user asked for (`abort` already flagged
           // the session) arrives as the same status and must stay silent.
           const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
+          // No turn id here: an interrupted turn is recorded as an abort, and
+          // an abort carries no cause for a failure row to be named after — a
+          // row named after it would claim a join the transcript cannot make.
           surfaceFailure(message);
           notifyRunFailed({
             userId: normalizedUserId,
@@ -1651,7 +1802,10 @@ async function queryCodex(
         releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
       } else if (!appSessionId && residentGeneration !== null) {
         // A run without an app session has no conversation to stay resident
-        // for, so its process is closed with the round.
+        // for, so its process is closed with the round. Its agents are
+        // tracked under the native thread id, which the disposal does not
+        // clear, so they are settled here.
+        settleOutstandingAgents();
         releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
       } else if (residentGeneration !== null) {
         releaseCodexResidentSession(residentKey, { generation: residentGeneration });
@@ -1680,6 +1834,28 @@ async function queryCodex(
 }
 
 /**
+ * Stops the work a conversation still runs after its round ended.
+ *
+ * The engine names no agent it could stop, and it never reports the end of
+ * an agent whose parent turn failed, so the process is closed: closing it
+ * settles the agents as stopped through the session's disposal. The next
+ * message resumes the thread in a new process.
+ */
+function stopCodexBackgroundWork(sessionId: string): boolean {
+  const activity = readCodexResidentSessionActivity(sessionId);
+  // Without a live process there is nothing to close; a short connection
+  // settles its agents when its round ends.
+  if (!activity || (!activity.reporting && !codexBackgroundWork.hasSession(sessionId))) {
+    return false;
+  }
+  console.log(`[Codex] Stopping the background work of session ${sessionId} by closing its process.`);
+  // The same release as an archive, so a helper process of the conversation
+  // cannot keep holding its thread.
+  releaseCodexResidentSessionResources(sessionId);
+  return true;
+}
+
+/**
  * Cancels an active Codex session.
  *
  * `turn/interrupt` is the graceful stop — it lets the server close the turn
@@ -1689,10 +1865,16 @@ async function queryCodex(
 async function abortCodexSession(sessionId: string): Promise<boolean> {
   const session = activeCodexSessions.get(sessionId);
 
-  // A session whose round is over has nothing to stop: the entry stays for
-  // the diagnostics, but a stop must not report success for a round that
-  // already ended.
-  if (!session || session.status !== 'running') {
+  // A session whose round is over has no turn to interrupt, but its resident
+  // process may still run agents or a report of its own; that is stopped
+  // instead. Otherwise there is nothing to stop, and a stop must not report
+  // success for a round that already ended.
+  if (!session || session.status === 'completed') {
+    return stopCodexBackgroundWork(sessionId);
+  }
+  // A stop already waits for the engine to confirm the interrupt; a repeated
+  // press must not cut that short by closing the process.
+  if (session.status !== 'running') {
     return false;
   }
 
@@ -1719,6 +1901,31 @@ async function abortCodexSession(sessionId: string): Promise<boolean> {
 export const codexRuntime = {
   run: queryCodex,
   abort: abortCodexSession,
+  /**
+   * Compacts the thread through the app-server primitive the Codex IDE clients
+   * use: `thread/compact/start`, waited out until the summary lands.
+   */
+  async compact(
+    options: AnyRecord,
+    writer: ProviderRuntimeWriter,
+    context: ProviderRuntimeContext,
+  ): Promise<unknown> {
+    const appSessionId = typeof options.sessionId === 'string' ? options.sessionId : null;
+    const providerSessionId = context.resolveProviderSessionId(appSessionId);
+    if (!providerSessionId) {
+      throw new Error('This Codex session has no stored conversation to compact yet.');
+    }
+
+    sendMessage(writer, createNormalizedMessage({
+      kind: 'status',
+      text: 'Compacting context…',
+      sessionId: appSessionId,
+      provider: 'codex',
+    }));
+
+    await codexAppServer.compactThread({ threadId: providerSessionId });
+    return undefined;
+  },
   permissions: {
     /**
      * Answers one approval. The gateway fans a decision out to every
