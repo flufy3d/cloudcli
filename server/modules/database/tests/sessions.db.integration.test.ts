@@ -240,8 +240,7 @@ test('updateSessionCustomName only locks when asked', async () => {
   });
 });
 
-test('createForkedSession locks the name only when the user typed one', async () => {
-  await withIsolatedDatabase(() => {
+test('createForkedSession locks the name only when the user typed one', async () => {  await withIsolatedDatabase(() => {
     const baseInput = {
       sessionId: 'unused',
       provider: 'claude',
@@ -259,6 +258,28 @@ test('createForkedSession locks the name only when the user typed one', async ()
 
     assert.equal(sessionsDb.getSessionById('fork-user-title')?.name_locked, 1);
     assert.equal(sessionsDb.getSessionById('fork-auto-title')?.name_locked, 0);
+  });
+});
+
+test('a fork inherits the window the branched conversation was measured against', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createForkedSession({
+      sessionId: 'fork-with-window',
+      provider: 'claude',
+      projectPath: '/workspace/demo-project',
+      customName: 'Fork',
+      nameLocked: false,
+      providerSessionId: 'prov-fork-window',
+      jsonlPath: '/transcripts/fork-window.jsonl',
+      forkedFromSessionId: 'source-session',
+      model: 'opus[1m]',
+      effort: null,
+      contextWindow: 1_000_000,
+    });
+
+    // Without this the page's first reading falls back to a 200k default and
+    // draws 5x the real occupancy until the first turn ends.
+    assert.equal(sessionsDb.getSessionById('fork-with-window')?.context_window, 1_000_000);
   });
 });
 
