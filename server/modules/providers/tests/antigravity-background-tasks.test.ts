@@ -361,3 +361,221 @@ test('an agent\'s last steps arrive before its card settles and before the turn 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+
+test('a formal agent report retires only that agent while its parent keeps working', async () => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const first = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
+  const second = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb';
+  const parent = 'conv-report';
+  await withChildTranscripts({ [parent]: 'normal', [first]: 'normal', [second]: 'error' }, async () => {
+    const file = path.join(process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR!, 'brain', parent, '.system_generated', 'logs', 'transcript.jsonl');
+    const report = `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-23T00:00:00Z sender=${first} priority=MESSAGE_PRIORITY_LOW content=approved\n</SYSTEM_MESSAGE>`;
+    // Ordinary parent prose and a child's DONE planner response are not completion receipts.
+    await fs.writeFile(file, JSON.stringify({ step_index: 0, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'The review is approved.' }) + '\n');
+    await withStub([
+      { event: 'init', conversation_id: parent, init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', [first, second]), conversation_id: parent }),
+      step({ conversation_id: parent, step_index: 3, state: 'DONE', step_type: 'system_message' }),
+      5000,
+      step({ ...subagentStep('DONE', [first, second]), conversation_id: parent }),
+    ], async () => {
+      const { runtime, sent, done, waitForCard } = await createRun(parent);
+      try {
+        await waitForCard();
+        await new Promise((resolve) => setTimeout(resolve, 2200));
+        assert.equal(runtime.backgroundTasks.list(parent).length, 2, 'neither prose nor an unaddressed system notification finishes an agent');
+        await fs.appendFile(file, JSON.stringify({ step_index: 4, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: report }) + '\n');
+        const deadline = Date.now() + 4000;
+        while (runtime.backgroundTasks.list(parent).length === 2 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.deepEqual(runtime.backgroundTasks.list(parent).map((task) => task.id), [`tool_2:${second}`], 'a returned review must disappear before the parent turn ends');
+        assert.equal(sent.some((msg) => msg.kind === 'complete'), false, 'the parent is still working');
+        const notices = taskStatuses(sent).filter((msg) => msg.event === 'notification');
+        assert.deepEqual(notices.map((msg) => [msg.taskId, msg.status]), [[first, 'completed']]);
+        const finalStep = sent.findIndex((msg) => msg.parentToolUseId === `tool_2:${first}` && msg.content === 'Done.');
+        assert.ok(finalStep >= 0 && finalStep < sent.indexOf(notices[0]), 'final child activity precedes its completion');
+        const strips = sent.filter((msg) => msg.kind === 'status' && msg.text === 'background_tasks');
+        assert.deepEqual(strips.at(-1).backgroundTasks.map((task: any) => task.id), [`tool_2:${second}`]);
+        // Repeated receipts must not emit duplicate terminal notifications.
+        await fs.appendFile(file, JSON.stringify({ step_index: 5, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: report }) + '\n');
+        await new Promise((resolve) => setTimeout(resolve, 2200));
+        assert.equal(taskStatuses(sent).filter((msg) => msg.event === 'notification').length, 1);
+        assert.equal(taskStatuses(sent).filter((msg) => msg.event === 'started' && msg.taskId === first).length, 1, 'a replayed launch cannot resurrect a completed agent');
+      } finally {
+        await runtime.abort(parent);
+        await done;
+      }
+      assert.deepEqual(taskStatuses(sent).filter((msg) => msg.event === 'notification').map((msg) => [msg.taskId, msg.status]), [[first, 'completed'], [second, 'stopped']], 'abort only settles the agent still outstanding');
+    }, false);
+  });
+});
+
+
+test('reports in a delayed full transcript retire every agent before a successful parent result', async () => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const id = 'cccccccc-3333-4333-8333-cccccccccccc';
+  const parent = 'conv-full-report';
+  await withChildTranscripts({ [parent]: 'normal' }, async () => {
+    const compact = path.join(process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR!, 'brain', parent, '.system_generated', 'logs', 'transcript.jsonl');
+    const full = path.join(path.dirname(compact), 'transcript_full.jsonl');
+    const report = `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-23T00:00:00Z sender=${id} priority=MESSAGE_PRIORITY_LOW content=approved\n</SYSTEM_MESSAGE>`;
+    const row = { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE' };
+    await fs.writeFile(compact, JSON.stringify({ ...row, content: 'Report pending', truncated_fields: ['content'] }) + '\n');
+    await withStub([
+      { event: 'init', conversation_id: parent, init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', [id]), conversation_id: parent }),
+      step({ conversation_id: parent, step_index: 3, state: 'DONE', step_type: 'system_message' }),
+      3500,
+      { event: 'result', result: { conversation_id: parent, status: 'SUCCESS' } },
+    ], async () => {
+      const { runtime, sent, done, waitForCard } = await createRun(parent);
+      try {
+        await waitForCard();
+        // The initial contentless notification may beat persistence. The full
+        // artifact catches up later, without changing compact or sending a new notice.
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await fs.writeFile(full, JSON.stringify({ ...row, content: report }) + '\n');
+        const deadline = Date.now() + 2500;
+        while (runtime.backgroundTasks.list(parent).length > 0 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.deepEqual(runtime.backgroundTasks.list(parent), []);
+        assert.equal(sent.some((msg) => msg.kind === 'complete'), false);
+        assert.deepEqual(taskStatuses(sent).filter((msg) => msg.event === 'notification').map((msg) => msg.status), ['completed'], 'the parent report is sufficient even without a child transcript');
+        await done;
+        assert.deepEqual(taskStatuses(sent).filter((msg) => msg.event === 'notification').map((msg) => msg.status), ['completed'], 'the final result does not settle a returned agent twice');
+        const count = sent.length;
+        await fs.appendFile(full, JSON.stringify({ ...row, step_index: 2, content: report }) + '\n');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.equal(sent.length, count, 'no late events after the parent turn ended');
+      } finally {
+        await runtime.abort(parent);
+        await done;
+      }
+    });
+  });
+});
+
+test('a parent transcript missing on the first notice is retried after it appears', async () => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const id = 'dddddddd-4444-4444-8444-dddddddddddd';
+  const parent = 'conv-late-parent';
+  await withChildTranscripts({ [parent]: 'normal', [id]: 'normal' }, async () => {
+    const file = path.join(process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR!, 'brain', parent, '.system_generated', 'logs', 'transcript.jsonl');
+    await fs.rm(file);
+    await withStub([
+      { event: 'init', conversation_id: parent, init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', [id]), conversation_id: parent }),
+      step({ conversation_id: parent, step_index: 3, state: 'DONE', step_type: 'system_message' }),
+    ], async () => {
+      const { runtime, sent, done, waitForCard } = await createRun(parent);
+      try {
+        await waitForCard();
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const report = `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-23T00:00:00Z sender=${id} priority=MESSAGE_PRIORITY_LOW content=approved\n</SYSTEM_MESSAGE>`;
+        // A user quoting an agent receipt must not finish that agent.
+        await fs.writeFile(file, JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: report }) + '\n');
+        await new Promise((resolve) => setTimeout(resolve, 2200));
+        assert.equal(runtime.backgroundTasks.list(parent).length, 1);
+        await fs.appendFile(file, JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: report }) + '\n');
+        const deadline = Date.now() + 2500;
+        while (runtime.backgroundTasks.list(parent).length > 0 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.deepEqual(taskStatuses(sent).filter((msg) => msg.event === 'notification').map((msg) => msg.status), ['completed']);
+        assert.deepEqual(runtime.backgroundTasks.list(parent), []);
+      } finally {
+        await runtime.abort(parent);
+        await done;
+      }
+    }, false);
+  });
+});
+
+test('abort stops child polling immediately even while a parent report read is blocked', async (t) => {
+  const fs = (await import('node:fs/promises')).default;
+  const path = await import('node:path');
+  const { AntigravitySessionsProvider } = await import('@/modules/providers/list/antigravity/antigravity-sessions.provider.js');
+  const parent = 'conv-blocked-report';
+  const id = 'sub-blocked-report';
+  await withChildTranscripts({ [parent]: 'normal', [id]: 'normal' }, async () => {
+    const parentFile = path.join(process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR!, 'brain', parent, '.system_generated', 'logs', 'transcript.jsonl');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let blocked = false;
+    const stat = fs.stat;
+    t.mock.method(fs, 'stat', async (...args: Parameters<typeof stat>) => {
+      if (args[0] === parentFile) { blocked = true; await gate; }
+      return stat(...args);
+    });
+    let childReads = 0;
+    const fetch = AntigravitySessionsProvider.prototype.fetchHistory;
+    t.mock.method(AntigravitySessionsProvider.prototype, 'fetchHistory', async function (this: InstanceType<typeof AntigravitySessionsProvider>, ...args: Parameters<typeof fetch>) {
+      if (args[0] === id) childReads += 1;
+      return fetch.apply(this, args);
+    });
+    await withStub([
+      { event: 'init', conversation_id: parent, init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', [id]), conversation_id: parent }),
+      step({ conversation_id: parent, step_index: 3, state: 'DONE', step_type: 'system_message' }),
+    ], async () => {
+      const { runtime, sent, done, waitForCard } = await createRun(parent);
+      try {
+        await waitForCard();
+        const deadline = Date.now() + 1000;
+        while (!blocked && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.ok(blocked, 'the parent report read is in flight');
+        await runtime.abort(parent);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const readsAfterStop = childReads;
+        await new Promise((resolve) => setTimeout(resolve, 2200));
+        assert.equal(childReads, readsAfterStop, 'child polling must stop without waiting for the parent read');
+        release();
+        await done;
+        assert.deepEqual(taskStatuses(sent).filter((msg) => msg.event === 'notification').map((msg) => msg.status), ['stopped']);
+      } finally {
+        release();
+        await runtime.abort(parent);
+        await done;
+      }
+    }, false);
+  });
+});
+
+test('a final child read that exceeds the timeout cannot emit after the parent completes', async (t) => {
+  const { AntigravitySessionsProvider } = await import('@/modules/providers/list/antigravity/antigravity-sessions.provider.js');
+  const parent = 'conv-slow-child';
+  const id = 'sub-slow-child';
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const warnings: string[] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); });
+  const fetch = AntigravitySessionsProvider.prototype.fetchHistory;
+  t.mock.method(AntigravitySessionsProvider.prototype, 'fetchHistory', async function (this: InstanceType<typeof AntigravitySessionsProvider>, ...args: Parameters<typeof fetch>) {
+    if (args[0] === id) await gate;
+    return fetch.apply(this, args);
+  });
+  await withChildTranscripts({ [id]: 'normal' }, () => withStub([
+    { event: 'init', conversation_id: parent, init: { cwd: '/tmp' } },
+    step({ ...subagentStep('DONE', [id]), conversation_id: parent }),
+    150,
+    { event: 'result', result: { conversation_id: parent, status: 'SUCCESS' } },
+  ], async () => {
+    const { sent, done } = await createRun(parent);
+    try {
+      await done;
+      assert.ok(warnings.some((line) => line.includes('Final agent transcript reads did not finish in time')));
+      const count = sent.length;
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(sent.length, count, 'a timed-out child read must not write past complete');
+    } finally {
+      release();
+    }
+  }));
+});

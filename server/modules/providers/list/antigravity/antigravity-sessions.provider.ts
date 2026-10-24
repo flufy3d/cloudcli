@@ -31,6 +31,7 @@ import {
   readJsonlRecords,
   compactProviderPayload,
   AppError,
+  createCompactionMessage,
   createNormalizedMessage,
   generateMessageId,
   normalizeProjectPath,
@@ -64,7 +65,7 @@ import {
   readTrackedAgentIds,
   readAgentReports,
   readInvokedAgentSpecs,
-  SPAWN_RECEIPT_MARKER,
+  SPAWN_RECEIPT_PATTERN,
 } from './antigravity-subagent.js';
 import { readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
 
@@ -495,6 +496,18 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       const textDelta = readOptionalString(step.text_delta);
       const stepIndex = typeof step.step_index === 'number' ? step.step_index : undefined;
 
+      // A checkpoint is Antigravity's compaction: running while it summarizes,
+      // done once the summary is in. The summary itself only reaches the
+      // transcript, so history adds it.
+      if (stepType === 'checkpoint' && stepIndex !== undefined && (state === 'ACTIVE' || state === 'DONE' || state === 'ERROR')) {
+        messages.push(createCompactionMessage({
+          id: `msg_${sessionId}_${stepIndex}_compact`,
+          sessionId,
+          provider: PROVIDER,
+          phase: state === 'ACTIVE' ? 'running' : state === 'ERROR' ? 'failed' : 'done',
+        }));
+      }
+
       // Agent streaming text delta
       if (stepType === 'agent_response' && textDelta) {
         messages.push(createNormalizedMessage({
@@ -655,6 +668,32 @@ export class AntigravitySessionsProvider implements IProviderSessions {
             continue;
           }
 
+          // A checkpoint is a compaction; its content is the summary the
+          // conversation continues from, folded into the row by the client.
+          if (type === 'CHECKPOINT') {
+            normalizedMessages.push(createCompactionMessage({
+              id: `${baseId}_compact`,
+              sessionId,
+              timestamp: createdAt,
+              provider: PROVIDER,
+              phase: readOptionalString(entry.status) === 'ERROR' ? 'failed' : 'done',
+            }));
+            if (rawContent.trim()) {
+              normalizedMessages.push(createNormalizedMessage({
+                id: `${baseId}_summary`,
+                sessionId,
+                timestamp: createdAt,
+                provider: PROVIDER,
+                kind: 'text',
+                role: 'assistant',
+                content: rawContent,
+                isCompactSummary: true,
+                sequence: stepIndex,
+              }));
+            }
+            continue;
+          }
+
           // Planner entries carry tool invocations, reasoning, and/or the assistant's
           // reply text. Real transcripts emit replies as PLANNER_RESPONSE.
           if (type === 'PLANNER_RESPONSE') {
@@ -687,11 +726,9 @@ export class AntigravitySessionsProvider implements IProviderSessions {
                 // Both transports must name this call the same way, or the
                 // live card and the persisted one render side by side. Live
                 // reports the tool at its own step, which is the step after
-                // the planner entry that declared it (verified across two
-                // real sessions: 830/830 and 798/807 calls are followed by
-                // their GENERIC output one step later, and no planner entry
-                // has ever carried more than one call). `t` keeps the formula
-                // total should that ever change.
+                // the planner entry that declared it, plus this call's
+                // position when a planner entry batches several tools. This
+                // also binds an agent receipt after neighboring tool results.
                 const toolId = buildAntigravityToolId(nativeStepIndex, t);
 
                 if (toolName === ANTIGRAVITY_SPAWN_TOOL) {
@@ -735,7 +772,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
             const spawnCall = nativeStepIndex === undefined
               ? undefined
               : spawnCalls.get(buildAntigravityToolId(nativeStepIndex, null));
-            if (spawnCall && !spawnCall.receipt && rawContent.includes(SPAWN_RECEIPT_MARKER)) {
+            if (spawnCall && !spawnCall.receipt && SPAWN_RECEIPT_PATTERN.test(rawContent)) {
               spawnCall.receipt = rawContent;
               continue;
             }
@@ -845,7 +882,7 @@ export class AntigravitySessionsProvider implements IProviderSessions {
         const report = conversationId ? reports.get(conversationId.toLowerCase()) : undefined;
         // One judgement for live and history: a report or the agent's own
         // transcript says how it ended; an agent this server's `agy` still
-        // tracks is running until the turn result settles it.
+        // tracks is running until its report or the turn result settles it.
         const status: SubagentInfo['status'] = !conversationId
           ? 'stopped'
           : report !== undefined

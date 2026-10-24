@@ -221,6 +221,15 @@ export const getQuickSettingsTabPanelId = (tab: QuickSettingsTab): string => `qu
 export const isSkillCommand = (command: SlashCommand): boolean =>
   command.type === 'skill' || command.metadata?.type === 'skill';
 
+/**
+ * Whether a slash command goes to the engine as message text instead of being
+ * run by cloudcli: a provider skill, or an engine command such as `/compact`.
+ * Picking one from the menu inserts it into the composer; sending it skips the
+ * built-in command handler.
+ */
+export const isEnginePromptCommand = (command: SlashCommand): boolean =>
+  isSkillCommand(command) || command.type === 'engine';
+
 export const getSessionTitle = (session: ProjectSession): string =>
   (session.summary as string) || 'New Session';
 

@@ -96,9 +96,11 @@ export type ProviderCapabilities = {
   /** Whether a session's transcript can be branched into an independent one. */
   supportsSessionForking: boolean;
   /**
-   * Whether the conversation can be compacted on demand (`/compact`), which
-   * requires an engine primitive that replaces the carried history with a
-   * summary.
+  /**
+   * Whether the `/compact` chat command summarizes the conversation and frees
+   * up the engine's context window. The composer offers the command only when
+   * this is true; the runtimes that cannot parse the text themselves turn it
+   * into their engine's own compaction call.
    */
   supportsCompaction: boolean;
   /**

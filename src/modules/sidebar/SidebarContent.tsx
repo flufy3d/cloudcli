@@ -3,6 +3,7 @@ import { Activity, Archive, ChevronDown, ChevronRight, Folder, MessageSquare, Ro
 import type { TFunction } from 'i18next';
 
 import { LLMProviderLogo, ScrollArea } from '@/shared/ui';
+import { APP_VERSION } from '@/shared/constants';
 import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationSearchResults, Project, RecentConversationListItem, SearchProgress, SessionWithProvider, SidebarProjectListProps, SidebarSearchMode, SystemUpdateStatus } from '@/shared/types';
 import { formatCompactAge, getAllSessions } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import SidebarFooter from '@/modules/sidebar/SidebarFooter';
@@ -239,6 +240,7 @@ export default function SidebarContent({
       style={{}}
     >
       <SidebarHeader
+        currentVersion={APP_VERSION}
         isPWA={isPWA}
         isMobile={isMobile}
         isLoading={isLoading}

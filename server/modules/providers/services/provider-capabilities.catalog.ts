@@ -77,6 +77,12 @@ export type ProviderCatalogEntry = {
    * `supportsEffort` is false.
    */
   effortLevels: readonly string[];
+  /**
+   * Whether a `/compact` prompt compacts the conversation. Claude, ZCode and
+   * Antigravity parse the command from the prompt text themselves; the Codex
+   * and OpenCode runtimes turn it into their engines' compaction calls.
+   */
+  supportsCompaction: boolean;
 };
 
 export const PROVIDER_CATALOG = {
@@ -94,6 +100,7 @@ export const PROVIDER_CATALOG = {
     editRevertsFiles: false,
     inputWhileBusy: 'background',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
+    supportsCompaction: true,
   },
   cursor: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -107,6 +114,7 @@ export const PROVIDER_CATALOG = {
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
     effortLevels: [],
+    supportsCompaction: false,
   },
   codex: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
@@ -120,6 +128,7 @@ export const PROVIDER_CATALOG = {
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    supportsCompaction: true,
   },
   opencode: {
     // Mapped by the runtime onto the service: the read-only `plan` agent
@@ -141,6 +150,7 @@ export const PROVIDER_CATALOG = {
     // Passed on as OpenCode's `--variant`. `thinking` (MiniMax's on/off
     // variant, paired with `none`) is not a strength, so it sorts last.
     effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
+    supportsCompaction: true,
   },
   zcode: {
     // Mapped by the runtime onto ZCode's session/setMode modes: build
@@ -161,6 +171,7 @@ export const PROVIDER_CATALOG = {
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
     effortLevels: ['low', 'high', 'max'],
+    supportsCompaction: true,
   },
   antigravity: {
     permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
@@ -174,5 +185,6 @@ export const PROVIDER_CATALOG = {
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
     effortLevels: ['low', 'medium', 'high'],
+    supportsCompaction: true,
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;

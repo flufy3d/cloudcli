@@ -838,7 +838,9 @@ export function codexThreadItemToRows(item: CodexThreadItem, timestamp: string):
       return [];
 
     case 'context_compaction':
-      return [{ uuid: item.id, type: 'status_note', timestamp, content: 'Context compacted' }];
+      // The shared compaction row; the live loop adds `phase: 'running'`
+      // while the item is still working.
+      return [{ uuid: item.id, type: 'compaction', timestamp }];
 
     case 'task_result': {
       let parsedOutput: AnyRecord = {};

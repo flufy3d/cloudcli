@@ -15,6 +15,12 @@ import type { Project } from '@/shared/types';
 
 const listCommands = vi.fn();
 const listSkills = vi.fn();
+const capabilityMap = vi.fn();
+
+// The capability matrix decides which engine commands the provider offers.
+vi.mock('@/shared/hooks/useProviderCapabilities', () => ({
+  useProviderCapabilitiesMap: () => capabilityMap(),
+}));
 
 vi.mock('@/shared/api', () => ({
   api: {
@@ -34,6 +40,8 @@ const jsonResponse = (body: unknown, ok = true) => ({ ok, json: async () => body
 beforeEach(() => {
   listCommands.mockReset();
   listSkills.mockReset();
+  capabilityMap.mockReset();
+  capabilityMap.mockReturnValue({ capabilities: null, loaded: false });
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
 
@@ -126,4 +134,50 @@ test('a disabled consumer does not request until it is enabled', async () => {
   rerender({ enabled: true });
   await waitFor(() => assert.equal(result.current.commands.length, 1));
   assert.equal(listCommands.mock.calls.length, 1);
+});
+
+test('a provider that compacts offers /compact after the built-ins, as text for the engine', async () => {
+  capabilityMap.mockReturnValue({ capabilities: { zcode: { supportsCompaction: true } }, loaded: true });
+  listCommands.mockResolvedValue(jsonResponse({ builtIn: [{ name: '/help' }], custom: [{ name: '/deploy' }] }));
+  listSkills.mockResolvedValue(jsonResponse({ data: { skills: [{ name: 'review', command: '/review', scope: 'user' }] } }));
+
+  const { useProjectSlashCommands } = await import('@/shared/hooks/useProjectSlashCommands');
+  const { isEnginePromptCommand } = await import('@/shared/utils');
+  const { result } = renderHook(() => useProjectSlashCommands(project, 'zcode'));
+
+  await waitFor(() => assert.equal(result.current.isLoading, false));
+  assert.deepEqual(
+    result.current.commands.map((command) => [command.name, command.type]),
+    [['/help', 'built-in'], ['/compact', 'engine'], ['/review', 'skill'], ['/deploy', 'custom']],
+  );
+  assert.equal(isEnginePromptCommand(result.current.commands[1]), true);
+  assert.equal(isEnginePromptCommand(result.current.commands[2]), true);
+  assert.equal(isEnginePromptCommand(result.current.commands[0]), false);
+});
+
+test('/compact is not offered before the matrix loads, nor by a provider that cannot compact', async () => {
+  listCommands.mockResolvedValue(jsonResponse({ builtIn: [{ name: '/help' }], custom: [] }));
+  listSkills.mockResolvedValue(jsonResponse({ data: { skills: [] } }));
+  const { useProjectSlashCommands } = await import('@/shared/hooks/useProjectSlashCommands');
+
+  const loading = renderHook(() => useProjectSlashCommands(project, 'zcode'));
+  await waitFor(() => assert.equal(loading.result.current.isLoading, false));
+  assert.deepEqual(loading.result.current.commands.map((command) => command.name), ['/help']);
+
+  capabilityMap.mockReturnValue({ capabilities: { cursor: { supportsCompaction: false } }, loaded: true });
+  const cursor = renderHook(() => useProjectSlashCommands(project, 'cursor'));
+  await waitFor(() => assert.equal(cursor.result.current.isLoading, false));
+  assert.deepEqual(cursor.result.current.commands.map((command) => command.name), ['/help']);
+});
+
+test('a project command of the same name keeps /compact and the engine entry is not added twice', async () => {
+  capabilityMap.mockReturnValue({ capabilities: { claude: { supportsCompaction: true } }, loaded: true });
+  listCommands.mockResolvedValue(jsonResponse({ builtIn: [], custom: [{ name: '/compact', description: 'Mine' }] }));
+  listSkills.mockResolvedValue(jsonResponse({ data: { skills: [] } }));
+
+  const { useProjectSlashCommands } = await import('@/shared/hooks/useProjectSlashCommands');
+  const { result } = renderHook(() => useProjectSlashCommands(project, 'claude'));
+
+  await waitFor(() => assert.equal(result.current.isLoading, false));
+  assert.deepEqual(result.current.commands.map((command) => [command.name, command.type]), [['/compact', 'custom']]);
 });

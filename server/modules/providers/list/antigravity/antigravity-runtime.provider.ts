@@ -41,11 +41,12 @@ import {
   sanitizeLeafDirectoryName,
 } from '@/shared/utils.js';
 
-import { getAntigravityDataRoot } from './antigravity-data-root.js';
+import { getAntigravityDataRoot, getAntigravityTranscriptCandidates } from './antigravity-data-root.js';
 import { tryResolveEnginePath } from './antigravity-engine-path.js';
 import { createAgentTranscriptTail } from './antigravity-agent-tail.js';
 import { AntigravitySessionsProvider } from './antigravity-sessions.provider.js';
-import { antigravityBackgroundWork, extractAntigravitySubagents, judgeAntigravityAgent } from './antigravity-subagent.js';
+import { readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
+import { antigravityBackgroundWork, extractAntigravitySubagents, judgeAntigravityAgent, readAgentReports } from './antigravity-subagent.js';
 import {
   findCatalogOptionForModelString,
   resolveAntigravityModelArgs,
@@ -152,6 +153,9 @@ export function getAntigravityBackgroundTasksForSession(sessionId: string): Acti
  */
 /** How long a run waits for its agents' final transcript reads before settling. */
 const AGENT_TAIL_FINAL_READ_TIMEOUT_MS = 5_000;
+
+/** Retry parent reports after the contentless live notice, including delayed transcript writes. */
+const AGENT_REPORT_POLL_INTERVAL_MS = 2_000;
 
 const STDERR_TAIL_LIMIT = 4_000;
 
@@ -268,20 +272,89 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
       const historyReader = new AntigravitySessionsProvider();
       /** The turn-end work a `result` event started; `close` and `error` wait for it. */
       let turnEnding: Promise<void> | null = null;
+      let agentTailsClosed = false;
       const agentTail = createAgentTranscriptTail({
         readTimeline: async (conversationId) => (await historyReader.fetchHistory(conversationId, {})).messages,
-        emit: (message) => writer.send(message),
+        emit: (message) => { if (!agentTailsClosed) writer.send(message); },
       });
+      // A launch can be replayed after its agent has already returned.
+      const startedAgentIds = new Set<string>();
+      let reportTimer: NodeJS.Timeout | undefined;
+      let reportRead: Promise<void> | null = null;
+      let reportsClosed = false;
+      let reportFingerprint: string | undefined;
+      let agentReports = new Map<string, string>();
+      /**
+       * agy omits report bodies from its live system_message steps. Read the
+       * parent's canonical transcript instead; only a report addressed by an
+       * outstanding agent's id finishes it, never the parent's prose or an
+       * intermediate DONE response in the child's transcript.
+       */
+      const settleReportedAgents = (): Promise<void> | null => {
+        if (reportsClosed || reportRead || !antigravityBackgroundWork.hasSession(sessionKey)) return reportRead;
+        reportRead = (async () => {
+          try {
+            const parentId = capturedSessionId || providerSessionId;
+            if (!parentId) return;
+            const safeId = sanitizeLeafDirectoryName(parentId, 'antigravity session id');
+            const compact = getAntigravityTranscriptCandidates(safeId).find((candidate) => fsSync.existsSync(candidate));
+            if (!compact) return;
+            // Poll metadata only while unchanged; long parent transcripts need
+            // no repeated parsing. Full transcripts can catch up independently.
+            const files = [compact, path.join(path.dirname(compact), 'transcript_full.jsonl')];
+            const stamps = await Promise.all(files.map(async (file) => {
+              try {
+                const stat = await fsp.stat(file);
+                return [file, stat.size, stat.mtimeMs];
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [file, null];
+                throw error;
+              }
+            }));
+            const fingerprint = JSON.stringify(stamps);
+            if (reportFingerprint !== fingerprint) {
+              const rows = await readCanonicalAntigravityTranscript(parentId);
+              const contents = rows.flatMap(({ entry }) => {
+                if (entry.status !== 'DONE' || entry.source === 'USER_EXPLICIT' || entry.type === 'USER_INPUT') return [];
+                const content = readOptionalString(entry.content) ?? '';
+                return Array.from(content.matchAll(/<SYSTEM_MESSAGE>\s*([\s\S]*?)(?:<\/SYSTEM_MESSAGE>|$)/gi), (match) => match[1]);
+              });
+              agentReports = readAgentReports(contents);
+              reportFingerprint = fingerprint;
+            }
+            // A report can precede the live launch; apply cached receipts too.
+            for (const id of agentReports.keys()) {
+              if (reportsClosed) return;
+              const task = antigravityBackgroundWork.get(sessionKey, id);
+              if (!task) continue;
+              await agentTail.stop(id);
+              // A result, abort or process exit can win while the final read waits.
+              if (reportsClosed || !antigravityBackgroundWork.end(sessionKey, id)) continue;
+              writer.send(createTaskStatusMessage(
+                { provider: PROVIDER, sessionId: capturedSessionId || sessionId || null,
+                  taskId: id, toolUseId: task.toolUseId, taskType: LOCAL_AGENT_TASK_TYPE },
+                { event: 'notification', status: 'completed' },
+              ));
+              broadcastBackgroundTasks();
+            }
+          } catch (error) {
+            console.warn('[AntigravityRuntime] Could not reconcile agent reports:', error);
+          }
+        })().finally(() => { reportRead = null; });
+        return reportRead;
+      };
       /**
        * Stops following every agent after one last read, bounded so a stuck
        * transcript read cannot hold the run open forever; a failure is
        * reported and the run still settles.
        */
       const finishAgentTails = async (): Promise<void> => {
+        reportsClosed = true;
+        clearInterval(reportTimer);
         let timer: NodeJS.Timeout | undefined;
         try {
           await Promise.race([
-            agentTail.stopAll(),
+            Promise.all([reportRead, agentTail.stopAll()]),
             new Promise<void>((resolve) => {
               timer = setTimeout(() => {
                 console.warn('[AntigravityRuntime] Final agent transcript reads did not finish in time; settling without them.');
@@ -292,6 +365,8 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         } catch (error) {
           console.error('[AntigravityRuntime] Failed to finish agent transcript tails:', error);
         } finally {
+          // A timed-out read may finish later; it must not write past complete.
+          agentTailsClosed = true;
           clearTimeout(timer);
         }
       };
@@ -574,6 +649,8 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             const startedAgents = extractAntigravitySubagents(stepUpdateRecord);
             if (startedAgents.length > 0) {
               for (const agent of startedAgents) {
+                if (startedAgentIds.has(agent.conversationId)) continue;
+                startedAgentIds.add(agent.conversationId);
                 antigravityBackgroundWork.start(sessionKey, {
                   taskId: agent.conversationId,
                   toolUseId: agent.toolUseId,
@@ -593,7 +670,10 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
                 ));
               }
               broadcastBackgroundTasks();
+              reportTimer ??= setInterval(() => { void settleReportedAgents(); }, AGENT_REPORT_POLL_INTERVAL_MS);
+              reportTimer.unref();
             }
+            if (stepUpdateRecord.step_type === 'system_message') void settleReportedAgents();
           }
 
           // Context occupancy comes from step_update usage only: each one

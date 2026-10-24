@@ -92,6 +92,22 @@ const renderBash = (
     />,
   );
 
+// Folded bodies mount on first open, so tests that read hunks open every fold
+// first — repeatedly, since opening one can reveal folds nested inside it.
+const openAllFolds = (container: HTMLElement) => {
+  for (;;) {
+    const closed = container.querySelector<HTMLElement>('button[aria-expanded="false"]');
+    if (!closed) return container;
+    fireEvent.click(closed);
+  }
+};
+
+const renderBashOpen = (toolUseResult: unknown) => {
+  const view = renderBash(toolUseResult);
+  openAllFolds(view.container);
+  return view;
+};
+
 const textOf = (toolUseResult: unknown) => renderBash(toolUseResult).container.textContent ?? '';
 
 // Every note under the file blocks, in order.
@@ -107,7 +123,7 @@ const diffLineTexts = (container: HTMLElement) =>
 
 describe('what a Bash command changed', () => {
   it('lists one block per file with its change counts and unified hunks', () => {
-    const { container } = renderBash(TWO_FILES_CHANGED);
+    const { container } = renderBashOpen(TWO_FILES_CHANGED);
     const text = container.textContent ?? '';
 
     expect(text).toContain("sed -i 's/two/TWO/' g.txt");
@@ -133,7 +149,7 @@ describe('what a Bash command changed', () => {
   });
 
   it('colours added lines green and removed lines red, like the Edit diff', () => {
-    const { container } = renderBash(TWO_FILES_CHANGED);
+    const { container } = renderBashOpen(TWO_FILES_CHANGED);
     const rows = Array.from(container.querySelectorAll('.font-mono.text-\\[11px\\] > div'));
     const removed = rows.find((row) => row.textContent === '-two');
     const added = rows.find((row) => row.textContent === '+TWO');
@@ -145,7 +161,7 @@ describe('what a Bash command changed', () => {
   });
 
   it('says whether each file was created, updated or deleted', () => {
-    const { container } = renderBash(CREATED_AND_DELETED);
+    const { container } = renderBashOpen(CREATED_AND_DELETED);
     const text = container.textContent ?? '';
 
     expect(text.match(/Created/g)).toHaveLength(2);
@@ -159,7 +175,7 @@ describe('what a Bash command changed', () => {
 
   it('numbers the missing side of a created or deleted file from 0, as git does', () => {
     // 2.1.280 wrote oldStart 1 for the created h.txt and newStart 1 for the deleted keep.txt.
-    const rows = diffLineTexts(renderBash(CREATED_AND_DELETED).container);
+    const rows = diffLineTexts(renderBashOpen(CREATED_AND_DELETED).container);
 
     expect(rows).toContain('@@ -0,0 +1,2 @@');
     expect(rows).toContain('@@ -1,1 +0,0 @@');
@@ -183,7 +199,7 @@ describe('what a Bash command changed', () => {
   });
 
   it('marks "\\ No newline at end of file" as a note on the line above, not a change', () => {
-    const { container } = renderBash({
+    const { container } = renderBashOpen({
       bashEditDiff: {
         files: [{
           filePath: '/repo/bin.dat',
@@ -357,7 +373,7 @@ describe('what a Bash command changed', () => {
 
   it('caps a long file and says how many lines it left out, while counting them all', () => {
     const lines = Array.from({ length: 250 }, (_, index) => `+line ${index + 1}`);
-    const { container } = renderBash({
+    const { container } = renderBashOpen({
       bashEditDiff: {
         files: [{ filePath: '/repo/long.txt', hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 250, lines }], created: true }],
         moreFiles: 0,
@@ -420,6 +436,7 @@ describe('a live Bash result reaching the transcript', () => {
         <MessageComponent message={message} prevMessage={null} createDiff={() => []} provider="claude" />
       </UiPreferencesProvider>,
     );
+    openAllFolds(container);
 
     expect(container.textContent).toContain("sed -i 's/two/TWO/' g.txt");
     expect(diffLineTexts(container)).toContain('+TWO');

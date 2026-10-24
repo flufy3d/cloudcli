@@ -72,6 +72,7 @@ import {
   createNormalizedMessage,
   resolveCodexExecutionPolicy,
   resolveModelEffort,
+  readCompactCommand,
   AppError,
   readObjectRecord,
   CODEX_TASK_MCP_NAME,
@@ -216,6 +217,7 @@ const pendingCodexApprovals = new Map<string, PendingCodexApproval>();
  * reasoning) or is already complete when announced.
  */
 const PROGRESSIVE_CODEX_ITEM_TYPES = new Set([
+  'contextCompaction',
   'commandExecution',
   'fileChange',
   'mcpToolCall',
@@ -627,7 +629,10 @@ function emitCodexItem(
     emitCodexSubagentActivity(target, item, timestamp, backgroundWorkKey);
     return;
   }
-  for (const row of codexThreadItemToRows(item, timestamp)) {
+  for (const itemRow of codexThreadItemToRows(item, timestamp)) {
+    // A compaction that has started but not finished is the running row its
+    // completion replaces (same id).
+    const row = source === 'started' && itemRow.type === 'compaction' ? { ...itemRow, phase: 'running' } : itemRow;
     if (row.type === 'tool_use' && !target.approvalSubjects.has(item.id)) {
       target.approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
     }
@@ -1677,6 +1682,13 @@ async function queryCodex(
       throw new Error('Codex app-server opened no thread to run the turn in.');
     }
 
+    // `/compact` is not text for the model: the engine compacts only through
+    // its own call, which runs as a turn and reports a context-compaction item.
+    const compactCommand = toolOutputParam ? null : readCompactCommand(command);
+    if (compactCommand?.instructions) {
+      throw new Error('Codex compacts without instructions. Send /compact on its own.');
+    }
+
 
 
     if (residentGeneration !== null) {
@@ -1685,8 +1697,9 @@ async function queryCodex(
       const submitted = await submitCodexResidentRound({
         appSessionId: residentKey,
         generation: residentGeneration ?? undefined,
-        input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
+        input: toolOutputParam || compactCommand ? [] : toAppServerInput(inputItems as AnyRecord[]),
         ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
+        ...(compactCommand ? { compact: true } : {}),
         model: resolvedModel ?? undefined,
         effort: resolvedEffort ?? undefined,
         workingDirectory,
@@ -1699,6 +1712,9 @@ async function queryCodex(
       residentRoundId = submitted.clientUserMessageId;
       // The engine has the input but has not started its turn yet.
       announceActivityState();
+    } else if (compactCommand) {
+      // The answer names no turn; the `turn/started` event records it.
+      await connection.call('thread/compact/start', { threadId: capturedSessionId });
     } else {
       const startResult = readObjectRecord(await connection.call('turn/start', {
         threadId: capturedSessionId,

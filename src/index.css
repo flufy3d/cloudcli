@@ -59,14 +59,11 @@
     /* Safe area CSS variables */
     --safe-area-inset-top: env(safe-area-inset-top);
     --safe-area-inset-right: env(safe-area-inset-right);
-    --safe-area-inset-bottom: env(safe-area-inset-bottom);
+    /* iOS 26 standalone PWAs inflate env(safe-area-inset-bottom) (observed 93px
+       = top 59 + real bottom 34). No real device reports more than 34px (iPhone
+       home indicator; iPad 20px), so clamp to that ceiling. */
+    --safe-area-inset-bottom: min(env(safe-area-inset-bottom, 0px), 34px);
     --safe-area-inset-left: env(safe-area-inset-left);
-
-    /* Mobile navigation dimensions - Single source of truth */
-    /* Floating nav: ~52px bar + 8px bottom margin + 12px px-3 top spacing */
-    --mobile-nav-height: 52px;
-    --mobile-nav-padding: 20px;
-    --mobile-nav-total: calc(var(--mobile-nav-height) + var(--mobile-nav-padding) + env(safe-area-inset-bottom, 0px));
 
     /* Header safe area dimensions */
     --header-safe-area-top: env(safe-area-inset-top, 0px);
@@ -738,11 +735,6 @@
     }
   }
   
-  /* Safe area support for iOS devices */
-  .ios-bottom-safe {
-    padding-bottom: env(safe-area-inset-bottom);
-  }
-  
   /* PWA specific header adjustments - uses CSS variables for consistency */
   .pwa-header-safe {
     padding-top: var(--header-base-padding);
@@ -763,7 +755,7 @@
   
   @media screen and (max-width: 768px) {
     .chat-input-mobile {
-      padding-bottom: calc(60px + env(safe-area-inset-bottom));
+      padding-bottom: calc(60px + var(--safe-area-inset-bottom));
     }
   }
 

@@ -43,12 +43,12 @@ const withFakeService = async (
         reply(200, { data: { id: 'msg_fake', sessionID: 'ses_fake', type: 'user' } });
         return;
       }
-      if (request.method === 'POST' && path.endsWith('/interrupt')) {
-        reply(200, { interrupted: true });
+      if (request.method === 'POST' && path.endsWith('/compact')) {
+        reply(200, { data: { id: 'msg_compaction', sessionID: 'ses_fake', type: 'compaction', payload: {}, delivery: 'steer' } });
         return;
       }
-      if (request.method === 'POST' && path.endsWith('/compact')) {
-        reply(200, { data: { id: 'msg_compact', sessionID: 'ses_fake', type: 'compaction' } });
+      if (request.method === 'POST' && path.endsWith('/interrupt')) {
+        reply(200, { interrupted: true });
         return;
       }
       if (request.method === 'GET' && path === '/api/session/ses_fake') {
@@ -103,7 +103,7 @@ test('sends the verified wire shapes with Basic auth on every call', async () =>
     });
     assert.equal(prompted.messageId, 'msg_fake');
     assert.equal(await client.interrupt('ses_fake'), true);
-    assert.equal((await client.compactSession('ses_fake')).messageId, 'msg_compact');
+    assert.equal((await client.compactSession('ses_fake')).messageId, 'msg_compaction');
     await client.replyPermission('ses_fake', 'per_1', { decision: 'reject', message: 'nope' });
     await client.replyForm('ses_fake', 'frm_1', { q0: 'Blue', q1: ['a', 'b'] });
     await client.cancelForm('ses_fake', 'frm_2', 'skipped by user');
@@ -176,5 +176,16 @@ test('turns non-2xx answers into OpenCodeApiError carrying status and message', 
         && error.status === 404
         && error.message.includes('Session ses_missing not found'),
     );
+  });
+});
+
+test('compact posts to the session compaction endpoint and returns the admitted message id', async () => {
+  await withFakeService(async ({ client, requests }) => {
+    const result = await client.compactSession('ses_fake');
+    assert.deepEqual(result, { messageId: 'msg_compaction' });
+    const request = requests.at(-1);
+    assert.equal(request?.method, 'POST');
+    assert.equal(request?.path, '/api/session/ses_fake/compact');
+    assert.deepEqual(request?.body, {});
   });
 });

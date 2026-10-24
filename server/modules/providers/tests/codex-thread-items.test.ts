@@ -20,6 +20,7 @@ import {
   readCodexAppServerItem,
   readCodexRolloutItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
+import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
 
 const TIMESTAMP = '2026-09-21T16:35:41.044Z';
 
@@ -208,4 +209,21 @@ test('orchestration-only collaboration calls never reach the transcript', () => 
   const rows = codexThreadItemToRows(spawn, TIMESTAMP);
   assert.deepEqual(rows.map((row) => row.toolName), ['Agent']);
   assert.equal(JSON.parse(String(rows[0].toolInput)).description, 'Audit');
+});
+
+test('a context compaction is the shared compaction row, the same from history and live', () => {
+  const rows = codexThreadItemToRows({ kind: 'context_compaction', id: 'cmp-1' }, '2026-10-23T00:00:00.000Z');
+  assert.deepEqual(rows, [{ uuid: 'cmp-1', type: 'compaction', timestamp: '2026-10-23T00:00:00.000Z' }]);
+
+  const provider = new CodexSessionsProvider();
+  const [done] = provider.normalizeMessage(rows[0], 'thread-1');
+  assert.equal(done.id, 'cmp-1');
+  assert.equal(done.kind, 'text');
+  assert.equal(done.role, 'assistant');
+  assert.equal(done.content, 'Compacted');
+  assert.deepEqual(done.compact, { phase: 'done' });
+
+  const [running] = provider.normalizeMessage({ ...rows[0], phase: 'running' }, 'thread-1');
+  assert.equal(running.id, 'cmp-1');
+  assert.deepEqual(running.compact, { phase: 'running' });
 });

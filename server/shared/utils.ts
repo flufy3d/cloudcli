@@ -1536,6 +1536,110 @@ export function normalizeSessionName(rawValue: string | undefined, fallback: str
 }
 
 // ---------------------------
+//----------------- CONVERSATION COMPACTION COMMAND ------------
+/**
+ * Reads a chat prompt as the `/compact` command, or returns null when it is an
+ * ordinary message.
+ *
+ * `/compact` asks the engine to summarize the conversation so far and free up
+ * its context window. Claude, ZCode and Antigravity parse the command out of
+ * the prompt text themselves; Codex and OpenCode only compact through a
+ * dedicated protocol call, so their runtimes use this to recognize the command
+ * and make that call instead of sending the text to the model.
+ *
+ * The command is the exact, case-sensitive word `/compact` after leading
+ * whitespace, ended by whitespace or the end of the text. Whatever follows is
+ * returned as `instructions`, trimmed, line breaks kept; a bare command yields
+ * an empty string. `/compacted`, `/Compact` or text that merely mentions the
+ * command are ordinary messages.
+ */
+export function readCompactCommand(command: unknown): { instructions: string } | null {
+  if (typeof command !== 'string') {
+    return null;
+  }
+  const match = command.trimStart().match(/^\/compact(?=\s|$)([\s\S]*)$/);
+  return match ? { instructions: match[1].trim() } : null;
+}
+
+/** A token count the way the CLI writes one: `334k`, `1.2M`. */
+const formatCompactionTokenCount = (tokens: number): string => {
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(1)}M`;
+  }
+  return tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : `${tokens}`;
+};
+
+/** A duration the way the CLI writes one: `2m 22s`. */
+const formatCompactionDuration = (milliseconds: number): string => {
+  const seconds = Math.round(milliseconds / 1_000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+};
+
+/**
+ * The one timeline row every provider draws a compaction as.
+ *
+ * A compaction is the most expensive thing a long session does on its own, so
+ * every engine reports it the same way: an assistant `text` row whose
+ * `content` says it in a sentence (`Compacted · manual · 334k → 19k tokens ·
+ * 2m 20s`, `Compacting conversation…`, `Compaction failed: …`) and whose
+ * `compact` field carries the numbers, so a client that knows nothing of
+ * compaction still reads the sentence while one that does draws a row of its
+ * own and folds the engine's summary (an `isCompactSummary` row) into it.
+ *
+ * The caller owns `id`: a running row and the row that ends it share one, and
+ * the live stream and the history read must derive the same one, so a
+ * persisted row replaces the live copy instead of sitting beside it.
+ * Consumers: the Claude, Codex, OpenCode and ZCode session normalizers.
+ */
+export function createCompactionMessage(input: {
+  id: string;
+  sessionId: string | null;
+  timestamp?: string;
+  provider: NormalizedMessage['provider'];
+  phase: 'running' | 'done' | 'failed';
+  trigger?: 'manual' | 'auto';
+  preTokens?: number;
+  postTokens?: number;
+  durationMs?: number;
+  error?: string | null;
+}): NormalizedMessage {
+  const { phase, trigger, preTokens, postTokens, durationMs, error } = input;
+  let content: string;
+  if (phase === 'running') {
+    content = 'Compacting conversation…';
+  } else if (phase === 'failed') {
+    content = `Compaction failed${error ? `: ${error}` : ''}`;
+  } else {
+    const said = ['Compacted'];
+    if (trigger) said.push(trigger);
+    if (preTokens) {
+      said.push(postTokens
+        ? `${formatCompactionTokenCount(preTokens)} → ${formatCompactionTokenCount(postTokens)} tokens`
+        : `${formatCompactionTokenCount(preTokens)} tokens`);
+    }
+    if (durationMs) said.push(formatCompactionDuration(durationMs));
+    content = said.join(' · ');
+  }
+  return createNormalizedMessage({
+    id: input.id,
+    sessionId: input.sessionId,
+    ...(input.timestamp ? { timestamp: input.timestamp } : {}),
+    provider: input.provider,
+    kind: 'text',
+    role: 'assistant',
+    content,
+    compact: {
+      phase,
+      ...(trigger ? { trigger } : {}),
+      ...(preTokens ? { preTokens } : {}),
+      ...(postTokens ? { postTokens } : {}),
+      ...(durationMs ? { durationMs } : {}),
+      ...(phase === 'failed' && error !== undefined ? { error } : {}),
+    },
+  });
+}
+
+// ---------------------------
 //----------------- PROVIDER SESSION VALUE NORMALIZATION UTILITIES ------------
 /**
  * Converts provider-native timestamps into ISO strings.

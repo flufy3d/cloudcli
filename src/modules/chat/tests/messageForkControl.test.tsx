@@ -67,6 +67,8 @@ function renderRow(message: ChatMessage, prevMessage: ChatMessage | null, isTurn
 describe('per-turn fork control placement', () => {
   it('renders no fork row under a turn-leading thinking block', () => {
     const { container } = renderRow(thinkingMessage, userMessage, false);
+    // The folded thinking body mounts on first open.
+    fireEvent.click(screen.getByText('Thought for a few seconds'));
     expect(container.textContent).toContain('先想想怎么改。');
     expect(screen.queryByTitle('Fork from here')).toBeNull();
   });

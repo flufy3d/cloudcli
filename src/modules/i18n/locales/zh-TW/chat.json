@@ -4,7 +4,9 @@
   },
   "misc": {
     "outputAssets": "結果附件（{{count}}）",
-    "fullOutput": "完整輸出.txt"
+    "fullOutput": "完整輸出.txt",
+    "compacted": "已壓縮",
+    "compactionSummary": "完整摘要"
   },
   "codeBlock": {
     "copy": "複製",

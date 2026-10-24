@@ -58,7 +58,7 @@ function deriveCapabilities(providerId: LLMProvider, provider: {
     effortLevels: [...catalog.effortLevels],
     supportsMessageEditing: typeof provider.sessions?.resolveEditAnchor === 'function',
     supportsSessionForking: provider.fork !== undefined,
-    supportsCompaction: typeof provider.runtime?.compact === 'function',
+    supportsCompaction: catalog.supportsCompaction,
     supportsNativeScheduling: catalog.supportsNativeScheduling,
     editRevertsFiles: catalog.editRevertsFiles,
     inputWhileBusy: catalog.inputWhileBusy,

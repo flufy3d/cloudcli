@@ -50,6 +50,7 @@ import {
   createCompleteMessage,
   createNormalizedMessage,
   generateMessageId,
+  readCompactCommand,
   readObjectRecord,
   readOptionalString,
   resolveModelEffort,
@@ -406,9 +407,15 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       return failRun(identity, writer, describeError(error));
     }
 
-    const text = buildOpenCodePromptText(command, options);
-    const files = await buildOpenCodePromptFiles(options, workingDir);
-    if (!text.trim() && files.length === 0) {
+    // `/compact` is not text for the model: the service compacts only through
+    // its own endpoint, which runs as an execution of its own.
+    const compactCommand = readCompactCommand(command);
+    if (compactCommand?.instructions) {
+      return failRun(identity, writer, 'OpenCode compacts without instructions. Send /compact on its own.');
+    }
+    const text = compactCommand ? '' : buildOpenCodePromptText(command, options);
+    const files = compactCommand ? [] : await buildOpenCodePromptFiles(options, workingDir);
+    if (!compactCommand && !text.trim() && files.length === 0) {
       return failRun(identity, writer, 'Nothing to send: the message is empty.');
     }
 
@@ -428,7 +435,11 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     await eventStream.connected();
 
     try {
-      await activeClient.prompt(providerSessionId, { text, files });
+      if (compactCommand) {
+        await activeClient.compactSession(providerSessionId);
+      } else {
+        await activeClient.prompt(providerSessionId, { text, files });
+      }
       activeRun.promptAccepted = true;
     } catch (error) {
       runs.release(activeRun);

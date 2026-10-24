@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.9.0 / 2026-10-17
+> 基准：2.13.0 / 2026-10-24
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。

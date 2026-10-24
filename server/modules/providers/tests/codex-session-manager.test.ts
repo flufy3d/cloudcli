@@ -44,6 +44,13 @@ type FakeServer = {
   auxStart?: () => Promise<unknown>;
   /** The queued items the fake engine holds, keyed by the client message id. */
   queue: Map<string, { id: string; clientUserMessageId: string }>;
+  /**
+   * Whether the fake engine holds its queue the way codex-cli 0.163.0 does
+   * after a turn was interrupted: nothing drains on its own, and
+   * `thread/queue/start` starts the named input. Otherwise the fake thread
+   * counts as busy and refuses the start.
+   */
+  queueHeld: boolean;
 };
 
 const notify = (server: FakeServer, method: string, params: unknown): void => {
@@ -57,6 +64,7 @@ function installFakeAppServer(t: any): FakeServer {
     handlers: {},
     closed: false,
     queue: new Map(),
+    queueHeld: false,
     exited: Promise.resolve(),
   };
 
@@ -100,6 +108,19 @@ function installFakeAppServer(t: any): FakeServer {
         }
         if (method === 'thread/queue/list') {
           return { data: [...server.queue.values()], nextCursor: null };
+        }
+        if (method === 'thread/queue/start') {
+          const entry = [...server.queue.entries()].find(([, item]) => item.id === params.queuedSubmissionId);
+          if (!server.queueHeld || !entry) {
+            throw new Error('thread already has an active or pending turn');
+          }
+          // The engine reports the consumption before it answers, and the
+          // turn after it.
+          server.queue.delete(entry[0]);
+          const turnId = `started-${entry[1].id}`;
+          notify(server, 'thread/queue/changed', { threadId: THREAD_ID });
+          setTimeout(() => notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: turnId, status: 'inProgress' } }), 0);
+          return { turn: { id: turnId, status: 'inProgress' } };
         }
         if (method === 'thread/queue/delete') {
           for (const [key, item] of server.queue) {
@@ -1822,4 +1843,258 @@ test('startup announcements wait for concurrent ownership and never detach a suc
     handle.release();
     assert.equal(isCodexResidentSessionBusy('aux-announcements'), false);
   } finally { closeCodexResidentSessions(); }
+});
+
+const HELD_SESSION_OPTIONS = {
+  nativeThreadId: null,
+  workingDirectory: '/tmp',
+  approvalPolicy: 'never',
+  sandbox: 'workspace-write' as const,
+  sandboxPolicy: { type: 'workspaceWrite' as const, networkAccess: false },
+};
+
+test('an input queued after an interrupted turn is started, because the engine holds its queue', async (t) => {
+  const server = installFakeAppServer(t);
+  server.queueHeld = true;
+  try {
+    await acquireCodexResidentSession({ appSessionId: 'held-queue', ...HELD_SESSION_OPTIONS });
+    const roundEvents: string[] = [];
+    await submitCodexResidentRound({
+      appSessionId: 'held-queue',
+      input: [{ type: 'text', text: 'write the handoff' }],
+      onEvent: (method) => roundEvents.push(method),
+      onRequest: () => undefined,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const start = server.calls.find((call) => call.method === 'thread/queue/start');
+    assert.equal(start?.params.threadId, THREAD_ID);
+    assert.equal(start?.params.queuedSubmissionId, 'queued-1');
+    assert.deepEqual(roundEvents, ['turn/started']);
+    assert.equal(readCodexResidentSessionActivity('held-queue')?.queued, false);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a held input waits for the report running ahead of it and starts when that report ends', async (t) => {
+  const server = installFakeAppServer(t);
+  server.queueHeld = true;
+  try {
+    await acquireCodexResidentSession({ appSessionId: 'held-behind-report', ...HELD_SESSION_OPTIONS });
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'report-turn', status: 'inProgress' } });
+    const roundEvents: string[] = [];
+    await submitCodexResidentRound({
+      appSessionId: 'held-behind-report',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: (method) => roundEvents.push(method),
+      onRequest: () => undefined,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The thread has a turn of its own; starting the input now would be refused.
+    assert.equal(server.calls.some((call) => call.method === 'thread/queue/start'), false);
+
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'report-turn', status: 'completed' } });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.equal(server.calls.filter((call) => call.method === 'thread/queue/start').length, 1);
+    assert.deepEqual(roundEvents, ['turn/started']);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a refused start leaves the input queued, and the queued round can still be withdrawn', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({ appSessionId: 'start-refused', ...HELD_SESSION_OPTIONS });
+    await submitCodexResidentRound({
+      appSessionId: 'start-refused',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: () => {},
+      onRequest: () => undefined,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.ok(server.calls.some((call) => call.method === 'thread/queue/start'));
+    assert.equal(readCodexResidentSessionActivity('start-refused')?.queued, true);
+    assert.equal(await stopCodexResidentRound('start-refused'), 'cancelled');
+    assert.equal(server.queue.size, 0);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a stop pressed while the held input is being started interrupts the turn it became', async (t) => {
+  const server = installFakeAppServer(t);
+  server.queueHeld = true;
+  try {
+    const resident = await acquireCodexResidentSession({ appSessionId: 'stop-during-start', ...HELD_SESSION_OPTIONS });
+    const original = resident.connection.call.bind(resident.connection);
+    let releaseStart!: () => void;
+    const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+    t.mock.method(resident.connection, 'call', async (method: string, params: unknown, options?: unknown) => {
+      if (method === 'thread/queue/start') await startGate;
+      return original(method, params, options as never);
+    });
+    await submitCodexResidentRound({
+      appSessionId: 'stop-during-start',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: () => {},
+      onRequest: () => undefined,
+    });
+
+    const stopping = stopCodexResidentRound('stop-during-start');
+    releaseStart();
+    // The turn the start produced is announced before the stop decides.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(await stopping, 'interrupted');
+    assert.equal(server.calls.some((call) => call.method === 'thread/queue/delete'), false);
+    assert.equal(server.calls.find((call) => call.method === 'turn/interrupt')?.params.turnId, 'started-queued-1');
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a held input starts after a report whose end arrived while its owner was still being decided', async (t) => {
+  const server = installFakeAppServer(t);
+  server.queueHeld = true;
+  try {
+    const resident = await acquireCodexResidentSession({ appSessionId: 'held-after-pending', ...HELD_SESSION_OPTIONS });
+    const original = resident.connection.call.bind(resident.connection);
+    // The first start is refused, as on a thread whose report is starting.
+    let refuseStart = true;
+    let releaseRead: (() => void) | null = null;
+    t.mock.method(resident.connection, 'call', async (method: string, params: unknown, options?: unknown) => {
+      if (method === 'thread/queue/start' && refuseStart) {
+        refuseStart = false;
+        throw new Error('thread already has an active or pending turn');
+      }
+      if (method === 'thread/queue/list' && !releaseRead && refuseStart === false) {
+        await new Promise<void>((resolve) => { releaseRead = resolve; });
+      }
+      return original(method, params, options as never);
+    });
+    const roundEvents: string[] = [];
+    await submitCodexResidentRound({
+      appSessionId: 'held-after-pending',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: (method) => roundEvents.push(method),
+      onRequest: () => undefined,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // A short report starts and ends while the queue read that decides its
+    // owner is still in flight.
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'short-report', status: 'inProgress' } });
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'short-report', status: 'completed' } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    (releaseRead as (() => void) | null)?.();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.equal(server.calls.filter((call) => call.method === 'thread/queue/start').length, 1);
+    assert.deepEqual(roundEvents, ['turn/started']);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('the turn a start returns is the round turn even when a report starts right after it', async (t) => {
+  const server = installFakeAppServer(t);
+  server.queueHeld = true;
+  try {
+    const resident = await acquireCodexResidentSession({ appSessionId: 'start-binds-turn', ...HELD_SESSION_OPTIONS });
+    const original = resident.connection.call.bind(resident.connection);
+    t.mock.method(resident.connection, 'call', async (method: string, params: unknown, options?: unknown) => {
+      const result = await original(method, params, options as never);
+      if (method === 'thread/queue/start') {
+        // A report is announced ahead of the started turn.
+        notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'late-report', status: 'inProgress' } });
+      }
+      return result;
+    });
+    const roundEvents: Array<string> = [];
+    await submitCodexResidentRound({
+      appSessionId: 'start-binds-turn',
+      input: [{ type: 'text', text: 'hello' }],
+      onEvent: (method, params) => roundEvents.push(`${method}:${(params.turn as { id?: string } | undefined)?.id}`),
+      onRequest: () => undefined,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.deepEqual(roundEvents, ['turn/started:started-queued-1']);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a compaction round starts the engine compaction and owns the turn it announces', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    const engineEvents: string[] = [];
+    await acquireCodexResidentSession({
+      appSessionId: 'app-compact',
+      nativeThreadId: THREAD_ID,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: (method) => engineEvents.push(method),
+    });
+
+    const roundEvents: string[] = [];
+    await submitCodexResidentRound({
+      appSessionId: 'app-compact',
+      input: [],
+      compact: true,
+      onEvent: (method) => roundEvents.push(method),
+      onRequest: () => undefined,
+    });
+
+    const methods = server.calls.map((call) => call.method);
+    assert.ok(methods.includes('thread/compact/start'));
+    assert.ok(!methods.includes('thread/queue/add'));
+    assert.ok(!methods.includes('turn/start'));
+    assert.equal(server.calls.find((call) => call.method === 'thread/compact/start')?.params.threadId, THREAD_ID);
+
+    // The engine answers the call with an empty object and names no turn; the
+    // turn it announces next is the compaction.
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'compact-turn', status: 'inProgress' } });
+    notify(server, 'item/started', { threadId: THREAD_ID, turnId: 'compact-turn', item: { type: 'contextCompaction', id: 'c-1' } });
+    notify(server, 'turn/completed', { threadId: THREAD_ID, turn: { id: 'compact-turn', status: 'completed' } });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.deepEqual(roundEvents, ['turn/started', 'item/started', 'turn/completed']);
+    assert.deepEqual(engineEvents, []);
+  } finally {
+    closeCodexResidentSessions();
+  }
+});
+
+test('a compaction round is refused while the engine is still reporting', async (t) => {
+  const server = installFakeAppServer(t);
+  try {
+    await acquireCodexResidentSession({
+      appSessionId: 'app-compact-busy',
+      nativeThreadId: THREAD_ID,
+      workingDirectory: '/tmp',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
+      onEngineEvent: () => {},
+    });
+    notify(server, 'turn/started', { threadId: THREAD_ID, turn: { id: 'engine-report', status: 'inProgress' } });
+
+    await assert.rejects(submitCodexResidentRound({
+      appSessionId: 'app-compact-busy',
+      input: [],
+      compact: true,
+      onEvent: () => {},
+      onRequest: () => undefined,
+    }), /busy/i);
+    assert.ok(!server.calls.some((call) => call.method === 'thread/compact/start'));
+  } finally {
+    closeCodexResidentSessions();
+  }
 });
