@@ -100,6 +100,8 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出；18MB 级
 
 **上下文窗口（本 fork 补充）**：transcript 只记录解析后的模型 id（`claude-opus-5`），读不出 `[1m]` 变体；SDK 只在 query 活着时知道真实窗口。runtime 因此在流头部与首批 assistant 回复各探测一次 `getContextUsage()`（最多两次，共享 in-flight 读），把结果经 `recordClaudeSessionContextWindow` 写进 `sessions.context_window`，并让该 run 之后发出的 `token_budget` 帧用这个窗口而不是启动参数（`createContextWindowCapture`，`services/claude-context-window.ts`）。历史页与 `/token-usage` 走同一个解析器（`resolveClaudeContextWindow`：记录值 → `CONTEXT_WINDOW` → 带 `[1m]` 的模型 id），所以实时百分比与刷新后一致。
 
+**编辑第一条 prompt = 换一个引擎会话（重指向）**：`chat.edit-send` 替换首条用户消息时带 `resumeFromScratch`，`mapCliOptionsToSDK` 因此不传 `resume`，SDK 开启**新的 provider session** 并写新的 `<projectDir>/<newId>.jsonl`。runtime 在流里发现 `session_id` 与行上的旧 id 不同，就用 `writer.setSessionId(newId, { transcriptPath })` 把「这是替换，不是首次映射」交给网关；`ChatRunRegistry.recordProviderSessionId` 据此调 `repointSessionToProviderSession(..., { supersedePrevious: true })`，在同一事务里把 app 行的 `provider_session_id` 与 `jsonl_path` 一起换到新转录、删掉 watcher 抢先建的同 id 行，并把旧 id 记进 `superseded_provider_sessions`（Claude 同步器据此跳过旧转录，整库重扫也不会把它带回来）。**这里不能用 `assignProviderSessionId`**：它故意保留旧 `jsonl_path`，历史会继续读旧文件。Codex 的 `rewindSession` 分支同理，只是它自己记录 superseded。
+
 ## 共享基础设施（写新引擎前先看）
 
 
