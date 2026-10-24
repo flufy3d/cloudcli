@@ -37,6 +37,20 @@ export function getZCodeDatabasePath(): string {
 }
 
 /**
+ * Resolves the directory holding the sidecars of every agent one session
+ * spawned (`<storage>/cli/agents/<parentSessionId>/<agentId>/metadata.json`
+ * beside the agent's `output.txt`). The engine writes `metadata.json` at
+ * spawn (`status: running`) and rewrites it when the agent stops, with the
+ * outcome and its totals; it is the only durable record of how an agent
+ * ended, because the lifecycle events are not persisted anywhere else.
+ *
+ * Consumers: zcode sessions provider (history replay of Agent cards).
+ */
+export function getZCodeAgentSidecarDir(parentSessionId: string): string {
+  return path.join(getZCodeStorageDir(), 'cli', 'agents', parentSessionId);
+}
+
+/**
  * Returns the storage-relative directories the File Tree may open read-only
  * for files ZCode references in chat: its persistent memories, user-level
  * skills, and the root AGENTS.md instructions file.

@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
 import type { ServerEvent } from '@/shared/context/WebSocketContext';
-import { showCompletionTitleIndicator } from '@/modules/chat/utils/pageTitleNotification';
+import { showCompletionTitleIndicator } from '@/shared/utils';
 import { playChatCompletionSound, playNotificationSound } from '@/modules/chat/utils/notificationSound';
 import type { MarkSessionIdle, MarkSessionProcessing } from '@/shared/types';
 import type { PendingPermissionRequest } from '@/shared/types';

@@ -106,7 +106,8 @@ temp/
 .netlify
 
 # AI specific
-.claude/
+.claude/*
+!.claude/settings.json
 .cursor/
 .roo/
 .taskmaster/

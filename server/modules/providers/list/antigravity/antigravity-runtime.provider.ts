@@ -20,6 +20,11 @@ import {
   appendImagesInputTag,
   normalizeAttachmentDescriptors,
 } from '@/shared/image-attachments.js';
+import {
+  LOCAL_AGENT_TASK_TYPE,
+  createBackgroundTasksStatusMessage,
+  createTaskStatusMessage,
+} from '@/modules/providers/shared/background-work/task-status.js';
 import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type {
   ActiveBackgroundTask,
@@ -38,6 +43,9 @@ import {
 
 import { getAntigravityDataRoot } from './antigravity-data-root.js';
 import { tryResolveEnginePath } from './antigravity-engine-path.js';
+import { createAgentTranscriptTail } from './antigravity-agent-tail.js';
+import { AntigravitySessionsProvider } from './antigravity-sessions.provider.js';
+import { antigravityBackgroundWork, extractAntigravitySubagents, judgeAntigravityAgent } from './antigravity-subagent.js';
 import {
   findCatalogOptionForModelString,
   resolveAntigravityModelArgs,
@@ -118,36 +126,23 @@ let keylessRunCounter = 0;
 const abortedProcessKeys = new Set<string>();
 
 /**
- * Subagents each live session is waiting on, shown as task cards.
+ * Session keys a keyless run is also reachable by once the engine names its
+ * conversation: `backgroundTasks.list` is asked by app or conversation id,
+ * while the run's tasks are registered under the key it started with.
  */
-const activeSessionBackgroundTasks = new Map<string, Map<string, ActiveBackgroundTask>>();
+const backgroundKeyAliases = new Map<string, string>();
 
-export function getAntigravityBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
-  const tasks = activeSessionBackgroundTasks.get(sessionId);
-  return tasks ? Array.from(tasks.values()) : [];
+/** Number of live key aliases; the tests use it to prove a finished run leaves none behind. */
+export function getAntigravityBackgroundKeyAliasCount(): number {
+  return backgroundKeyAliases.size;
 }
 
 /**
- * Extracts the subagents an `invoke_subagent` step created.
- *
- * Only the step's DONE update carries each subagent's `conversation_id`. agy
- * withholds the turn's result until every subagent reports back, and the
- * report is a contentless `system_message` step that names no subagent, so
- * the cards are cleared together when the result arrives. A backgrounded
- * run_command needs no card: its `tool` step stays ACTIVE until the command
- * exits and renders as a running tool row.
+ * The agents a session is waiting on, in the shape the composer's strip lists.
+ * `id` is the id of each agent's `Agent` card.
  */
-export function extractAntigravityBackgroundTasks(step: AnyRecord): ActiveBackgroundTask[] {
-  if (readOptionalString(step?.step_type) !== 'subagent' || readOptionalString(step.state) !== 'DONE') return [];
-  const subagents = readObjectRecord(step.subagent_info)?.subagents;
-  if (!Array.isArray(subagents)) return [];
-  return subagents.flatMap((entry) => {
-    const subagent = readObjectRecord(entry);
-    const id = readOptionalString(subagent?.conversation_id);
-    if (!id) return [];
-    const role = readOptionalString(subagent?.role) ?? 'Subagent';
-    return [{ id, toolName: 'Subagent', command: role, description: role, startedAt: Date.now() }];
-  });
+export function getAntigravityBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {
+  return antigravityBackgroundWork.listStripTasks(backgroundKeyAliases.get(sessionId) ?? sessionId);
 }
 
 /**
@@ -155,6 +150,9 @@ export function extractAntigravityBackgroundTasks(step: AnyRecord): ActiveBackgr
  * writes actionable errors (auth failures, bad flags, quota) to stderr only;
  * the tail is what the user sees when the run fails.
  */
+/** How long a run waits for its agents' final transcript reads before settling. */
+const AGENT_TAIL_FINAL_READ_TIMEOUT_MS = 5_000;
+
 const STDERR_TAIL_LIMIT = 4_000;
 
 /**
@@ -257,32 +255,71 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
 
       const processKey = sessionId || capturedSessionId || `agy_${Date.now()}_${keylessRunCounter += 1}`;
       const sessionKey = sessionId || capturedSessionId || processKey;
-      let sessionTasks = activeSessionBackgroundTasks.get(sessionKey);
-      if (!sessionTasks) {
-        sessionTasks = new Map<string, ActiveBackgroundTask>();
-        activeSessionBackgroundTasks.set(sessionKey, sessionTasks);
-      }
-
       const broadcastBackgroundTasks = () => {
-        const tasksArray = Array.from(sessionTasks?.values() ?? []);
-        writer.send(createNormalizedMessage({
-          id: generateMessageId(PROVIDER),
-          kind: 'status',
-          text: 'background_tasks',
-          backgroundTasks: tasksArray,
-          sessionId: capturedSessionId || sessionId || null,
-          provider: PROVIDER,
-        }));
+        writer.send(createBackgroundTasksStatusMessage(
+          { provider: PROVIDER, sessionId: capturedSessionId || sessionId || null },
+          getAntigravityBackgroundTasksForSession(sessionKey),
+        ));
       };
 
-      // Every way the run ends must tell the client its cards are gone: the
-      // composer strip only changes on a `background_tasks` frame, so a list
-      // emptied silently (abort, crash, watchdog) stayed on screen until a
-      // reload re-read it from the subscribe ack.
-      const clearBackgroundTasks = () => {
-        if (sessionTasks.size === 0) return;
-        sessionTasks.clear();
-        broadcastBackgroundTasks();
+      // The agents' own work lives in their transcripts, not in `agy`'s
+      // stream; following those puts their steps into their cards as they
+      // happen, in the same shape history gives them.
+      const historyReader = new AntigravitySessionsProvider();
+      /** The turn-end work a `result` event started; `close` and `error` wait for it. */
+      let turnEnding: Promise<void> | null = null;
+      const agentTail = createAgentTranscriptTail({
+        readTimeline: async (conversationId) => (await historyReader.fetchHistory(conversationId, {})).messages,
+        emit: (message) => writer.send(message),
+      });
+      /**
+       * Stops following every agent after one last read, bounded so a stuck
+       * transcript read cannot hold the run open forever; a failure is
+       * reported and the run still settles.
+       */
+      const finishAgentTails = async (): Promise<void> => {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            agentTail.stopAll(),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(() => {
+                console.warn('[AntigravityRuntime] Final agent transcript reads did not finish in time; settling without them.');
+                resolve();
+              }, AGENT_TAIL_FINAL_READ_TIMEOUT_MS);
+            }),
+          ]);
+        } catch (error) {
+          console.error('[AntigravityRuntime] Failed to finish agent transcript tails:', error);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      /**
+       * Settles every agent the session still waits on: one `task_status`
+       * per agent so its card stops running, then the registry empties. At the
+       * turn's result each agent settles by how its own transcript ended (the
+       * same judgement history uses, so a refresh shows the same card); a
+       * process that ends without a result settles them `stopped`, because
+       * nothing is left to report on them.
+       */
+      const settleOutstandingAgents = (judge: 'transcript' | 'stopped') => {
+        const outstanding = antigravityBackgroundWork.list().find((entry) => entry.sessionId === sessionKey)?.tasks ?? [];
+        for (const task of outstanding) {
+          writer.send(createTaskStatusMessage(
+            {
+              provider: PROVIDER,
+              sessionId: capturedSessionId || sessionId || null,
+              taskId: task.taskId,
+              toolUseId: task.toolUseId,
+              taskType: LOCAL_AGENT_TASK_TYPE,
+            },
+            { event: 'notification', status: judge === 'stopped' ? 'stopped' : judgeAntigravityAgent(task.taskId) },
+          ));
+        }
+        antigravityBackgroundWork.clearSession(sessionKey);
+        return outstanding.length > 0;
       };
 
       // Numbers the interrupted-stream notices of this run so two of them
@@ -302,6 +339,14 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             : `Antigravity CLI exited with code ${code}`;
         const stderr = stderrTail.trim();
         return stderr ? `${base}\nstderr:\n${stderr}` : base;
+      };
+
+      /** Forgets the run's registered agents and the aliases that reached them. */
+      const releaseBackgroundKeys = () => {
+        antigravityBackgroundWork.clearSession(sessionKey);
+        if (capturedSessionId && backgroundKeyAliases.get(capturedSessionId) === sessionKey) {
+          backgroundKeyAliases.delete(capturedSessionId);
+        }
       };
 
       const settleOnce = (callback: () => void) => {
@@ -339,20 +384,12 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
                 : describeFailure(code)),
           });
         }
-        clearBackgroundTasks();
-        activeSessionBackgroundTasks.delete(finalSessionId);
-        if (sessionId) activeSessionBackgroundTasks.delete(sessionId);
-        if (capturedSessionId) activeSessionBackgroundTasks.delete(capturedSessionId);
+        releaseBackgroundKeys();
       };
 
       const enginePath = tryResolveEnginePath();
       if (!enginePath) {
-        if (sessionTasks) {
-          sessionTasks.clear();
-        }
-        activeSessionBackgroundTasks.delete(sessionKey);
-        if (sessionId) activeSessionBackgroundTasks.delete(sessionId);
-        if (capturedSessionId) activeSessionBackgroundTasks.delete(capturedSessionId);
+        releaseBackgroundKeys();
 
         const notInstalledMsg = createNormalizedMessage({
           id: generateMessageId(PROVIDER),
@@ -508,8 +545,11 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             const convId = readOptionalString(rawRecord.conversation_id);
             if (convId && !capturedSessionId) {
               capturedSessionId = convId;
-              if (sessionTasks) {
-                activeSessionBackgroundTasks.set(capturedSessionId, sessionTasks);
+              // A run keyed by its own process (no app session id) is also
+              // reached by the conversation id the engine names; a run keyed
+              // by the app session id needs no alias.
+              if (capturedSessionId !== sessionKey) {
+                backgroundKeyAliases.set(capturedSessionId, sessionKey);
               }
               writer.setSessionId?.(capturedSessionId);
 
@@ -528,21 +568,38 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             return;
           }
 
-          // Context occupancy comes from step_update usage only: each one
-          // reports a single model call, i.e. the live context size. The
-          // result event's usage sums every call of the turn and would
-          // overstate the context (easily past 100%) in agentic loops.
+          // Extract and broadcast token budget from step_update or result
           const stepUpdateRecord = readObjectRecord(rawRecord?.step_update);
           if (stepUpdateRecord) {
-            const startedTasks = extractAntigravityBackgroundTasks(stepUpdateRecord);
-            if (startedTasks.length > 0) {
-              for (const task of startedTasks) {
-                sessionTasks.set(task.id, task);
+            const startedAgents = extractAntigravitySubagents(stepUpdateRecord);
+            if (startedAgents.length > 0) {
+              for (const agent of startedAgents) {
+                antigravityBackgroundWork.start(sessionKey, {
+                  taskId: agent.conversationId,
+                  toolUseId: agent.toolUseId,
+                  taskType: LOCAL_AGENT_TASK_TYPE,
+                  description: agent.role ?? 'Subagent',
+                });
+                agentTail.follow(agent.conversationId, agent.toolUseId);
+                writer.send(createTaskStatusMessage(
+                  {
+                    provider: PROVIDER,
+                    sessionId: capturedSessionId || sessionId || null,
+                    taskId: agent.conversationId,
+                    toolUseId: agent.toolUseId,
+                    taskType: LOCAL_AGENT_TASK_TYPE,
+                  },
+                  { event: 'started', description: agent.role },
+                ));
               }
               broadcastBackgroundTasks();
             }
           }
 
+          // Context occupancy comes from step_update usage only: each one
+          // reports a single model call, i.e. the live context size. The
+          // result event's usage sums every call of the turn and would
+          // overstate the context (easily past 100%) in agentic loops.
           const usageRecord = readObjectRecord(stepUpdateRecord?.usage);
 
           // Segment boundary for streaming text: the first event that is not
@@ -641,40 +698,52 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
               }));
             }
 
-            // agy reports a turn only after its subagents are back, so their
-            // cards go before the client sees the turn complete. An
-            // interrupted-stream result is not the end of the turn (below).
-            const turnContinues = isError && isStreamInterruptedNotice(errorMessage);
-            if (!turnContinues) {
-              clearBackgroundTasks();
-            }
-
-            // A finished turn releases the stdin that was holding the CLI
-            // open: agy exits on EOF and `close` settles the run. An
-            // interrupted-stream result is deliberately excluded — agy has
+            // An interrupted-stream result is not the end of the turn: agy has
             // injected its own continuation prompt and is still working, so
             // closing stdin here would EOF the CLI mid-task and resurrect the
             // very "async work silently killed" bug stdin ownership exists to
             // prevent. Its eventual real result closes stdin instead, and the
-            // watchdog bounds the wait if that result never comes.
+            // watchdog bounds the wait if that result never comes. The client
+            // keeps the turn busy too.
+            const turnContinues = isError && isStreamInterruptedNotice(errorMessage);
             if (turnContinues) {
-              // The client keeps the turn busy too: agy is still working on it.
               return;
             }
-            closeStdinTurn();
 
-            if (!completeSent) {
-              completeSent = true;
-              const completeMsg = createCompleteMessage({
-                provider: PROVIDER,
-                sessionId: capturedSessionId || sessionId || null,
-                exitCode: isError && !streamInterruptedResult ? 1 : 0,
-              });
-              if (totalTokens !== undefined) {
-                completeMsg.tokens = totalTokens;
+            // agy reports a turn only after its subagents are back, so their
+            // cards settle before the client sees the turn complete — and only
+            // after each agent's last steps were read from its transcript, so
+            // none of them lands behind the settle frames or the `complete`.
+            // `close` waits for this before it speaks for the run.
+            turnEnding = (async () => {
+              // A failed or stuck final read must not keep the turn from
+              // ending: `close` waits on this, and the run only settles after.
+              await finishAgentTails();
+              try {
+                if (settleOutstandingAgents(isError ? 'stopped' : 'transcript')) {
+                  broadcastBackgroundTasks();
+                }
+              } catch (error) {
+                console.error('[AntigravityRuntime] Failed to settle agent cards at turn end:', error);
               }
-              writer.send(completeMsg);
-            }
+
+              // A finished turn releases the stdin that was holding the CLI
+              // open: agy exits on EOF and `close` settles the run.
+              closeStdinTurn();
+
+              if (!completeSent) {
+                completeSent = true;
+                const completeMsg = createCompleteMessage({
+                  provider: PROVIDER,
+                  sessionId: capturedSessionId || sessionId || null,
+                  exitCode: isError && !streamInterruptedResult ? 1 : 0,
+                });
+                if (totalTokens !== undefined) {
+                  completeMsg.tokens = totalTokens;
+                }
+                writer.send(completeMsg);
+              }
+            })();
             return;
           }
 
@@ -787,7 +856,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
       });
 
-      agyProcess.on('close', (code: number | null) => {
+      agyProcess.on('close', async (code: number | null) => {
         clearWatchdog();
         activeProcesses.delete(processKey);
 
@@ -809,12 +878,17 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
           }));
         }
 
+        // Agents that never reported are gone with the process; what they did
+        // last is still read from their transcripts first.
+        await turnEnding;
+        await finishAgentTails();
+        if (settleOutstandingAgents('stopped')) {
+          broadcastBackgroundTasks();
+        }
+
         // An exit right after an interrupted-stream notice settles as a
         // success below, so its complete must not report a failure either.
         const succeeded = !watchdogExpired && (code === 0 || (streamInterruptedResult && !sawErrorResult));
-        // Before the complete, and ahead of the aborted early return below,
-        // which never reaches notifyTerminalState.
-        clearBackgroundTasks();
         if (!completeSent) {
           completeSent = true;
           writer.send(createCompleteMessage({
@@ -829,6 +903,7 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         // instead of reporting a failure or a completion.
         const wasAborted = abortedProcessKeys.delete(processKey);
         if (wasAborted) {
+          releaseBackgroundKeys();
           notifyRunStopped({
             userId: writer.userId != null ? String(writer.userId) : null,
             provider: PROVIDER,
@@ -865,10 +940,16 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         }
       });
 
-      agyProcess.on('error', (err: Error) => {
+      agyProcess.on('error', async (err: Error) => {
         clearWatchdog();
         activeProcesses.delete(processKey);
         console.error('[Antigravity CLI error]:', err);
+
+        await turnEnding;
+        await finishAgentTails();
+        if (settleOutstandingAgents('stopped')) {
+          broadcastBackgroundTasks();
+        }
 
         writer.send(createNormalizedMessage({
           id: generateMessageId(PROVIDER),
@@ -879,7 +960,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
           isError: true,
         }));
 
-        clearBackgroundTasks();
         if (!completeSent) {
           completeSent = true;
           writer.send(createCompleteMessage({
@@ -899,7 +979,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
    * Aborts an active Antigravity session.
    */
   async abort(sessionId: string): Promise<boolean> {
-    activeSessionBackgroundTasks.delete(sessionId);
     const process = activeProcesses.get(sessionId);
     if (process) {
       console.info(`[AntigravityRuntime] Aborting session: ${sessionId}`);

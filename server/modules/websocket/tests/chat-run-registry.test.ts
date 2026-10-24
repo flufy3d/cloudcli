@@ -22,6 +22,127 @@ class FakeConnection {
   }
 }
 
+test('gateway stamps one epoch across runs and replay declares its complete lower bound', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'epoch-session', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    run.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'first', streamEpoch: 'provider-forgery' } as any);
+    const replay = chatRunRegistry.replayEvents('epoch-session', 0);
+    assert.equal(typeof (replay as any).streamEpoch, 'string');
+    assert.notEqual((replay as any).streamEpoch, 'provider-forgery');
+    assert.equal((replay as any).replayFromSeq, 1);
+    assert.equal((replay.events[0] as any).streamEpoch, (replay as any).streamEpoch);
+    run.writer.sendComplete({ exitCode: 0 });
+    const next = chatRunRegistry.startRun({ appSessionId: 'epoch-session', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(next);
+    next.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'next' });
+    const nextReplay = chatRunRegistry.replayEvents('epoch-session', 2);
+    assert.equal((nextReplay as any).streamEpoch, (replay as any).streamEpoch);
+    // The replay buffer belongs to the session, so the previous round's events
+    // are still replayable and the lower bound stays at the session's start.
+    assert.equal((nextReplay as any).replayFromSeq, 1);
+    assert.equal(nextReplay.events[0].seq, 3);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('an event published outside a run reaches the session and is replayable', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const connection = new FakeConnection();
+    const run = chatRunRegistry.startRun({ appSessionId: 'session-events', provider: 'codex', providerSessionId: null, connection, userId: null });
+    assert.ok(run);
+    run.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'from the round' });
+    chatRunRegistry.publishSessionEvent('session-events', { kind: 'stream_delta', provider: 'codex', content: 'from the engine' } as any);
+
+    const replay = chatRunRegistry.replayEvents('session-events', 0);
+    assert.equal(replay.events.length, 2);
+    assert.equal(replay.events[0].seq, 1);
+    assert.equal(replay.events[1].seq, 2);
+    assert.equal(connection.frames.length, 2);
+    assert.equal((connection.frames[1] as any).content, 'from the engine');
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('a session event without a run does not make the session look busy', () => {
+  chatRunRegistry.clearAll();
+  try {
+    chatRunRegistry.publishSessionEvent('idle-session', { kind: 'stream_delta', provider: 'codex', content: 'late report' } as any);
+    assert.equal(chatRunRegistry.isProcessing('idle-session'), false);
+    assert.equal(chatRunRegistry.replayEvents('idle-session', 0).events.length, 1);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('a published terminal event is dropped, so no round is ended by it', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'published-complete', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    chatRunRegistry.publishSessionEvent('published-complete', { kind: 'complete', provider: 'codex', exitCode: 0 } as any);
+    assert.equal(chatRunRegistry.isProcessing('published-complete'), true);
+    assert.equal(chatRunRegistry.replayEvents('published-complete', 0).events.length, 0);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('replay buffers are bounded by bytes and report a gap even from sequence zero', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'byte-budget', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    for (let i = 0; i < 100; i += 1) {
+      run.writer.send({ kind: 'stream_delta', provider: 'codex', content: `${i}:` + 'x'.repeat(200_000) });
+    }
+    const replay = chatRunRegistry.replayEvents('byte-budget', 0);
+    assert.ok(Buffer.byteLength(JSON.stringify(replay.events)) <= 8 * 1024 * 1024);
+    assert.equal(replay.stale, true);
+    assert.equal(replay.lastSeq, 100);
+    assert.equal(chatRunRegistry.replayEvents('byte-budget', 99).stale, false);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('a single oversized event is not retained and cannot hide a replay gap', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'single-budget', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    run.writer.send({ id: 'large-tool', kind: 'tool_use', provider: 'codex', toolInput: Array.from({ length: 300 }, () => 'x'.repeat(8_000)) });
+    assert.equal(run.events.length, 0);
+    run.writer.send({ kind: 'stream_end', provider: 'codex' });
+    assert.equal(chatRunRegistry.replayEvents('single-budget', 0).stale, true);
+    assert.equal(chatRunRegistry.replayEvents('single-budget', 1).stale, false);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('many sessions share one process-wide replay byte budget', () => {
+  chatRunRegistry.clearAll();
+  try {
+    const runs = Array.from({ length: 10 }, (_, index) => chatRunRegistry.startRun({ appSessionId: `global-budget-${index}`, provider: 'codex', providerSessionId: null, connection: null, userId: null }));
+    for (const run of runs) {
+      assert.ok(run);
+      for (let i = 0; i < 25; i += 1) run.writer.send({ kind: 'stream_delta', provider: 'codex', content: 'x'.repeat(200_000) });
+    }
+    const bytes = runs.reduce((sum, run) => sum + (run?.bufferedBytes ?? 0), 0);
+    assert.ok(bytes <= 32 * 1024 * 1024);
+    assert.equal(chatRunRegistry.replayEvents('global-budget-0', 0).stale, true);
+    assert.equal(chatRunRegistry.replayEvents('global-budget-9', 0).stale, false);
+  } finally { chatRunRegistry.clearAll(); }
+});
+
+test('an expired run still reports missing events using its session watermark', (context) => {
+  chatRunRegistry.clearAll();
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const run = chatRunRegistry.startRun({ appSessionId: 'expired-budget', provider: 'codex', providerSessionId: null, connection: null, userId: null });
+    assert.ok(run);
+    run.writer.send({ id: 'large-tool', kind: 'tool_use', provider: 'codex', toolInput: Array.from({ length: 300 }, () => 'x'.repeat(8_000)) });
+    run.writer.sendComplete({ exitCode: 0 });
+    context.mock.timers.tick(5 * 60 * 1000 + 1);
+    assert.equal(chatRunRegistry.getRun('expired-budget'), undefined);
+    assert.equal(chatRunRegistry.replayEvents('expired-budget', 0).stale, true);
+    assert.equal(chatRunRegistry.replayEvents('expired-budget', 2).stale, false);
+  } finally { context.mock.timers.reset(); chatRunRegistry.clearAll(); }
+});
+
 async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const tempDirectory = await mkdtemp(path.join(tmpdir(), 'chat-run-registry-'));
@@ -530,10 +651,10 @@ test('adoption refuses unknown, mismatched, archived and busy sessions', async (
       'a session with a run in flight is not adoptable',
     );
 
-    sessionsDb.archiveSessionsOlderThanCutoff('2999-01-01T00:00:00Z');
+    sessionsDb.archiveSessionsByIds(sessionsDb.listSessionsOlderThanCutoff('2999-01-01T00:00:00Z'));
     sessionsDb.createAppSession('app-archived', 'opencode', '/workspace/demo');
     sessionsDb.assignProviderSessionId('app-archived', 'ses_engine_3');
-    sessionsDb.archiveSessionsOlderThanCutoff('2999-01-01T00:00:00Z');
+    sessionsDb.archiveSessionsByIds(sessionsDb.listSessionsOlderThanCutoff('2999-01-01T00:00:00Z'));
     assert.equal(
       chatRunRegistry.adoptExternalRun({ provider: 'opencode', providerSessionId: 'ses_engine_3' }),
       null,

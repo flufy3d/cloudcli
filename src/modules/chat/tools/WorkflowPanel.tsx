@@ -524,8 +524,8 @@ export const WorkflowPanel = memo(({ toolInput, toolResult, workflow, taskStatus
           {taskStatus?.usage && (
             <div className="text-[11px] text-muted-foreground/70">
               {t('workflow.usage', '{{toolUses}} tool uses · {{elapsed}}', {
-                toolUses: taskStatus.usage.toolUses,
-                elapsed: formatTaskDuration(taskStatus.usage.durationMs),
+                toolUses: taskStatus.usage.toolUses ?? 0,
+                elapsed: formatTaskDuration(taskStatus.usage.durationMs ?? 0),
               })}
               {status === 'running' && currentAgentLabel && ` · ${t('workflow.currentAgent', 'current: {{label}}', { label: currentAgentLabel })}`}
             </div>

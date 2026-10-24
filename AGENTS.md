@@ -53,6 +53,17 @@ Saying "发布/发版本" (release a version) means running this whole pipeline 
 7. Stop before the restart-producing deploy step. Tell the user to run `node scripts/deploy.mjs` from the worktree themselves; non-interactive shells need `PATH="$HOME/Library/pnpm:$PATH" PNPM_HOME="$HOME/Library/pnpm"` so pnpm and the stable global CLI entry are available. Resume verification only after the user confirms it completed.
 8. Verify four things: pm2 online with the new version, `curl http://localhost:3030/` returns 200, the fixed runtime's `dist/assets/*.js` fingerprint has no `-dirty`, and `gh release view` confirms the release.
 
+## Parallel development worktrees
+
+Every code change starts in its own worktree under `.worktrees/`, so multiple terminals or AI sessions work without stepping on each other. Do not edit code directly in the main repo, and never hand-run `git worktree add`. The `npm run worktree:*` scripts call the shared `nexus-devflow` CLI from nexus-kit, which must be on `PATH`. The cloudcli settings (directory, ports, recycle whitelist, post-create and post-merge commands) live in `nexus.config.json`.
+
+1. `npm run worktree:new <branch>` creates the tree, runs `npm ci --include=dev` in it (`--include=dev` because sessions launched from the cloudcli production instance inherit `NODE_ENV=production`), and registers a dev port P. Ignore the `--port P --strictPort` hint the command prints; start this repo's dev servers with `SERVER_PORT=<P> VITE_PORT=<P+1> npm run dev`.
+2. When the work is done and verified, run `git rebase main` in the tree and verify again on the rebased code.
+3. `cd` back to the main repo and run `npm run worktree:merge <branch>` on its own. It fast-forwards only, then runs `npm ci --include=dev && npm run build` in the main repo; a non-zero exit means merged but not validated, so keep fixing.
+4. After the merge succeeds, run `npm run worktree:rm <name>` from the main repo. It refuses to run while your shell sits inside that tree. It stops the tree's servers and pm2 apps, and it refuses to drop uncommitted or unrecoverable files unless you pass `-- --force`.
+
+`worktree:ls` lists trees, and `worktree:isolate` detaches a shared item. `.claude/settings.json` wires the WorktreeCreate and WorktreeRemove hooks to the same CLI, so `claude --worktree` and subagents with `isolation: "worktree"` get the same tree setup. Details: `docs/design/并行开发工作树.md`.
+
 ## Frontend code
 
 For every task that creates, modifies, refactors, or reviews frontend code under `src/`, load and follow `$frontend-module-standards` from `.agents/skills/frontend-module-standards/SKILL.md`. Apply it only to frontend code; do not impose those architecture rules on the backend.

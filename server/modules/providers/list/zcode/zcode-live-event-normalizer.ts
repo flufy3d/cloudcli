@@ -1,5 +1,10 @@
-import type { AnyRecord, NormalizedMessage } from '@/shared/types.js';
 import {
+  LOCAL_AGENT_TASK_TYPE,
+  createTaskStatusMessage,
+} from '@/modules/providers/shared/background-work/task-status.js';
+import type { AnyRecord, NormalizedMessage, TaskUsage } from '@/shared/types.js';
+import {
+  compactProviderPayload,
   createNormalizedMessage,
   generateMessageId,
   normalizeProviderTimestamp,
@@ -151,6 +156,146 @@ function tryParseJsonObject(text: string): Record<string, unknown> | null {
 }
 
 /**
+ * One engine session event with its envelope peeled: the typed record the
+ * engine built (`{ id, sessionId, type, timestamp, payload }`), found under
+ * up to three layers of transport wrapping (`session/event` notification
+ * params, `{ event }`, `{ data }`).
+ */
+type ZCodeSessionEvent = {
+  type: string;
+  payload: AnyRecord;
+  sessionId: string | null;
+  timestamp: string;
+  /** The engine's own id for the event, or a fresh one when it sent none. */
+  id: string;
+};
+
+/**
+ * Unwraps a raw engine notification into its typed session event, or null
+ * when nothing typed is inside. `fallbackSessionId` stands in when the event
+ * names no session.
+ *
+ * Consumers: this normalizer's `normalize`, and the runtime's subagent
+ * lifecycle watcher, which reads the same envelope outside a run.
+ */
+export function readZCodeSessionEvent(rawMessage: unknown, fallbackSessionId: string | null): ZCodeSessionEvent | null {
+  const raw = readObjectRecord(compactProviderPayload(rawMessage));
+  if (!raw) {
+    return null;
+  }
+
+  let event: AnyRecord = raw;
+  for (let depth = 0; depth < 3 && !readOptionalString(event.type); depth += 1) {
+    const next = readObjectRecord(event.event)
+      ?? readObjectRecord(compactProviderPayload(event.data))
+      ?? readObjectRecord(event.params);
+    if (!next) {
+      break;
+    }
+    event = next;
+  }
+
+  const type = readOptionalString(event.type) ?? readOptionalString(event.event);
+  if (!type) {
+    return null;
+  }
+
+  const payload = readObjectRecord(event.payload) ?? {};
+  return {
+    type: EVENT_TYPE_ALIASES[type] ?? type,
+    payload,
+    sessionId: readOptionalString(event.sessionId) ?? readOptionalString(raw.sessionId) ?? fallbackSessionId,
+    timestamp: normalizeProviderTimestamp(event.time ?? event.timestamp),
+    id: readOptionalString(event.id)
+      ?? readOptionalString(event.messageID)
+      ?? readOptionalString(payload.messageId)
+      ?? generateMessageId('zcode'),
+  };
+}
+
+/** The `Agent` call whose agent made a mirrored tool event, or undefined for a main-thread event. */
+function readSubagentParentToolCallId(payload: AnyRecord): string | undefined {
+  return readOptionalString(payload.source) === 'subagent' ? readOptionalString(payload.parentToolCallId) : undefined;
+}
+
+/**
+ * Whether an event type is one of the two subagent lifecycle events this
+ * module translates.
+ *
+ * Consumers: `normalize` (dispatch) and the runtime's subagent lifecycle
+ * watcher, which must forward exactly these and ignore the rest of the stream.
+ */
+export function isZCodeSubagentLifecycleEvent(type: string): boolean {
+  return type === 'subagent_spawned' || type === 'subagent_stopped';
+}
+
+/** An engine-reported total, or undefined when the engine did not report one (or reported nonsense). */
+const readReportedTotal = (value: unknown): number | undefined => {
+  const parsed = Number(value);
+  return value !== undefined && value !== null && Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+};
+
+/**
+ * Translates the engine's subagent lifecycle events — emitted on the PARENT
+ * session when an `Agent` call's child session is ready and when it stops —
+ * into the `task_status` events the client folds onto the launching Agent
+ * card. Both events name the launching call (`parentToolCallId`); one that
+ * does not is dropped, because an unattached status has no card to land on.
+ *
+ * `subagent_spawned` marks the card running. `subagent_stopped` settles it:
+ * the engine reports `completed` or `failed` and, on failure, the error as the
+ * summary. Its totals become the card's usage line, but only the ones the
+ * engine sent: a failure stop carries no token or tool-call totals, and a
+ * missing figure stays missing instead of reading as a measured zero.
+ */
+function normalizeZCodeSubagentLifecycleEvent(event: ZCodeSessionEvent): NormalizedMessage | null {
+  const { payload } = event;
+  const taskId = readOptionalString(payload.agentId);
+  const toolUseId = readOptionalString(payload.parentToolCallId);
+  if (!taskId || !toolUseId) {
+    return null;
+  }
+
+  const subject = {
+    provider: PROVIDER,
+    sessionId: event.sessionId,
+    taskId,
+    toolUseId,
+    taskType: LOCAL_AGENT_TASK_TYPE,
+  } as const;
+  const timing = { id: event.id, timestamp: event.timestamp };
+
+  if (event.type === 'subagent_spawned') {
+    return createTaskStatusMessage(subject, {
+      ...timing,
+      event: 'started',
+      description: readOptionalString(payload.description) ?? readOptionalString(payload.prompt),
+    });
+  }
+
+  const reported = readOptionalString(payload.status);
+  const status = reported === 'completed' || reported === 'failed' ? reported : 'stopped';
+  const reportedUsage: Record<keyof TaskUsage, number | undefined> = {
+    totalTokens: readReportedTotal(payload.totalTokens),
+    toolUses: readReportedTotal(payload.totalToolUseCount),
+    durationMs: readReportedTotal(payload.totalDurationMs),
+  };
+  // Keep only the figures the engine sent.
+  const usage = Object.fromEntries(
+    Object.entries(reportedUsage).filter(([, value]) => value !== undefined),
+  ) as TaskUsage;
+  const hasUsage = Object.keys(usage).length > 0;
+  return createTaskStatusMessage(subject, {
+    ...timing,
+    event: 'notification',
+    status,
+    summary: readOptionalString(payload.error),
+    usage: hasUsage ? usage : undefined,
+    outputFile: readOptionalString(payload.outputFile),
+  });
+}
+
+/**
  * Turns ZCode real-time session events into normalized chat records.
  *
  * Consumer: ZCodeSessionsProvider delegates its public live-event interface
@@ -176,37 +321,12 @@ export class ZCodeLiveEventNormalizer {
   private readonly textRowMessageIds = new Map<string, string>();
 
   normalize(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
-    const raw = readObjectRecord(rawMessage);
-    if (!raw) {
+    const event = readZCodeSessionEvent(rawMessage, sessionId);
+    if (!event) {
       return [];
     }
 
-    let event: AnyRecord = raw;
-    for (let depth = 0; depth < 3 && !readOptionalString(event.type); depth += 1) {
-      const next = readObjectRecord(event.event)
-        ?? readObjectRecord(event.data)
-        ?? readObjectRecord(event.params);
-      if (!next) {
-        break;
-      }
-      event = next;
-    }
-
-    const type = readOptionalString(event.type) ?? readOptionalString(event.event);
-    if (!type) {
-      return [];
-    }
-
-    const payload = readObjectRecord(event.payload) ?? {};
-    const eventSessionId = readOptionalString(event.sessionId)
-      ?? readOptionalString(raw.sessionId)
-      ?? sessionId;
-    const timestamp = normalizeProviderTimestamp(event.time ?? event.timestamp);
-    const baseId = readOptionalString(event.id)
-      ?? readOptionalString(event.messageID)
-      ?? readOptionalString(payload.messageId)
-      ?? generateMessageId('zcode');
-    const normalizedType = EVENT_TYPE_ALIASES[type] ?? type;
+    const { payload, sessionId: eventSessionId, timestamp, id: baseId, type: normalizedType } = event;
 
     if (normalizedType === 'model_streaming') {
       return this.normalizeStreamingKind(payload, eventSessionId, timestamp, baseId);
@@ -214,6 +334,11 @@ export class ZCodeLiveEventNormalizer {
 
     if (normalizedType === 'tool_call_scheduled') {
       return this.normalizeScheduledTool(payload, eventSessionId, timestamp, baseId);
+    }
+
+    if (isZCodeSubagentLifecycleEvent(normalizedType)) {
+      const status = normalizeZCodeSubagentLifecycleEvent(event);
+      return status ? [status] : [];
     }
 
     if (normalizedType === 'model_complete' || normalizedType === 'turn_complete') {
@@ -325,6 +450,10 @@ export class ZCodeLiveEventNormalizer {
       toolName,
       toolInput: payload.input,
       toolId,
+      // While an agent runs the engine mirrors its tool calls onto the parent
+      // session's stream, marked `source: "subagent"` with the agent's `Agent`
+      // call as `parentToolCallId`; they belong in that card's timeline.
+      parentToolUseId: readSubagentParentToolCallId(payload),
     })];
   }
 

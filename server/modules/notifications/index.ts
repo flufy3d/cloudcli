@@ -11,7 +11,11 @@ export {
   notifyRunStopped,
   // Used by provider runtimes to report background work that finished after its turn ended.
   notifyBackgroundWorkCompleted,
+  // Used by the chat gateway to report an approval card from any engine.
+  notifyPermissionRequired,
 } from '@/modules/notifications/services/notification-orchestrator.service.js';
+// The event type settings re-publishes through its boundary.
+export type { NotificationEvent } from '@/modules/notifications/services/notification-orchestrator.service.js';
 export {
   registerDesktopNotificationClient,
   sendDesktopNotification,

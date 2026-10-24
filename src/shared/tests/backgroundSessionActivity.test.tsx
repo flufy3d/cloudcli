@@ -131,3 +131,29 @@ test('a poll that changes what it says about a listed task is not dropped as a r
   assert.equal(listed?.nested, true);
   assert.equal(listed?.description, 'Audit the whole frontend');
 });
+
+test('the poll carries what the engine says about the round onto the activity', () => {
+  // The engine alone knows whether a round still waits in its queue and
+  // whether it reports on finished background work in a turn of its own; the
+  // pill reads both off the activity, so the poll must not drop them.
+  const { result } = renderHook(() => useSessionProtection());
+  const startedAt = Date.now() - 30_000;
+
+  act(() => {
+    result.current.syncProcessingSessions([
+      { sessionId: 'queued-session', startedAt, canInterrupt: true, queued: true },
+      { sessionId: 'report-session', startedAt, canInterrupt: true, background: true, tasks: [], reporting: true },
+    ]);
+  });
+  assert.equal(result.current.getSessionActivity('queued-session')?.queued, true);
+  assert.equal(result.current.getSessionActivity('report-session')?.reporting, true);
+
+  act(() => {
+    result.current.syncProcessingSessions([
+      { sessionId: 'queued-session', startedAt, canInterrupt: true, queued: false },
+      { sessionId: 'report-session', startedAt, canInterrupt: true, background: true, tasks: [], reporting: false },
+    ]);
+  });
+  assert.equal(result.current.getSessionActivity('queued-session')?.queued, false, 'the engine picked the round up');
+  assert.equal(result.current.getSessionActivity('report-session')?.reporting, false, 'the report ended while work still runs');
+});

@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+import readline from 'node:readline';
 
 import type { AnyRecord } from '@/shared/types.js';
-import { readObjectRecord, sanitizeLeafDirectoryName } from '@/shared/utils.js';
+import { parseProviderJson, readObjectRecord, sanitizeLeafDirectoryName } from '@/shared/utils.js';
 
 import { getAntigravityTranscriptCandidates } from './antigravity-data-root.js';
 
@@ -17,21 +17,23 @@ function isContentTruncated(entry: AnyRecord): boolean {
 }
 
 async function readJsonl(pathname: string): Promise<CanonicalAntigravityTranscriptRow[]> {
+  const rows: CanonicalAntigravityTranscriptRow[] = [];
   try {
-    const content = await readFile(pathname, 'utf8');
-    return content.split(/\r?\n/).flatMap((line) => {
-      if (!line.trim()) return [];
+    const input = fs.createReadStream(pathname);
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (!line.trim()) continue;
       try {
-        const entry = readObjectRecord(JSON.parse(line));
-        if (!entry) return [];
-        return [{ entry, contentCompleteness: isContentTruncated(entry) ? 'truncated' : 'complete' }];
-      } catch {
-        return [];
+        const entry = readObjectRecord(parseProviderJson(line));
+        if (entry) rows.push({ entry, contentCompleteness: isContentTruncated(entry) ? 'truncated' : 'complete' });
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
       }
-    });
-  } catch {
-    return [];
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  return rows;
 }
 
 /**

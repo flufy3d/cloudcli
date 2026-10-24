@@ -8,6 +8,7 @@ import {
   createNotificationEvent,
   getPublicKey,
   notifyUserIfEnabled,
+  type NotificationEvent,
 } from '@/modules/notifications/index.js';
 
 import { createSettingsRouter } from './settings.routes.js';
@@ -36,7 +37,9 @@ const settingsService = createSettingsService({
       provider: 'system', kind: 'info', code: 'push.enabled',
       meta: { message: 'Push notifications are now enabled!' }, severity: 'info',
     }),
-    notifyUser: (userId, event) => notifyUserIfEnabled({ userId, event }),
+    // The settings boundary types the event loosely; its only caller passes
+    // `createEnabledEvent`'s output, which satisfies NotificationEvent.
+    notifyUser: (userId, event) => notifyUserIfEnabled({ userId, event: event as NotificationEvent }),
   },
   pushSubscriptions: {
     save: (userId, endpoint, p256dh, auth) =>

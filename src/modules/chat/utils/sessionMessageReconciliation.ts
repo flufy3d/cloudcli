@@ -61,12 +61,19 @@ export type OptimisticPromptReconciliation = {
  * anchor row out of the window entirely. Rather than keep an unmatched prompt
  * on screen forever — the failure this whole mechanism exists to prevent —
  * a finished run lets the prompt pair with any user row it has not claimed.
+ *
+ * `priorPairings` are pairings an earlier pass already made, and they stand.
+ * A long session keeps only the newest transcript page loaded; once a
+ * prompt's copy scrolls out of it, pairing that prompt again from scratch
+ * takes some newer turn's row, every later prompt slides down with it, and
+ * the newest is left with nothing to claim — rendered beside its own copy.
  */
 export function reconcileOptimisticPrompts(
   serverMessages: NormalizedMessage[],
   realtimeMessages: NormalizedMessage[],
   pendingPrompts: ReadonlyMap<string, PendingPrompt>,
   runEnded: boolean,
+  priorPairings: ReadonlyMap<string, string> = new Map(),
 ): OptimisticPromptReconciliation {
   const retiredAnchors = new Map<string, string>();
   const provenAnchors = new Map<string, string>();
@@ -75,6 +82,12 @@ export function reconcileOptimisticPrompts(
   }
 
   const claimedServerIds = new Set<string>();
+  for (const message of realtimeMessages) {
+    const priorServerId = priorPairings.get(message.id);
+    if (priorServerId !== undefined && isOptimisticPromptRow(message)) {
+      claimedServerIds.add(priorServerId);
+    }
+  }
 
   for (const message of realtimeMessages) {
     if (!isOptimisticPromptRow(message)) {
@@ -82,6 +95,20 @@ export function reconcileOptimisticPrompts(
     }
 
     const anchorRowId = pendingPrompts.get(message.id)?.afterRowId ?? null;
+    const priorServerId = priorPairings.get(message.id);
+    if (priorServerId !== undefined) {
+      retiredAnchors.set(message.id, priorServerId);
+      // Proven on the same terms as a fresh pairing: the anchor is loaded and
+      // the paired row sits after it.
+      const anchorIndex = anchorRowId === null
+        ? -1
+        : serverMessages.findIndex((candidate) => candidate.id === anchorRowId);
+      const pairedIndex = serverMessages.findIndex((candidate) => candidate.id === priorServerId);
+      if (anchorIndex >= 0 && pairedIndex > anchorIndex) {
+        provenAnchors.set(message.id, priorServerId);
+      }
+      continue;
+    }
     let firstEligibleIndex = 0;
     // A prompt sent with nothing loaded has no anchor to be right about. Its
     // pairing is the best available reading until the run ends — by then the

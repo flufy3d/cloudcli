@@ -206,6 +206,6 @@ test('orchestration-only collaboration calls never reach the transcript', () => 
   });
   assert.ok(spawn);
   const rows = codexThreadItemToRows(spawn, TIMESTAMP);
-  assert.deepEqual(rows.map((row) => row.toolName), ['Task']);
+  assert.deepEqual(rows.map((row) => row.toolName), ['Agent']);
   assert.equal(JSON.parse(String(rows[0].toolInput)).description, 'Audit');
 });

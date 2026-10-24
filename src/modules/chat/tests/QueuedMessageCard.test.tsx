@@ -54,7 +54,7 @@ describe('QueuedMessageCard', () => {
 
     expect(screen.getByText(/后台任务完成后将自动发送/)).toBeTruthy();
 
-    const forceSendBtn = screen.getByTitle('立即发送并中断后台任务');
+    const forceSendBtn = screen.getByTitle('Send now; background tasks keep running');
     expect(forceSendBtn).toBeTruthy();
 
     fireEvent.click(forceSendBtn);

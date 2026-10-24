@@ -1,7 +1,7 @@
 import type {
   ActiveBackgroundTask,
   AnyRecord,
-  BackgroundTaskSummary,
+  SessionBackgroundWork,
   FetchHistoryOptions,
   FetchHistoryResult,
   LLMProvider,
@@ -47,6 +47,7 @@ export interface IProviderRuntime {
   ): Promise<unknown>;
   abort(sessionId: string): boolean | Promise<boolean>;
   /**
+  /**
    * Compacts a stored conversation into a summary the next turn builds on.
    *
    * Present only for engines whose CLI or protocol exposes on-demand
@@ -75,11 +76,57 @@ export interface IProviderRuntime {
     options: AnyRecord,
     context: ProviderRuntimeContext,
   ): Promise<boolean>;
+  /**
+   * What the engine is doing with the session's round.
+   *
+   * A resident engine knows whether the queued input has been picked up; the
+   * caller needs that to tell "waiting for the engine" from "the engine is
+   * working on this round".
+   */
+  getSessionActivity?(sessionId: string): { queued: boolean; reporting: boolean } | null;
+  /**
+   * Whether the session still has work that must not be reclaimed.
+   *
+   * A conversation with a turn in flight, with a report the engine started on
+   * its own, or with an agent that is still running cannot be archived or
+   * deleted while that work is alive.
+   */
+  hasSessionWork?(sessionId: string): boolean;
+  /**
+   * Stops new work from starting in the session.
+   *
+   * The caller looks at the session's state afterwards and releases it, so a
+   * run cannot start in between the check and the action.
+   */
+  closeSessionAdmission?(sessionId: string): void;
+  /**
+   * Releases the resources the session holds, such as a process that stays
+   * alive between rounds. Called once the session's work is over; the
+   * admission stays closed until the caller opens it again.
+   */
+  releaseSession?(sessionId: string): void;
+  /**
+   * Opens the session's admission again, after the action that closed it.
+   */
+  openSessionAdmission?(sessionId: string): void;
   permissions?: ProviderRuntimePermissionGateway;
   backgroundTasks?: {
     list(sessionId: string): ActiveBackgroundTask[];
     /** Includes pending execution and the follow-up reply after its task settles. */
     isPending?(sessionId: string): boolean;
+    /**
+     * False only for a session whose listed work this runtime holds and
+     * `abort` can no longer stop — its turn has ended and the runtime keeps no
+     * run to cancel. Left undefined, or true, the work counts as stoppable.
+     */
+    canInterrupt?(sessionId: string): boolean;
+    /**
+     * False when a message sent during this session's background work does
+     * not disturb it — the runtime takes the turn alongside the work (Claude's
+     * held process) — so the page sends at once instead of queueing.
+     * Undefined counts as true: the message waits for the work.
+     */
+    queuesInput?(sessionId: string): boolean;
   };
   /**
    * Sessions with background tasks still outstanding, whether or not their
@@ -87,7 +134,7 @@ export interface IProviderRuntime {
    * such work has anything to report; the others leave this undefined and the
    * running-sessions list falls back to chat runs alone.
    */
-  listBackgroundWork?(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }>;
+  listBackgroundWork?(): SessionBackgroundWork[];
   /**
    * Stops one outstanding background task. Resolves false when the session has
    * no live process or that process is not tracking the task — it already

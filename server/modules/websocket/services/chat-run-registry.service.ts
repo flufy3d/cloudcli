@@ -1,14 +1,18 @@
+import { randomUUID } from 'node:crypto';
+
+import { WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import { recordRunOutcome } from '@/modules/diagnostics/index.js';
 import { ChatSessionWriter } from '@/modules/websocket/services/chat-session-writer.service.js';
 import { broadcastSessionUpserted } from '@/modules/websocket/services/session-upsert-broadcast.service.js';
-import { WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import type {
   LLMProvider,
   NormalizedMessage,
   RealtimeClientConnection,
   RunOutcomeReason,
 } from '@/shared/types.js';
+
+import { CHAT_REPLAY_LIMITS } from '../../../../shared/protocol/frames.js';
 
 type ChatRunStatus = 'running' | 'completed';
 
@@ -22,6 +26,39 @@ export type ChatReplayResult = {
   events: NormalizedMessage[];
   lastSeq: number;
   stale: boolean;
+  streamEpoch: string;
+  replayFromSeq: number;
+};
+
+// One namespace for this gateway process, independent of run eviction/reset.
+const streamEpoch = randomUUID();
+
+/**
+ * The session's event channel: the audience, the sequence numbers and the
+ * bounded replay buffer.
+ *
+ * The channel belongs to the session rather than to a run, because a provider
+ * that stays resident keeps reporting after its round ended — the engine
+ * starts a turn of its own to report a background result, and that report
+ * belongs to the session, not to the round the user is waiting for. A new
+ * round replaces the run record but not the channel, and the round's writer
+ * and the session's publish entry travel on the same channel.
+ */
+type ChatSessionChannel = {
+  appSessionId: string;
+  /** Every socket watching this session, across rounds. */
+  audience: Set<RealtimeClientConnection>;
+  /** The last sequence number handed out for this session. */
+  lastSeq: number;
+  /** When the channel was created, which orders the sessions by age. */
+  createdAt: number;
+  /** The events a reconnecting client can replay. */
+  events: NormalizedMessage[];
+  eventBytes: number[];
+  bufferedBytes: number;
+  lastDroppedSeq: number;
+  /** The writer for events that belong to the session rather than to a run. */
+  writer: ChatSessionWriter;
 };
 
 /**
@@ -34,8 +71,8 @@ export type ChatReplayResult = {
  * - `status`: drives `chat_subscribed.isProcessing`, prevents double sends
  *   into the same session, and guards the synthetic-complete fallback in the
  *   chat handler (only emitted when a runtime died without completing).
- * - `lastSeq` / `events`: the run's event log. Every live event gets a
- *   `seq` continuing the session's watermark (see `sessionWatermarks`) and is
+ * - `channel`: the session's event channel. Every live event gets a `seq`
+ *   continuing the session's watermark (see `sessionWatermarks`) and is
  *   buffered so a reconnecting client can replay exactly the events it missed
  *   via `chat.subscribe`.
  */
@@ -44,8 +81,14 @@ type ChatRun = {
   provider: LLMProvider;
   providerSessionId: string | null;
   status: ChatRunStatus;
-  lastSeq: number;
-  events: NormalizedMessage[];
+  /** The session channel this run's events travel on. */
+  channel: ChatSessionChannel;
+  /** The session's last sequence number, read from the channel. */
+  readonly lastSeq: number;
+  /** The session's replay buffer, read from the channel. */
+  readonly events: NormalizedMessage[];
+  /** The session's buffered bytes, read from the channel. */
+  readonly bufferedBytes: number;
   writer: ChatSessionWriter;
   startedAt: number;
   completedAt: number | null;
@@ -67,12 +110,31 @@ type ChatRun = {
 const COMPLETED_RUN_RETENTION_MS = 5 * 60 * 1000;
 
 /**
- * Upper bound on buffered events per run so a very long tool-heavy run cannot
- * grow memory unbounded. When exceeded, the oldest events are dropped —
+ * Upper bound on buffered events per session so a very long tool-heavy run
+ * cannot grow memory unbounded. When exceeded, the oldest events are dropped —
  * a reconnecting client whose `lastSeq` predates the buffer falls back to a
  * REST history refresh, which is always the authoritative source.
  */
-const MAX_BUFFERED_EVENTS_PER_RUN = 5000;
+const MAX_BUFFERED_EVENTS_PER_RUN = CHAT_REPLAY_LIMITS.events;
+const MAX_BUFFERED_EVENT_BYTES = CHAT_REPLAY_LIMITS.eventBytes;
+const MAX_BUFFERED_RUN_BYTES = CHAT_REPLAY_LIMITS.sessionBytes;
+const MAX_BUFFERED_TOTAL_BYTES = CHAT_REPLAY_LIMITS.totalBytes;
+let totalBufferedBytes = 0;
+
+function dropOldestEvent(channel: ChatSessionChannel): void {
+  const removed = channel.events.shift();
+  const bytes = channel.eventBytes.shift() ?? 0;
+  channel.bufferedBytes -= bytes;
+  totalBufferedBytes -= bytes;
+  if (typeof removed?.seq === 'number') channel.lastDroppedSeq = Math.max(channel.lastDroppedSeq, removed.seq);
+}
+
+function releaseBufferedEvents(channel: ChatSessionChannel): void {
+  totalBufferedBytes -= channel.bufferedBytes;
+  channel.events.length = 0;
+  channel.eventBytes.length = 0;
+  channel.bufferedBytes = 0;
+}
 
 /**
  * Active and recently-completed runs keyed by app session id.
@@ -84,12 +146,22 @@ const MAX_BUFFERED_EVENTS_PER_RUN = 5000;
 const runs = new Map<string, ChatRun>();
 
 /**
+ * The event channels of the sessions that have been talked to, keyed by app
+ * session id.
+ *
+ * A channel outlives its runs: the next round of the conversation travels on
+ * the same channel, and a provider that reports in the background finds the
+ * audience it has to deliver to.
+ */
+const sessionChannels = new Map<string, ChatSessionChannel>();
+
+/**
  * Per-session monotonic sequence watermark.
  *
  * seq is a session-scoped contract: clients keep one `lastSeq` per session and
  * send it back with `chat.subscribe`, so the counter must never restart when a
- * new run begins. This map is the single owner of that watermark — `startRun`
- * seeds the new run's counter from it and every stamped event writes it back.
+ * new run begins. This map is the single owner of that watermark — the channel
+ * seeds its counter from it and every stamped event writes it back.
  * It deliberately survives run switches and buffer eviction (entries are one
  * number per session), so a reconnecting client's `lastSeq` stays comparable
  * even when the previous run's buffer is long gone.
@@ -137,11 +209,61 @@ function evictRunLater(run: ChatRun): void {
       evictRunLater(run);
       return;
     }
+    releaseBufferedEvents(run.channel);
     runs.delete(run.appSessionId);
   }, COMPLETED_RUN_RETENTION_MS);
 
   // Never keep the process alive just to evict a buffered run.
   timer.unref?.();
+}
+
+/**
+ * Buffers one stamped event for replay and keeps the buffer within its bounds.
+ *
+ * The audience still receives an event that is too large to buffer: a
+ * reconnecting client must fetch its authoritative history instead of
+ * silently replaying across the hole.
+ */
+function bufferSessionEvent(channel: ChatSessionChannel, outbound: NormalizedMessage): void {
+  const bytes = Buffer.byteLength(JSON.stringify(outbound));
+  if (bytes > MAX_BUFFERED_EVENT_BYTES) {
+    channel.lastDroppedSeq = channel.lastSeq;
+    return;
+  }
+
+  channel.events.push(outbound);
+  channel.eventBytes.push(bytes);
+  channel.bufferedBytes += bytes;
+  totalBufferedBytes += bytes;
+  while (channel.events.length > MAX_BUFFERED_EVENTS_PER_RUN || channel.bufferedBytes > MAX_BUFFERED_RUN_BYTES) {
+    dropOldestEvent(channel);
+  }
+  while (totalBufferedBytes > MAX_BUFFERED_TOTAL_BYTES) {
+    // The oldest session goes first, so the conversations that are still
+    // streaming keep their history and the quiet ones lose it.
+    const candidates = [...sessionChannels.values()]
+      .filter((entry) => entry.events.length > 0)
+      .sort((a, b) => a.createdAt - b.createdAt);
+    if (!candidates[0]) break;
+    dropOldestEvent(candidates[0]);
+  }
+}
+
+/**
+ * Stamps one event with the session's next sequence number.
+ *
+ * Provider-native ids never leave the backend, so the session id is remapped
+ * to the app session id here as well.
+ */
+function stampSessionEvent(channel: ChatSessionChannel, message: NormalizedMessage): NormalizedMessage {
+  channel.lastSeq += 1;
+  sessionWatermarks.set(channel.appSessionId, channel.lastSeq);
+  return {
+    ...message,
+    sessionId: channel.appSessionId,
+    seq: channel.lastSeq,
+    streamEpoch,
+  };
 }
 
 /**
@@ -163,14 +285,7 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
     return null;
   }
 
-  run.lastSeq += 1;
-  sessionWatermarks.set(run.appSessionId, run.lastSeq);
-
-  const outbound: NormalizedMessage = {
-    ...message,
-    sessionId: run.appSessionId,
-    seq: run.lastSeq,
-  };
+  const outbound = stampSessionEvent(run.channel, message);
 
   if (message.kind === 'complete') {
     // The provider may report its own id here; the frontend only ever knows
@@ -188,17 +303,32 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
       exitCode: readExitCode(message),
       startedAt: run.startedAt,
       endedAt: run.completedAt,
-      eventCount: run.events.length + 1,
-      lastSeq: run.lastSeq,
+      eventCount: run.channel.events.length + 1,
+      lastSeq: run.channel.lastSeq,
     });
     evictRunLater(run);
   }
 
-  run.events.push(outbound);
-  if (run.events.length > MAX_BUFFERED_EVENTS_PER_RUN) {
-    run.events.splice(0, run.events.length - MAX_BUFFERED_EVENTS_PER_RUN);
-  }
+  bufferSessionEvent(run.channel, outbound);
 
+  return outbound;
+}
+
+/**
+ * Decorates one event that belongs to the session rather than to a run.
+ *
+ * A background report travels here: it is stamped and buffered like any other
+ * event, but it never flips a run to `completed` and never invents one, so a
+ * session with no round in flight does not start looking busy.
+ */
+function decorateSessionEvent(channel: ChatSessionChannel, message: NormalizedMessage): NormalizedMessage | null {
+  // A terminal event belongs to a run's contract. A session-level event that
+  // carried one would end a round nobody started.
+  if (message.kind === 'complete') {
+    return null;
+  }
+  const outbound = stampSessionEvent(channel, message);
+  bufferSessionEvent(channel, outbound);
   return outbound;
 }
 
@@ -245,6 +375,68 @@ function recordProviderSessionId(run: ChatRun, providerSessionId: string): void 
 }
 
 /**
+ * The event channel of a session, created when the session is first talked to.
+ *
+ * The channel keeps the session's audience, so a provider that reports after
+ * its round ended still reaches the tabs that are watching the conversation.
+ */
+function ensureSessionChannel(
+  appSessionId: string,
+  options: { userId: string | number | null; provider: LLMProvider },
+): ChatSessionChannel {
+  const existing = sessionChannels.get(appSessionId);
+  if (existing) {
+    return existing;
+  }
+  pruneSessionChannels();
+  const channel: ChatSessionChannel = {
+    appSessionId,
+    audience: new Set<RealtimeClientConnection>(),
+    // Continue the session's watermark: a client that watched the previous
+    // run keeps one `lastSeq` per session, so a fresh counter per run would
+    // make its replay filter silently drop the new run's events.
+    lastSeq: sessionWatermarks.get(appSessionId) ?? 0,
+    createdAt: Date.now(),
+    events: [],
+    eventBytes: [],
+    bufferedBytes: 0,
+    lastDroppedSeq: 0,
+    writer: null as unknown as ChatSessionWriter,
+  };
+  channel.writer = new ChatSessionWriter({
+    connection: null,
+    audience: channel.audience,
+    userId: options.userId,
+    provider: options.provider,
+    providerSessionId: null,
+    onProviderSessionId: () => {},
+    decorateOutboundEvent: (message) => decorateSessionEvent(channel, message),
+  });
+  sessionChannels.set(appSessionId, channel);
+  return channel;
+}
+
+/**
+ * Drops the channels that no run, no event and no socket needs any more.
+ *
+ * A channel outlives the run that created it, because a resident engine
+ * reports on it after the run is over. One that nothing points at any more
+ * would only keep its sockets alive.
+ */
+function pruneSessionChannels(): void {
+  for (const [sessionId, channel] of sessionChannels) {
+    for (const connection of channel.audience) {
+      if (connection.readyState !== WS_OPEN_STATE) {
+        channel.audience.delete(connection);
+      }
+    }
+    if (!runs.has(sessionId) && channel.events.length === 0 && channel.audience.size === 0) {
+      sessionChannels.delete(sessionId);
+    }
+  }
+}
+
+/**
  * Registry of live provider runs keyed by the stable app session id.
  *
  * The registry is what makes the websocket protocol provider-independent:
@@ -274,10 +466,22 @@ export const chatRunRegistry = {
      */
     connection: RealtimeClientConnection | null;
     userId: string | number | null;
+    /** What the user calls the session, for notification titles. */
+    sessionName?: string | null;
   }): ChatRun | null {
     const existing = runs.get(input.appSessionId);
     if (existing && existing.status === 'running') {
       return null;
+    }
+
+    const channel = ensureSessionChannel(input.appSessionId, {
+      userId: input.userId,
+      provider: input.provider,
+    });
+    // The socket that asked for the run also watches the session, so the
+    // events that belong to the session reach it as well.
+    if (input.connection) {
+      channel.audience.add(input.connection);
     }
 
     const run: ChatRun = {
@@ -285,11 +489,16 @@ export const chatRunRegistry = {
       provider: input.provider,
       providerSessionId: input.providerSessionId,
       status: 'running',
-      // Continue the session's watermark: a client that watched the previous
-      // run keeps one `lastSeq` per session, so a fresh counter per run would
-      // make its replay filter silently drop the new run's events.
-      lastSeq: sessionWatermarks.get(input.appSessionId) ?? 0,
-      events: [],
+      channel,
+      get lastSeq() {
+        return channel.lastSeq;
+      },
+      get events() {
+        return channel.events;
+      },
+      get bufferedBytes() {
+        return channel.bufferedBytes;
+      },
       writer: null as unknown as ChatSessionWriter,
       startedAt: Date.now(),
       completedAt: null,
@@ -298,7 +507,12 @@ export const chatRunRegistry = {
 
     run.writer = new ChatSessionWriter({
       connection: input.connection,
+      // The sockets watching the conversation when the round starts. A tab that
+      // opens the conversation later joins the session's audience, not this
+      // round's: it replays what it missed instead.
+      audience: new Set(channel.audience),
       userId: input.userId,
+      sessionName: input.sessionName,
       provider: input.provider,
       providerSessionId: input.providerSessionId,
       onProviderSessionId: (providerSessionId) => {
@@ -331,7 +545,7 @@ export const chatRunRegistry = {
         sessionId: run.appSessionId,
         provider: run.provider,
         startedAt: run.startedAt,
-        lastSeq: run.lastSeq,
+        lastSeq: run.channel.lastSeq,
       }));
   },
 
@@ -432,7 +646,7 @@ export const chatRunRegistry = {
   },
 
   /**
-   * Adds a websocket connection to a run's live audience.
+   * Adds a websocket connection to a session's audience.
    *
    * This is the generic replacement for the Claude-only writer reconnect:
    * after a page refresh the new socket subscribes and immediately starts
@@ -444,14 +658,53 @@ export const chatRunRegistry = {
    * closed. Replay stays per-connection because each client sends its own
    * `lastSeq` with `chat.subscribe`.
    */
-  attachConnection(appSessionId: string, connection: RealtimeClientConnection): boolean {
-    const run = runs.get(appSessionId);
-    if (!run) {
-      return false;
+  attachConnection(
+    appSessionId: string,
+    connection: RealtimeClientConnection,
+    options?: { includeRun?: boolean },
+  ): boolean {
+    // The session's audience is for the events that belong to the session
+    // rather than to a round: a resident engine reports on it after its run
+    // is over. A session that has not run yet has no channel, because a
+    // resident engine only exists once a round ran in this process.
+    const channel = sessionChannels.get(appSessionId);
+    if (channel) {
+      channel.audience.add(connection);
+      pruneSessionChannels();
     }
 
-    run.writer.updateWebSocket(connection);
-    return true;
+    const run = runs.get(appSessionId);
+    if (!run) {
+      return Boolean(channel);
+    }
+    const includeRun = options?.includeRun ?? run.status === 'running';
+    if (includeRun) {
+      // A run that is still going, or one that the session's background work
+      // keeps alive, delivers its later events to the socket as well.
+      run.writer.updateWebSocket(connection);
+      return true;
+    }
+    // A finished run keeps its own audience: a socket that opens the
+    // conversation afterwards does not receive that run's late events, it
+    // replays them instead.
+    return Boolean(channel);
+  },
+
+  /**
+   * Publishes one event to a session outside any run.
+   *
+   * A resident provider can report after its round ended — the engine starts
+   * a turn of its own to deliver a background result. That event belongs to
+   * the session: it is stamped with the session's next sequence number,
+   * buffered for replay and delivered to the session's audience, but it never
+   * makes the session look busy and never ends a round.
+   */
+  publishSessionEvent(appSessionId: string, message: NormalizedMessage): void {
+    const channel = ensureSessionChannel(appSessionId, {
+      userId: null,
+      provider: message.provider ?? 'codex',
+    });
+    channel.writer.send(message);
   },
 
   /**
@@ -459,24 +712,21 @@ export const chatRunRegistry = {
    * replay state for `chat.subscribe`'s ack.
    *
    * `stale` is true when the client's `afterSeq` predates the oldest buffered
-   * event: the middle of the stream was dropped (the per-run buffer cap or the
-   * completed-run retention window), replay cannot bridge the gap, and the
+   * event: the middle of the stream was dropped (the per-session buffer cap or
+   * the completed-run retention window), replay cannot bridge the gap, and the
    * client must refresh history over REST instead of trusting the replay.
    */
   replayEvents(appSessionId: string, afterSeq: number): ChatReplayResult {
     const lastSeq = sessionWatermarks.get(appSessionId) ?? 0;
-    const run = runs.get(appSessionId);
-    if (!run) {
-      return { events: [], lastSeq, stale: false };
+    const channel = sessionChannels.get(appSessionId);
+    if (!channel) {
+      return { events: [], lastSeq, stale: afterSeq !== lastSeq, streamEpoch, replayFromSeq: lastSeq + 1 };
     }
 
-    const events = run.events.filter((event) => typeof event.seq === 'number' && event.seq > afterSeq);
-    const oldestBuffered = run.events.find((event) => typeof event.seq === 'number')?.seq;
-    const stale = afterSeq > 0
-      && typeof oldestBuffered === 'number'
-      && oldestBuffered > afterSeq + 1;
-
-    return { events, lastSeq, stale };
+    const events = channel.events.filter((event) => typeof event.seq === 'number' && event.seq > afterSeq);
+    const oldestBuffered = channel.events.find((event) => typeof event.seq === 'number')?.seq;
+    const replayFromSeq = Math.max(channel.lastDroppedSeq + 1, oldestBuffered ?? lastSeq + 1);
+    return { events, lastSeq, stale: afterSeq < replayFromSeq - 1 || afterSeq > lastSeq, streamEpoch, replayFromSeq };
   },
 
   /**
@@ -518,10 +768,13 @@ export const chatRunRegistry = {
   },
 
   /**
-   * Test-only escape hatch: clears every tracked run and sequence watermark.
+   * Test-only escape hatch: clears every tracked run, channel and sequence
+   * watermark.
    */
   clearAll(): void {
     runs.clear();
+    sessionChannels.clear();
+    totalBufferedBytes = 0;
     sessionWatermarks.clear();
     sessionSubscribers.clear();
   },

@@ -10,6 +10,7 @@ import {
   resolveOpenCodeMessageLayout,
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
+import { consumeAppliedEngineState } from './opencode-engine-renames.js';
 
 type OpenCodeSessionRow = {
   id: string;
@@ -22,6 +23,21 @@ type OpenCodeSessionRow = {
 
 type OpenCodeChildSessionRow = {
   id: string;
+};
+
+/**
+ * True when the stored title is the placeholder OpenCode falls back to for a
+ * session it has not named.
+ *
+ * The engine's own fallback is `New session - <the session's creation time>`,
+ * so only that exact string counts: a title that merely starts with the same
+ * words is a name someone chose and must reach the sidebar untouched.
+ */
+const isEngineDefaultTitle = (title: string, timeCreatedMs: number | null): boolean => {
+  if (timeCreatedMs === null) {
+    return false;
+  }
+  return title === `New session - ${new Date(timeCreatedMs).toISOString()}`;
 };
 /**
  * Session indexer for OpenCode's SQLite-backed session store.
@@ -115,8 +131,30 @@ export class OpenCodeSessionSynchronizer extends SqliteSessionSynchronizer<OpenC
     return readOptionalString(row.directory) ?? readOptionalString(row.worktree) ?? null;
   }
 
-  protected deriveSessionName(db: Database.Database, row: OpenCodeSessionRow): string | null {
-    return readOptionalString(row.title) ?? this.readFirstUserText(db, row.id) ?? null;
+  protected deriveSessionName(db: Database.Database, row: OpenCodeSessionRow) {
+    const title = readOptionalString(row.title) ?? null;
+    if (title !== null && !isEngineDefaultTitle(title, row.time_created)) {
+      return { name: title, generated: true };
+    }
+    // No engine title yet: the first user text is only a placeholder, not a
+    // name the engine generated, so it never replaces an existing synced name.
+    return { name: this.readFirstUserText(db, row.id) ?? null, generated: false };
+  }
+
+  /**
+   * Skips a row the runtime already applied.
+   *
+   * The runtime writes the name OpenCode generated into the app row when the
+   * engine announces it. The scan that follows the engine's own write would
+   * otherwise announce the same rename again, as a content change.
+   */
+  protected isProviderStateAlreadyApplied(row: OpenCodeSessionRow): boolean {
+    if (row.time_updated === null) {
+      // Without a timestamp there is nothing to compare the recorded state
+      // against, so the row is applied as usual.
+      return false;
+    }
+    return consumeAppliedEngineState(row.id, row.time_updated);
   }
 
   /**

@@ -32,11 +32,32 @@ import {
   codexAppServerTransport,
   type CodexAppServerConnection,
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
+import { CODEX_BACKGROUND_TASK_TYPE, codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import {
+  acquireCodexResidentSession,
+  closeCodexResidentSessionAdmission,
+  completeCodexResidentRound,
+  isCodexResidentSessionAdmissionClosed,
+  isCodexResidentSessionBusy,
+  listCodexReportingOnlySessions,
+  readCodexResidentSessionActivity,
+  openCodexResidentSessionAdmission,
+  releaseCodexResidentSession,
+  releaseCodexResidentSessionResources,
+  stopCodexResidentRound,
+  submitCodexResidentRound,
+  type CodexResidentSession,
+} from '@/modules/providers/list/codex/codex-session-manager.js';
+import {
+  buildCodexSubagentAgentRow,
   codexThreadItemToRows,
   readCodexAppServerItem,
   readCodexCommandLine,
+  readCodexSubagentLabel,
+  type CodexThreadItem,
 } from '@/modules/providers/list/codex/codex-thread-items.js';
+import { createBackgroundTasksStatusMessage, createTaskStatusMessage } from '@/modules/providers/shared/background-work/task-status.js';
+import { codexSessionTitleService } from '@/modules/providers/services/codex-session-title.service.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import {
   appendFilesInputTag,
@@ -46,6 +67,10 @@ import {
   createNormalizedMessage,
   resolveCodexExecutionPolicy,
   resolveModelEffort,
+  AppError,
+  readObjectRecord,
+  CODEX_TASK_MCP_NAME,
+  CODEX_HOST_CREDENTIAL_ENV_NAMES,
 } from '@/shared/index.js';
 import type {
   AnyRecord,
@@ -53,13 +78,13 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
 } from '@/shared/index.js';
-import type { BackgroundTaskSummary } from '@/shared/types.js';
-import { readObjectRecord } from '@/shared/utils.js';
+import type { NormalizedMessage, SessionBackgroundWork } from '@/shared/types.js';
 
-const TASK_MCP_NAME = 'cloudcli_task_continuations';
+const TASK_MCP_NAME = CODEX_TASK_MCP_NAME;
 const TASK_API_URL_ENV = 'CLOUDCLI_TASK_API_URL';
 const TASK_API_KEY_ENV = 'CLOUDCLI_TASK_API_KEY';
 const TASK_RUN_CONTEXT_ENV = 'CLOUDCLI_TASK_RUN_CONTEXT';
+const TASK_BRIDGE_ENV = 'CLOUDCLI_TASK_BRIDGE';
 
 function getTaskMcpCommand(): { command: string; args: string[] } {
   const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -76,23 +101,38 @@ function getTaskMcpCommand(): { command: string; args: string[] } {
   };
 }
 
+/**
+ * The task MCP server's configuration and environment.
+ *
+ * A short-lived process carries the round's own capability and the global API
+ * key. A resident process cannot: it outlives the round that started it, so
+ * it carries a narrow bridge credential instead, and the host matches every
+ * call against the engine call it observed.
+ */
 function getTaskMcpRuntimeOptions(input: {
-  token: string;
+  token?: string;
+  bridgeToken?: string;
 }): { config: Record<string, unknown>; env: NodeJS.ProcessEnv } {
   const apiUrl = process.env.CLOUDCLI_API_URL
     || `http://127.0.0.1:${process.env.SERVER_PORT || process.env.PORT || '3001'}`;
+  const env: NodeJS.ProcessEnv = { [TASK_API_URL_ENV]: apiUrl.replace(/\/$/, '') };
+  const envVars = [TASK_API_URL_ENV];
+  if (input.bridgeToken) {
+    env[TASK_BRIDGE_ENV] = input.bridgeToken;
+    envVars.push(TASK_BRIDGE_ENV);
+  } else {
+    env[TASK_API_KEY_ENV] = process.env.API_KEY ?? '';
+    env[TASK_RUN_CONTEXT_ENV] = input.token ?? '';
+    envVars.push(TASK_API_KEY_ENV, TASK_RUN_CONTEXT_ENV);
+  }
   return {
     config: {
       [`mcp_servers.${TASK_MCP_NAME}`]: {
         ...getTaskMcpCommand(),
-        env_vars: [TASK_API_URL_ENV, TASK_API_KEY_ENV, TASK_RUN_CONTEXT_ENV],
+        env_vars: envVars,
       },
     },
-    env: {
-      [TASK_API_URL_ENV]: apiUrl.replace(/\/$/, ''),
-      [TASK_API_KEY_ENV]: process.env.API_KEY ?? '',
-      [TASK_RUN_CONTEXT_ENV]: input.token,
-    },
+    env,
   };
 }
 
@@ -109,7 +149,12 @@ async function readEffectiveShellEnvironmentExcludes(
 }
 
 type ActiveCodexSession = {
-  connection: CodexAppServerConnection;
+  /**
+   * Ends the round: it interrupts a turn that already runs, or removes the
+   * input that is still waiting in the engine's queue.
+   */
+  /** Ends the round. Resolves once the engine confirmed what it did. */
+  stop: () => Promise<unknown>;
   /** Set once the server reports the turn; `turn/interrupt` needs it. */
   threadId: string | null;
   turnId: string | null;
@@ -120,55 +165,20 @@ type ActiveCodexSession = {
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
 
 /**
- * Collab agents still running, keyed by app session id, then by the collab
- * item id that spawned the agent.
+ * Whether a Codex conversation keeps its process alive between rounds.
  *
- * Unlike Claude — where one CLI process owns a turn and dies with it — the
- * codex engine outlives turns, so an agent spawned mid-turn keeps working
- * after the turn's `result`. This map is what the running-sessions poll reads
- * (through `listBackgroundWork`) so the composer's background-work strip can
- * show and name that work while it runs. A terminal item event (completed,
- * failed, declined, interrupted) retires the entry; a session the cleanup
- * timer removes takes its entries with it.
+ * The resident path is what lets the engine report in the background while
+ * the next message waits for its own turn, so it is off until the whole
+ * delivery — background reports, task credentials, reclaim — is accepted.
  */
-const codexBackgroundWork = new Map<string, Map<string, BackgroundTaskSummary>>();
+const isResidentSessionsEnabled = (): boolean => process.env.CLOUDCLI_CODEX_RESIDENT !== '0';
 
-const CODEX_BACKGROUND_TASK_TYPE = 'collab_agent';
 const DETACHED_COMMAND_ENV_ALLOWLIST = [
   'PATH', 'HOME', 'CODEX_HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
   'TERM', 'USER', 'LOGNAME', 'SHELL', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
 ] as const;
-const TASK_CREDENTIAL_ENV_NAMES = [
-  'API_KEY',
-  'CLOUDCLI_TASK_API_KEY',
-  'CLOUDCLI_TASK_RUN_CONTEXT',
-  'CLOUDCLI_REGISTRATION_TOKEN',
-  'CLOUDCLI_TASK_TOKEN',
-  'JWT_SECRET',
-] as const;
+const TASK_CREDENTIAL_ENV_NAMES = CODEX_HOST_CREDENTIAL_ENV_NAMES;
 const DETACHED_COMMAND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-
-function recordCodexBackgroundStart(appSessionId: string, item: { id: string; label: string; prompt?: string }): void {
-  let tasks = codexBackgroundWork.get(appSessionId);
-  if (!tasks) {
-    tasks = new Map();
-    codexBackgroundWork.set(appSessionId, tasks);
-  }
-  // Re-recorded starts refresh the entry in place; the original startedAt
-  // survives so the strip's elapsed time does not jump.
-  const previous = tasks.get(item.id);
-  tasks.set(item.id, {
-    taskId: item.id,
-    toolUseId: item.id,
-    taskType: CODEX_BACKGROUND_TASK_TYPE,
-    description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
-    startedAt: previous?.startedAt ?? Date.now(),
-  });
-}
-
-function recordCodexBackgroundEnd(appSessionId: string, itemId: string): void {
-  codexBackgroundWork.get(appSessionId)?.delete(itemId);
-}
 
 /**
  * One approval Codex is blocked on, waiting for a human.
@@ -209,24 +219,6 @@ const PROGRESSIVE_CODEX_ITEM_TYPES = new Set([
 
 /** Default context window reported when the server has not said otherwise. */
 const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
-
-/**
- * Maps a permission mode onto the two knobs `thread/start` takes.
- *
- * Unchanged from the `codex exec` mapping this replaced, so a mode decides
- * exactly what it decided before — except that `on-request` now means what it
- * says: the escalation reaches the user's approval card instead of dying in a
- * transport with nobody to ask.
- *
- * Who reviews an approval is deliberately not set here: Codex's own
- * `approvals_reviewer` config decides whether a request is auto-reviewed
- * before it ever reaches a client, and overriding that would quietly undo a
- * setting the user made.
- */
-function mapPermissionModeToCodexOptions(permissionMode: string): { sandbox: string; approvalPolicy: string } {
-  const policy = resolveCodexExecutionPolicy(permissionMode);
-  return { sandbox: policy.sandbox, approvalPolicy: policy.approvalPolicy };
-}
 
 /**
  * The server-to-client requests that are an approval the user can answer.
@@ -348,6 +340,341 @@ function sendMessage(ws: ProviderRuntimeWriter, data: unknown) {
 }
 
 /**
+ * Where one set of Codex events goes.
+ *
+ * A foreground round delivers through the run's writer, so the gateway stamps
+ * the run's sequence numbers and ends the run on its terminal event. A turn
+ * the engine started by itself delivers through the session's publish entry:
+ * that event belongs to the session, and it must not end a round nobody
+ * started.
+ */
+type CodexEventTarget = {
+  /** The app session the events belong to. */
+  appSessionId: string | null;
+  /** The native thread the conversation runs in. */
+  threadId: () => string | null;
+  /** Normalizes one provider row into the app's rows. */
+  normalize: (raw: unknown, sessionId: string | null) => NormalizedMessage[];
+  /** Delivers one row to the client. */
+  deliver: (message: NormalizedMessage) => void;
+  /** The tool each announced item needs, so an approval card can name it. */
+  approvalSubjects: Map<string, { toolName: string; input: unknown }>;
+  /**
+   * Records one MCP tool call the engine made.
+   *
+   * A resident process outlives the round that started it, so the host takes
+   * the authority for a call from the engine call it observed rather than
+   * from a secret the process carries.
+   */
+  registerToolCall?: (call: { callId: string; server: string; tool: string; arguments: Record<string, unknown> }) => void;
+};
+
+/** One `task_status` frame for a collab agent, folded by the client onto the card of `toolUseId`. */
+function codexTaskStatus(
+  messageSessionId: string | null,
+  taskId: string,
+  toolUseId: string,
+  fields: Parameters<typeof createTaskStatusMessage>[1],
+) {
+  return createTaskStatusMessage(
+    { provider: 'codex', sessionId: messageSessionId, taskId, toolUseId, taskType: CODEX_BACKGROUND_TASK_TYPE },
+    fields,
+  );
+}
+
+/**
+ * Re-sends the composer strip's list for a session; called after every change
+ * to the agents tracked under `backgroundWorkKey`. The turn is in flight for
+ * as long as an agent is tracked, so the work is always stoppable through the
+ * turn.
+ */
+function broadcastCodexBackgroundTasks(target: CodexEventTarget, backgroundWorkKey: string): void {
+  target.deliver(createBackgroundTasksStatusMessage(
+    { provider: 'codex', sessionId: target.threadId() || target.appSessionId || null },
+    codexBackgroundWork.listStripTasks(backgroundWorkKey),
+    true,
+  ));
+}
+
+/**
+ * Draws and settles the Agent card of an agent announced only through its
+ * activity record (the shape real engines use; see
+ * `buildCodexSubagentAgentRow`). `started` opens the card, marks it running
+ * and tracks the agent as background work under its thread id; `completed`
+ * and `interrupted` settle the card they started — found through that
+ * thread id, since the item id differs between the two — and retire the
+ * entry. An end with no tracked start (the server restarted while the
+ * agent ran) has no card to settle and is dropped. `interacted` is the
+ * agents talking among themselves and draws nothing.
+ */
+function emitCodexSubagentActivity(
+  target: CodexEventTarget,
+  item: Extract<CodexThreadItem, { kind: 'subagent_activity' }>,
+  timestamp: string,
+  backgroundWorkKey: string | null | undefined,
+): void {
+  const messageSessionId = target.threadId() || target.appSessionId || null;
+  if (item.activity === 'started') {
+    const taskId = item.agentThreadId ?? item.id;
+    if (backgroundWorkKey && codexBackgroundWork.get(backgroundWorkKey, taskId)) {
+      return;
+    }
+    for (const message of target.normalize(buildCodexSubagentAgentRow(item, timestamp), messageSessionId)) {
+      target.deliver(message);
+    }
+    const description = readCodexSubagentLabel(item);
+    if (backgroundWorkKey) {
+      codexBackgroundWork.start(backgroundWorkKey, {
+        taskId,
+        toolUseId: item.id,
+        taskType: CODEX_BACKGROUND_TASK_TYPE,
+        description,
+      });
+      broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+    }
+    target.deliver(codexTaskStatus(messageSessionId, taskId, item.id, { event: 'started', description }));
+    return;
+  }
+
+  if (item.activity !== 'completed' && item.activity !== 'interrupted') {
+    return;
+  }
+  const tracked = backgroundWorkKey && item.agentThreadId
+    ? codexBackgroundWork.end(backgroundWorkKey, item.agentThreadId)
+    : undefined;
+  if (!backgroundWorkKey || !tracked) {
+    return;
+  }
+  broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+  target.deliver(codexTaskStatus(messageSessionId, tracked.taskId, tracked.toolUseId, {
+    event: 'notification',
+    status: item.activity === 'completed' ? 'completed' : 'stopped',
+  }));
+}
+
+/**
+ * Announces one engine item as the app's rows.
+ *
+ * A collab agent's lifecycle feeds the background-work tracker, so the
+ * running-sessions poll and the composer's strip name the agents the turn
+ * in flight is waiting on. Which event announced the item — not the item's
+ * own status field, which `started` events may omit — decides between tracked
+ * and retired: an unrecognized status parses as `completed`, and trusting it
+ * on `started` would drop the agent before its first tick.
+ */
+function emitCodexItem(
+  target: CodexEventTarget,
+  rawItem: unknown,
+  timestamp: string,
+  source: 'started' | 'completed',
+  backgroundWorkKey: string | null | undefined,
+): void {
+  const item = readCodexAppServerItem(rawItem);
+  if (!item) {
+    return;
+  }
+  if (item.kind === 'collab_spawn' && backgroundWorkKey) {
+    if (source === 'started') {
+      codexBackgroundWork.start(backgroundWorkKey, {
+        taskId: item.id,
+        toolUseId: item.id,
+        taskType: CODEX_BACKGROUND_TASK_TYPE,
+        description: item.prompt ? `${item.label}: ${item.prompt}` : item.label,
+      });
+      broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+    } else if (codexBackgroundWork.end(backgroundWorkKey, item.id)) {
+      broadcastCodexBackgroundTasks(target, backgroundWorkKey);
+    }
+  }
+  if (item.kind === 'mcp_tool_call') {
+    const args = readObjectRecord(item.toolArguments);
+    if (args) target.registerToolCall?.({ callId: item.id, server: item.server, tool: item.tool, arguments: args });
+  }
+  if (item.kind === 'subagent_activity') {
+    emitCodexSubagentActivity(target, item, timestamp, backgroundWorkKey);
+    return;
+  }
+  for (const row of codexThreadItemToRows(item, timestamp)) {
+    if (row.type === 'tool_use' && !target.approvalSubjects.has(item.id)) {
+      target.approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
+    }
+    for (const message of target.normalize(row, target.threadId() || target.appSessionId || null)) {
+      target.deliver(message);
+    }
+  }
+}
+
+/**
+ * A running agent's own finished item, as a row tied to its card. Agents
+ * work on their own thread of this connection; the thread id is how the
+ * registry finds the card. The agent's prompt (the card's task) and its
+ * lifecycle items are left out, the same as when history rebuilds the
+ * timeline from the agent's rollout, so the card reads alike either way.
+ * Threads this session did not spawn are ignored.
+ */
+function emitCodexAgentItem(
+  target: CodexEventTarget,
+  agentThreadId: string,
+  rawItem: unknown,
+  timestamp: string,
+  backgroundWorkKey: string | null | undefined,
+): void {
+  const owner = codexBackgroundWork.find(agentThreadId);
+  const item = readCodexAppServerItem(rawItem);
+  if (!owner || owner.sessionKey !== backgroundWorkKey || !item || item.kind === 'user_message' || item.kind === 'subagent_activity') {
+    return;
+  }
+  for (const row of codexThreadItemToRows(item, timestamp)) {
+    for (const message of target.normalize(row, target.threadId() || target.appSessionId || null)) {
+      target.deliver({ ...message, parentToolUseId: owner.task.toolUseId });
+    }
+  }
+}
+
+/**
+ * The events of a turn the engine started on its own.
+ *
+ * The engine starts a turn to deliver a background result, and that turn
+ * belongs to the session rather than to the round the user is waiting for.
+ * Its events are published to the session, so they reach the tabs watching
+ * the conversation without ending a round.
+ *
+ * The handler is bound to the session, not to a round: a resident process
+ * reports after the round that started it is gone, so nothing here may
+ * depend on that round's writer.
+ */
+function handleCodexSessionEvent(
+  target: CodexEventTarget,
+  method: string,
+  params: AnyRecord,
+): void {
+  const backgroundWorkKey = target.appSessionId;
+  const eventThreadId = readNonEmptyString(params.threadId) ?? readNonEmptyString(params.thread_id);
+  if (eventThreadId && target.threadId() && eventThreadId !== target.threadId()) {
+    // A subagent reports on the same connection, and its card still belongs
+    // to the conversation the user is looking at.
+    if (method === 'item/completed') {
+      emitCodexAgentItem(target, eventThreadId, params.item, new Date().toISOString(), backgroundWorkKey);
+    }
+    return;
+  }
+
+  const sessionId = target.threadId() || target.appSessionId || null;
+  switch (method) {
+    case 'turn/started': {
+      console.log(`[Codex] The engine started a turn of its own on thread ${target.threadId() ?? 'unknown'}.`);
+      return;
+    }
+
+    case 'item/started': {
+      const startedType = readObjectRecord(params.item)?.type;
+      if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
+        emitCodexItem(target, params.item, new Date().toISOString(), 'started', backgroundWorkKey);
+      }
+      return;
+    }
+
+    case 'item/completed': {
+      emitCodexItem(target, params.item, new Date().toISOString(), 'completed', backgroundWorkKey);
+      return;
+    }
+
+    case 'item/agentMessage/delta': {
+      if (typeof params.delta === 'string' && params.delta) {
+        target.deliver(createNormalizedMessage({
+          kind: 'stream_delta',
+          role: 'assistant',
+          content: params.delta,
+          sessionId,
+          provider: 'codex',
+        }));
+      }
+      return;
+    }
+
+    case 'thread/tokenUsage/updated': {
+      const tokenBudget = readCodexTokenBudget(params);
+      if (tokenBudget) {
+        target.deliver(createNormalizedMessage({
+          kind: 'status',
+          text: 'token_budget',
+          tokenBudget,
+          sessionId,
+          provider: 'codex',
+        }));
+      }
+      return;
+    }
+
+    case 'error': {
+      const error = readObjectRecord(params.error);
+      const message = readNonEmptyString(error?.message)?.trim() || readNonEmptyString(params.message)?.trim();
+      if (message) {
+        target.deliver(createNormalizedMessage({
+          kind: 'error',
+          content: message,
+          sessionId,
+          provider: 'codex',
+        }));
+      }
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+/**
+ * Settles the agents of a session whose process is gone.
+ *
+ * A process that is closed takes its agents with it, so their cards would
+ * spin forever.
+ */
+function settleCodexSessionAgents(
+  appSessionId: string,
+  deliver: (message: NormalizedMessage) => void,
+): void {
+  const outstanding = codexBackgroundWork.clearSession(appSessionId);
+  if (outstanding.length === 0) {
+    return;
+  }
+  deliver(createBackgroundTasksStatusMessage(
+    { provider: 'codex', sessionId: appSessionId },
+    codexBackgroundWork.listStripTasks(appSessionId),
+    true,
+  ));
+  for (const task of outstanding) {
+    deliver(codexTaskStatus(appSessionId, task.taskId, task.toolUseId, {
+      event: 'notification',
+      status: 'stopped',
+    }));
+  }
+}
+
+/**
+ * The tool each announced item needs, per session.
+ *
+ * A resident session can be asked for an approval while no round is in
+ * flight, and the card has to name the tool that waits.
+ */
+const sessionApprovalSubjects = new Map<string, Map<string, { toolName: string; input: unknown }>>();
+/** Session approvals outlive any one borrower's round and are retracted on disposal. */
+const sessionApprovalIds = new Map<string, Set<string>>();
+
+/** The approval subjects of a session, created on first use. */
+function readSessionApprovalSubjects(appSessionId: string | null): Map<string, { toolName: string; input: unknown }> {
+  const key = appSessionId ?? '';
+  const existing = sessionApprovalSubjects.get(key);
+  if (existing) {
+    return existing;
+  }
+  const created = new Map<string, { toolName: string; input: unknown }>();
+  sessionApprovalSubjects.set(key, created);
+  return created;
+}
+
+/**
  * Executes one Codex turn and streams it to the client.
  */
 async function queryCodex(
@@ -388,7 +715,13 @@ async function queryCodex(
   const targetPermissionMode = taskSandboxPolicyType === 'dangerFullAccess'
     ? 'bypassPermissions'
     : taskApprovalPolicy === 'never' ? 'acceptEdits' : permissionMode;
-  const { sandbox, approvalPolicy } = mapPermissionModeToCodexOptions(targetPermissionMode);
+  const { sandbox, approvalPolicy, sandboxPolicy } = resolveCodexExecutionPolicy(targetPermissionMode);
+  const toolOutputParam = options.toolOutput ?? (options.taskContinuation ? {
+      name: 'cloudcli_task_result',
+      output: typeof options.taskContinuation === 'string'
+        ? options.taskContinuation
+        : JSON.stringify(options.taskContinuation),
+    } : null);
   const taskExecutionContext = readObjectRecord(options.taskExecutionContext);
   const taskContinuationLifecycle = readObjectRecord(options.taskContinuationLifecycle);
   const onEngineTurnStarted = typeof taskContinuationLifecycle?.onEngineTurnStarted === 'function'
@@ -403,6 +736,40 @@ async function queryCodex(
   const taskMcpOptions = taskRunToken
     ? getTaskMcpRuntimeOptions({ token: taskRunToken })
     : null;
+  /**
+   * The task MCP options of a resident process.
+   *
+   * A resident process carries a narrow bridge credential instead of the
+   * round's capability, because it outlives the round that started it. The
+   * credential is bound to the process generation, so it is created when the
+   * manager starts the process.
+   */
+  let residentTaskMcpOptions: { config: Record<string, unknown>; env: NodeJS.ProcessEnv } | null = null;
+  const createResidentTaskMcpOptions = (generation: number) => {
+    if (!normalizedUserId) {
+      console.warn('[Codex] The conversation has no trusted user; the task tools are not available.');
+      residentTaskMcpOptions = null;
+      return null;
+    }
+    const bridge = context.createBridgeCredential?.({
+      userId: normalizedUserId,
+      appSessionId: residentKey,
+      generation,
+    });
+    if (!bridge) {
+      // Without a bridge credential the process gets no task tools at all:
+      // a per-round capability would outlive the round it belongs to.
+      residentTaskMcpOptions = null;
+      return null;
+    }
+    residentTaskMcpOptions = getTaskMcpRuntimeOptions({ bridgeToken: bridge.token });
+    return { env: residentTaskMcpOptions.env, credentialToken: bridge.token };
+  };
+
+  /** Publishes one event to the session, outside any round. */
+  const publishSessionMessage = (message: NormalizedMessage): void => {
+    context.publishSessionEvent?.(residentKey, message);
+  };
   const catalog = await context.getProviderModels();
   const resolvedEffort = resolveModelEffort(resolvedModel, effort, catalog);
 
@@ -414,6 +781,7 @@ async function queryCodex(
   let connection: CodexAppServerConnection | null = null;
   let engineTurnId: string | null = null;
   let terminalStatus: 'completed' | 'failed' | 'interrupted' | 'unknown' = 'unknown';
+  let acceptanceUnknown = false;
   let acceptedTurnCallbackSent = false;
 
   const recordStartedTurn = (turnId: string | null): void => {
@@ -471,37 +839,90 @@ async function queryCodex(
    */
   const approvalSubjects = new Map<string, { toolName: string; input: unknown }>();
 
-  const emitItem = (rawItem: unknown, timestamp: string, source: 'started' | 'completed'): void => {
-    const item = readCodexAppServerItem(rawItem);
-    if (!item) {
+  /**
+   * The events of this round, delivered through the run's writer.
+   *
+   * The gateway stamps the round's sequence numbers and ends the round on its
+   * terminal event, so a round's own events never travel the session's
+   * publish entry.
+   */
+  let residentGeneration: number | null = null;
+  let knownNativeName: string | null = null;
+  let residentRoundId: string | null = null;
+  const roundTarget: CodexEventTarget = {
+    appSessionId: sessionId || null,
+    threadId: () => capturedSessionId,
+    normalize: (raw, nativeSessionId) => context.normalizeMessage(raw, nativeSessionId),
+    deliver: (message) => sendMessage(ws, message),
+    approvalSubjects,
+    registerToolCall: (call) => {
+      if (!taskRunToken || !capturedSessionId || residentGeneration === null) {
+        return;
+      }
+      context.registerEngineToolCall?.({
+        appSessionId: sessionId || capturedSessionId,
+        generation: residentGeneration,
+        arguments: call.arguments,
+        threadId: capturedSessionId,
+        turnId: engineTurnId,
+        callId: call.callId,
+        server: call.server,
+        tool: call.tool,
+        runToken: taskRunToken,
+      });
+    },
+  };
+
+  /**
+   * Re-sends the composer strip's list for this run's session; called after
+   * every change to the agents tracked under `backgroundWorkKey`. The turn is
+   * in flight for as long as an agent is tracked (the turn's end clears the
+   * rest), so the work is always stoppable through the turn.
+   */
+  const broadcastBackgroundTasks = (backgroundWorkKey: string): void => {
+    broadcastCodexBackgroundTasks(roundTarget, backgroundWorkKey);
+  };
+
+  /**
+   * Settles every agent this run still tracks as `stopped`. The app-server is
+   * a child process that `connection.close()` kills when the turn ends, and
+   * the agents it ran die with it, so an agent still registered here will
+   * never report: its card would spin forever. Called before the terminal
+   * `complete` so the page never sees a finished turn with a running card;
+   * a second call finds the registry already empty.
+   */
+  const settleOutstandingAgents = (): void => {
+    const backgroundWorkKey = sessionId || capturedSessionId;
+    if (!backgroundWorkKey) {
       return;
     }
-    // A collab agent's lifecycle feeds the background-work tracker: the agent
-    // outlives the turn, and the running-sessions poll needs to know it is
-    // still going after the composer's own indicator has handed the session
-    // over from "responding" to "background work". Keyed like Claude's
-    // tracker: the app session id when the run knows one, the native thread
-    // id as the fallback for a brand-new session's first turn. Which event
-    // announced the item — not the item's own status field, which `started`
-    // events may omit — decides between tracked and retired: an unrecognized
-    // status parses as `completed`, and trusting it on `started` would drop
-    // the agent before its first tick.
-    const backgroundWorkKey = sessionId || capturedSessionId;
-    if (item.kind === 'collab_spawn' && backgroundWorkKey) {
-      if (source === 'started') {
-        recordCodexBackgroundStart(backgroundWorkKey, item);
-      } else {
-        recordCodexBackgroundEnd(backgroundWorkKey, item.id);
-      }
+    const outstanding = codexBackgroundWork.clearSession(backgroundWorkKey);
+    if (outstanding.length === 0) {
+      return;
     }
-    for (const row of codexThreadItemToRows(item, timestamp)) {
-      if (row.type === 'tool_use' && !approvalSubjects.has(item.id)) {
-        approvalSubjects.set(item.id, { toolName: String(row.toolName), input: row.toolInput });
-      }
-      for (const message of context.normalizeMessage(row, capturedSessionId || sessionId || null)) {
-        sendMessage(ws, message);
-      }
+    broadcastBackgroundTasks(backgroundWorkKey);
+    for (const task of outstanding) {
+      sendMessage(ws, codexTaskStatus(capturedSessionId || sessionId || null, task.taskId, task.toolUseId, {
+        event: 'notification',
+        status: 'stopped',
+      }));
     }
+  };
+
+  const emitItem = (rawItem: unknown, timestamp: string, source: 'started' | 'completed'): void => {
+    emitCodexItem(roundTarget, rawItem, timestamp, source, sessionId || capturedSessionId);
+  };
+
+  /**
+   * A running agent's own finished item, as a row tied to its card. Agents
+   * work on their own thread of this connection; the thread id is how the
+   * registry finds the card. The agent's prompt (the card's task) and its
+   * lifecycle items are left out, the same as when history rebuilds the
+   * timeline from the agent's rollout, so the card reads alike either way.
+   * Threads this run did not spawn are ignored.
+   */
+  const emitAgentItem = (agentThreadId: string, rawItem: unknown, timestamp: string): void => {
+    emitCodexAgentItem(roundTarget, agentThreadId, rawItem, timestamp, sessionId || capturedSessionId);
   };
 
   /** Approvals this run opened, so the run's end can retract them. */
@@ -514,7 +935,13 @@ async function queryCodex(
    * is unbounded on purpose: a prompt that times out on its own would deny an
    * action the user was still reading.
    */
-  const requestApproval = (method: string, params: AnyRecord): Promise<ProviderPermissionDecision | null> => {
+  const requestApproval = (
+    method: string,
+    params: AnyRecord,
+    deliver: (message: NormalizedMessage) => void = (message) => sendMessage(ws, message),
+    subjects: Map<string, { toolName: string; input: unknown }> = approvalSubjects,
+    ownedApprovalIds: Set<string> = openApprovalIds,
+  ): Promise<ProviderPermissionDecision | null> => {
     const itemId = readNonEmptyString(params.itemId) ?? randomUUID();
     const requestId = randomUUID();
     // A command approval is asked *before* the item is announced and carries
@@ -523,8 +950,14 @@ async function queryCodex(
     const command = readNonEmptyString(params.command);
     const subject = command
       ? { toolName: 'Bash', input: JSON.stringify({ command: readCodexCommandLine(command) }) }
-      : approvalSubjects.get(itemId);
+      : subjects.get(itemId);
     const reason = readNonEmptyString(params.reason);
+    // An approval for a running agent's thread names the agent's card.
+    const askingThread = readNonEmptyString(params.threadId);
+    const owner = askingThread && askingThread !== capturedSessionId ? codexBackgroundWork.find(askingThread) : undefined;
+    const subagent = owner && owner.sessionKey === (sessionId || capturedSessionId)
+      ? { toolUseId: owner.task.toolUseId, description: owner.task.description }
+      : undefined;
 
     return new Promise<ProviderPermissionDecision | null>((resolve) => {
       let settled = false;
@@ -534,7 +967,7 @@ async function queryCodex(
         }
         settled = true;
         pendingCodexApprovals.delete(requestId);
-        openApprovalIds.delete(requestId);
+        ownedApprovalIds.delete(requestId);
         resolve(decision);
       };
 
@@ -546,9 +979,9 @@ async function queryCodex(
         input: subject?.input,
         receivedAt: new Date(),
       });
-      openApprovalIds.add(requestId);
+      ownedApprovalIds.add(requestId);
 
-      sendMessage(ws, createNormalizedMessage({
+      deliver(createNormalizedMessage({
         kind: 'permission_request',
         requestId,
         toolName: subject?.toolName ?? 'Codex',
@@ -560,6 +993,7 @@ async function queryCodex(
           reason: reason ?? (method === 'item/fileChange/requestApproval'
             ? 'Codex wants to write outside its sandbox.'
             : 'Codex wants to step outside its sandbox.'),
+          ...(subagent ? { subagent } : {}),
         },
         canInterrupt: true,
         sessionId: capturedSessionId || sessionId || null,
@@ -568,7 +1002,7 @@ async function queryCodex(
     }).then((decision) => {
       // Every attached tab drops the prompt, including one that reconnects
       // mid-run and replays the request frame.
-      sendMessage(ws, createNormalizedMessage({
+      deliver(createNormalizedMessage({
         kind: 'permission_resolved',
         requestId,
         sessionId: capturedSessionId || sessionId || null,
@@ -592,188 +1026,313 @@ async function queryCodex(
     }
   };
 
-  try {
-    connection = await codexAppServerTransport.open({
-      onExit: (reason) => {
-        if (currentSession()?.status !== 'aborted' && !terminalFailure) {
-          terminalFailure = { message: reason };
+  /**
+   * Retracts the approvals the session opened for the engine's own requests.
+   *
+   * They belong to the session rather than to a round: a round that ends must
+   * not retract the approval the engine is still waiting for.
+   */
+  const cancelSessionApprovals = (appSessionId: string | null, reason: string): void => {
+    const key = appSessionId || capturedSessionId || '';
+    const ids = sessionApprovalIds.get(key);
+    if (!ids) {
+      return;
+    }
+    sessionApprovalIds.delete(key);
+    for (const requestId of [...ids]) {
+      publishSessionMessage(createNormalizedMessage({
+        kind: 'permission_cancelled',
+        requestId,
+        reason,
+        sessionId: capturedSessionId || sessionId || null,
+        provider: 'codex',
+      }));
+      pendingCodexApprovals.get(requestId)?.settle(null);
+    }
+  };
+
+  /** Set when the process of this round died, which kills its agents with it. */
+  let residentProcessExited = false;
+
+  /**
+   * Settles the agents of this round when nothing can be running any more.
+   *
+   * A resident process keeps the agents alive past the end of the round, so
+   * they are only settled when the process itself is gone.
+   */
+  const settleAgentsWhenProcessIsGone = (): void => {
+    if (residentGeneration === null || residentProcessExited) {
+      settleOutstandingAgents();
+    }
+  };
+
+  /**
+   * The process died, so the round can never reach a terminal state.
+   */
+  const handleProcessExit = (reason: string): void => {
+    residentProcessExited = true;
+    if (currentSession()?.status !== 'aborted' && !terminalFailure) {
+      terminalFailure = { message: reason };
+    }
+    settle();
+  };
+
+  /**
+   * Answers the server-to-client requests the round has to handle.
+   *
+   * An approval waits for the user, so the answer must reach the request
+   * that is still open.
+   */
+  const handleRoundRequest = async (method: string, params: AnyRecord) => {
+    if (method === TASK_MCP_ELICITATION_METHOD) {
+      if (!taskMcpOptions || params.serverName !== TASK_MCP_NAME) {
+        return undefined;
+      }
+      // CloudCLI's current permission card cannot collect form answers or complete URL handshakes.
+      return { action: 'decline', content: null };
+    }
+    if (!CODEX_APPROVAL_METHODS.has(method)) {
+      return undefined;
+    }
+    const decision = await requestApproval(method, params);
+    return toCodexApprovalResponse(method, params, decision);
+
+  };
+
+  /**
+   * The events of the round's own turn.
+   *
+   * The events of a turn the engine started on its own never reach this
+   * handler: a background report must not end the user's round.
+   */
+  /**
+   * Announces what the engine is doing with the round.
+   *
+   * The page learns it from this frame instead of waiting for the next poll,
+   * so a round that waits for the engine says so at once.
+   */
+  const announceActivityState = (): void => {
+    const activity = readCodexResidentSessionActivity(residentKey);
+    if (!activity) {
+      return;
+    }
+    sendMessage(ws, createNormalizedMessage({
+      kind: 'status',
+      text: 'activity_state',
+      activityState: { queued: activity.queued, reporting: activity.reporting },
+      sessionId: capturedSessionId || sessionId || null,
+      provider: 'codex',
+    }));
+  };
+
+  const handleRoundEvent = (method: string, params: AnyRecord): void => {
+    const session = currentSession();
+    // A stop the user asked for silences the events that follow it, but the
+    // terminal event still has to arrive: the round waits for it, and a
+    // resident process keeps running after the stop, so nothing else would
+    // ever settle the round.
+    if (session?.status === 'aborted' && method !== 'turn/completed') {
+      return;
+    }
+
+    const notificationRecord = readObjectRecord(params);
+    const turnRecord = readObjectRecord(notificationRecord?.turn);
+    const itemRecord = readObjectRecord(notificationRecord?.item);
+    const eventThreadId =
+      readNonEmptyString(notificationRecord?.threadId) ??
+      readNonEmptyString(notificationRecord?.thread_id) ??
+      readNonEmptyString(turnRecord?.threadId) ??
+      readNonEmptyString(turnRecord?.thread_id) ??
+      readNonEmptyString(itemRecord?.threadId) ??
+      readNonEmptyString(itemRecord?.thread_id) ??
+      null;
+
+    // Subagents in multi-agent mode emit their own lifecycle events on the same
+    // app-server connection. Only events for the target thread (the parent session)
+    // drive this turn's terminal state, live transcript, and token updates.
+    if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
+      if (method === 'item/completed') {
+        emitAgentItem(eventThreadId, params.item, new Date().toISOString());
+      }
+      return;
+    }
+
+    switch (method) {
+      case 'turn/started': {
+        const turn = readObjectRecord(params.turn);
+        const turnId = typeof turn?.id === 'string' ? turn.id : null;
+        if (turnId) {
+          recordStartedTurn(turnId);
+        }
+        const active = currentSession();
+        if (active) {
+          active.turnId = turnId;
+        }
+        // The engine took the round; it is not waiting any more.
+        announceActivityState();
+        return;
+      }
+
+      case 'item/started': {
+        // Only work the user waits on is worth showing before it
+        // finishes. Text and reasoning items start empty — their content
+        // arrives as deltas — and a user message announced twice would be
+        // appended twice, because a transcript row is appended on arrival
+        // and only reconciled against *history* by id.
+        const startedType = readObjectRecord(params.item)?.type;
+        if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
+          emitItem(params.item, new Date().toISOString(), 'started');
+        }
+        return;
+      }
+
+      case 'item/completed':
+        emitItem(params.item, new Date().toISOString(), 'completed');
+        return;
+
+      case 'item/agentMessage/delta': {
+        // Streamed prose has its own protocol frame: the client grows one
+        // placeholder from the fragments and the completed item's row
+        // then takes its place. Re-sending the whole text as a `text` row
+        // per delta instead appends one row per fragment.
+        if (typeof params.delta === 'string' && params.delta) {
+          sendMessage(ws, createNormalizedMessage({
+            kind: 'stream_delta',
+            role: 'assistant',
+            content: params.delta,
+            sessionId: capturedSessionId || sessionId || null,
+            provider: 'codex',
+          }));
+        }
+        return;
+      }
+
+      case 'thread/tokenUsage/updated': {
+        const tokenBudget = readCodexTokenBudget(params);
+        if (tokenBudget) {
+          sendMessage(ws, createNormalizedMessage({
+            kind: 'status',
+            text: 'token_budget',
+            tokenBudget,
+            sessionId: capturedSessionId || sessionId || null,
+            provider: 'codex',
+          }));
+        }
+        return;
+      }
+
+      case 'error': {
+        const error = readObjectRecord(params.error);
+        const message = readNonEmptyString(error?.message)?.trim()
+          || readNonEmptyString(params.message)?.trim()
+          || 'Codex reported an error.';
+        // A recoverable stream error is progress, not a failed turn. Keep
+        // its cause in logs without adding a permanent chat error row.
+        if (params.willRetry === true) {
+          console.warn('[Codex] Retrying turn:', message);
+          return;
+        }
+        surfaceFailure(message);
+        return;
+      }
+
+      case 'turn/completed': {
+        const turn = readObjectRecord(params.turn);
+        if (typeof turn?.id === 'string') engineTurnId = turn.id;
+        terminalStatus = turn?.status === 'completed'
+          ? 'completed'
+          : turn?.status === 'failed'
+            ? 'failed'
+            : turn?.status === 'interrupted'
+              ? 'interrupted'
+              : 'unknown';
+        if (turn?.status === 'failed') {
+          const error = readObjectRecord(turn.error);
+          const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
+          surfaceFailure(message);
+          notifyRunFailed({
+            userId: normalizedUserId,
+            provider: 'codex',
+            sessionId: appSessionId || capturedSessionId || null,
+            sessionName: sessionSummary,
+            error: terminalFailure,
+          });
+        }
+        if (turn?.status === 'interrupted' && currentSession()?.status !== 'aborted') {
+          // Codex ends a usage-limit, shutdown, or engine-internal interrupt
+          // here rather than at `failed` — on codex 0.155 a spawned agent
+          // finishing mid-turn aborted the whole agent tree as `interrupted`
+          // (fixed upstream in 0.156/#45549 and 0.157/#47340). Treating the
+          // status as a normal completion sent the client a clean `complete`
+          // while the rollout recorded `turn_aborted`, so the abort was
+          // invisible until history re-read it and diagnostics logged the run
+          // as a success. A stop the user asked for (`abort` already flagged
+          // the session) arrives as the same status and must stay silent.
+          const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
+          surfaceFailure(message);
+          notifyRunFailed({
+            userId: normalizedUserId,
+            provider: 'codex',
+            sessionId: appSessionId || capturedSessionId || null,
+            sessionName: sessionSummary,
+            error: terminalFailure,
+          });
         }
         settle();
-      },
-      onRequest: async (method, params) => {
-        if (method === TASK_MCP_ELICITATION_METHOD) {
-          if (!taskMcpOptions || params.serverName !== TASK_MCP_NAME) {
-            return undefined;
-          }
-          // CloudCLI's current permission card cannot collect form answers or complete URL handshakes.
-          return { action: 'decline', content: null };
-        }
-        if (!CODEX_APPROVAL_METHODS.has(method)) {
-          return undefined;
-        }
-        const decision = await requestApproval(method, params);
-        return toCodexApprovalResponse(method, params, decision);
-      },
-      onNotification: (method, params) => {
-        const session = currentSession();
-        if (session?.status === 'aborted') {
-          return;
-        }
+        return;
+      }
 
-        const notificationRecord = readObjectRecord(params);
-        const turnRecord = readObjectRecord(notificationRecord?.turn);
-        const itemRecord = readObjectRecord(notificationRecord?.item);
-        const eventThreadId =
-          readNonEmptyString(notificationRecord?.threadId) ??
-          readNonEmptyString(notificationRecord?.thread_id) ??
-          readNonEmptyString(turnRecord?.threadId) ??
-          readNonEmptyString(turnRecord?.thread_id) ??
-          readNonEmptyString(itemRecord?.threadId) ??
-          readNonEmptyString(itemRecord?.thread_id) ??
-          null;
+      default:
+        return;
+    }
 
-        // Subagents in multi-agent mode emit their own lifecycle events on the same
-        // app-server connection. Only events for the target thread (the parent session)
-        // drive this turn's terminal state, live transcript, and token updates.
-        if (eventThreadId && capturedSessionId && eventThreadId !== capturedSessionId) {
-          return;
-        }
+  };
 
-        switch (method) {
-          case 'turn/started': {
-            const turn = readObjectRecord(params.turn);
-            const turnId = typeof turn?.id === 'string' ? turn.id : null;
-            if (turnId) {
-              recordStartedTurn(turnId);
-            }
-            const active = currentSession();
-            if (active) {
-              active.turnId = turnId;
-            }
-            return;
-          }
+  /**
+   * The resident key is the app session id, so the next round of the same
+   * conversation finds the process that is already running.
+   */
+  const residentKey = appSessionId ?? `codex-unbound-${randomUUID()}`;
 
-          case 'item/started': {
-            // Only work the user waits on is worth showing before it
-            // finishes. Text and reasoning items start empty — their content
-            // arrives as deltas — and a user message announced twice would be
-            // appended twice, because a transcript row is appended on arrival
-            // and only reconciled against *history* by id.
-            const startedType = readObjectRecord(params.item)?.type;
-            if (typeof startedType === 'string' && PROGRESSIVE_CODEX_ITEM_TYPES.has(startedType)) {
-              emitItem(params.item, new Date().toISOString(), 'started');
-            }
-            return;
-          }
+  try {
+    // A conversation that is being archived or deleted must not start a
+    // round while that action is in flight.
+    if (appSessionId && isCodexResidentSessionAdmissionClosed(appSessionId)) {
+      throw new Error('The Codex conversation is being closed and cannot take another message.');
+    }
 
-          case 'item/completed':
-            emitItem(params.item, new Date().toISOString(), 'completed');
-            return;
-
-          case 'item/agentMessage/delta': {
-            // Streamed prose has its own protocol frame: the client grows one
-            // placeholder from the fragments and the completed item's row
-            // then takes its place. Re-sending the whole text as a `text` row
-            // per delta instead appends one row per fragment.
-            if (typeof params.delta === 'string' && params.delta) {
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'stream_delta',
-                role: 'assistant',
-                content: params.delta,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
-            }
-            return;
-          }
-
-          case 'thread/tokenUsage/updated': {
-            const tokenBudget = readCodexTokenBudget(params);
-            if (tokenBudget) {
-              sendMessage(ws, createNormalizedMessage({
-                kind: 'status',
-                text: 'token_budget',
-                tokenBudget,
-                sessionId: capturedSessionId || sessionId || null,
-                provider: 'codex',
-              }));
-            }
-            return;
-          }
-
-          case 'error': {
-            const error = readObjectRecord(params.error);
-            const message = readNonEmptyString(error?.message)?.trim()
-              || readNonEmptyString(params.message)?.trim()
-              || 'Codex reported an error.';
-            // A recoverable stream error is progress, not a failed turn. Keep
-            // its cause in logs without adding a permanent chat error row.
-            if (params.willRetry === true) {
-              console.warn('[Codex] Retrying turn:', message);
-              return;
-            }
-            surfaceFailure(message);
-            return;
-          }
-
-          case 'turn/completed': {
-            const turn = readObjectRecord(params.turn);
-            if (typeof turn?.id === 'string') engineTurnId = turn.id;
-            terminalStatus = turn?.status === 'completed'
-              ? 'completed'
-              : turn?.status === 'failed'
-                ? 'failed'
-                : turn?.status === 'interrupted'
-                  ? 'interrupted'
-                  : 'unknown';
-            if (turn?.status === 'failed') {
-              const error = readObjectRecord(turn.error);
-              const message = readNonEmptyString(error?.message)?.trim() || terminalFailure?.message || 'Turn failed';
-              surfaceFailure(message);
-              notifyRunFailed({
-                userId: normalizedUserId,
-                provider: 'codex',
-                sessionId: appSessionId || capturedSessionId || null,
-                sessionName: sessionSummary,
-                error: terminalFailure,
-              });
-            }
-            if (turn?.status === 'interrupted' && currentSession()?.status !== 'aborted') {
-              // Codex ends a usage-limit, shutdown, or engine-internal interrupt
-              // here rather than at `failed` — on codex 0.155 a spawned agent
-              // finishing mid-turn aborted the whole agent tree as `interrupted`
-              // (fixed upstream in 0.156/#45549 and 0.157/#47340). Treating the
-              // status as a normal completion sent the client a clean `complete`
-              // while the rollout recorded `turn_aborted`, so the abort was
-              // invisible until history re-read it and diagnostics logged the run
-              // as a success. A stop the user asked for (`abort` already flagged
-              // the session) arrives as the same status and must stay silent.
-              const message = terminalFailure?.message ?? 'Codex interrupted this turn before it finished. This can mean an account usage limit, or the engine stopping the turn itself. Sending a message continues from where it stopped.';
-              surfaceFailure(message);
-              notifyRunFailed({
-                userId: normalizedUserId,
-                provider: 'codex',
-                sessionId: appSessionId || capturedSessionId || null,
-                sessionName: sessionSummary,
-                error: terminalFailure,
-              });
-            }
-            settle();
-            return;
-          }
-
-          default:
-            return;
-        }
-      },
-    }, taskMcpOptions ? { env: taskMcpOptions.env } : undefined);
+    /**
+     * Ends the round.
+     *
+     * A resident session interrupts the turn it started, or removes the input
+     * that is still waiting in the engine's queue. A short connection is torn
+     * down behind the interrupt.
+     */
+    const stopRound = (): Promise<unknown> => {
+      if (residentGeneration !== null) {
+        // The confirmation matters: the engine may already have run the input,
+        // and the user must not see a success before that is known.
+        return stopCodexResidentRound(residentKey);
+      }
+      const session = currentSession();
+      if (session?.threadId && session.turnId) {
+        connection?.call('turn/interrupt', { threadId: session.threadId, turnId: session.turnId })
+          .catch((error: unknown) => {
+            console.warn(`[Codex] Interrupt for session ${residentKey} was not accepted:`, error);
+          });
+      }
+      // The connection is torn down on the next tick so the interrupt has a
+      // chance to leave the process before its pipes close.
+      setTimeout(() => connection?.close(), 250).unref?.();
+      return Promise.resolve('interrupted');
+    };
 
     const registerSession = (id: string | null) => {
-      if (!id || !connection) {
+      if (!id) {
         return;
       }
       runSession = {
-        connection,
+        stop: stopRound,
         threadId: capturedSessionId,
         turnId: null,
         status: 'running',
@@ -782,43 +1341,8 @@ async function queryCodex(
       activeCodexSessions.set(id, runSession);
     };
 
-    if (sessionKey()) {
-      registerSession(sessionKey());
-    }
-
-    const effectiveShellExcludes = taskMcpOptions
-      ? await readEffectiveShellEnvironmentExcludes(connection, workingDirectory)
-      : [];
-
-    // `config` carries the settings the protocol has no field of its own for.
-    const threadSettings: AnyRecord = {
-      cwd: workingDirectory,
-      sandbox,
-      approvalPolicy,
-      config: {
-        'features.defer_mailbox_preemption': true,
-        ...(taskMcpOptions?.config ?? {}),
-        ...(taskMcpOptions ? {
-          'shell_environment_policy.exclude': [...new Set([
-            ...effectiveShellExcludes,
-            TASK_API_KEY_ENV,
-            TASK_RUN_CONTEXT_ENV,
-          ])],
-        } : {}),
-      },
-      ...(resolvedModel ? { model: resolvedModel } : {}),
-    };
-    const thread = readObjectRecord(providerSessionId
-      ? await connection.call('thread/resume', {
-        threadId: providerSessionId,
-        excludeTurns: true,
-        ...threadSettings,
-      })
-      : await connection.call('thread/start', threadSettings));
-
-    const threadRecord = readObjectRecord(thread?.thread);
-    const discoveredSessionId = typeof threadRecord?.id === 'string' ? threadRecord.id : null;
-    if (discoveredSessionId) {
+    /** Records the native thread the conversation runs in. */
+    const adoptNativeThread = (discoveredSessionId: string) => {
       onNativeThreadResolved?.(discoveredSessionId);
       const isNewThread = !capturedSessionId;
       capturedSessionId = discoveredSessionId;
@@ -841,6 +1365,148 @@ async function queryCodex(
           provider: 'codex',
         }));
       }
+    };
+
+    if (sessionKey()) {
+      registerSession(sessionKey());
+    }
+
+    let resident: CodexResidentSession | null = null;
+    if (isResidentSessionsEnabled()) {
+      try {
+        resident = await acquireCodexResidentSession({
+        appSessionId: residentKey,
+        lifetime: toolOutputParam ? 'turn' : 'session',
+        reserveForRound: true,
+        userId: normalizedUserId,
+        nativeThreadId: providerSessionId,
+        workingDirectory,
+        env: (generation) => createResidentTaskMcpOptions(generation),
+        config: async (openConnection) => {
+          const excludes = residentTaskMcpOptions
+            ? await readEffectiveShellEnvironmentExcludes(openConnection, workingDirectory)
+            : [];
+          return {
+            'features.defer_mailbox_preemption': true,
+            ...(residentTaskMcpOptions?.config ?? {}),
+            ...(residentTaskMcpOptions ? {
+              'shell_environment_policy.exclude': [...new Set([
+                ...excludes,
+                TASK_BRIDGE_ENV,
+              ])],
+            } : {}),
+          };
+        },
+        approvalPolicy,
+        sandbox,
+        sandboxPolicy,
+        onEngineEvent: (method, params, threadId) => handleCodexSessionEvent({
+          appSessionId: residentKey,
+          threadId: () => threadId,
+          normalize: (raw, nativeSessionId) => context.normalizeMessage(raw, nativeSessionId),
+          deliver: (message) => {
+            context.publishSessionEvent?.(residentKey, message);
+          },
+          approvalSubjects: readSessionApprovalSubjects(residentKey),
+        }, method, params),
+        onSessionExit: handleProcessExit,
+        onSessionRequest: async (method, params) => {
+          if (!CODEX_APPROVAL_METHODS.has(method)) return undefined;
+          let ids = sessionApprovalIds.get(residentKey);
+          if (!ids) {
+            ids = new Set<string>();
+            sessionApprovalIds.set(residentKey, ids);
+          }
+          const decision = await requestApproval(method, params, publishSessionMessage,
+            readSessionApprovalSubjects(residentKey), ids);
+          return toCodexApprovalResponse(method, params, decision);
+        },
+        onRoundEnded: (reason, cause) => {
+          // The round cannot wait for an event that will never come: the
+          // input was withdrawn, or the turn could not be identified.
+          if (reason === 'cancelled') {
+            terminalStatus = 'interrupted';
+          } else {
+            terminalStatus = 'unknown';
+            acceptanceUnknown = true;
+            surfaceFailure(cause === 'interrupt'
+              ? 'Codex could not confirm that this turn stopped. Its conversation process and background agents were force-stopped. Check the results before retrying; independent tasks may still be running.'
+              : cause === 'stop'
+              ? 'Codex could not confirm whether the queued message ran. Its conversation process and background agents were force-stopped. Check the results before retrying; independent tasks may still be running.'
+              : 'Codex could not tell which turn answered this message.');
+          }
+          settle();
+        },
+        revokeCredential: (token: string) => {
+          context.revokeBridgeCredential?.(token);
+        },
+        onSessionDisposed: () => {
+          // The agents of a closed process cannot report any more, so their
+          // cards are settled.
+          settleCodexSessionAgents(residentKey, publishSessionMessage);
+          cancelSessionApprovals(residentKey, 'The conversation process closed before this was answered.');
+          sessionApprovalSubjects.delete(residentKey);
+        },
+        isBusy: () => codexBackgroundWork.hasSession(residentKey),
+      });
+      } catch (error) {
+        // Every resident process is busy. The short connection still works, so
+        // the message goes out instead of failing to send.
+        if (!(error instanceof AppError) || error.code !== 'CODEX_RESIDENT_CAPACITY') {
+          throw error;
+        }
+        console.warn(`[Codex] ${error.message} This round runs on a short connection.`);
+        resident = null;
+      }
+    }
+
+    if (resident) {
+      connection = resident.connection;
+      residentGeneration = resident.generation;
+      knownNativeName = resident.nativeName;
+      adoptNativeThread(resident.threadId);
+    } else {
+      connection = await codexAppServerTransport.open({
+        onExit: handleProcessExit,
+        onRequest: handleRoundRequest,
+        onNotification: handleRoundEvent,
+      }, taskMcpOptions ? { env: taskMcpOptions.env } : undefined);
+
+      const effectiveShellExcludes = taskMcpOptions
+        ? await readEffectiveShellEnvironmentExcludes(connection, workingDirectory)
+        : [];
+
+      // `config` carries the settings the protocol has no field of its own for.
+      const threadSettings: AnyRecord = {
+        cwd: workingDirectory,
+        sandbox,
+        approvalPolicy,
+        config: {
+          'features.defer_mailbox_preemption': true,
+          ...(taskMcpOptions?.config ?? {}),
+          ...(taskMcpOptions ? {
+            'shell_environment_policy.exclude': [...new Set([
+              ...effectiveShellExcludes,
+              TASK_API_KEY_ENV,
+              TASK_RUN_CONTEXT_ENV,
+            ])],
+          } : {}),
+        },
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+      };
+      const thread = readObjectRecord(providerSessionId
+        ? await connection.call('thread/resume', {
+          threadId: providerSessionId,
+          excludeTurns: true,
+          ...threadSettings,
+        })
+        : await connection.call('thread/start', threadSettings));
+
+      const threadRecord = readObjectRecord(thread?.thread);
+      const discoveredSessionId = typeof threadRecord?.id === 'string' ? threadRecord.id : null;
+      if (discoveredSessionId) {
+        adoptNativeThread(discoveredSessionId);
+      }
     }
 
     // Turns with image attachments send structured input items so Codex reads
@@ -860,28 +1526,49 @@ async function queryCodex(
       throw new Error('Codex app-server opened no thread to run the turn in.');
     }
 
-    const toolOutputParam = options.toolOutput ?? (options.taskContinuation ? {
-      name: 'cloudcli_task_result',
-      output: typeof options.taskContinuation === 'string'
-        ? options.taskContinuation
-        : JSON.stringify(options.taskContinuation),
-    } : null);
 
-    const startResult = readObjectRecord(await connection.call('turn/start', {
-      threadId: capturedSessionId,
-      input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
-      ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
-      ...(resolvedEffort ? { effort: resolvedEffort } : {}),
-    }));
-    const startedTurn = readObjectRecord(startResult?.turn);
-    recordStartedTurn(typeof startedTurn?.id === 'string' ? startedTurn.id : null);
+
+    if (residentGeneration !== null) {
+      // The engine's queue is the admission gate: the input waits while the
+      // thread is busy and becomes a turn of its own once it is idle.
+      const submitted = await submitCodexResidentRound({
+        appSessionId: residentKey,
+        generation: residentGeneration ?? undefined,
+        input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
+        ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
+        model: resolvedModel ?? undefined,
+        effort: resolvedEffort ?? undefined,
+        workingDirectory,
+        approvalPolicy,
+        sandbox,
+        sandboxPolicy,
+        onEvent: handleRoundEvent,
+        onRequest: handleRoundRequest,
+      });
+      residentRoundId = submitted.clientUserMessageId;
+      // The engine has the input but has not started its turn yet.
+      announceActivityState();
+    } else {
+      const startResult = readObjectRecord(await connection.call('turn/start', {
+        threadId: capturedSessionId,
+        input: toolOutputParam ? [] : toAppServerInput(inputItems as AnyRecord[]),
+        ...(toolOutputParam ? { toolOutput: toolOutputParam } : {}),
+        ...(resolvedEffort ? { effort: resolvedEffort } : {}),
+      }));
+      const startedTurn = readObjectRecord(startResult?.turn);
+      recordStartedTurn(typeof startedTurn?.id === 'string' ? startedTurn.id : null);
+    }
 
     await turnSettled;
+    if (toolOutputParam && residentGeneration !== null) {
+      releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
+    }
+    settleAgentsWhenProcessIsGone();
 
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session.
     const runAborted = currentSession()?.status === 'aborted';
-    if (runAborted) {
+    if (runAborted && !acceptanceUnknown) {
       terminalStatus = 'interrupted';
     }
     if (!runAborted) {
@@ -904,13 +1591,17 @@ async function queryCodex(
 
   } catch (error) {
     const runError = error instanceof Error ? error : new Error(String(error));
+    if (toolOutputParam && error instanceof AppError && error.code === 'CODEX_SESSION_BUSY') {
+      return { engineTurnId: null, terminalStatus: 'unknown' as const, busy: true };
+    }
+    settleAgentsWhenProcessIsGone();
     const wasAborted =
       currentSession()?.status === 'aborted' ||
       runError.name === 'AbortError' ||
       runError.message.toLowerCase().includes('aborted');
 
     if (!wasAborted) {
-      terminalStatus = 'failed';
+      if (!acceptanceUnknown) terminalStatus = 'failed';
       console.error('[Codex] Error:', error);
 
       if (!errorSurfaced) {
@@ -940,22 +1631,51 @@ async function queryCodex(
           error,
         });
       }
-    } else {
+    } else if (!acceptanceUnknown) {
       terminalStatus = 'interrupted';
     }
 
   } finally {
     cancelOpenApprovals('The run ended before this was answered.');
-    connection?.close();
+    settleAgentsWhenProcessIsGone();
     const session = currentSession();
     if (session) {
       session.status = session.status === 'aborted' ? 'aborted' : 'completed';
     }
+    if (residentGeneration !== null) {
+      // The process stays alive: the next round continues in the same thread.
+      if (residentGeneration !== null && residentRoundId) {
+        completeCodexResidentRound(residentKey, { generation: residentGeneration, clientUserMessageId: residentRoundId });
+      }
+      if (toolOutputParam && residentGeneration !== null) {
+        releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
+      } else if (!appSessionId && residentGeneration !== null) {
+        // A run without an app session has no conversation to stay resident
+        // for, so its process is closed with the round.
+        releaseCodexResidentSession(residentKey, { dispose: true, generation: residentGeneration });
+      } else if (residentGeneration !== null) {
+        releaseCodexResidentSession(residentKey, { generation: residentGeneration });
+      }
+    } else {
+      connection?.close();
+    }
+  }
+
+  const finalStatus = resolveCodexTerminalStatus(terminalStatus, Boolean(terminalFailure));
+  if (finalStatus === 'completed' && !terminalFailure && !toolOutputParam
+    && currentSession()?.status !== 'aborted' && appSessionId && capturedSessionId) {
+    void codexSessionTitleService.enqueue({
+      appSessionId, nativeThreadId: capturedSessionId, generation: residentGeneration ?? 0,
+      workingDirectory, model: resolvedModel ?? catalog.DEFAULT, models: catalog,
+      ...(!providerSessionId ? { initialPrompt: command } : {}),
+    }, knownNativeName).catch(() => {
+      console.warn(`[CodexTitle] ${appSessionId} ${capturedSessionId} enqueue_failed`);
+    });
   }
 
   return {
     engineTurnId,
-    terminalStatus: resolveCodexTerminalStatus(terminalStatus, Boolean(terminalFailure)),
+    terminalStatus: finalStatus,
   };
 }
 
@@ -966,70 +1686,32 @@ async function queryCodex(
  * out in the rollout — and the connection is closed behind it so a server
  * that ignores the interrupt cannot keep the run alive.
  */
-function abortCodexSession(sessionId: string) {
+async function abortCodexSession(sessionId: string): Promise<boolean> {
   const session = activeCodexSessions.get(sessionId);
 
-  if (!session) {
+  // A session whose round is over has nothing to stop: the entry stays for
+  // the diagnostics, but a stop must not report success for a round that
+  // already ended.
+  if (!session || session.status !== 'running') {
     return false;
   }
 
   session.status = 'aborted';
-  // Closing the connection takes its collab agents with it, and no terminal
-  // item event will arrive to retire their entries on the strip.
-  codexBackgroundWork.delete(sessionId);
   console.log(
     `[Codex] Aborting session ${sessionId} (thread ${session.threadId ?? 'unknown'}, `
     + `turn ${session.turnId ?? 'none'}) — started ${session.startedAt}`,
   );
-  if (session.threadId && session.turnId) {
-    session.connection
-      .call('turn/interrupt', { threadId: session.threadId, turnId: session.turnId })
-      .catch((error: unknown) => {
-        console.warn(`[Codex] Interrupt for session ${sessionId} was not accepted:`, error);
-      });
-  }
-  // The connection is torn down on the next tick so the interrupt has a
-  // chance to leave the process before its pipes close. The timer stays
-  // ref'd: a run settled only by this close must keep the loop alive until
-  // it fires (the test harness has no other handles to do it).
-  setTimeout(() => session.connection.close(), 250);
+  // The stop waits for the engine's confirmation. A queued input the engine
+  // already ran cannot be taken back, and the user must not see a success
+  // before that is known; the manager reports the unknown case itself.
+  await session.stop();
 
   return true;
 }
 
 /**
- * Compacts a Codex thread's carried conversation into a summary.
- *
- * `thread/compact/start` is the app-server primitive the Codex IDE clients
- * use. Only a stored thread has something to compact; the run's synthetic
- * terminal `complete` is what makes the UI refresh the transcript and show
- * the summary.
- */
-async function compactCodexSession(
-  options: AnyRecord,
-  writer: ProviderRuntimeWriter,
-  context: ProviderRuntimeContext,
-): Promise<unknown> {
-  const appSessionId = typeof options.sessionId === 'string' ? options.sessionId : null;
-  const providerSessionId = context.resolveProviderSessionId(appSessionId);
-  if (!providerSessionId) {
-    throw new Error('This Codex session has no stored conversation to compact yet.');
-  }
-
-  sendMessage(writer, createNormalizedMessage({
-    kind: 'status',
-    text: 'Compacting context…',
-    sessionId: appSessionId,
-    provider: 'codex',
-  }));
-
-  await codexAppServer.compactThread({ threadId: providerSessionId });
-  return undefined;
-}
-
-/**
- * Used by the providers module's CodexProvider to run, abort, and compact
- * turns, and to answer the approvals a run is blocked on.
+ * Used by the providers module's CodexProvider to run and abort turns, and to
+ * answer the approvals a run is blocked on.
  *
  * Declaring `permissions` is also what turns `supportsPermissionRequests` on
  * for Codex in the capability catalog.
@@ -1037,7 +1719,6 @@ async function compactCodexSession(
 export const codexRuntime = {
   run: queryCodex,
   abort: abortCodexSession,
-  compact: compactCodexSession,
   permissions: {
     /**
      * Answers one approval. The gateway fans a decision out to every
@@ -1066,18 +1747,56 @@ export const codexRuntime = {
     },
   },
   /**
-   * Sessions with collab agents still running, for the running-sessions poll.
-   * The engine outlives turns, so an agent spawned mid-turn keeps working
-   * after the turn's `result` — this is how the UI learns it is still going.
+   * Sessions with collab agents still running, for the running-sessions poll,
+   * plus resident sessions whose engine reports in a turn of its own after
+   * the last agent ended (listed with no tasks, so the page shows them
+   * working). A short-connection app-server dies with the turn, so its agents
+   * are those of turns still in flight; the turn's end settles the rest.
    */
-  listBackgroundWork(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
-    const entries: Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> = [];
-    for (const [sessionId, tasks] of codexBackgroundWork) {
-      if (tasks.size > 0) {
-        entries.push({ sessionId, tasks: Array.from(tasks.values()) });
-      }
-    }
-    return entries;
+  listBackgroundWork(): SessionBackgroundWork[] {
+    const work = codexBackgroundWork.list();
+    const reporting = listCodexReportingOnlySessions()
+      .filter((sessionId) => !codexBackgroundWork.hasSession(sessionId))
+      .map((sessionId) => ({ sessionId, tasks: [] }));
+    return [...work, ...reporting];
+  },
+  /**
+   * What the engine is doing with the conversation's round.
+   *
+   * The engine is the only one that knows whether it picked the queued input
+   * up, so the page asks the engine instead of guessing.
+   */
+  getSessionActivity(sessionId: string): { queued: boolean; reporting: boolean } | null {
+    return readCodexResidentSessionActivity(sessionId);
+  },
+  /**
+   * Whether the conversation still has work that must not be reclaimed.
+   */
+  hasSessionWork(sessionId: string): boolean {
+    return isCodexResidentSessionBusy(sessionId);
+  },
+  /**
+   * Stops new rounds from starting in the conversation, so an archive or a
+   * delete can look at its state and act on it.
+   */
+  closeSessionAdmission(sessionId: string): void {
+    closeCodexResidentSessionAdmission(sessionId);
+  },
+  /**
+   * Releases the process the conversation kept alive between rounds.
+   */
+  releaseSession(sessionId: string): void {
+    releaseCodexResidentSessionResources(sessionId);
+  },
+  /**
+   * Opens the conversation's admission again.
+   */
+  openSessionAdmission(sessionId: string): void {
+    openCodexResidentSessionAdmission(sessionId);
+  },
+  /** What the composer's strip shows for a session that subscribes mid-turn. */
+  backgroundTasks: {
+    list: (sessionId: string) => codexBackgroundWork.listStripTasks(sessionId),
   },
 };
 
@@ -1142,9 +1861,9 @@ const completedSessionCleanupTimer = setInterval(() => {
       const startedAt = new Date(session.startedAt).getTime();
       if (now - startedAt > maxAge) {
         activeCodexSessions.delete(id);
-        // The session's tracked agents went with its connection; entries left
-        // here would keep a dead task on the background-work strip forever.
-        codexBackgroundWork.delete(id);
+        // A run settles its own agents when its turn ends; this only drops
+        // entries a run that never reached its end left behind.
+        codexBackgroundWork.clearSession(id);
       }
     }
   }

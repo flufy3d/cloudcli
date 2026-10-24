@@ -14,24 +14,7 @@ import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/datab
 import { AppError } from '@/shared/utils.js';
 
 import { createWorkspaceFixture } from './workspace-fixture.js';
-
-/** Redirects ZCODE_STORAGE_DIR to a temp dir for fixture isolation. */
-const withZCodeStorage = async (runTest: (storageDir: string) => Promise<void>): Promise<void> => {
-  const previous = process.env.ZCODE_STORAGE_DIR;
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'zcode-sessions-'));
-  process.env.ZCODE_STORAGE_DIR = tempDir;
-
-  try {
-    await runTest(tempDir);
-  } finally {
-    if (previous === undefined) {
-      delete process.env.ZCODE_STORAGE_DIR;
-    } else {
-      process.env.ZCODE_STORAGE_DIR = previous;
-    }
-    await rm(tempDir, { recursive: true, force: true });
-  }
-};
+import { withZCodeStorage } from './zcode-storage-fixture.js';
 
 /**
  * Creates a fixture ZCode database with one user prompt and one assistant
@@ -1302,15 +1285,17 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
           parent_id TEXT,
           directory TEXT,
           title TEXT,
+          title_source TEXT,
           time_created INTEGER,
-          time_updated INTEGER
+          time_updated INTEGER,
+          time_title_updated INTEGER
         )
       `);
       const insertSession = db.prepare(
-        'INSERT INTO session (id, parent_id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO session (id, parent_id, directory, title, title_source, time_created, time_updated, time_title_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       );
-      insertSession.run('sess_sync', null, workspaceDir, 'Fixture session', 1000, 2000);
-      insertSession.run('sess_subagent_agent_x', 'sess_sync', workspaceDir, 'Subagent', 9000, 9500);
+      insertSession.run('sess_sync', null, workspaceDir, 'Fixture session', 'first_input', 1000, 2000, null);
+      insertSession.run('sess_subagent_agent_x', 'sess_sync', workspaceDir, 'Subagent', 'first_input', 9000, 9500, null);
     } finally {
       db.close();
     }
@@ -1329,6 +1314,66 @@ test('synchronizer maps fixture rows through the shared SQLite skeleton', async 
       const target = synchronizer.getSessionWatchTarget();
       assert.equal(target.rootPath, path.join(storageDir, 'cli', 'db'));
       assert.equal(target.isTargetFile(path.join(storageDir, 'cli', 'db', 'db.sqlite-wal')), true);
+    });
+  });
+});
+
+test('a generated title is re-synced even when message activity has gone quiet', async () => {
+  await withZCodeStorage(async (storageDir) => {
+    const workspaceDir = await createWorkspaceFixture();
+    await createFixtureDatabase(storageDir, 'sess_retitle');
+
+    const Database = (await import('better-sqlite3')).default;
+    const dbPath = path.join(storageDir, 'cli', 'db', 'db.sqlite');
+    const db = new Database(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE session (
+          id TEXT PRIMARY KEY,
+          parent_id TEXT,
+          directory TEXT,
+          title TEXT,
+          title_source TEXT,
+          time_created INTEGER,
+          time_updated INTEGER,
+          time_title_updated INTEGER
+        )
+      `);
+      const insertSession = db.prepare(
+        'INSERT INTO session (id, parent_id, directory, title, title_source, time_created, time_updated, time_title_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      );
+      // The engine seeds the title with the raw first input; only the raw
+      // message is on record so far.
+      insertSession.run('sess_retitle', null, workspaceDir, '帮我看看登录重定向的问题', 'first_input', 1000, 2000, 2000);
+    } finally {
+      db.close();
+    }
+
+    await withIsolatedAppDatabase(async () => {
+      const synchronizer = new ZCodeSessionSynchronizer();
+      assert.equal(await synchronizer.synchronize(), 1);
+      assert.equal(
+        sessionsDb.getSessionByProviderSessionId('sess_retitle')?.custom_name,
+        '帮我看看登录重定向的问题',
+      );
+
+      // The engine later generates its title while the session stays idle:
+      // time_updated does not move, only time_title_updated does.
+      const engine = new Database(dbPath);
+      try {
+        engine.prepare(
+          'UPDATE session SET title = ?, title_source = ?, time_title_updated = ? WHERE id = ?',
+        ).run('登录重定向问题修复', 'generated', 2500, 'sess_retitle');
+      } finally {
+        engine.close();
+      }
+
+      // The watcher-triggered incremental pass must still pick the row up.
+      assert.equal(await synchronizer.synchronizeFile(dbPath), 'sess_retitle');
+      assert.equal(
+        sessionsDb.getSessionByProviderSessionId('sess_retitle')?.custom_name,
+        '登录重定向问题修复',
+      );
     });
   });
 });

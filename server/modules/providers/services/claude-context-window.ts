@@ -97,3 +97,53 @@ export function readClaudeSessionWindowSources(
     return { recorded: null, selectedModel: null };
   }
 }
+
+/**
+ * Bounded context-window capture for one live run.
+ *
+ * The SDK answers only while the query is live, and a control request can
+ * fail or still be warming up when the stream's head asks for it. So the
+ * first `maxAttempts` probes try, a read already in flight is shared rather
+ * than issued twice, and the first positive answer stops the capture for the
+ * rest of the run.
+ *
+ * Consumer: the Claude runtime provider, which funnels the SDK's window into
+ * `recordClaudeSessionContextWindow` and the live `token_budget` frames.
+ */
+export function createContextWindowCapture(
+  readBudget: () => Promise<{ total?: number | null } | null | undefined>,
+  onWindow: (total: number) => void,
+  maxAttempts = 2,
+): () => Promise<void> {
+  let attempts = 0;
+  let inFlight: Promise<void> | null = null;
+  let captured = false;
+
+  return () => {
+    if (inFlight) {
+      return inFlight;
+    }
+    if (captured || attempts >= maxAttempts) {
+      return Promise.resolve();
+    }
+
+    attempts += 1;
+    inFlight = Promise.resolve()
+      .then(readBudget)
+      .then((budget) => {
+        const total = Number(budget?.total);
+        if (Number.isFinite(total) && total > 0) {
+          captured = true;
+          onWindow(total);
+        }
+      })
+      .catch(() => {
+        // A control request that failed says nothing about the window; the
+        // next probe, or the next turn, reads it again.
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+    return inFlight;
+  };
+}

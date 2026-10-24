@@ -120,6 +120,22 @@ export type {
 };
 
 
+/**
+ * One session's outstanding background work, the unit a runtime's
+ * `listBackgroundWork()` returns and the background-work registry lists:
+ * `sessionId` is the app session id, `tasks` what it still waits on.
+ */
+export type SessionBackgroundWork = {
+  sessionId: string;
+  tasks: BackgroundTaskSummary[];
+  /**
+   * When the work the entry stands for began, for an entry with no task to
+   * date it: a report turn the engine runs on its own. The running-sessions
+   * poll otherwise dates the entry by its earliest task.
+   */
+  startedAt?: number;
+};
+
 export type {
   McpScope,
   McpTransport,
@@ -415,6 +431,53 @@ export type ProviderRuntimePermissionGateway = {
   reconcilePending?(sessionId: string): void;
 };
 
+//----------------- CODEX AUTOMATIC SESSION TITLES ------------
+/**
+ * Immutable identity captured after a successful normal user turn. Providers'
+ * runtime, title scheduler and title client use it to reject late work after
+ * thread replacement. `models` is the runtime's discovered catalog snapshot;
+ * `initialPrompt` is supplied only when this turn created the native thread.
+ */
+export type CodexSessionTitleTarget = {
+  appSessionId: string;
+  nativeThreadId: string;
+  /** Zero requests a manager-owned transient worker after a short chat connection. */
+  generation: number;
+  /** Manager record key when a transient worker serves a different app-session key. */
+  residentKey?: string;
+  workingDirectory: string;
+  model: string;
+  models: ProviderModelsDefinition;
+  initialPrompt?: string;
+};
+
+// ---------------------------
+//----------------- RESIDENT TASK BRIDGE ------------
+/** Trusted process identity issued by providers and verified by task-continuations. */
+export type TaskBridgeCredentialContext = {
+  userId: string | number;
+  appSessionId: string;
+  generation: number;
+};
+
+/**
+ * A tool invocation observed on the owning resident connection, never supplied
+ * by the HTTP caller. Providers attach the current run capability only after
+ * binding its native turn; task-continuations compares arguments and generation.
+ */
+export type TaskBridgeEngineCall = {
+  appSessionId: string;
+  generation: number;
+  threadId: string;
+  turnId: string | null;
+  callId: string;
+  server: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  runToken: string;
+};
+
+// ---------------------------
 /**
  * Provider-scoped application capabilities supplied to a runtime for one run.
  *
@@ -429,6 +492,46 @@ export type ProviderRuntimeContext = {
   ): Promise<string | undefined>;
   getProviderModels(): Promise<ProviderModelsDefinition>;
   normalizeMessage(raw: unknown, sessionId: string | null): NormalizedMessage[];
+  /**
+   * Publishes one event to a session outside any run.
+   *
+   * A provider that stays resident keeps working after its round ended — the
+   * engine starts a turn of its own to report a background result. The
+   * gateway owns the session's sequence numbers, audience and replay buffer,
+   * so the runtime only supplies the event; the gateway decides where it goes.
+   */
+  publishSessionEvent?(appSessionId: string, message: NormalizedMessage): void;
+  /**
+   * Issues the narrow credential a resident process carries.
+   *
+   * A resident process outlives the round that started it, so it cannot
+   * carry the round's capability; it carries a bridge credential instead,
+   * and the host matches every call against the engine call it observed.
+   */
+  createBridgeCredential?(input: {
+    userId: string;
+    appSessionId: string;
+    generation: number;
+  }): { token: string } | null;
+  /**
+   * Revokes a bridge credential, for example when the process that carried
+   * it is gone.
+   */
+  revokeBridgeCredential?(token: string): void;
+  /**
+   * Registers one MCP tool call the engine made.
+   *
+   * A resident process outlives the round that started it, so the host
+   * cannot take the round's authority from the process. It takes it from the
+   * engine call it observed, and this is how that call reaches the host.
+   */
+  registerEngineToolCall?(call: TaskBridgeEngineCall): void;
+  /**
+   * The engine's transcript file for an app session, or null when it is not
+   * known yet. A runtime whose process outlives a turn reads it to notice
+   * another process continuing the conversation in the meantime.
+   */
+  resolveTranscriptPath?(appSessionId: string): string | null;
   /** Optional provider hook for clearing incomplete real-time state at a terminal run outcome. */
   resetLiveMessageState?(sessionId: string): void;
   isProviderInstalled(): Promise<boolean>;
@@ -949,6 +1052,50 @@ export type WorktreeProjectView = {
   sessions: [];
   sessionMeta: { hasMore: false; total: 0 };
 };
+
+//--------------------------- SESSION WORKTREE PLACEMENT ------------
+/**
+ * The main checkout a linked git worktree belongs to, resolved from the
+ * worktree directory itself.
+ *
+ * Produced by the Worktrees module's `resolveWorktreeHome` and consumed by the
+ * session worktree placement policy, which reunifies engine sessions that an
+ * engine (currently OpenCode) rebound from a project's main checkout into one
+ * of its worktrees.
+ */
+export type WorktreeHome = {
+  /** Absolute path of the repository's main worktree. */
+  rootPath: string;
+  /** Branch checked out in the linked worktree; null when detached. */
+  branch: string | null;
+};
+
+/**
+ * Async lookup from a session directory to the main checkout of the git
+ * worktree it belongs to.
+ *
+ * Implementations must resolve to null (never throw) when the directory is not
+ * a linked worktree — plain checkouts, missing directories, and non-repository
+ * paths are all ordinary answers here, because every indexed session passes
+ * through the lookup once per cache TTL.
+ */
+export type WorktreeHomeResolver = (directory: string) => Promise<WorktreeHome | null>;
+
+/**
+ * The worktree a session actually runs in, recorded alongside its owning
+ * (main-checkout) project.
+ *
+ * Written by the session synchronizers after placement resolution and surfaced
+ * to the frontend so the workspace header can label a reunified session with
+ * its branch. Both fields are null for sessions running in their project's
+ * main checkout.
+ */
+export type SessionWorktreeInfo = {
+  path: string;
+  branch: string | null;
+};
+
+// ---------------------------
 
 /**
  * Input accepted when removing a linked Git worktree.

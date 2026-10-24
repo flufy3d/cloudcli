@@ -14,6 +14,8 @@ import type { IProviderSessionSynchronizer } from '@/shared/interfaces.js';
 import type { ProviderSessionWatchTarget } from '@/shared/types.js';
 
 import { admitsWorkspacePath } from '../../shared/sessions/workspace-admission.js';
+import { applySessionWorktreePlacement } from '../../shared/sessions/session-worktree-placement.js';
+import { resolveSessionTitle, type DerivedSessionTitle } from '../../shared/sessions/session-title-resolution.js';
 
 type ParsedSession = {
   sessionId: string;
@@ -80,14 +82,16 @@ export class ClaudeSessionSynchronizer implements IProviderSessionSynchronizer {
       }
 
       const timestamps = await readFileTimestamps(filePath);
+      const placement = await applySessionWorktreePlacement(parsed.projectPath);
       sessionsDb.createSession(
         parsed.sessionId,
         this.provider,
-        parsed.projectPath,
+        placement.projectPath,
         parsed.sessionName,
         timestamps.createdAt,
         timestamps.updatedAt,
-        filePath
+        filePath,
+        placement.worktree
       );
       processed += 1;
     }
@@ -113,14 +117,16 @@ export class ClaudeSessionSynchronizer implements IProviderSessionSynchronizer {
     }
 
     const timestamps = await readFileTimestamps(filePath);
+    const placement = await applySessionWorktreePlacement(parsed.projectPath);
     return sessionsDb.createSession(
       parsed.sessionId,
       this.provider,
-      parsed.projectPath,
+      placement.projectPath,
       parsed.sessionName,
       timestamps.createdAt,
       timestamps.updatedAt,
-      filePath
+      filePath,
+      placement.worktree
     );
   }
 
@@ -156,26 +162,31 @@ export class ClaudeSessionSynchronizer implements IProviderSessionSynchronizer {
       return null;
     }
 
+    // Claude names the session itself (`custom-title` from a manual /rename,
+    // then `ai-title`); those generated titles are followed on every rescan.
+    // `last-prompt` rotates every turn and history.jsonl holds raw prompts, so
+    // both only fill a nameless row and never drift an existing name.
+    const extractedTitle = await this.extractSessionTitle(filePath, parsed.sessionId);
+    const generated = extractedTitle?.generated ?? false;
+    let derivedName = extractedTitle?.name;
+    if (!derivedName && !generated) {
+      derivedName = nameMap.get(parsed.sessionId);
+    }
+
     // App-created sessions are keyed by an app id, so disk-discovered provider
     // ids must be resolved through the provider-id mapping first.
     const existingSession = sessionsDb.getSessionByProviderSessionId(parsed.sessionId)
       ?? sessionsDb.getSessionById(parsed.sessionId);
-    const existingSessionName = existingSession?.custom_name;
-    if (existingSessionName && existingSessionName !== 'Untitled Claude Session') {
-      return {
-        ...parsed,
-        sessionName: normalizeSessionName(existingSessionName, 'Untitled Claude Session'),
-      };
-    }
-
-    let sessionName = await this.extractSessionTitle(filePath, parsed.sessionId);
-    if (!sessionName) {
-      sessionName = nameMap.get(parsed.sessionId);
-    }
+    const resolvedName = resolveSessionTitle({
+      nameLocked: existingSession?.name_locked === 1,
+      existingName: existingSession?.custom_name,
+      fallbackTitle: 'Untitled Claude Session',
+      derived: { name: derivedName ?? null, generated },
+    });
 
     return {
       ...parsed,
-      sessionName: normalizeSessionName(sessionName, 'Untitled Claude Session'),
+      sessionName: normalizeSessionName(resolvedName ?? undefined, 'Untitled Claude Session'),
     };
   }
 
@@ -187,12 +198,15 @@ export class ClaudeSessionSynchronizer implements IProviderSessionSynchronizer {
    * Claude writes `custom-title` immediately before `ai-title`, so a reverse
    * scan that returns its first hit would always lose the manual rename.
    *
+   * The flag reports whether the winner is engine-generated naming
+   * (`custom-title`/`ai-title`) or merely the rotating last prompt.
+   *
    * Returns undefined on a missing or unreadable file so sync can continue.
    */
   private async extractSessionTitle(
     filePath: string,
     sessionId: string
-  ): Promise<string | undefined> {
+  ): Promise<DerivedSessionTitle | undefined> {
     try {
       const content = await readFile(filePath, 'utf8');
       const lines = content.split(/\r?\n/);
@@ -240,7 +254,16 @@ export class ClaudeSessionSynchronizer implements IProviderSessionSynchronizer {
         }
       }
 
-      return foundCustomTitle || foundAiTitle || foundLastPrompt;
+      if (foundCustomTitle) {
+        return { name: foundCustomTitle, generated: true };
+      }
+      if (foundAiTitle) {
+        return { name: foundAiTitle, generated: true };
+      }
+      if (foundLastPrompt) {
+        return { name: foundLastPrompt, generated: false };
+      }
+      return undefined;
     } catch {
       // Ignore missing/unreadable files so sync can continue.
     }

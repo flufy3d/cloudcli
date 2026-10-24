@@ -95,6 +95,9 @@ test('a tab that subscribes during background work receives the run\'s later eve
     assert.equal(newTab.frames[0]?.kind, 'chat_subscribed');
     assert.equal(newTab.frames[0]?.isProcessing, false);
     assert.equal(newTab.frames[0]?.backgroundWorkPending, true);
+    assert.equal(typeof newTab.frames[0]?.streamEpoch, 'string');
+    assert.equal(newTab.frames[0]?.replayFromSeq, 2);
+    assert.equal(newTab.frames[0]?.stale, true);
 
     run.writer.send({ kind: 'task_status', provider: 'claude', sessionId: 'native-1', event: 'notification', taskId: 't1', status: 'completed' } as never);
     assert.ok(
@@ -190,5 +193,55 @@ test('background work without a tracked reply phase does not mark the subscriber
     // A provider that never broadcasts `background_tasks` could not clear it again.
     assert.equal(newTab.frames[0]?.kind, 'chat_subscribed');
     assert.equal(newTab.frames[0]?.backgroundWorkPending, false);
+  });
+});
+
+test('the subscribe ack says whether the session\'s background work can still be stopped', async () => {
+  await withIsolatedDatabase(async () => {
+    startAndCompleteRun(createFakeSocket());
+    const newTab = createFakeSocket();
+    handleChatConnection(
+      newTab as never,
+      { user: { id: 1 } } as never,
+      { runtime: {
+        hasBackgroundWork: () => true,
+        isBackgroundWorkPending: () => false,
+        getPendingApprovalsForSession: () => [],
+        getBackgroundTasksForSession: () => [{ id: 'call_agent', toolName: 'Agent', startedAt: 1 }],
+        canInterruptBackgroundWork: (sessionId: string) => sessionId !== SESSION_ID,
+        backgroundWorkQueuesInput: (provider: string) => provider !== 'claude',
+      } as never },
+    );
+    newTab.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 0 }] }));
+    await settle();
+
+    assert.equal(newTab.frames[0]?.kind, 'chat_subscribed');
+    assert.equal(newTab.frames[0]?.backgroundCanInterrupt, false);
+    // The session row is a Claude session, whose next turn joins its held process.
+    assert.equal(newTab.frames[0]?.backgroundWorkQueuesInput, false);
+  });
+});
+
+test('subscribe validates replay metadata and a previous epoch cannot suppress current events', async () => {
+  await withIsolatedDatabase(async () => {
+    const run = chatRunRegistry.startRun({ appSessionId: SESSION_ID, provider: 'claude', providerSessionId: 'native-1', connection: null, userId: 1 });
+    assert.ok(run);
+    run.writer.send({ kind: 'stream_delta', provider: 'claude', content: 'new output' });
+    const socket = createFakeSocket();
+    handleChatConnection(socket as never, { user: { id: 1 } } as never, { runtime: {
+      hasBackgroundWork: () => false, getPendingApprovalsForSession: () => [], isBackgroundWorkPending: () => false,
+    } as never });
+    for (const cursor of [{ lastSeq: -1 }, { lastSeq: 0.5 }, { lastSeq: '1' }, { streamEpoch: '' }, { streamEpoch: 1 }]) {
+      socket.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, ...cursor }] }));
+      await settle();
+      assert.equal(socket.frames.pop()?.kind, 'protocol_error');
+    }
+    socket.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID, lastSeq: 999, streamEpoch: 'previous-gateway' }] }));
+    await settle();
+    assert.equal(socket.frames[0]?.kind, 'chat_subscribed');
+    assert.equal(socket.frames[0]?.stale, true);
+    assert.equal(socket.frames[0]?.lastSeq, 1);
+    assert.equal(socket.frames[1]?.seq, 1);
+    assert.equal(socket.frames[1]?.streamEpoch, socket.frames[0]?.streamEpoch);
   });
 });

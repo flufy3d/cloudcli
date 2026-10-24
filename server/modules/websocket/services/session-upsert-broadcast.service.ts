@@ -20,6 +20,7 @@ import type { ScheduledJobsChangedEvent, SessionRemovedEvent, SessionUpsertedEve
  */
 async function buildSessionUpsertedEvent(
   sessionIdOrProviderSessionId: string,
+  options: { metadataOnly?: boolean } = {},
 ): Promise<SessionUpsertedEvent | null> {
   // Resolving by provider id first covers the watcher, which only ever sees
   // the id written in the transcript. For a row where the two ids are equal
@@ -44,11 +45,14 @@ async function buildSessionUpsertedEvent(
     // The column is a plain TEXT and typed as `string` on the row, but only
     // provider adapters ever write it.
     provider: row.provider as SessionUpsertedEvent['provider'],
+    ...(options.metadataOnly ? { metadataOnly: true } : {}),
     session: {
       id: row.session_id,
       summary: row.custom_name || '',
       messageCount: 0,
       lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
+      worktreePath: row.worktree_path,
+      worktreeBranch: row.worktree_branch,
     },
     project: project
       ? {
@@ -77,9 +81,19 @@ function sendToConnectedClients(payloads: string[]): void {
   });
 }
 
-/** Announces one session. Used by the chat run registry when a run reports its provider-native id. */
-export async function broadcastSessionUpserted(sessionIdOrProviderSessionId: string): Promise<void> {
-  const event = await buildSessionUpsertedEvent(sessionIdOrProviderSessionId);
+/**
+ * Announces one session. Used by the chat run registry when a run reports its provider-native id.
+ *
+ * `metadataOnly` marks a delta that carries a new session name and nothing
+ * else: the client takes the title and leaves the transcript, the attention
+ * mark and the list order alone. The OpenCode runtime uses it for the name
+ * the engine generated for a session.
+ */
+export async function broadcastSessionUpserted(
+  sessionIdOrProviderSessionId: string,
+  options: { metadataOnly?: boolean } = {},
+): Promise<void> {
+  const event = await buildSessionUpsertedEvent(sessionIdOrProviderSessionId, options);
   if (event) {
     sendToConnectedClients([JSON.stringify(event)]);
   }

@@ -4,11 +4,23 @@ import type {
   NormalizedMessage,
   RealtimeClientConnection,
 } from '@/shared/types.js';
+import { notifyPermissionRequired } from '@/modules/notifications/index.js';
 import { enforceNormalizedMessageContract } from '@/shared/normalized-message-contract.js';
-import { createCompleteMessage } from '@/shared/utils.js';
+import {
+  createCompleteMessage,
+  compactProviderPayload,
+} from '@/shared/utils.js';
 
 type ChatSessionWriterOptions = {
   connection: RealtimeClientConnection | null;
+  /**
+   * The audience to deliver to, when the session's channel owns it.
+   *
+   * The channel keeps one audience per session, so a run's writer and the
+   * session's publish entry reach the same sockets. A writer without one keeps
+   * a private audience, which is what the tests use.
+   */
+  audience?: Set<RealtimeClientConnection>;
   userId: string | number | null;
   provider: LLMProvider;
   /** Provider-native id when resuming an existing session, otherwise null. */
@@ -26,6 +38,23 @@ type ChatSessionWriterOptions = {
    * `complete` after an abort already completed the run).
    */
   decorateOutboundEvent: (message: NormalizedMessage) => NormalizedMessage | null;
+  /**
+   * What the user calls this session, for notification titles. A brand-new
+   * session has no stored name yet, so the run's creator passes what it knows.
+   */
+  sessionName?: string | null;
+  /**
+   * Raises the push notification for an approval card. Defaults to the
+   * notification service; tests inject their own.
+   */
+  notifyPermissionRequest?: (info: {
+    userId: string | number | null;
+    provider: LLMProvider;
+    sessionId: string | null;
+    toolName?: string;
+    requestId: string;
+    sessionName?: string | null;
+  }) => void;
 };
 
 /**
@@ -63,7 +92,7 @@ export class ChatSessionWriter {
    * stream away from everyone before it, so a second tab silently froze
    * mid-run and only caught up on the next REST history refresh.
    */
-  private readonly connections = new Set<RealtimeClientConnection>();
+  private readonly connections: Set<RealtimeClientConnection>;
   /**
    * The provider-native session id as the runtime knows it. Kept locally
    * (besides the registry) because runtimes read it back via `getSessionId()`
@@ -74,6 +103,7 @@ export class ChatSessionWriter {
 
   constructor(options: ChatSessionWriterOptions) {
     this.options = options;
+    this.connections = options.audience ?? new Set<RealtimeClientConnection>();
     // A run started by a timer has no audience yet. Everything still goes
     // through `decorateOutboundEvent` into the run's replay buffer, so a
     // client that subscribes mid-run catches up from the beginning.
@@ -89,7 +119,7 @@ export class ChatSessionWriter {
     // runtimes are `.js` files the compiler never type-checks, so this is the
     // last place an undeclared field can be stopped before a renderer starts
     // depending on it.
-    const checked = enforceNormalizedMessageContract(data);
+    const checked = enforceNormalizedMessageContract(compactProviderPayload(data));
     if (!checked.ok) {
       console.error(
         `[ChatSessionWriter] Dropping outbound payload from ${this.options.provider}: ${checked.reason}`,
@@ -129,6 +159,19 @@ export class ChatSessionWriter {
     const outbound = this.options.decorateOutboundEvent(message);
     if (outbound) {
       this.forward(outbound);
+      // Every engine's approval and question cards pass through here, so this
+      // is the one place that tells the user something waits for them, whether
+      // or not a page is open.
+      if (outbound.kind === 'permission_request' && outbound.requestId) {
+        (this.options.notifyPermissionRequest ?? notifyPermissionRequired)({
+          userId: this.userId,
+          provider: this.options.provider,
+          sessionId: outbound.sessionId ?? null,
+          toolName: outbound.toolName,
+          requestId: outbound.requestId,
+          sessionName: this.options.sessionName ?? null,
+        });
+      }
     }
   }
 

@@ -54,8 +54,8 @@ export default function QueuedMessageCard({
             <button
               type="button"
               onClick={onForceSend}
-              aria-label={t('input.queue.forceSend', { defaultValue: '立即发送并中断后台任务' })}
-              title={t('input.queue.forceSend', { defaultValue: '立即发送并中断后台任务' })}
+              aria-label={t('input.queue.forceSend', { defaultValue: 'Send now; background tasks keep running' })}
+              title={t('input.queue.forceSend', { defaultValue: 'Send now; background tasks keep running' })}
               className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-amber-600 bg-amber-500/10 hover:bg-amber-500/20 dark:text-amber-400 transition-colors"
             >
               <Zap className="h-3.5 w-3.5" />

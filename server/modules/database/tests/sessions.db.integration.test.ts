@@ -75,7 +75,7 @@ test('createSession preserves archived state of existing rows', async () => {
   });
 });
 
-test('archiveSessionsOlderThanCutoff returns the ids it archived and only those', async () => {
+test('the cutoff listing and the archiving by id cover the stale sessions and only those', async () => {
   await withIsolatedDatabase(() => {
     // One clock read for every instant, and a cutoff a full day in the past,
     // so nothing here depends on how long the test itself takes. Reading the
@@ -95,11 +95,12 @@ test('archiveSessionsOlderThanCutoff returns the ids it archived and only those'
     sessionsDb.createSession('session-already-archived', 'claude', '/workspace/demo-project', 'Archived', twoDaysAgo, twoDaysAgo);
     sessionsDb.updateSessionIsArchived('session-already-archived', true);
 
-    const archivedIds = sessionsDb.archiveSessionsOlderThanCutoff(oneDayAgo);
+    const candidates = sessionsDb.listSessionsOlderThanCutoff(oneDayAgo);
+    const archivedIds = sessionsDb.archiveSessionsByIds(candidates);
 
     assert.deepEqual(archivedIds.sort(), ['session-stale-1', 'session-stale-2']);
     // A second run finds nothing left to archive.
-    assert.deepEqual(sessionsDb.archiveSessionsOlderThanCutoff(oneDayAgo), []);
+    assert.deepEqual(sessionsDb.listSessionsOlderThanCutoff(oneDayAgo), []);
   });
 });
 
@@ -197,6 +198,70 @@ test('repository reads normalize SQLite UTC timestamps to ISO strings', async ()
   });
 });
 
+test('createSession lets an engine title replace an unlocked name and spares locked ones', async () => {
+  await withIsolatedDatabase(() => {
+    // App-created rows carry the initial first-sentence name and no lock, so
+    // the next synchronizer write may replace it with the engine's own title.
+    sessionsDb.createAppSession('app-unlocked', 'claude', '/workspace/demo-project', 'first sentence name');
+    sessionsDb.assignProviderSessionId('app-unlocked', 'prov-unlocked');
+    sessionsDb.createSession('prov-unlocked', 'claude', '/workspace/demo-project', 'Engine title');
+
+    assert.equal(sessionsDb.getSessionById('app-unlocked')?.custom_name, 'Engine title');
+    assert.equal(sessionsDb.getSessionById('app-unlocked')?.name_locked, 0);
+
+    // After the user renamed the session the lock is set; engine titles no
+    // longer win, in either upsert branch.
+    sessionsDb.updateSessionCustomName('app-unlocked', 'My own name', { lockName: true });
+
+    sessionsDb.createSession('prov-unlocked', 'claude', '/workspace/demo-project', 'Newer engine title');
+    assert.equal(sessionsDb.getSessionById('app-unlocked')?.custom_name, 'My own name');
+
+    // ON CONFLICT branch: the app row has no provider id yet, so indexing
+    // under its own id lands there.
+    sessionsDb.createAppSession('app-locked', 'claude', '/workspace/demo-project', 'first sentence name');
+    sessionsDb.updateSessionCustomName('app-locked', 'Renamed early', { lockName: true });
+    sessionsDb.createSession('app-locked', 'claude', '/workspace/demo-project', 'Engine title');
+
+    assert.equal(sessionsDb.getSessionById('app-locked')?.custom_name, 'Renamed early');
+  });
+});
+
+test('updateSessionCustomName only locks when asked', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createSession('session-codex-upgrade', 'codex', '/workspace/demo-project', 'Untitled Codex Session');
+
+    // The synchronizer's fallback-name upgrade must not mark the row as
+    // user-renamed — the engine title has to stay followable.
+    sessionsDb.updateSessionCustomName('session-codex-upgrade', 'Engine title');
+    assert.equal(sessionsDb.getSessionById('session-codex-upgrade')?.name_locked, 0);
+
+    sessionsDb.updateSessionCustomName('session-codex-upgrade', 'Renamed', { lockName: true });
+    assert.equal(sessionsDb.getSessionById('session-codex-upgrade')?.name_locked, 1);
+  });
+});
+
+test('createForkedSession locks the name only when the user typed one', async () => {
+  await withIsolatedDatabase(() => {
+    const baseInput = {
+      sessionId: 'unused',
+      provider: 'claude',
+      projectPath: '/workspace/demo-project',
+      customName: 'Fork name',
+      providerSessionId: 'prov-fork',
+      jsonlPath: '/transcripts/fork.jsonl',
+      forkedFromSessionId: 'source-session',
+      model: null,
+      effort: null,
+    } as const;
+
+    sessionsDb.createForkedSession({ ...baseInput, sessionId: 'fork-user-title', nameLocked: true });
+    sessionsDb.createForkedSession({ ...baseInput, sessionId: 'fork-auto-title', nameLocked: false });
+
+    assert.equal(sessionsDb.getSessionById('fork-user-title')?.name_locked, 1);
+    assert.equal(sessionsDb.getSessionById('fork-auto-title')?.name_locked, 0);
+  });
+});
+
 test('recent sessions are globally ordered, paginated, and limited to visible conversations', async () => {
   await withIsolatedDatabase(() => {
     const fixtures: Array<Parameters<typeof sessionsDb.createSession>> = [
@@ -225,5 +290,26 @@ test('recent sessions are globally ordered, paginated, and limited to visible co
       secondPage.sessions.map((session) => session.session_id),
       ['session-middle', 'session-oldest'],
     );
+  });
+});
+
+test('automatic names only change the matching unlocked active native session', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('auto-title', 'codex', '/workspace/title', 'Original');
+    sessionsDb.assignProviderSessionId('auto-title', 'thread-a');
+    const before = sessionsDb.getSessionById('auto-title')!;
+    assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', 'codex', 'thread-a', '排查重复消息'), true);
+    assert.equal(sessionsDb.getSessionById('auto-title')?.custom_name, '排查重复消息');
+    assert.equal(sessionsDb.getSessionById('auto-title')?.updated_at, before.updated_at);
+    for (const [provider, nativeId] of [['claude', 'thread-a'], ['codex', 'thread-b']]) {
+      assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', provider, nativeId, 'Wrong'), false);
+    }
+    sessionsDb.updateSessionIsArchived('auto-title', true);
+    assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', 'codex', 'thread-a', 'Archived'), false);
+    sessionsDb.updateSessionIsArchived('auto-title', false);
+    sessionsDb.updateSessionCustomName('auto-title', 'My title', { lockName: true });
+    assert.equal(sessionsDb.applyAutomaticSessionName('auto-title', 'codex', 'thread-a', 'Overwrite'), false);
+    assert.equal(sessionsDb.getSessionById('auto-title')?.custom_name, 'My title');
+    assert.equal(sessionsDb.applyAutomaticSessionName('missing', 'codex', 'thread-a', 'Missing'), false);
   });
 });

@@ -11,7 +11,7 @@ import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import { connectedClients } from '@/modules/websocket/index.js';
 import type { IProvider } from '@/shared/interfaces.js';
-import type { BackgroundTaskSummary } from '@/shared/types.js';
+import type { BackgroundTaskSummary, LLMProvider } from '@/shared/types.js';
 
 class FakeConnection {
   readyState = 1; // WS_OPEN_STATE
@@ -45,7 +45,7 @@ async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promis
 }
 
 async function withProviders(
-  runtimes: Partial<Record<'claude' | 'codex', IProvider['runtime']>>,
+  runtimes: Partial<Record<LLMProvider, IProvider['runtime']>>,
   runTest: () => void | Promise<void>,
 ): Promise<void> {
   const realListProviders = providerRegistry.listProviders;
@@ -92,19 +92,51 @@ test('provider session id returns the mapped native id', { concurrency: false },
   });
 });
 
-test('app session names use at most four whole words from the initial message', { concurrency: false }, async () => {
+test('app session names take the first sentence of the initial message', { concurrency: false }, async () => {
   await withIsolatedDatabase(() => {
     const result = sessionsService.createAppSession(
       'codex',
       '/tmp/session-name-project',
-      '  supercalifragilisticexpialidocious\nsecond   third fourth fifth  ',
+      '帮我看看登录重定向的问题。然后顺便把超时也调大一点',
     );
 
-    assert.equal(result.sessionName, 'supercalifragilisticexpialidocious second third fourth');
+    assert.equal(result.sessionName, '帮我看看登录重定向的问题');
     assert.equal(
       sessionsDb.getSessionById(result.sessionId)?.custom_name,
-      'supercalifragilisticexpialidocious second third fourth',
+      '帮我看看登录重定向的问题',
     );
+  });
+});
+
+test('app session names fall back to the first line capped at 40 characters', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const longLine = '这个消息没有任何句读就是一长串文字'.repeat(4);
+    const result = sessionsService.createAppSession('codex', '/tmp/session-name-project', longLine);
+
+    assert.equal(result.sessionName, longLine.slice(0, 40));
+  });
+});
+
+test('app session names cut at Latin exclamation or question marks but not periods', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const excited = sessionsService.createAppSession('claude', '/tmp/session-name-project', 'Fix this! Then also that');
+    assert.equal(excited.sessionName, 'Fix this');
+
+    // A Latin period is often a list marker or abbreviation ("1.", "e.g."),
+    // so it never splits the name.
+    const listed = sessionsService.createAppSession('claude', '/tmp/session-name-project', '1. 先做这个 2. 再做那个');
+    assert.equal(listed.sessionName, '1. 先做这个 2. 再做那个');
+  });
+});
+
+test('app session names skip leading terminators instead of giving up', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const exclaimed = sessionsService.createAppSession('claude', '/tmp/session-name-project', '？？？为什么这里会崩');
+    assert.equal(exclaimed.sessionName, '为什么这里会崩');
+
+    // A message that is only punctuation has nothing to name.
+    const punctuated = sessionsService.createAppSession('claude', '/tmp/session-name-project', '？？？');
+    assert.equal(punctuated.sessionName, 'Untitled Session');
   });
 });
 
@@ -392,6 +424,58 @@ test('running sessions carry their tasks on a chat run that is still going', { c
           lastSeq: 0,
           tasks,
         });
+      },
+    ));
+  });
+});
+
+test('background work whose runtime can still stop it offers the stop', { concurrency: false }, async () => {
+  await withIsolatedDatabase(async () => {
+    sessionsDb.createAppSession('report-session', 'opencode', '/tmp/running-project');
+    await withClaudeCliRegistry([], async () => await withProviders(
+      {
+        opencode: {
+          run: async () => undefined,
+          abort: () => false,
+          // The engine reports on finished background work in a turn of its own.
+          listBackgroundWork: () => [{ sessionId: 'report-session', tasks: [] }],
+          getSessionActivity: () => ({ queued: false, reporting: true }),
+          backgroundTasks: { list: () => [], canInterrupt: () => true },
+        },
+      },
+      async () => {
+        const sessions = await sessionsService.listRunningSessions();
+        assert.equal(sessions.length, 1);
+        assert.equal(sessions[0].background, true);
+        assert.equal(sessions[0].canInterrupt, true, 'abort can stop the report turn');
+        assert.equal(sessions[0].reporting, true);
+      },
+    ));
+  });
+});
+
+test('a running session says whether its round waits for the engine', { concurrency: false }, async () => {
+  await withIsolatedDatabase(async () => {
+    sessionsDb.createAppSession('queued-session', 'codex', '/tmp/running-project');
+    const run = chatRunRegistry.startRun({
+      appSessionId: 'queued-session', provider: 'codex', providerSessionId: null, connection: null, userId: null,
+    });
+    assert.ok(run);
+
+    await withClaudeCliRegistry([], async () => await withProviders(
+      {
+        codex: {
+          run: async () => undefined,
+          abort: () => false,
+          // The engine has the round but has not started its turn.
+          getSessionActivity: () => ({ queued: true, reporting: false }),
+        },
+      },
+      async () => {
+        const sessions = await sessionsService.listRunningSessions();
+        assert.equal(sessions.length, 1);
+        assert.equal(sessions[0].queued, true);
+        assert.equal(sessions[0].reporting, false);
       },
     ));
   });

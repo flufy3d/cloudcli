@@ -10,7 +10,7 @@ import { createContext, useContext } from 'react';
  * subagent panels would come out empty, and their activity caps would truncate
  * for a viewport that does not exist. This flag tells them to render whole.
  */
-export const TranscriptRenderContext = createContext<{ isExporting: boolean }>({ isExporting: false });
+export const TranscriptRenderContext = createContext<{ isExporting: boolean; assetData?: Readonly<Record<string, string>> }>({ isExporting: false });
 
 /** True only while the transcript is being rendered into an exported document. */
 export function useIsExportingTranscript(): boolean {

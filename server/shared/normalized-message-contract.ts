@@ -14,6 +14,7 @@
  * log so the adapter that invented it can be fixed.
  */
 
+import { isValidReplaySeq, isValidStreamEpoch } from '../../shared/protocol/frameNarrowing.js';
 import { isVolatileMessageId, TRANSCRIPT_ROW_KINDS } from '../../shared/protocol/messageKinds.js';
 import type { NormalizedMessage } from '@/shared/types.js';
 import { readObjectRecord } from '@/shared/utils.js';
@@ -29,7 +30,9 @@ const TRANSCRIPT_ROW_KIND_SET: ReadonlySet<string> = new Set(TRANSCRIPT_ROW_KIND
  * mirror it exists to prevent.
  */
 const NORMALIZED_MESSAGE_KEYS = [
+  'activityState',
   'backgroundWorkPending',
+  'backgroundWorkQueuesInput',
   'aborted',
   'agents',
   'actualSessionId',
@@ -69,6 +72,7 @@ const NORMALIZED_MESSAGE_KEYS = [
   'role',
   'rowid',
   'seq',
+  'streamEpoch',
   'sequence',
   'sessionId',
   'status',
@@ -158,6 +162,12 @@ export function enforceNormalizedMessageContract(value: unknown): NormalizedMess
   }
   if (typeof record.provider !== 'string' || !record.provider) {
     return { ok: false, reason: `missing \`provider\` on a ${record.kind} message` };
+  }
+  if ('seq' in record && !isValidReplaySeq(record.seq)) {
+    return { ok: false, reason: 'invalid `seq`' };
+  }
+  if ('streamEpoch' in record && !isValidStreamEpoch(record.streamEpoch)) {
+    return { ok: false, reason: 'invalid `streamEpoch`' };
   }
 
   const contractViolations = collectContractViolations(record);

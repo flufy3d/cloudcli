@@ -17,6 +17,9 @@ import {
     initializeSessionsWatcher,
     providerRuntimeService,
     sessionsAutoArchiveService,
+    setSessionWorktreeHomeResolver,
+    closeClaudeResidentSessions,
+    closeCodexResidentSessions,
     shutdownZCodeRuntime,
 } from '@/modules/providers/index.js';
 import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/index.js';
@@ -63,7 +66,7 @@ import { assetsRoutes } from './modules/assets/index.js';
 import { fileTreeRoutes } from './modules/file-tree/index.js';
 import { diagnosticsRoutes } from './modules/diagnostics/index.js';
 import { createLocalProxyRouter, localProxyAbsolutePathFallback } from './modules/local-proxy/index.js';
-import { worktreesRoutes } from './modules/worktrees/index.js';
+import { worktreesRoutes, resolveWorktreeHome } from './modules/worktrees/index.js';
 import {
     browserUseMcpRoutes,
     browserUseRoutes,
@@ -72,9 +75,19 @@ import {
 import { initializeDatabase, sessionsDb } from './modules/database/index.js';
 import { configureWebPush } from './modules/notifications/index.js';
 import {
+    createTaskBridgeCredential,
+    registerTaskBridgeCall,
+    revokeTaskBridgeCredential,
     startTaskContinuationRuntime,
+    taskBridgeRouter,
     taskContinuationsRouter,
 } from './modules/task-continuations/index.js';
+
+// The session synchronizers ask the worktree placement policy where a session
+// really belongs when an engine rebound it into a git worktree; the git lookup
+// itself lives in the Worktrees module and is injected here because a static
+// import from the placement module would close a module-initialization cycle.
+setSessionWorktreeHomeResolver(resolveWorktreeHome);
 
 const __dirname = getModuleDirectory(import.meta.url);
 // The server source runs from /server, while the compiled output runs from /dist-server/server.
@@ -142,6 +155,27 @@ configureOpenCodeExternalRunAdoption(({ providerSessionId }) =>
     chatRunRegistry.adoptExternalRun({ provider: 'opencode', providerSessionId }),
 );
 
+// A resident provider can report after its round ended. The gateway owns the
+// session's sequence numbers, audience and replay buffer, so the runtime
+// hands the event over instead of numbering it itself.
+providerRuntimeService.setSessionEventPublisher((appSessionId, message) => {
+    chatRunRegistry.publishSessionEvent(appSessionId, message);
+});
+
+// A resident process outlives the round that started it, so the host takes
+// the authority for a task call from the engine call it observed, and the
+// process carries a narrow bridge credential instead of the round's own.
+providerRuntimeService.setBridgeCredentialIssuer((input) => {
+    const credential = createTaskBridgeCredential(input);
+    return { token: credential.token };
+});
+providerRuntimeService.setEngineToolCallRegistrar((call) => {
+    registerTaskBridgeCall(call);
+});
+providerRuntimeService.setBridgeCredentialRevoker((token) => {
+    revokeTaskBridgeCredential(token);
+});
+
 createWebSocketServer(server, {
     verifyClient: {
         isPlatform: IS_PLATFORM,
@@ -199,6 +233,12 @@ app.get('/health', (req, res) => {
         version: RUNNING_VERSION
     });
 });
+
+// The bridge entry a resident Codex process calls authenticates itself with
+// a narrow credential and with the engine's own call identity, so it is
+// mounted before the API-wide key check. Every other path keeps the usual
+// authentication.
+app.use('/api/tasks', taskBridgeRouter);
 
 // Optional API key validation (if configured)
 app.use('/api', validateApiKey);
@@ -530,6 +570,21 @@ async function startServer() {
                 await shutdownZCodeRuntime();
             } catch (err) {
                 console.error('[ZCode] Error during protocol client shutdown:', getErrorMessage(err));
+            }
+            try {
+                // The Codex processes that stay alive between rounds must not
+                // outlive the host.
+                closeCodexResidentSessions();
+            } catch (err) {
+                console.error('[Codex] Error closing the resident sessions during shutdown:', getErrorMessage(err));
+            }
+            try {
+                // Likewise the Claude processes kept for the next turn or for
+                // background work: closing stdin is the CLI's own signal to
+                // wind down, ahead of the exit below.
+                closeClaudeResidentSessions();
+            } catch (err) {
+                console.error('[Claude] Error closing the resident sessions during shutdown:', getErrorMessage(err));
             }
             process.exit(0);
         };

@@ -24,10 +24,14 @@ import type {
 import { parseFilesInputTag } from '@/shared/image-attachments.js';
 import { prepareTranscriptMessages, truncateNestedOutput } from '@/shared/message-unification.js';
 import {
+  ProviderDisplayAssetError,
+  readJsonlRecords,
+  parseProviderJson,
+  compactProviderPayload,
   AppError,
+  canonicalClaudeSubagentToolName,
   createNormalizedMessage,
   generateMessageId,
-  isClaudeApiRequestLogRow,
   isPlaceholderProviderModel,
   normalizeProjectPath,
   readObjectRecord,
@@ -35,6 +39,7 @@ import {
   sanitizeLeafDirectoryName,
   sliceTailPage,
   stripAnsiSequences,
+  MAX_TRANSMITTED_SUBAGENT_ACTIVITIES,
   truncateSubagentActivity,
 } from '@/shared/utils.js';
 import { sessionsDb } from '@/modules/database/index.js';
@@ -42,6 +47,7 @@ import { readClaudeSessionWindowSources } from '@/modules/providers/services/cla
 import { getClaudeSDKSessionStartTime } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 import { summarizeClaudeTokenUsage } from '@/modules/providers/services/claude-usage.js';
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
+import { isClaudeConversationRecord } from '@/shared/index.js';
 
 const PROVIDER = 'claude';
 
@@ -58,16 +64,6 @@ const formatDuration = (milliseconds: number): string => {
   const seconds = Math.round(milliseconds / 1_000);
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 };
-
-/**
- * Upper bound on how much of a subagent's timeline is sent to the client. A
- * long-running agent can record hundreds of tool calls, and the transcript only
- * ever shows them behind a collapsed header, so shipping the whole history on
- * every load costs far more than it shows. The newest steps are the ones
- * kept: a running agent's timeline is polled for what it is doing now, and
- * the card says how many earlier ones were left out.
- */
-const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
 
 type ClaudeToolResult = {
   content: unknown;
@@ -128,10 +124,8 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
       }
 
       try {
-        const entry = JSON.parse(line) as AnyRecord;
-        if (isClaudeApiRequestLogRow(entry)) {
-          continue;
-        }
+        const entry = parseProviderJson(line) as AnyRecord;
+        if (!isClaudeConversationRecord(entry)) continue;
         const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
         if (timestamp && !transcript.startedAt) {
           transcript.startedAt = timestamp;
@@ -147,7 +141,7 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
               const tool: SubagentActivity = {
                 kind: 'tool',
                 toolId: String(part.id ?? ''),
-                toolName: String(part.name ?? 'Tool'),
+                toolName: canonicalClaudeSubagentToolName(String(part.name ?? 'Tool')),
                 toolInput: part.input,
                 timestamp,
               };
@@ -190,11 +184,13 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
             };
           }
         }
-      } catch {
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
         // Skip malformed lines that can happen during concurrent writes.
       }
     }
   } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`Error parsing agent file ${filePath}:`, message);
   }
@@ -266,26 +262,8 @@ async function findClaudeSubagentTranscript(
 async function readWorkflowJournal(transcriptDir: string): Promise<WorkflowAgentInfo[]> {
   const agentsById = new Map<string, WorkflowAgentInfo>();
 
-  let journal: string;
   try {
-    journal = await fsp.readFile(path.join(transcriptDir, 'journal.jsonl'), 'utf8');
-  } catch {
-    return [];
-  }
-
-  for (const line of journal.split('\n')) {
-    if (!line.trim()) {
-      continue;
-    }
-
-    let entry: AnyRecord;
-    try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
-      // The workflow appends while this reads, so the last line can be partial.
-      continue;
-    }
-
+    for await (const entry of readJsonlRecords(path.join(transcriptDir, 'journal.jsonl'))) {
     const agentId = typeof entry.agentId === 'string' ? entry.agentId : '';
     if (!agentId) {
       continue;
@@ -310,6 +288,10 @@ async function readWorkflowJournal(transcriptDir: string): Promise<WorkflowAgent
     } else if (entry.type === 'failed') {
       agent.status = 'failed';
     }
+  }
+
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
 
   return [...agentsById.values()];
@@ -391,7 +373,7 @@ function readTaskNotificationTexts(message: AnyRecord): string[] {
     return typeof message.content === 'string' ? [message.content] : [];
   }
 
-  if (message.message?.role !== 'user') {
+  if (!isClaudeConversationRecord(message) || message.type !== 'user') {
     return [];
   }
 
@@ -484,29 +466,21 @@ function replaceLaunchToolResultContent(message: AnyRecord, replacement: string)
  */
 async function readTranscriptRows(jsonlPath: string, providerSessionId: string): Promise<AnyRecord[]> {
   const rows: AnyRecord[] = [];
-  const fileStream = fs.createReadStream(jsonlPath);
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-  for await (const line of rl) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const entry = JSON.parse(line) as AnyRecord;
-      if (entry.sessionId === providerSessionId && !isClaudeApiRequestLogRow(entry)) {
-        rows.push(entry);
-      }
-    } catch {
-      // A row can be half-written while the CLI is streaming into the file.
+  for await (const entry of readJsonlRecords(jsonlPath)) {
+    if (entry.sessionId !== providerSessionId) continue;
+    // Preserve graph/control records for their own consumers. A nested message
+    // in any other record is a diagnostic payload, not another conversation.
+    if (isClaudeConversationRecord(entry)
+      || ['last-prompt', 'progress', 'system', 'attachment', 'queue-operation'].includes(entry.type)) {
+      rows.push(compactProviderPayload(entry));
     }
   }
-
   return rows;
 }
 
 /** True for a row the user typed, as opposed to a tool result or an injected note. */
 function isUserPromptRow(row: AnyRecord): boolean {
-  if (row.type !== 'user' || row.isMeta === true || row.isCompactSummary === true) {
+  if (!isClaudeConversationRecord(row) || row.type !== 'user' || row.isMeta === true || row.isCompactSummary === true) {
     return false;
   }
 
@@ -938,6 +912,7 @@ async function getSessionMessages(
       limit,
     };
   } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
     console.error(`Error reading messages for session ${sessionId}:`, error);
     return limit === null ? [] : { messages: [], total: 0, hasMore: false };
   }
@@ -1272,10 +1247,19 @@ export class ClaudeSessionsProvider implements IProviderSessions {
    * of them would show up as a message the user silently cannot edit.
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
+    const record = readObjectRecord(rawMessage);
+    const role = readObjectRecord(record?.message)?.role;
+    // Reject copied/unknown message wrappers before materializing assets,
+    // minting row identities or consuming the compact-summary latch. Flat
+    // realtime records keep their explicit handlers below.
+    if ((role === 'user' || role === 'assistant') && !isClaudeConversationRecord(record)
+      && !['thinking', 'tool_use', 'tool_result'].includes(String(record?.type))) {
+      return [];
+    }
     const messages = this.normalizeMessageRows(rawMessage, sessionId);
     // A synthesized id is useless as an anchor — it changes on every read — so
     // a row without its own uuid produces messages with no anchor at all.
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     const anchorId = typeof raw?.uuid === 'string' && raw.uuid ? raw.uuid : null;
     if (anchorId) {
       for (const message of messages) {
@@ -1298,7 +1282,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
   }
 
   private normalizeMessageRows(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
-    const raw = readObjectRecord(rawMessage);
+    const raw = readObjectRecord(compactProviderPayload(rawMessage));
     if (!raw) {
       return [];
     }
@@ -1399,7 +1383,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       return [];
     }
 
-    if (raw.message?.role === 'user') {
+    if (isClaudeConversationRecord(raw) && raw.type === 'user') {
       /**
        * Claude stores compact summaries as synthetic "user" rows so the CLI can
        * resume the next session turn with the summary in-context. For the web
@@ -1438,7 +1422,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
      * dropped rather than attributed to a prompt the user never sent.
      */
     if (
-      raw.message?.role === 'user'
+      isClaudeConversationRecord(raw) && raw.type === 'user'
       && raw.message?.content
       && raw.isMeta !== true
       && raw.isVisibleInTranscriptOnly !== true
@@ -1447,8 +1431,11 @@ export class ClaudeSessionsProvider implements IProviderSessions {
         // Image attachments sent through the SDK are persisted as base64
         // `image` blocks next to the prompt text. Collect them so the UI can
         // render them on the user bubble.
-        const imageAttachments: Array<{ data: string }> = [];
+        const imageAttachments: Array<{ data?: string; path?: string }> = [];
         for (const part of raw.message.content) {
+          if (part?.type === 'image' && part.source?.type === 'url' && typeof part.source.url === 'string' && part.source.url.startsWith('/api/assets/images/')) {
+            imageAttachments.push({ path: part.source.url });
+          }
           if (part?.type === 'image' && part.source?.type === 'base64' && typeof part.source.data === 'string') {
             const mediaType = typeof part.source.media_type === 'string' ? part.source.media_type : 'image/png';
             imageAttachments.push({ data: `data:${mediaType};base64,${part.source.data}` });
@@ -1631,7 +1618,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
         timestamp: ts,
         provider: PROVIDER,
         kind: 'tool_use',
-        toolName: raw.toolName,
+        toolName: canonicalClaudeSubagentToolName(String(raw.toolName)),
         toolInput: raw.toolInput,
         toolId: raw.toolCallId || baseId,
       }));
@@ -1652,7 +1639,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       return messages;
     }
 
-    if (raw.message?.role === 'assistant' && raw.message?.content) {
+    if (isClaudeConversationRecord(raw) && raw.type === 'assistant' && raw.message?.content) {
       // Which model actually answered. It rides on the assistant row itself in
       // both the transcript and the live SDK stream, so history renders it
       // retroactively with no migration. Only prose carries it: a tool call has
@@ -1686,7 +1673,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
               timestamp: ts,
               provider: PROVIDER,
               kind: 'tool_use',
-              toolName: part.name,
+              toolName: typeof part.name === 'string' ? canonicalClaudeSubagentToolName(part.name) : part.name,
               toolInput: part.input,
               toolId: part.id,
             }));
@@ -1850,6 +1837,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       // not raw JSONL records.
       result = await getSessionMessages(sessionId, providerSessionId, null, 0, this.getLiveRunStartTime);
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ClaudeProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
@@ -1859,7 +1847,7 @@ export class ClaudeSessionsProvider implements IProviderSessions {
 
     const toolResultMap = new Map<string, ClaudeToolResult>();
     for (const raw of rawMessages) {
-      if (raw.message?.role === 'user' && Array.isArray(raw.message?.content)) {
+      if (isClaudeConversationRecord(raw) && raw.type === 'user' && Array.isArray(raw.message?.content)) {
         for (const part of raw.message.content) {
           if (part.type === 'tool_result' && part.tool_use_id) {
             toolResultMap.set(part.tool_use_id, {

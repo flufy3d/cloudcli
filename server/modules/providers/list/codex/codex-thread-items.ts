@@ -30,7 +30,11 @@
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 import { toImageAttachments } from '@/shared/image-attachments.js';
 import type { AnyRecord } from '@/shared/types.js';
-import { readObjectRecord } from '@/shared/utils.js';
+import {
+  compactProviderPayload,
+  readObjectRecord,
+  SUBAGENT_TOOL_NAME,
+} from '@/shared/utils.js';
 
 /**
  * Lifecycle of an item that does work. Both transports report the same four
@@ -328,7 +332,7 @@ function readUserImages(item: AnyRecord): Array<{ path?: string; data?: string }
  * Consumer: the history reader in `codex-sessions.provider.ts`.
  */
 export function readCodexRolloutItem(raw: unknown): CodexThreadItem | null {
-  const item = readObjectRecord(raw);
+  const item = readObjectRecord(compactProviderPayload(raw));
   const id = item ? readNonEmptyString(item.id) : undefined;
   if (!item || !id) {
     return null;
@@ -452,7 +456,7 @@ function readSubagentActivityKind(value: unknown): 'started' | 'completed' | 'in
  * Consumer: the live run loop in `codex-runtime.provider.ts`.
  */
 export function readCodexAppServerItem(raw: unknown): CodexThreadItem | null {
-  const item = readObjectRecord(raw);
+  const item = readObjectRecord(compactProviderPayload(raw));
   const id = item ? readNonEmptyString(item.id) : undefined;
   if (!item || !id) {
     return null;
@@ -595,14 +599,46 @@ export function readCodexProposedPlan(text: string): string | null {
 /**
  * Turns a tool name into the label the transcript shows.
  *
- * Consumer: this module's renderer, and the subagent panel in
- * `codex-sessions.provider.ts`.
+ * Consumer: this module's renderer and `readCodexSubagentLabel`.
  */
 export function humanizeCodexToolName(toolName: string): string {
   return toolName
     .replace(/__/g, ' ')
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+/**
+ * The name a spawned agent shows under, from the last segment of its agent
+ * path (`/root/standards` → "Standards"). The engine assigns no other label
+ * to an agent announced only through its activity record.
+ *
+ * Consumers: `buildCodexSubagentAgentRow` and the codex runtime's
+ * background-work entries.
+ */
+export function readCodexSubagentLabel(item: { agentPath?: string }): string {
+  return humanizeCodexToolName(item.agentPath?.split('/').filter(Boolean).pop() ?? 'agent');
+}
+
+/**
+ * The `Agent` row for an agent whose only announcement is its activity
+ * record. Real engines never send a spawn tool-call item — every recorded
+ * collab tool call is a `wait` — so the row is built from the `started`
+ * activity and keeps that item's id as its call id; the agent's later
+ * activity pairs with it through the thread id, not the item id.
+ *
+ * Consumers: codex history (rollout replay) and the codex runtime (live
+ * stream), so a reload rebuilds exactly the card the stream drew.
+ */
+export function buildCodexSubagentAgentRow(item: { id: string; agentPath?: string }, timestamp: string): AnyRecord {
+  return {
+    uuid: item.id,
+    type: 'tool_use',
+    timestamp,
+    toolName: SUBAGENT_TOOL_NAME,
+    toolInput: JSON.stringify({ description: readCodexSubagentLabel(item) }),
+    toolCallId: item.id,
+  };
 }
 
 /**
@@ -766,7 +802,7 @@ export function codexThreadItemToRows(item: CodexThreadItem, timestamp: string):
         uuid: item.id,
         type: 'tool_use',
         timestamp,
-        toolName: 'Task',
+        toolName: SUBAGENT_TOOL_NAME,
         // No `subagent_type`: Codex has no agent presets, and naming the
         // provider there would render as "Codex / Codex" in the transcript.
         toolInput: JSON.stringify({
@@ -796,7 +832,7 @@ export function codexThreadItemToRows(item: CodexThreadItem, timestamp: string):
     }
 
     case 'subagent_activity':
-      // Lifecycle only: the caller turns a `started` into the Task row and a
+      // Lifecycle only: the caller turns a `started` into the Agent row and a
       // `completed` into its result, because only it can pair them across the
       // thread id they share.
       return [];

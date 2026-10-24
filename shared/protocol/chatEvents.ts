@@ -128,13 +128,15 @@ export type CompactionInfo = {
 };
 
 /**
- * What a background task has spent so far, as the CLI reports it on
- * `task_progress` and `task_notification`.
+ * What a background task has spent so far, as the engine reports it. Claude's
+ * `task_progress` and `task_notification` carry all three; an engine that
+ * leaves a figure out (ZCode's failure stop has no token or tool-call totals)
+ * leaves it undefined, which means "not reported", not zero.
  */
 export type TaskUsage = {
-  totalTokens: number;
-  toolUses: number;
-  durationMs: number;
+  totalTokens?: number;
+  toolUses?: number;
+  durationMs?: number;
 };
 
 /**
@@ -334,11 +336,25 @@ export type SessionUpsertedEvent = {
   sessionId: string;
   providerSessionId: string | null;
   provider: LLMProvider;
+  /**
+   * True when the delta carries a new session name and nothing else.
+   *
+   * A name-only delta updates the title in the sidebar and in the open
+   * session's header; it must not make the client re-read the transcript,
+   * mark the session as needing attention, or re-order the list. Absent means
+   * the session changed in a way the client has to look at (new messages, new
+   * activity), which is the historical meaning of this event.
+   */
+  metadataOnly?: boolean;
   session: {
     id: string;
     summary: string;
     messageCount: number;
     lastActivity: string;
+    /** Git worktree the session runs in; null for main-checkout sessions. */
+    worktreePath?: string | null;
+    /** Branch checked out in that worktree; null when detached or main-checkout. */
+    worktreeBranch?: string | null;
   };
   project: SessionUpsertedProject | null;
   timestamp: string;
@@ -416,6 +432,8 @@ export type NormalizedMessage = {
    * reconnects. History messages loaded over REST do not carry it.
    */
   seq?: number;
+  /** Gateway process identity; event identity is (streamEpoch, sessionId, seq). Absent on REST history and legacy servers. */
+  streamEpoch?: string;
   role?: 'user' | 'assistant';
   content?: string;
   /**
@@ -489,9 +507,21 @@ export type NormalizedMessage = {
    */
   summaryKey?: string;
   tokenBudget?: unknown;
+  /**
+   * What the engine is doing with the round: `queued` means the engine holds
+   * it and has not started its turn, `reporting` means the engine runs a
+   * turn of its own, which is why it waits.
+   */
+  activityState?: { queued?: boolean; reporting?: boolean };
   backgroundTasks?: ActiveBackgroundTask[];
   /** True while background execution or its follow-up reply still blocks queued messages. */
   backgroundWorkPending?: boolean;
+  /**
+   * False when a message sent during the background work does not disturb it
+   * (Claude takes it as a turn of the held process), so the page sends it at
+   * once. Omitted means the message waits for the work.
+   */
+  backgroundWorkQueuesInput?: boolean;
   /**
    * Live background-work events (`task_status` rows): what a launched agent,
    * workflow or backgrounded command is doing while its turn has ended. The
@@ -511,8 +541,8 @@ export type NormalizedMessage = {
   agents?: WorkflowAgentProgress[];
   /**
    * Timeline of everything a subagent did, attached to the `tool_use` that
-   * spawned it. Present for Claude `Agent`/`Task` calls and Codex
-   * `spawn_agent` calls; absent for every other tool.
+   * spawned it. Present for `Agent` calls (every engine's subagent spawn);
+   * absent for every other tool.
    */
   subagentTools?: SubagentActivity[];
   /** Identity and lifecycle of the subagent this `tool_use` spawned. */

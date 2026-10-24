@@ -22,7 +22,7 @@ vi.mock('@/shared/hooks/useProviderCapabilities', () => ({
       claude: { permissionModes: ['default', 'auto', 'acceptEdits', 'bypassPermissions', 'plan'], defaultPermissionMode: 'default' },
       cursor: { permissionModes: ['default', 'acceptEdits'], defaultPermissionMode: 'default' },
       codex: { permissionModes: ['default', 'acceptEdits', 'bypassPermissions'], defaultPermissionMode: 'default' },
-      opencode: { permissionModes: ['default', 'plan'], defaultPermissionMode: 'default' },
+      opencode: { permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'], defaultPermissionMode: 'default' },
       zcode: { permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'], defaultPermissionMode: 'default' },
       antigravity: { permissionModes: ['default', 'acceptEdits', 'bypassPermissions', 'plan'], defaultPermissionMode: 'default' },
     },
@@ -151,6 +151,15 @@ test('设置页保存后会刷新当前空白新会话', async () => {
   await act(async () => {
     writeUserPreference('codexPermissions', { permissionMode: 'acceptEdits' });
   });
+
+  assert.equal(result.current.permissionMode, 'acceptEdits');
+});
+
+test('新 OpenCode 会话读取设置页保存的权限模式', async () => {
+  writeUserPreference('opencodePermissions', { permissionMode: 'acceptEdits' });
+
+  const { result } = renderProviderState('opencode');
+  await act(async () => {});
 
   assert.equal(result.current.permissionMode, 'acceptEdits');
 });

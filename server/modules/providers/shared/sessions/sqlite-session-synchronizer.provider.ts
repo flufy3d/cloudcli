@@ -5,8 +5,8 @@
  * SQLite database (zcode, antigravity, opencode). It owns the scan skeleton
  * the three implementations used to duplicate: watch-file filtering, the
  * high-water-mark incremental cursor, the short read-only connection
- * discipline, the pending-app-session binding protocol, custom-name
- * preservation, and the createSession upsert.
+ * discipline, the pending-app-session binding protocol, session-title
+ * resolution (lock/generated protocol), and the createSession upsert.
  *
  * Adapters contribute only what is genuinely provider-specific: the database
  * path, the row-selection SQL, and the row → session-metadata mapping.
@@ -25,6 +25,8 @@ import type { LLMProvider, ProviderSessionWatchTarget } from '@/shared/types.js'
 import { normalizeProviderTimestamp, normalizeSessionName, readOptionalString } from '@/shared/utils.js';
 
 import { admitsWorkspacePath } from './workspace-admission.js';
+import { applySessionWorktreePlacement } from './session-worktree-placement.js';
+import { resolveSessionTitle, type DerivedSessionTitle } from './session-title-resolution.js';
 
 /**
  * Minimal row contract every adapter's SQL must satisfy; adapters declare
@@ -83,7 +85,7 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
    * adapter's SQL) and upserts each one.
    */
   async synchronize(since?: Date): Promise<number> {
-    const result = this.queryUpdatedSessions(since?.getTime() ?? null, null);
+    const result = await this.queryUpdatedSessions(since?.getTime() ?? null, null);
     return result.processedCount;
   }
 
@@ -97,7 +99,7 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
     }
 
     const sinceMillis = this.highWaterMark > 0 ? this.highWaterMark : null;
-    const result = this.queryUpdatedSessions(sinceMillis, this.incrementalSyncLimit);
+    const result = await this.queryUpdatedSessions(sinceMillis, this.incrementalSyncLimit);
     return result.firstSessionId;
   }
 
@@ -127,9 +129,27 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
 
   /**
    * Title derived from the provider row. `db` is open for adapters that fall
-   * back to reading session content (opencode's first user text).
+   * back to reading session content (opencode's first user text). Adapters
+   * mark whether the title is engine-generated (the engine's own naming) or
+   * merely content-derived — only generated titles may replace an existing
+   * synced name.
    */
-  protected abstract deriveSessionName(db: Database.Database, row: Row): string | null;
+  protected abstract deriveSessionName(db: Database.Database, row: Row): DerivedSessionTitle;
+
+  /**
+   * True when the app row already carries this provider row's state, so the
+   * scan has nothing to apply and must not announce the session again.
+   *
+   * An adapter whose engine writes the app row itself uses this: OpenCode
+   * names a session on its own, and the runtime applies that name to the app
+   * row when the engine announces it. The scan that follows the engine's
+   * write would otherwise announce the same rename a second time, as a
+   * content change — which makes the client re-read the transcript and mark
+   * the session as needing attention.
+   */
+  protected isProviderStateAlreadyApplied(_row: Row): boolean {
+    return false;
+  }
 
   /**
    * Extracts the provider-native session id from a row. Adapters may override
@@ -142,11 +162,14 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
   /**
    * Shared scan step: opens a short read-only connection, selects and filters
    * rows, upserts each, and advances the high-water mark. Never throws.
+   *
+   * Async because the worktree placement lookup may spawn a git process per
+   * unseen session directory (cached, so steady-state scans stay git-free).
    */
-  protected queryUpdatedSessions(
+  protected async queryUpdatedSessions(
     sinceMillis: number | null,
     limit: number | null,
-  ): { processedCount: number; firstSessionId: string | null } {
+  ): Promise<{ processedCount: number; firstSessionId: string | null }> {
     const dbPath = this.getDatabasePath();
     if (!fsSync.existsSync(dbPath)) {
       return { processedCount: 0, firstSessionId: null };
@@ -165,7 +188,7 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
           continue;
         }
 
-        const sessionId = this.upsertSession(db, row);
+        const sessionId = await this.upsertSession(db, row);
         if (sessionId) {
           processedCount += 1;
           firstSessionId ??= sessionId;
@@ -189,10 +212,11 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
   }
 
   /**
-   * Upserts one provider row: binds pending app sessions, preserves custom
-   * names, and writes the normalized session row.
+   * Upserts one provider row: binds pending app sessions, resolves the title
+   * against the lock/generated protocol, resolves the worktree placement, and
+   * writes the normalized session row.
    */
-  private upsertSession(db: Database.Database, row: Row): string | null {
+  private async upsertSession(db: Database.Database, row: Row): Promise<string | null> {
     const sessionId = this.getSessionId(row);
     if (!sessionId) {
       return null;
@@ -209,18 +233,33 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
 
     this.bindPendingAppSession(sessionId, projectPath);
 
-    const derivedName = this.deriveSessionName(db, row);
-    const nextName = this.resolveSessionName(sessionId, derivedName);
+    if (this.isProviderStateAlreadyApplied(row)) {
+      // Another path already wrote this provider state into the app row.
+      // Applying it again would announce a change the client has seen.
+      return null;
+    }
+
+    const derivedTitle = this.deriveSessionName(db, row);
+    const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId)
+      ?? sessionsDb.getSessionById(sessionId);
+    const nextName = resolveSessionTitle({
+      nameLocked: existingSession?.name_locked === 1,
+      existingName: existingSession?.custom_name,
+      fallbackTitle: this.fallbackTitle,
+      derived: derivedTitle,
+    });
     const { createdAtMs, updatedAtMs } = this.getRowTimestampsMs(row);
+    const placement = await applySessionWorktreePlacement(projectPath);
 
     return sessionsDb.createSession(
       sessionId,
       this.provider,
-      projectPath,
+      placement.projectPath,
       normalizeSessionName(nextName ?? undefined, this.fallbackTitle),
       normalizeProviderTimestamp(createdAtMs),
       normalizeProviderTimestamp(updatedAtMs),
       this.resolveJsonlPath(row),
+      placement.worktree,
     );
   }
 
@@ -241,21 +280,6 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
     if (pendingAppSession && !pendingAppSession.provider_session_id) {
       sessionsDb.assignProviderSessionId(pendingAppSession.session_id, sessionId);
     }
-  }
-
-  /**
-   * Preserves an existing custom session name; otherwise uses the derived
-   * name (adapters may fall back to content, e.g. opencode's first user text).
-   */
-  private resolveSessionName(sessionId: string, derivedName: string | null): string | null {
-    const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId)
-      ?? sessionsDb.getSessionById(sessionId);
-    const existingName = existingSession?.custom_name;
-
-    if (existingName && existingName !== this.fallbackTitle) {
-      return existingName;
-    }
-    return derivedName ?? this.fallbackTitle;
   }
 
   /**

@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useContext, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '@/shared/api';
 import { UnifiedImageViewer } from '@/shared/ui';
 import type { ChatImage } from '@/shared/types';
+import { TranscriptRenderContext } from '@/modules/chat/context/TranscriptRenderContext';
 
 type ChatMessageImagesProps = {
   images: ChatImage[];
@@ -18,22 +19,17 @@ type ChatMessageImagesProps = {
  * sessions recorded before attachments moved to the global store.
  */
 function useChatImageSrc(image: ChatImage, projectId?: string | null): { src: string | null; failed: boolean } {
-  const [src, setSrc] = useState<string | null>(image.data || null);
+  const { isExporting, assetData } = useContext(TranscriptRenderContext);
+  const storedDataPath = image.data?.startsWith('/api/assets/images/') ? image.data : null;
+  const inlineData = (isExporting && assetData?.[image.path || storedDataPath || '']) || (storedDataPath ? null : image.data);
+  const [src, setSrc] = useState<string | null>(inlineData || null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    if (image.data) {
-      setSrc(image.data);
-      setFailed(false);
-      return;
-    }
+    if (inlineData) return;
 
-    const imagePath = image.path;
-    if (!imagePath) {
-      setSrc(null);
-      setFailed(true);
-      return;
-    }
+    const imagePath = image.path || storedDataPath;
+    if (!imagePath) return;
 
     const filename = imagePath.split(/[\\/]/).pop() || '';
     let objectUrl: string | null = null;
@@ -76,8 +72,10 @@ function useChatImageSrc(image: ChatImage, projectId?: string | null): { src: st
         URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [image.data, image.path, projectId]);
+  }, [inlineData, storedDataPath, image.path, projectId]);
 
+  if (inlineData) return { src: inlineData, failed: false };
+  if (!image.path && !storedDataPath) return { src: null, failed: true };
   return { src, failed };
 }
 

@@ -1,4 +1,5 @@
 import { clsx, type ClassValue } from 'clsx';
+import { defaultUrlTransform } from 'react-markdown';
 import { twMerge } from 'tailwind-merge';
 
 import type { Project, ProjectSession, QuickSettingsTab, SlashCommand } from '@/shared/types';
@@ -10,6 +11,12 @@ import type { Project, ProjectSession, QuickSettingsTab, SlashCommand } from '@/
  * Read it to hide or gate features that only exist in one of the two deployments.
  */
 export const IS_PLATFORM = import.meta.env?.VITE_IS_PLATFORM === 'true';
+
+//----------------- STORED OUTPUT REFERENCES ------------
+/** Chat output previews and export builders recognize only content-addressed display assets. */
+export function collectStoredOutputAssets(content: string): string[] {
+  return [...new Set(content.match(/\/api\/assets\/(?:images\/inline-[a-f0-9]{64}\.(?:png|jpg|gif|webp|svg)|files\/output-[a-f0-9]{64}\.txt)/g) ?? [])];
+}
 
 // ---------------------------
 
@@ -218,6 +225,46 @@ export const getSessionTitle = (session: ProjectSession): string =>
   (session.summary as string) || 'New Session';
 
 /**
+ * Worktree label for a session running in a git worktree of its owning
+ * project ("feat/x"): the branch name, falling back to the worktree
+ * directory's basename for a detached checkout. Null for main-checkout
+ * sessions, whose rows carry no worktree metadata.
+ *
+ * Used by the workspace header subtitle and the sidebar session rows.
+ */
+export const getSessionWorktreeLabel = (session: ProjectSession | null): string | null => {
+  if (!session) {
+    return null;
+  }
+
+  const branch = typeof session.worktreeBranch === 'string' ? session.worktreeBranch.trim() : '';
+  if (branch) {
+    return branch;
+  }
+
+  const worktreePath = typeof session.worktreePath === 'string' ? session.worktreePath.trim() : '';
+  if (!worktreePath) {
+    return null;
+  }
+
+  // Server paths arrive normalized per-platform (Windows keeps backslashes),
+  // so split on both separators before taking the last segment.
+  const segments = worktreePath.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] ?? null;
+};
+
+/**
+ * The full session subtitle: owning project name plus the worktree label when
+ * the session runs in a worktree ("MirLite · feat/x"). Mirrors the
+ * "repo · branch" naming the open-worktree-as-project flow uses, so both
+ * surfaces read the same. Rendered by WorkspaceTitle.
+ */
+export const getSessionSubtitle = (projectDisplayName: string, session: ProjectSession | null): string => {
+  const worktreeLabel = getSessionWorktreeLabel(session);
+  return worktreeLabel ? `${projectDisplayName} · ${worktreeLabel}` : projectDisplayName;
+};
+
+/**
  * Builds the browser tab title for the current selection: the session title when one is
  * open, otherwise the project name, otherwise the app name.
  */
@@ -232,6 +279,135 @@ export const getPageTitle = (
   const displayName = selectedProject?.displayName?.trim();
   return displayName ? `${displayName} - ${DEFAULT_PAGE_TITLE}` : DEFAULT_PAGE_TITLE;
 };
+
+//----------------- DOCUMENT TITLE NOTIFICATIONS ------------
+
+const COMPLETION_TITLE_INDICATOR = '[Done]';
+const TITLE_INDICATOR_CLEAR_DELAY_MS = 2000;
+
+// Completion notifications retain their clear deadline and return listeners.
+let clearTimer: number | null = null;
+let returnListenersAttached = false;
+
+const getIndicatorPrefix = () => `${COMPLETION_TITLE_INDICATOR} `;
+
+const stripIndicator = (title: string): string => {
+  const prefix = getIndicatorPrefix();
+  return title.startsWith(prefix) ? title.slice(prefix.length) : title;
+};
+
+const pageIsActive = (): boolean => (
+  document.visibilityState === 'visible' && document.hasFocus()
+);
+
+const removeReturnListeners = (): void => {
+  if (!returnListenersAttached || typeof window === 'undefined') {
+    return;
+  }
+
+  document.removeEventListener('visibilitychange', handleUserReturn);
+  window.removeEventListener('focus', handleUserReturn, true);
+  window.removeEventListener('click', handleUserReturn, true);
+  returnListenersAttached = false;
+};
+
+const clearTitleIndicator = (): void => {
+  if (clearTimer !== null) {
+    window.clearTimeout(clearTimer);
+    clearTimer = null;
+  }
+
+  removeReturnListeners();
+  removePageInactiveListener();
+
+  if (document.title.startsWith(getIndicatorPrefix())) {
+    document.title = stripIndicator(document.title);
+  }
+};
+
+const removePageInactiveListener = (): void => {
+  document.removeEventListener('visibilitychange', handlePageInactive);
+};
+
+const scheduleClear = (): void => {
+  if (clearTimer !== null) {
+    window.clearTimeout(clearTimer);
+  }
+
+  clearTimer = window.setTimeout(() => {
+    clearTitleIndicator();
+  }, TITLE_INDICATOR_CLEAR_DELAY_MS);
+
+  removePageInactiveListener();
+  document.addEventListener('visibilitychange', handlePageInactive, { once: true });
+};
+
+function handleUserReturn(): void {
+  if (!pageIsActive()) {
+    return;
+  }
+
+  // Background completions keep the marker indefinitely. A tab click normally
+  // surfaces as visibility/focus, while an in-page click is a useful fallback.
+  scheduleClear();
+}
+
+function handlePageInactive(): void {
+  if (document.visibilityState !== 'hidden') {
+    return;
+  }
+
+  if (clearTimer !== null) {
+    window.clearTimeout(clearTimer);
+    clearTimer = null;
+  }
+
+  if (!returnListenersAttached) {
+    document.addEventListener('visibilitychange', handleUserReturn);
+    window.addEventListener('focus', handleUserReturn, true);
+    window.addEventListener('click', handleUserReturn, true);
+    returnListenersAttached = true;
+  }
+}
+
+/** Chat realtime completion uses the shared page-title notification lifecycle. */
+export const showCompletionTitleIndicator = (): void => {
+  if (typeof document === 'undefined' || typeof window === 'undefined') {
+    return;
+  }
+
+  const baseTitle = stripIndicator(document.title || 'CloudCLI UI');
+  document.title = `${getIndicatorPrefix()}${baseTitle}`;
+
+  if (pageIsActive()) {
+    scheduleClear();
+    return;
+  }
+
+  if (clearTimer !== null) {
+    window.clearTimeout(clearTimer);
+    clearTimer = null;
+  }
+
+  if (!returnListenersAttached) {
+    document.addEventListener('visibilitychange', handleUserReturn);
+    window.addEventListener('focus', handleUserReturn, true);
+    window.addEventListener('click', handleUserReturn, true);
+    returnListenersAttached = true;
+  }
+};
+
+/**
+ * Workspace selection updates the base document title. Same-session metadata
+ * updates preserve a pending completion marker; navigating to another target
+ * clears that marker through the existing notification cleanup path.
+ */
+export function setPageTitle(title: string, preserveCompletion: boolean): void {
+  if (!preserveCompletion) clearTitleIndicator();
+  document.title = `${preserveCompletion && document.title.startsWith(getIndicatorPrefix()) ? getIndicatorPrefix() : ''}${title}`;
+}
+
+// ---------------------------
 
 // Fork: storage access guarded for contexts where localStorage is unavailable.
 export const safeLocalStorage = {
@@ -514,3 +690,74 @@ export function createClientRequestId(): string {
   }
   return `submit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+// ---------------------------
+
+//----------------- MARKDOWN URLS ------------
+
+/**
+ * Whether a URL points at a local file (`file://`). Providers such as
+ * Antigravity link workspace-external documents and their images this way.
+ */
+export const isFileUrl = (url?: string): boolean => /^file:\/\//i.test(url ?? '');
+
+/** Whether a URL is a Windows absolute path, in either separator or percent-escaped form. */
+export const isWindowsAbsolutePath = (url?: string): boolean =>
+  /^[a-zA-Z]:([/\\]|%5[cC])/i.test(url ?? '');
+
+/**
+ * The `urlTransform` hook to hand react-markdown: it keeps `file://` URLs and
+ * Windows absolute paths verbatim and delegates every other URL to the
+ * library's default sanitization, whose `file:` handling would strip the scheme
+ * and destroy the path. Use it for any markdown that can reference local files.
+ */
+export const markdownUrlTransform = (url: string): string =>
+  isFileUrl(url) || isWindowsAbsolutePath(url) ? url : defaultUrlTransform(url);
+
+/**
+ * Converts a `file://` URL back into an absolute filesystem path, decoding
+ * percent-escapes so paths with spaces or non-ASCII characters survive. Returns
+ * undefined for anything that is not a local `file://` URL (remote hosts such
+ * as `file://server/share` are not local paths).
+ */
+export const filePathFromFileUrl = (href?: string): string | undefined => {
+  if (!isFileUrl(href)) {
+    return undefined;
+  }
+  try {
+    const url = new URL(href as string);
+    if (url.host && url.host !== 'localhost') {
+      return undefined;
+    }
+    return decodeURIComponent(url.pathname);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Turns a markdown link `href` into the filesystem reference the code editor
+ * should open. react-markdown percent-escapes non-ASCII characters and spaces
+ * before handing an href to a custom renderer, so those are decoded back; web
+ * and other non-file schemes are left alone instead of being decoded.
+ */
+export const fileReferenceFromMarkdownHref = (href?: string): string | undefined => {
+  if (!href) {
+    return undefined;
+  }
+
+  if (isFileUrl(href)) {
+    return filePathFromFileUrl(href) ?? href;
+  }
+
+  if (!isWindowsAbsolutePath(href) && /^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    return href;
+  }
+
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    // A literal or incomplete percent escape may be part of a valid filename.
+    return href;
+  }
+};

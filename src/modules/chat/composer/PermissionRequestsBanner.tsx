@@ -17,6 +17,13 @@ import {
 
 registerPermissionPanel('AskUserQuestion', AskUserQuestionPanel);
 
+/** The subagent that asked, when the provider says one did. */
+function readSubagentOrigin(request: PendingPermissionRequest): { description: string } | null {
+  const subagent = (request.context as { subagent?: { description?: unknown } } | null | undefined)?.subagent;
+  const description = typeof subagent?.description === 'string' ? subagent.description.trim() : '';
+  return subagent && typeof subagent === 'object' ? { description } : null;
+}
+
 type PermissionRequestsBannerProps = {
   pendingPermissionRequests: PendingPermissionRequest[];
   /** The session's engine: only Claude honours persisted allow rules, so the remember button shows for it alone. */
@@ -58,14 +65,22 @@ export default function PermissionRequestsBanner({
     <div className="mb-3 space-y-2">
       {filteredRequests.map((request) => {
         const CustomPanel = getPermissionPanel(request.toolName);
+        const origin = readSubagentOrigin(request);
+        const originLine = origin && (
+          <div className="mb-1 text-xs text-muted-foreground" data-testid="permission-origin">
+            {t('chat:subagent.askedBy', { description: origin.description || 'Agent', defaultValue: 'From subagent: {{description}}' })}
+          </div>
+        );
         if (CustomPanel) {
           return (
-            <CustomPanel
-              key={request.requestId}
-              request={request}
-              providerLabel={providerLabel}
-              onDecision={handlePermissionDecision}
-            />
+            <div key={request.requestId}>
+              {originLine}
+              <CustomPanel
+                request={request}
+                providerLabel={providerLabel}
+                onDecision={handlePermissionDecision}
+              />
+            </div>
           );
         }
 
@@ -87,6 +102,7 @@ export default function PermissionRequestsBanner({
 
         return (
           <Confirmation key={request.requestId} approval="pending">
+            {originLine}
             <ConfirmationTitle className="flex items-start gap-3">
               <ShieldAlertIcon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
               <ConfirmationRequest>

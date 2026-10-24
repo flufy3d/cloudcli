@@ -156,3 +156,26 @@ test('only runtimes that track the reply phase report background work as pending
   assert.equal(service.hasBackgroundWork('claude-session'), true);
   assert.equal(service.hasBackgroundWork('idle-session'), false);
 });
+
+test('background work is stoppable unless the runtime holding it says it is not', () => {
+  const service = createService([
+    createProvider('claude', createRuntime({ backgroundTasks: { list: () => [] } })),
+    createProvider('zcode', createRuntime({
+      backgroundTasks: { list: () => [], canInterrupt: (sessionId) => sessionId !== 'zcode-idle-session' },
+    })),
+  ]);
+
+  assert.equal(service.canInterruptBackgroundWork('zcode-idle-session'), false);
+  assert.equal(service.canInterruptBackgroundWork('zcode-running-session'), true);
+  assert.equal(service.canInterruptBackgroundWork('claude-session'), true);
+});
+
+test('background work holds back the next message unless the runtime holding it takes turns alongside it', () => {
+  const service = createService([
+    createProvider('claude', createRuntime({ backgroundTasks: { list: () => [], queuesInput: () => false } })),
+    createProvider('zcode', createRuntime({ backgroundTasks: { list: () => [] } })),
+  ]);
+
+  assert.equal(service.backgroundWorkQueuesInput('claude', 'claude-session'), false);
+  assert.equal(service.backgroundWorkQueuesInput('zcode', 'zcode-session'), true);
+});

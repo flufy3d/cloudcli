@@ -32,7 +32,7 @@ export const pushSubscriptionsDb = {
   },
 
   /** Returns all subscriptions for a user. */
-  getPushSubscriptions(userId: number): PushSubscriptionLookupRow[] {
+  getPushSubscriptions(userId: number | string): PushSubscriptionLookupRow[] {
     const db = getConnection();
     return db
       .prepare(
@@ -67,7 +67,9 @@ export const pushSubscriptionsDb = {
       keysAuth
     );
   },
-  getSubscriptions(userId: number): PushSubscriptionLookupRow[] {
+  // userId may be a number or a string: notification callers pass the runtime
+  // writer's id, and the queries bind either.
+  getSubscriptions(userId: number | string): PushSubscriptionLookupRow[] {
     return pushSubscriptionsDb.getPushSubscriptions(userId);
   },
   removeSubscription(endpoint: string): void {

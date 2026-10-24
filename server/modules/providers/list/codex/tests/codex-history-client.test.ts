@@ -5,6 +5,7 @@ import {
   codexAppServerTransport,
   listCodexThreadTurns,
 } from '@/modules/providers/list/codex/codex-app-server.client.js';
+import { AppError } from '@/shared/utils.js';
 
 test('history reader resumes the requested thread and reads every full page with experimental API', async () => {
   const originalOpen = codexAppServerTransport.open;
@@ -37,6 +38,34 @@ test('history reader resumes the requested thread and reads every full page with
     });
     assert.equal(calls[2].params.cursor, 'cursor-2');
     assert.equal(closed, true);
+  } finally {
+    codexAppServerTransport.open = originalOpen;
+  }
+});
+
+test('history reader lists a thread another process holds instead of taking it over', async () => {
+  const originalOpen = codexAppServerTransport.open;
+  const calls: Array<{ method: string; params: any }> = [];
+  codexAppServerTransport.open = async () => ({
+    close: () => {},
+    call: async (method, params) => {
+      calls.push({ method, params: params as Record<string, unknown> });
+      if (method === 'thread/resume') {
+        // The engine refuses a second writer for a thread a resident
+        // conversation holds.
+        throw new AppError('thread thread-held already has an active writer', {
+          code: 'CODEX_APP_SERVER_ERROR',
+          statusCode: 502,
+          details: { method: 'thread/resume', rpcCode: -32600 },
+        });
+      }
+      return { data: [{ id: 'turn-1' }], nextCursor: null };
+    },
+  });
+
+  try {
+    assert.deepEqual(await listCodexThreadTurns('thread-held'), [{ id: 'turn-1' }]);
+    assert.deepEqual(calls.map(({ method }) => method), ['thread/resume', 'thread/turns/list']);
   } finally {
     codexAppServerTransport.open = originalOpen;
   }

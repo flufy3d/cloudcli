@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { LLMProviderLogo } from '@/shared/ui';
 import type { AppTab, Project, ProjectSession } from '@/shared/types';
 import { usePlugins } from '@/modules/plugins';
-import { getSessionTitle } from '@/shared/utils';
+import { getSessionSubtitle, getSessionTitle } from '@/shared/utils';
 import { useSessionTitleRename } from '@/modules/project-workspace/hooks/useSessionTitleRename';
 
 type WorkspaceTitleProps = {
@@ -117,7 +117,9 @@ export default function WorkspaceTitle({
                 {sessionTitle}
               </h2>
             )}
-            <div className="truncate text-[11px] leading-tight text-muted-foreground">{selectedProject.displayName}</div>
+            <div className="truncate text-[11px] leading-tight text-muted-foreground">
+              {getSessionSubtitle(selectedProject.displayName, selectedSession)}
+            </div>
           </div>
         ) : showChatNewSession ? (
           <div className="min-w-0">

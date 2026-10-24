@@ -28,7 +28,7 @@
  */
 
 import type { ProviderPermissionDecision, ProviderRuntimeWriter } from '@/shared/types.js';
-import { createNormalizedMessage, generateMessageId, readJsonRecord, readOptionalString } from '@/shared/utils.js';
+import { createNormalizedMessage, generateMessageId, readJsonRecord, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
 import type { ProtocolServerRequest } from './zcode-codec.js';
 import { readDecryptedZCodeIndividualPlanApiKey, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
@@ -130,6 +130,13 @@ export type RunHandle = {
   /** Set when a delivered session/stop confirmed the user's abort. */
   abortRequested: boolean;
   /**
+   * Set right before the run's prompt goes to the engine. A run listens to
+   * the engine session from the moment it starts, but a turn-ending event
+   * seen before its own prompt was sent belongs to an earlier turn and must
+   * not end this one.
+   */
+  promptDispatched: boolean;
+  /**
    * Who performs terminal handling and cleanup: the run coroutine until the
    * silence watchdog hands off, the detached watcher afterwards. A handle
    * whose owner is the watcher must not be disposed by the run's finally.
@@ -224,6 +231,7 @@ export class ZCodeRunLifecycle {
   private readonly runs = new Map<string, RunHandle>();
   /** Live runs by ZCode-native session id — what the permission bridge and engine events resolve against. */
   private readonly runsByEngineSession = new Map<string, RunHandle>();
+  private readonly idleTargets = new Map<string, { writer: ProviderRuntimeWriter; appSessionId: string | null }>();
 
   /**
    * One resolver per in-flight protocol request id: the engine re-announces a
@@ -255,6 +263,7 @@ export class ZCodeRunLifecycle {
       appSessionId: start.appSessionId,
       writer: start.writer,
       abortRequested: false,
+      promptDispatched: false,
       owner: 'run',
       state: { completed: false, lastActivityAt: Date.now() },
     };
@@ -271,6 +280,43 @@ export class ZCodeRunLifecycle {
   /** Whether this handle is still the run registered for its abort key. */
   isActiveRun(handle: RunHandle): boolean {
     return this.runs.get(handle.abortKey) === handle;
+  }
+
+  /**
+   * Where an engine session's approval and question cards go: the run on it,
+   * else the watcher keeping its background agents (see `adoptIdleTarget`).
+   * Also where a followed subagent's live steps are sent.
+   */
+  private requestTargetFor(engineSessionId: string): { writer: ProviderRuntimeWriter; appSessionId: string | null } | undefined {
+    return this.runsByEngineSession.get(engineSessionId) ?? this.idleTargets.get(engineSessionId);
+  }
+
+  /**
+   * Lets requests for an engine session reach `writer` while no run is active
+   * on it. A background agent keeps working after its turn ended and can still
+   * ask for approval (the engine files the request under the parent session);
+   * without a target such a request is denied on the spot. The lifecycle
+   * watcher registers its writer here while it waits on the session's agents.
+   */
+  adoptIdleTarget(engineSessionId: string, target: { writer: ProviderRuntimeWriter; appSessionId: string | null }): void {
+    this.idleTargets.set(engineSessionId, target);
+  }
+
+  /** Stops routing an idle session's requests; a run takes over, or its agents are done. */
+  releaseIdleTarget(engineSessionId: string): void {
+    this.idleTargets.delete(engineSessionId);
+  }
+
+  /**
+   * Whether no newer run has claimed this handle's engine session. A
+   * superseded run must not leave anything behind on the session — the
+   * newer run's listener owns the stream — so its wind-down checks this
+   * before arming the subagent watcher. True once the handle is disposed,
+   * since a disposed run was never replaced.
+   */
+  isNewestRunForEngineSession(handle: RunHandle): boolean {
+    const current = this.runsByEngineSession.get(handle.sessionId);
+    return current === undefined || current === handle;
   }
 
   /** A readonly view of the run's terminal bookkeeping for reporting. */
@@ -449,8 +495,8 @@ export class ZCodeRunLifecycle {
       });
     }
 
-    const handle = sessionId ? this.runsByEngineSession.get(sessionId) : undefined;
-    if (!sessionId || !handle) {
+    const target = sessionId ? this.requestTargetFor(sessionId) : undefined;
+    if (!sessionId || !target) {
       return { result: { decision: 'deny', reason: 'No active chat stream for this session' } };
     }
 
@@ -461,6 +507,7 @@ export class ZCodeRunLifecycle {
       reason: readOptionalString(params.reason),
       options: params.options,
       suggestedPermissionUpdates: params.suggestedPermissionUpdates,
+      ...readSubagentOrigin(params),
     };
 
     // Register before sending the frame: if the send throws, the parked
@@ -472,13 +519,13 @@ export class ZCodeRunLifecycle {
       input: params.input,
       context,
       sessionId,
-      appSessionId: handle.appSessionId ?? undefined,
+      appSessionId: target.appSessionId ?? undefined,
       receivedAt: new Date(),
       lastAnnouncedAt: Date.now(),
     });
     this.pendingPermissionResolvers.set(requestId, []);
 
-    handle.writer.send(createNormalizedMessage({
+    target.writer.send(createNormalizedMessage({
       id: generateMessageId('zcode'),
       sessionId,
       provider: 'zcode',
@@ -567,8 +614,8 @@ export class ZCodeRunLifecycle {
       });
     }
 
-    const handle = sessionId ? this.runsByEngineSession.get(sessionId) : undefined;
-    if (!sessionId || !handle) {
+    const target = sessionId ? this.requestTargetFor(sessionId) : undefined;
+    if (!sessionId || !target) {
       return { result: { action: 'cancel', reason: 'No active chat stream for this session' } };
     }
 
@@ -582,15 +629,15 @@ export class ZCodeRunLifecycle {
       toolName,
       toolId,
       input: params.input,
-      context: { reason: readOptionalString(params.prompt) },
+      context: { reason: readOptionalString(params.prompt), ...readSubagentOrigin(params) },
       sessionId,
-      appSessionId: handle.appSessionId ?? undefined,
+      appSessionId: target.appSessionId ?? undefined,
       receivedAt: new Date(),
       lastAnnouncedAt: Date.now(),
     });
     this.pendingPermissionResolvers.set(requestId, []);
 
-    handle.writer.send(createNormalizedMessage({
+    target.writer.send(createNormalizedMessage({
       id: generateMessageId('zcode'),
       sessionId,
       provider: 'zcode',
@@ -599,7 +646,7 @@ export class ZCodeRunLifecycle {
       toolName,
       toolId,
       input: params.input,
-      context: { reason: readOptionalString(params.prompt) },
+      context: { reason: readOptionalString(params.prompt), ...readSubagentOrigin(params) },
       canInterrupt: true,
     }));
 
@@ -657,6 +704,27 @@ export class ZCodeRunLifecycle {
   }
 
   /**
+   * Takes down the pending cards of a subagent that has stopped (or, with no
+   * `agentToolUseId`, of every agent on the session, for an engine that died):
+   * nobody is waiting for the answer any more. The parked engine request is
+   * denied, and the card is retracted through the writer that showed it, so
+   * this must run before that writer stops being the session's target.
+   */
+  retractSubagentPermissions(engineSessionId: string, agentToolUseId?: string): void {
+    for (const [requestId, details] of [...this.pendingPermissionDetails]) {
+      if (details.sessionId !== engineSessionId) {
+        continue;
+      }
+      const origin = (details.context as { subagent?: { toolUseId?: string } } | undefined)?.subagent;
+      if (!origin || (agentToolUseId !== undefined && origin.toolUseId !== agentToolUseId)) {
+        continue;
+      }
+      this.answerPendingPermission(requestId, { result: { decision: 'deny', reason: 'The agent that asked has stopped.' } });
+      this.retractPendingPermission(requestId, details);
+    }
+  }
+
+  /**
    * Tells the live chat stream a pending card is gone; without this the card
    * only disappears on a `complete` replay, so a client that (re)subscribes
    * after the decision sees a zombie permission request forever.
@@ -666,7 +734,7 @@ export class ZCodeRunLifecycle {
     if (!sessionId) {
       return;
     }
-    const writer = this.runsByEngineSession.get(sessionId)?.writer;
+    const writer = this.requestTargetFor(sessionId)?.writer;
     if (!writer) {
       return;
     }
@@ -713,6 +781,22 @@ export class ZCodeRunLifecycle {
       }
     }
   }
+}
+
+/**
+ * `{ subagent }` for a request the engine filed on behalf of a subagent. The
+ * engine rewrites such a request to the parent session and tags it with
+ * `origin.kind: "subagent"`, whose `parentToolCallId` is the `Agent` call and
+ * `description` the agent's task line; anything else carries no subagent.
+ */
+function readSubagentOrigin(params: Record<string, unknown>): { subagent?: { toolUseId: string; description?: string } } {
+  const origin = readObjectRecord(params.origin);
+  const toolUseId = readOptionalString(origin?.parentToolCallId);
+  if (readOptionalString(origin?.kind) !== 'subagent' || !toolUseId) {
+    return {};
+  }
+  const description = readOptionalString(origin?.description);
+  return { subagent: { toolUseId, ...(description ? { description } : {}) } };
 }
 
 /**

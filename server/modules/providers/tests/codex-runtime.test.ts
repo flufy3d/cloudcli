@@ -20,15 +20,31 @@ import {
   codexRuntime,
   executeCodexSandboxCommand,
 } from '@/modules/providers/list/codex/codex-runtime.provider.js';
+import { closeCodexResidentSessions, listCodexResidentSessions } from '@/modules/providers/list/codex/codex-session-manager.js';
 import type { ProviderRuntimeContext } from '@/shared/index.js';
 
+import { codexSessionTitleService } from '../services/codex-session-title.service.js';
+
+test.beforeEach((t) => { if ('mock' in t) t.mock.method(codexSessionTitleService, 'enqueue', async () => {}); });
+
 const THREAD_ID = '01a0c4d2-a3c3-7510-8e3f-c36245fa5d9d';
+
+// The tests below cover the short connection path, the one a conversation
+// falls back to when the resident path is turned off. The resident path has
+// its own tests, which turn it on for the duration of one test.
+process.env.CLOUDCLI_CODEX_RESIDENT = '0';
 const TURN_ID = '01a0c4d2-a3fe-7330-bb87-5a99871777d0';
 
 type FakeServer = {
   calls: Array<{ method: string; params: any; options?: unknown }>;
   handlers: CodexAppServerHandlers;
   openOptions?: { env?: NodeJS.ProcessEnv; inheritEnv?: boolean };
+  /** Whether the run closed the connection, which kills the real app-server process. */
+  closed?: boolean;
+  /** The inputs the fake engine holds in its queue, keyed by client message id. */
+  queue: Map<string, { id: string; clientUserMessageId: string }>;
+  /** Set when the engine is busy and keeps the input queued. */
+  holdQueue?: boolean;
 };
 
 /**
@@ -39,7 +55,7 @@ function installFakeAppServer(
   t: any,
   script: (server: FakeServer) => void = replayOneTurn,
 ): FakeServer {
-  const server: FakeServer = { calls: [], handlers: {} };
+  const server: FakeServer = { calls: [], handlers: {}, closed: false, queue: new Map() };
 
   t.mock.method(codexAppServerTransport, 'open', async (
     handlers: CodexAppServerHandlers,
@@ -48,10 +64,25 @@ function installFakeAppServer(
     server.handlers = handlers;
     server.openOptions = openOptions;
     return {
-      async call(method: string, params: unknown, options?: unknown) {
+      async call(method: string, params: any, options?: unknown) {
         server.calls.push({ method, params, options });
         if (method === 'thread/start' || method === 'thread/resume') {
+          // A thread takes the sandbox mode as a string; the policy object
+          // belongs to a turn, and the engine ignores it here.
+          assert.ok(
+            params.sandbox === 'workspace-write' || params.sandbox === 'danger-full-access',
+            `thread/${method} needs a sandbox mode, got ${JSON.stringify(params.sandbox)}`,
+          );
+          assert.equal(params.sandboxPolicy, undefined);
           return { thread: { id: THREAD_ID } };
+        }
+        if (method === 'thread/settings/update') {
+          // A turn's settings take the policy object, which is tagged by its
+          // type; a mode string is rejected by the engine.
+          assert.ok(params.sandboxPolicy, 'thread/settings/update needs a sandbox policy');
+          assert.equal(typeof params.sandboxPolicy.type, 'string');
+          assert.equal(params.sandboxPolicy.mode, undefined);
+          return {};
         }
         if (method === 'config/read') {
           return { config: { shell_environment_policy: { exclude: ['TEST_EXISTING_EXCLUDE'] } } };
@@ -65,9 +96,36 @@ function installFakeAppServer(
           queueMicrotask(() => script(server));
           return { turn: { id: TURN_ID, status: 'inProgress' } };
         }
+        if (method === 'thread/queue/add') {
+          // The engine takes the input and, when the thread is idle, starts it
+          // as a turn of its own: the consumption is reported before the turn.
+          const id = `queued-${server.queue.size + 1}`;
+          server.queue.set(params.clientUserMessageId, { id, clientUserMessageId: params.clientUserMessageId });
+          if (server.holdQueue) {
+            // A busy engine keeps the input queued.
+            return { queuedSubmission: { id, input: params.input, clientUserMessageId: params.clientUserMessageId } };
+          }
+          queueMicrotask(() => {
+            server.queue.delete(params.clientUserMessageId);
+            server.handlers.onNotification?.('thread/queue/changed', { threadId: THREAD_ID } as any);
+            script(server);
+          });
+          return { queuedSubmission: { id, input: params.input, clientUserMessageId: params.clientUserMessageId } };
+        }
+        if (method === 'thread/queue/list') {
+          return { data: [...server.queue.values()], nextCursor: null };
+        }
+        if (method === 'thread/queue/delete') {
+          for (const [key, item] of server.queue) {
+            if (item.id === params.queuedSubmissionId) {
+              server.queue.delete(key);
+            }
+          }
+          return {};
+        }
         return {};
       },
-      close() {},
+      close() { server.closed = true; },
     };
   });
 
@@ -154,6 +212,223 @@ for (const resumed of [false, true]) {
     });
   }
 }
+
+test('a resident round is written to the engine queue instead of starting a turn', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+
+    assert.ok(!server.calls.some((call) => call.method === 'turn/start'));
+    const added = server.calls.find((call) => call.method === 'thread/queue/add');
+    assert.ok(added, 'the round must be queued');
+    assert.deepEqual(added.params.input, [{ type: 'text', text: 'hey there', text_elements: [] }]);
+
+    assert.ok(messages.some((message) => message.kind === 'complete' && message.exitCode === 0));
+    assert.ok(!messages.some((message) => message.kind === 'error'));
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
+test('a resident round announces that it waits for the engine and that it started', async (t) => {
+  const server = installFakeAppServer(t);
+  // The engine is busy with something else, so it holds the input.
+  server.holdQueue = true;
+  const messages: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    const run = codexRuntime.run('hey there', {
+      sessionId: 'resident-activity-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+
+    // The announcement follows the submission, so it arrives with the round.
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (messages.some((message) => message.kind === 'status' && message.text === 'activity_state')) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const queued = messages
+      .filter((message) => message.kind === 'status' && message.text === 'activity_state')
+      .map((message) => message.activityState);
+    assert.equal(queued[0].queued, true, 'the engine holds the round before its turn');
+
+    // The engine takes the input and starts the round's turn.
+    server.queue.clear();
+    server.handlers.onNotification?.('thread/queue/changed', { threadId: THREAD_ID } as any);
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'inProgress' },
+    } as any);
+    server.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'completed', error: null },
+    } as any);
+    await run;
+
+    const states = messages
+      .filter((message) => message.kind === 'status' && message.text === 'activity_state')
+      .map((message) => message.activityState);
+    assert.equal(states.at(-1).queued, false, 'the engine took the round');
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
+test('a resident conversation keeps its process and reuses it for the next round', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    for (const command of ['first message', 'second message']) {
+      await codexRuntime.run(command, {
+        sessionId: 'resident-session',
+        cwd: process.cwd(),
+      }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(false));
+    }
+
+    assert.equal(server.calls.filter((call) => call.method === 'thread/start').length, 1);
+    assert.equal(server.closed, false, 'the process must stay alive between rounds');
+    const queued = server.calls.filter((call) => call.method === 'thread/queue/add');
+    assert.equal(queued.length, 2);
+    assert.equal(queued[0].params.input[0].text, 'first message');
+    assert.equal(queued[1].params.input[0].text, 'second message');
+    assert.equal(messages.filter((message) => message.kind === 'complete').length, 2);
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
+test('stopping a finished round reports that there is nothing to stop', async (t) => {
+  const server = installFakeAppServer(t);
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-stop-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(false));
+
+    assert.equal(await codexRuntime.abort('resident-stop-session'), false);
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
+test('stopping a running resident round interrupts the turn the engine started', async (t) => {
+  const server = installFakeAppServer(t, (fake) => {
+    // The turn stays in flight, so the stop has a turn to interrupt.
+    fake.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'inProgress' },
+    } as any);
+  });
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    const run = codexRuntime.run('hey there', {
+      sessionId: 'resident-running-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(false));
+
+    await waitFor(() => server.calls.some((call) => call.method === 'thread/queue/add'));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(await codexRuntime.abort('resident-running-session'), true);
+    await waitFor(() => server.calls.some((call) => call.method === 'turn/interrupt'));
+    assert.equal(
+      server.calls.find((call) => call.method === 'turn/interrupt')?.params.turnId,
+      TURN_ID,
+    );
+
+    // The engine reports the interrupted turn, which ends the round.
+    server.handlers.onNotification?.('turn/completed', {
+      threadId: THREAD_ID,
+      turn: { id: TURN_ID, status: 'interrupted', error: null },
+    } as any);
+    await run;
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
+test('an approval the engine asks for with no round in flight is answered', async (t) => {
+  const server = installFakeAppServer(t);
+  const published: any[] = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-approval-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: () => {} }, {
+      ...runtimeContext(false),
+      publishSessionEvent: (_appSessionId: string, message: any) => published.push(message),
+    } as never);
+
+    // The engine asks for an approval while no round waits: the request must
+    // not be answered as "not implemented".
+    const answer = server.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      itemId: 'item-1',
+      command: 'ls -la',
+    } as any);
+
+    assert.ok(answer !== undefined, 'the request must get an answer');
+    const card = published.find((message) => message.kind === 'permission_request');
+    assert.ok(card, 'the approval card must reach the session');
+    assert.equal(card.toolName, 'Bash');
+    codexRuntime.permissions.resolve(card.requestId, { allow: true });
+    assert.deepEqual(await answer, { decision: 'accept' });
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
+test('a turn the engine starts by itself is published to the session, not to the round', async (t) => {
+  const server = installFakeAppServer(t);
+  const messages: any[] = [];
+  const published: Array<{ appSessionId: string; message: any }> = [];
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await codexRuntime.run('hey there', {
+      sessionId: 'resident-engine-session',
+      cwd: process.cwd(),
+    }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, {
+      ...runtimeContext(false),
+      publishSessionEvent: (appSessionId, message) => published.push({ appSessionId, message }),
+    });
+
+    // The engine reports in the background, after the round is over.
+    server.handlers.onNotification?.('turn/started', {
+      threadId: THREAD_ID,
+      turn: { id: 'engine-turn', status: 'inProgress' },
+    } as any);
+    server.handlers.onNotification?.('item/agentMessage/delta', {
+      threadId: THREAD_ID,
+      turnId: 'engine-turn',
+      delta: 'the background report',
+    } as any);
+
+    assert.ok(published.length > 0, 'the report must reach the session');
+    assert.equal(published[0].appSessionId, 'resident-engine-session');
+    assert.equal(published[0].message.kind, 'stream_delta');
+    assert.equal(published[0].message.content, 'the background report');
+    // The round's own events stay in the round.
+    assert.ok(!messages.some((message) => message.content === 'the background report'));
+  } finally {
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
 
 test('an image-only turn sends a fallback prompt with the attachment', async (t) => {
   const server = installFakeAppServer(t);
@@ -475,7 +750,7 @@ test('a delayed aborted run does not read or complete over its successor session
   }, { isWebSocketWriter: true, send: (message) => firstMessages.push(message) }, runtimeContext(true));
   await firstStartedPromise;
 
-  assert.equal(codexRuntime.abort('app-session-successor'), true);
+  assert.equal(await codexRuntime.abort('app-session-successor'), true);
   const secondMessages: any[] = [];
   const secondRun = codexRuntime.run('second', {
     sessionId: 'app-session-successor', cwd: process.cwd(),
@@ -486,7 +761,7 @@ test('a delayed aborted run does not read or complete over its successor session
   assert.equal(firstResult.terminalStatus, 'interrupted');
   assert.ok(!firstMessages.some((message) => message.kind === 'complete'), 'aborted predecessor must not send a second completion');
 
-  assert.equal(codexRuntime.abort('app-session-successor'), true);
+  assert.equal(await codexRuntime.abort('app-session-successor'), true);
   const secondResult = await secondRun;
   assert.equal(secondResult.terminalStatus, 'interrupted');
   assert.ok(!secondMessages.some((message) => message.kind === 'complete'));
@@ -560,6 +835,28 @@ test('an approval waits for the user and carries the command it is about', async
   assert.deepEqual(await answer, { decision: 'accept' });
   assert.ok(messages.some((message) => message.kind === 'permission_resolved' && message.requestId === prompt.requestId));
   assert.equal(codexRuntime.permissions.listPending('app-session').length, 0);
+});
+
+test('an approval asked by a running agent says which agent asked', async (t) => {
+  let answer: Promise<unknown> | undefined;
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    // The request comes from the agent's own thread on the shared connection.
+    answer = Promise.resolve(fake.handlers.onRequest?.('item/commandExecution/requestApproval', {
+      threadId: 'thread_child_1', turnId: 'child-turn', itemId: 'child-exec', command: "/bin/zsh -lc 'rm x'",
+    } as any));
+    void answer.then(() => notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } }));
+  });
+  const messages: any[] = [];
+  const run = codexRuntime.run('go', { sessionId: 'app-session-origin', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const prompt = await waitFor(() => messages.find((message) => message.kind === 'permission_request'));
+  assert.deepEqual(prompt.context.subagent, { toolUseId: 'call_spawn_1', description: 'Standards' });
+  codexRuntime.permissions.resolve(prompt.requestId, { allow: true });
+  await run;
 });
 
 test('remembering an approval grants it for the whole session', async (t) => {
@@ -802,6 +1099,7 @@ test('detached Codex command execution keeps the original sandbox and strips tas
       env: {
         API_KEY: null,
         CLOUDCLI_TASK_API_KEY: null,
+        CLOUDCLI_TASK_BRIDGE: null,
         CLOUDCLI_TASK_RUN_CONTEXT: null,
         CLOUDCLI_REGISTRATION_TOKEN: null,
         CLOUDCLI_TASK_TOKEN: null,
@@ -902,50 +1200,414 @@ test('subagent notifications with different threadId are ignored and do not sett
 // Background work tracking (collab agents that outlive their turn)
 // ---------------------------------------------------------------------------
 
-test('a collab agent spawned mid-turn is listed as background work once the turn ends', async (t) => {
-  installFakeAppServer(t, (server) => {
-    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+// Real engines never announce a spawn as a collab tool-call item: every
+// recorded `CollabAgentToolCall` is a `wait`. The only word of a new agent is
+// its `subAgentActivity` record, whose item id differs between the start and
+// the end of the same agent; the thread id is what pairs them.
+const spawnActivity = { type: 'subAgentActivity', id: 'call_spawn_1', kind: 'started', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
+const doneActivity = { type: 'subAgentActivity', id: 'call_done_1', kind: 'completed', agentThreadId: 'thread_child_1', agentPath: '/root/standards' };
+
+test('an agent still running when the turn ends is settled as stopped, because closing the connection kills it', async (t) => {
+  const midTurn: Array<ReturnType<typeof codexRuntime.listBackgroundWork>> = [];
+  const server = installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
-    // The agent starts; no terminal event arrives before the turn settles —
-    // the agent outlives the turn, which is the whole point.
-    notify('item/started', {
-      threadId: THREAD_ID,
-      turnId: TURN_ID,
-      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', prompt: 'Audit the sidebar', status: 'inProgress' },
-    });
+    // The agent starts; no terminal event arrives before the turn settles.
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    midTurn.push(codexRuntime.listBackgroundWork());
     notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
   });
 
   assert.deepEqual(codexRuntime.listBackgroundWork(), []);
 
+  const messages: any[] = [];
   await codexRuntime.run('go', {
     sessionId: 'app-session',
     cwd: process.cwd(),
-  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
 
-  const listed = codexRuntime.listBackgroundWork();
-  assert.equal(listed.length, 1, 'the session appears on the background-work list');
-  assert.equal(listed[0].sessionId, 'app-session');
-  assert.equal(listed[0].tasks.length, 1);
-  assert.equal(listed[0].tasks[0].taskId, 'item_agent_1');
-  assert.equal(listed[0].tasks[0].taskType, 'collab_agent');
-  assert.match(listed[0].tasks[0].description, /Audit the sidebar/);
-  assert.equal(typeof listed[0].tasks[0].startedAt, 'number');
+  // The harness passes rows through un-normalized, so the card is the raw
+  // `tool_use` row the renderer would receive.
+  const launch = messages.find((message) => message.type === 'tool_use');
+  assert.equal(launch?.toolName, 'Agent', 'the activity record becomes the subagent card');
+  assert.equal(launch?.toolCallId, 'call_spawn_1');
+  assert.match(JSON.stringify(launch?.toolInput), /Standards/);
+  const started = messages.find((message) => message.kind === 'task_status' && message.event === 'started');
+  assert.equal(started?.taskId, 'thread_child_1');
+  assert.equal(started?.toolUseId, 'call_spawn_1');
+  assert.equal(started?.taskType, 'collab_agent');
 
-  // The terminal item event retires the entry.
-  const server = installFakeAppServer(t, (fake) => {
+  // While the turn runs, the agent is listed as background work.
+  assert.equal(midTurn[0].length, 1, 'the session appears on the background-work list');
+  assert.equal(midTurn[0][0].sessionId, 'app-session');
+  assert.deepEqual(midTurn[0][0].tasks.map((task) => [task.taskId, task.toolUseId, task.taskType, task.description]), [
+    ['thread_child_1', 'call_spawn_1', 'collab_agent', 'Standards'],
+  ]);
+
+  // The run closed the connection, which kills the app-server and the agent
+  // with it: no completion will ever arrive, so the card settles as stopped
+  // and nothing stays listed.
+  assert.equal(server.closed, true);
+  const stopped = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(stopped.map((message) => [message.toolUseId, message.taskId, message.status]), [
+    ['call_spawn_1', 'thread_child_1', 'stopped'],
+  ]);
+  assert.ok(
+    messages.indexOf(stopped[0]) < messages.findIndex((message) => message.kind === 'complete'),
+    'the card settles before the page sees the turn complete',
+  );
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('the composer strip lists a running agent while the turn waits on it and empties when it settles', async (t) => {
+  const midTurn: unknown[] = [];
+  installFakeAppServer(t, (fake) => {
     const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
     notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
-    notify('item/completed', {
-      threadId: THREAD_ID,
-      turnId: TURN_ID,
-      item: { type: 'collabAgentToolCall', id: 'item_agent_1', tool: 'spawn_agent', label: 'audit:sidebar', status: 'completed' },
-    });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    midTurn.push(codexRuntime.backgroundTasks.list('app-session-strip'));
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: doneActivity });
     notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
   });
-  await codexRuntime.run('again', {
-    sessionId: 'app-session',
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-strip', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  // The strip names the agent by its card; there is no handle to stop it on
+  // its own, so the frame carries no `taskId`.
+  const stripTask = { id: 'call_spawn_1', toolName: 'Agent', command: 'Standards', description: 'Standards' };
+  const strips = messages.filter((message) => message.kind === 'status' && message.text === 'background_tasks');
+  assert.deepEqual(
+    strips.map((message) => message.backgroundTasks.map(({ startedAt: _startedAt, ...task }: any) => task)),
+    [[stripTask], []],
+  );
+  // The turn is in flight while the agent runs, so the strip's work stops
+  // with the turn.
+  assert.ok(strips.every((message) => message.canInterrupt === true));
+  assert.deepEqual((midTurn[0] as any[]).map(({ startedAt: _startedAt, ...task }) => task), [stripTask]);
+  assert.deepEqual(codexRuntime.backgroundTasks.list('app-session-strip'), []);
+});
+
+test('an agent the turn leaves running is cleared from the strip before the turn completes', async (t) => {
+  installFakeAppServer(t, (fake) => {
+    const notify = (method: string, params: unknown) => fake.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-strip-left', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const strips = messages.filter((message) => message.kind === 'status' && message.text === 'background_tasks');
+  assert.deepEqual(strips.map((message) => message.backgroundTasks.length), [1, 0]);
+  assert.ok(
+    messages.indexOf(strips.at(-1)) < messages.findIndex((message) => message.kind === 'complete'),
+    'the strip empties before the page sees the turn complete',
+  );
+});
+
+test('a running agent\'s own steps arrive tied to its card, without its prompt or lifecycle items', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    // The agent works on its own thread of the same connection.
+    const childPrompt = { type: 'userMessage', id: 'child-user', content: [{ type: 'text', text: 'review it', text_elements: [] }] };
+    const command = { type: 'commandExecution', id: 'child-exec', command: "/bin/zsh -lc 'ls'", status: 'completed', aggregatedOutput: 'a.txt\n', exitCode: 0 };
+    notify('item/completed', { threadId: 'thread_child_1', item: childPrompt });
+    notify('item/completed', { threadId: 'thread_child_1', item: command });
+    // A thread nobody here spawned stays out.
+    notify('item/completed', { threadId: 'thread_stranger', item: { ...command, id: 'stranger-exec' } });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-child', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const childRows = messages.filter((message) => message.parentToolUseId === 'call_spawn_1');
+  assert.deepEqual(childRows.map((row) => [row.type, row.toolCallId]), [['tool_use', 'child-exec'], ['tool_result', 'child-exec']]);
+  assert.equal(messages.some((message) => message.toolCallId === 'stranger-exec'), false);
+  assert.equal(messages.some((message) => message.type === 'user'), false, 'the agent\'s prompt is the card\'s task, not a thread row');
+});
+
+test('an agent that reports back during the turn is settled once, as completed', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: doneActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', {
+    sessionId: 'app-session-completed',
     cwd: process.cwd(),
-  }, { isWebSocketWriter: true, send: () => {} }, runtimeContext(true));
-  assert.deepEqual(codexRuntime.listBackgroundWork(), [], 'the completed agent is retired');
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const settled = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(settled.map((message) => message.status), ['completed']);
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('an aborted run settles its running agents as stopped', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    // The user stops the run; the aborted-session guard swallows every later
+    // notification, and the run settles through the connection teardown.
+    codexRuntime.abort('app-session-aborted');
+    server.handlers.onExit?.('connection closed after abort');
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', {
+    sessionId: 'app-session-aborted',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const settled = messages.filter((message) => message.kind === 'task_status' && message.event === 'notification');
+  assert.deepEqual(settled.map((message) => message.status), ['stopped']);
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('a failed turn settles its running agents as stopped before the failed complete', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'failed', error: { message: 'boom' } } });
+  });
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-failed', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'stopped');
+  const complete = messages.find((message) => message.kind === 'complete');
+  assert.ok(stopped && complete);
+  assert.equal(complete.exitCode, 1);
+  assert.ok(messages.indexOf(stopped) < messages.indexOf(complete));
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('a run that throws after an agent started settles it as stopped before the failed complete', async (t) => {
+  t.mock.method(codexAppServerTransport, 'open', async (handlers: CodexAppServerHandlers) => ({
+    async call(method: string) {
+      if (method === 'thread/start' || method === 'thread/resume') return { thread: { id: THREAD_ID } };
+      if (method === 'turn/start') {
+        handlers.onNotification?.('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity } as any);
+        throw new Error('turn/start rejected');
+      }
+      return {};
+    },
+    close() {},
+  }));
+  const messages: any[] = [];
+  await codexRuntime.run('go', { sessionId: 'app-session-threw', cwd: process.cwd() },
+    { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'stopped');
+  const complete = messages.find((message) => message.kind === 'complete');
+  assert.ok(stopped && complete);
+  assert.ok(messages.indexOf(stopped) < messages.indexOf(complete));
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+test('an interrupted agent settles its card as stopped', async (t) => {
+  installFakeAppServer(t, (server) => {
+    const notify = (method: string, params: unknown) => server.handlers.onNotification?.(method, params as any);
+    notify('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'inProgress' } });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: spawnActivity });
+    notify('item/completed', { threadId: THREAD_ID, turnId: TURN_ID, item: { ...doneActivity, id: 'call_int_1', kind: 'interrupted' } });
+    notify('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status: 'completed', error: null } });
+  });
+
+  const messages: any[] = [];
+  await codexRuntime.run('go', {
+    sessionId: 'app-session-interrupted',
+    cwd: process.cwd(),
+  }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, runtimeContext(true));
+
+  assert.equal(messages.filter((message) => message.type === 'tool_use').length, 1);
+  const stopped = messages.find((message) => message.kind === 'task_status' && message.status === 'stopped');
+  assert.equal(stopped?.toolUseId, 'call_spawn_1');
+  assert.deepEqual(codexRuntime.listBackgroundWork(), []);
+});
+
+for (const payload of ['taskContinuation', 'toolOutput'] as const) {
+  test(`a resident ${payload} receives its own terminal event`, async (t) => {
+    installFakeAppServer(t);
+    const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+    process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+    const messages: any[] = [];
+    try {
+      const running = codexRuntime.run('', {
+        sessionId: `resident-${payload}`,
+        [payload]: payload === 'taskContinuation'
+          ? { taskId: 'task-test', eventId: 'event-test', summary: 'done' }
+          : { name: 'cloudcli_task_result', output: '{"summary":"done"}' },
+      }, { send: (message) => messages.push(message) }, runtimeContext(false));
+      const result = await Promise.race([
+        running.then(() => 'finished'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 100)),
+      ]);
+      assert.equal(result, 'finished');
+      assert.equal(listCodexResidentSessions().length, 0);
+      assert.equal(messages.filter((message) => message.kind === 'complete' && message.exitCode === 0).length, 1);
+    } finally {
+      if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+      else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+      closeCodexResidentSessions();
+    }
+  });
+}
+
+test('an unconfirmed withdrawal remains unknown after a user stop', async (t) => {
+  const server = installFakeAppServer(t, () => {});
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  const messages: any[] = [];
+  try {
+    const running = codexRuntime.run('do work', { sessionId: 'stop-unknown' }, { send: (message) => messages.push(message) }, runtimeContext(false));
+    await waitFor(() => server.calls.find((call) => call.method === 'thread/queue/add'));
+    assert.equal(await codexRuntime.abort('stop-unknown'), true);
+    const result = await running;
+    assert.equal(result.terminalStatus, 'unknown');
+    const error = messages.find((message) => message.kind === 'error');
+    assert.match(error?.content ?? '', /could not confirm.*queued message/i);
+    assert.match(error?.content ?? '', /background agents/i);
+    assert.equal(server.closed, true);
+  } finally {
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+    closeCodexResidentSessions();
+  }
+});
+
+test('a session approval survives the next round and is retracted when its process closes', async (t) => {
+  const server = installFakeAppServer(t);
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  const published: any[] = [];
+  const context = { ...runtimeContext(false), publishSessionEvent: (_sessionId: string, message: any) => published.push(message) };
+  try {
+    const run = () => codexRuntime.run('hey', { sessionId: 'session-approval-lifetime' }, { send() {} }, context);
+    await run();
+    const answer = server.handlers.onRequest?.('item/commandExecution/requestApproval', { command: 'pwd', itemId: 'background-command' });
+    assert.equal(codexRuntime.permissions.listPending('session-approval-lifetime').length, 1);
+    await run();
+    assert.equal(codexRuntime.permissions.listPending('session-approval-lifetime').length, 1);
+    closeCodexResidentSessions();
+    assert.deepEqual(await answer, { decision: 'decline' });
+    assert.equal(codexRuntime.permissions.listPending('session-approval-lifetime').length, 0);
+    assert.ok(published.some((message) => message.kind === 'permission_cancelled'));
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
+});
+
+test('a reporting conversation defers a task result without touching the process or emitting an error', async (t) => {
+  const server = installFakeAppServer(t);
+  const previous = process.env.CLOUDCLI_CODEX_RESIDENT;
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  const messages: any[] = [];
+  try {
+    await codexRuntime.run('normal', { sessionId: 'deferred-result' }, { send() {} }, runtimeContext(false));
+    server.handlers.onNotification?.('turn/started', { threadId: THREAD_ID, turn: { id: 'active-report' } });
+    const result = await codexRuntime.run('', {
+      sessionId: 'deferred-result', taskContinuation: { taskId: 'task-ready', summary: 'done' },
+    }, { send: (message) => messages.push(message) }, runtimeContext(false));
+    assert.equal((result as { busy?: boolean }).busy, true);
+    assert.equal(result.engineTurnId, null);
+    assert.equal(server.closed, false);
+    assert.equal(server.calls.filter((call) => call.method === 'thread/start' || call.method === 'thread/resume').length, 1);
+    assert.equal(messages.some((message) => message.kind === 'error'), false);
+  } finally {
+    closeCodexResidentSessions();
+    if (previous === undefined) process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    else process.env.CLOUDCLI_CODEX_RESIDENT = previous;
+  }
+});
+
+
+test('a successful user turn submits a title job without waiting for it', async (t) => {
+  installFakeAppServer(t);
+  const submitted: any[] = [];
+  t.mock.method(codexSessionTitleService, 'enqueue', (target: unknown) => {
+    submitted.push(target);
+    return new Promise<void>(() => {});
+  });
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const run = codexRuntime.run('排查重复消息', { sessionId: 'title-user-turn', cwd: '/tmp' }, { isWebSocketWriter: true, send() {} }, runtimeContext(false));
+    await Promise.race([run, new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('chat waited for title')), 500); })]);
+    assert.equal(submitted.length, 1);
+    assert.equal(submitted[0].appSessionId, 'title-user-turn');
+    assert.equal(submitted[0].nativeThreadId, THREAD_ID);
+    assert.equal(submitted[0].initialPrompt, '排查重复消息');
+  } finally {
+    clearTimeout(timer);
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    closeCodexResidentSessions();
+  }
+});
+
+for (const resumed of [false, true]) {
+  test(`short connection submits title after ${resumed ? 'resumed' : 'new'} successful user turn`, async (t) => {
+    installFakeAppServer(t);
+    const submitted: any[] = [];
+    t.mock.method(codexSessionTitleService, 'enqueue', async (target: unknown) => { submitted.push(target); });
+    await codexRuntime.run('short title', { sessionId: 'short-title' }, { send() {} }, runtimeContext(resumed));
+    assert.equal(submitted.length, 1);
+    assert.equal(submitted[0].generation, 0);
+    assert.equal(submitted[0].initialPrompt, resumed ? undefined : 'short title');
+  });
+}
+
+test('capacity fallback closes its short connection and submits a transient title job', async (t) => {
+  const server = installFakeAppServer(t);
+  const submitted: any[] = [];
+  t.mock.method(codexSessionTitleService, 'enqueue', async (target: unknown) => { submitted.push(target); });
+  const { acquireCodexResidentSession } = await import('../list/codex/codex-session-manager.js');
+  const previousMax = process.env.CLOUDCLI_CODEX_RESIDENT_MAX;
+  process.env.CLOUDCLI_CODEX_RESIDENT_MAX = '1';
+  process.env.CLOUDCLI_CODEX_RESIDENT = '1';
+  try {
+    await acquireCodexResidentSession({ appSessionId: 'capacity-busy', nativeThreadId: null, workingDirectory: process.cwd(), approvalPolicy: 'never', sandbox: 'workspace-write', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false }, isBusy: () => true });
+    await codexRuntime.run('capacity title', { sessionId: 'capacity-title' }, { send() {} }, runtimeContext(false));
+    assert.equal(server.closed, true, 'the fallback connection must close after the chat');
+    assert.equal(submitted.length, 1);
+    assert.equal(submitted[0].generation, 0);
+  } finally {
+    closeCodexResidentSessions();
+    process.env.CLOUDCLI_CODEX_RESIDENT = '0';
+    if (previousMax === undefined) delete process.env.CLOUDCLI_CODEX_RESIDENT_MAX;
+    else process.env.CLOUDCLI_CODEX_RESIDENT_MAX = previousMax;
+  }
+});
+
+for (const status of ['failed', 'interrupted']) {
+  test(`${status} user turns never submit a title job`, async (t) => {
+    installFakeAppServer(t, (server) => {
+      server.handlers.onNotification?.('turn/started', { threadId: THREAD_ID, turn: { id: TURN_ID } });
+      server.handlers.onNotification?.('turn/completed', { threadId: THREAD_ID, turn: { id: TURN_ID, status, error: status === 'failed' ? { message: 'fixture failure' } : null } });
+    });
+    const enqueue = t.mock.method(codexSessionTitleService, 'enqueue', async () => {});
+    await codexRuntime.run('unsuccessful', { sessionId: 'title-unsuccessful' }, { send() {} }, runtimeContext(false));
+    assert.equal(enqueue.mock.callCount(), 0);
+  });
+}
+
+test('successful tool output continuation never submits a title job', async (t) => {
+  installFakeAppServer(t);
+  const enqueue = t.mock.method(codexSessionTitleService, 'enqueue', async () => {});
+  await codexRuntime.run('', { sessionId: 'title-tool', toolOutput: { name: 'cloudcli_task_result', output: 'done' } }, { send() {} }, runtimeContext(true));
+  assert.equal(enqueue.mock.callCount(), 0);
 });

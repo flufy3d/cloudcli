@@ -6,9 +6,9 @@ import test from 'node:test';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError, buildLookupMap } from '@/shared/utils.js';
 import { ClaudeSessionSynchronizer } from '@/modules/providers/list/claude/claude-session-synchronizer.provider.js';
-import { buildLookupMap } from '@/shared/utils.js';
+import { searchConversations } from '@/modules/providers/services/session-conversations-search.service.js';
 
 import { createWorkspaceFixture } from './workspace-fixture.js';
 
@@ -74,12 +74,118 @@ const SESSION_ID = 'claude-session-1';
 const AGENT_ID = 'a1b2c3d4e5f60718';
 const AGENT_TOOL_USE_ID = 'toolu_agent_1';
 
+test('Claude request diagnostics never become conversation rows or consume compact boundaries', () => {
+  const provider = new ClaudeSessionsProvider();
+  const snapshot = {
+    type: 'api-request-blob', sessionId: SESSION_ID,
+    message: { role: 'user', content: [
+      { type: 'text', text: 'Request context' },
+      { type: 'text', text: 'Workspace details' },
+      { type: 'text', text: 'Review this workspace' },
+    ] },
+  };
+  assert.deepEqual(provider.normalizeMessage(snapshot, SESSION_ID), []);
+  assert.deepEqual(provider.normalizeMessage({
+    ...snapshot, message: { role: 'assistant', content: [
+      { type: 'text', text: 'I will inspect it.' },
+      { type: 'tool_use', id: 'call-real', name: 'Bash', input: { command: 'pwd' } },
+    ] },
+  }, SESSION_ID), []);
+
+  provider.normalizeMessage({ type: 'system', subtype: 'compact_boundary' }, SESSION_ID);
+  provider.normalizeMessage(snapshot, SESSION_ID);
+  const [summary] = provider.normalizeMessage({
+    type: 'user', uuid: 'summary-real', message: { role: 'user', content: 'The saved summary' },
+  }, SESSION_ID);
+  assert.equal(summary.isCompactSummary, true);
+});
+
+test('Claude accepts explicit realtime controls without UUIDs and rejects mismatched conversation wrappers', () => {
+  const provider = new ClaudeSessionsProvider();
+  for (const record of [
+    { type: 'future-request-diagnostic', message: { role: 'user', content: 'copied prompt' } },
+    { type: 'user', message: { role: 'assistant', content: 'wrong role' } },
+    { type: 'assistant', message: { role: 'user', content: 'wrong role' } },
+  ]) {
+    assert.deepEqual(provider.normalizeMessage(record, SESSION_ID), []);
+  }
+  for (const [record, kind] of [
+    [{ type: 'content_block_delta', delta: { text: 'live text' } }, 'stream_delta'],
+    [{ type: 'thinking', message: { content: 'live reasoning' } }, 'thinking'],
+    [{ type: 'tool_use', toolName: 'Bash', toolCallId: 'live-call', toolInput: { command: 'pwd' } }, 'tool_use'],
+    [{ type: 'tool_result', toolCallId: 'live-call', output: '/workspace' }, 'tool_result'],
+    [{ type: 'assistant', message: { role: 'assistant', content: 'live reply' } }, 'text'],
+  ] as const) {
+    assert.equal(provider.normalizeMessage(record, SESSION_ID)[0]?.kind, kind);
+  }
+});
+
+test('history excludes diagnostic result overrides while preserving real repeated prompts and workflow activity', async () => {
+  await withIsolatedDatabase(async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'claude-record-boundary-'));
+    try {
+      const workspace = await createWorkspaceFixture();
+      const filename = path.join(directory, `${SESSION_ID}.jsonl`);
+      const user = {
+        type: 'user', uuid: 'prompt-original', parentUuid: null, sessionId: SESSION_ID,
+        timestamp: '2026-10-20T00:00:00Z', message: { role: 'user', content: 'Review the workspace' },
+      };
+      const call = {
+        type: 'assistant', uuid: 'call-original', parentUuid: user.uuid, sessionId: SESSION_ID,
+        timestamp: '2026-10-20T00:00:01Z',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'call-boundary', name: 'Bash', input: { command: 'pwd' } }] },
+      };
+      const result = {
+        type: 'user', uuid: 'result-original', parentUuid: call.uuid, sessionId: SESSION_ID,
+        timestamp: '2026-10-20T00:00:02Z',
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-boundary', content: 'actual result' }] },
+      };
+      const diagnostics = [user, call, result].map(({ message }) => ({ type: 'api-request-blob', sessionId: SESSION_ID, message }));
+      diagnostics[2].message = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-boundary', content: 'diagnostic override' }] } as typeof result.message;
+      const diagnosticOnly = {
+        type: 'api-request-blob', sessionId: SESSION_ID,
+        timestamp: '2000-01-01T00:00:00Z',
+        message: { role: 'assistant', model: 'diagnostic-model', content: [{ type: 'text', text: 'snapshot-only-needle' }] },
+      };
+      const records = [user, call, result, ...diagnostics, diagnosticOnly];
+      await writeFile(filename, records.map(record => JSON.stringify(record)).join('\n') + '\n');
+      sessionsDb.createSession(SESSION_ID, 'claude', workspace, 'Record boundary', undefined, undefined, filename);
+      const provider = new ClaudeSessionsProvider({ getLiveRunStartTime: () => Date.parse(call.timestamp) - 1 });
+      const history = await provider.fetchHistory(SESSION_ID);
+      assert.deepEqual(history.messages.filter(row => row.role === 'user').map(row => row.id), [user.uuid]);
+      assert.deepEqual(history.messages.filter(row => row.kind === 'tool_use').map(row => row.toolId), ['call-boundary']);
+      assert.equal(history.messages.find(row => row.kind === 'tool_use')?.toolResult?.content, 'actual result');
+      const reloaded = await provider.fetchHistory(SESSION_ID);
+      assert.deepEqual(reloaded.messages, history.messages);
+
+      const agentDirectory = path.join(directory, SESSION_ID, 'subagents', 'workflows', 'workflow-boundary');
+      await mkdir(agentDirectory, { recursive: true });
+      await writeFile(path.join(agentDirectory, 'agent-worker.jsonl'), [diagnosticOnly, call, result, ...diagnostics].map(record => JSON.stringify(record)).join('\n') + '\n');
+      const activity = await provider.readWorkflowAgentActivity(SESSION_ID, 'workflow-boundary', 'worker');
+      assert.equal(activity?.activityCount, 1);
+      assert.equal(activity?.agent.model, undefined);
+      assert.equal(activity?.agent.status, 'running', 'a diagnostic timestamp must not make live activity appear stopped');
+      assert.equal(activity?.activity[0]?.toolResult?.content, 'actual result');
+      const search = await searchConversations('snapshot-only-needle');
+      assert.equal(search.totalMatches, 0);
+      const realSearch = await searchConversations('Review the workspace');
+      assert.equal(realSearch.totalMatches, 1);
+
+      await writeFile(filename, JSON.stringify({ ...user, uuid: 'prompt-repeated', parentUuid: result.uuid, timestamp: '2026-10-20T00:00:03Z' }) + '\n', { flag: 'a' });
+      const repeated = await provider.fetchHistory(SESSION_ID);
+      assert.deepEqual(repeated.messages.filter(row => row.role === 'user').map(row => row.id), [user.uuid, 'prompt-repeated']);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 /**
  * Writes the transcript pair current Claude versions produce for one async
  * subagent: the parent session, and the agent's own transcript plus sidecar
  * metadata under `<session>/subagents/`.
  */
-async function writeClaudeSubagentSession(projectDirectory: string): Promise<string> {
+async function writeClaudeSubagentSession(projectDirectory: string, spawnToolName = 'Agent'): Promise<string> {
   const parentPath = path.join(projectDirectory, `${SESSION_ID}.jsonl`);
   const subagentDirectory = path.join(projectDirectory, SESSION_ID, 'subagents');
   await mkdir(subagentDirectory, { recursive: true });
@@ -95,7 +201,7 @@ async function writeClaudeSubagentSession(projectDirectory: string): Promise<str
         content: [{
           type: 'tool_use',
           id: AGENT_TOOL_USE_ID,
-          name: 'Agent',
+          name: spawnToolName,
           input: { subagent_type: 'Explore', description: 'Survey the repo', prompt: 'Look around' },
         }],
       },
@@ -297,6 +403,54 @@ test('Claude history attaches a subagent transcript stored under the session dir
   }
 });
 
+test('Claude history presents a legacy Task spawn as an Agent card', { concurrency: false }, async () => {
+  // Transcripts written by older CLIs name the spawn call `Task`. The client
+  // draws a subagent card for `Agent` only, so the reader translates the name
+  // while keeping the agent's status and sub-timeline attached to the row.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-legacy-task-'));
+
+  try {
+    const parentPath = await writeClaudeSubagentSession(tempRoot, 'Task');
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Legacy session', now, now, parentPath);
+
+      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+        providerSessionId: SESSION_ID,
+      });
+      const spawnRows = history.messages.filter((message) => message.kind === 'tool_use' && message.toolId === AGENT_TOOL_USE_ID);
+
+      assert.equal(spawnRows.length, 1);
+      assert.equal(spawnRows[0].toolName, 'Agent');
+      assert.equal(spawnRows[0].subagent?.status, 'completed');
+      assert.equal(history.messages.some((message) => message.toolName === 'Task'), false);
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('a live legacy Task call and a live Agent call both reach the page as Agent, and task-list tools keep their names', () => {
+  const provider = new ClaudeSessionsProvider();
+  const rowFor = (name: string) => provider.normalizeMessage({
+    uuid: `row-${name}`,
+    type: 'assistant',
+    timestamp: new Date().toISOString(),
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: `toolu_${name}`, name, input: {} }] },
+  }, 'session-1')[0];
+
+  assert.equal(rowFor('Task').toolName, 'Agent');
+  assert.equal(rowFor('Agent').toolName, 'Agent');
+  assert.equal(rowFor('TaskCreate').toolName, 'TaskCreate');
+
+  // The flat live shape (toolName on the event itself) is translated too.
+  const [flat] = provider.normalizeMessage({
+    uuid: 'row-flat', type: 'tool_use', toolName: 'Task', toolInput: {}, toolCallId: 'toolu_flat', timestamp: new Date().toISOString(),
+  }, 'session-1');
+  assert.equal(flat.toolName, 'Agent');
+});
+
 test('Claude history folds an agent task notification into the call that spawned it', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-notification-'));
 
@@ -325,6 +479,30 @@ test('Claude history folds an agent task notification into the call that spawned
     });
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('request diagnostics cannot replace a real background task notification', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'claude-diagnostic-notification-'));
+  try {
+    const filename = await writeClaudeSubagentSession(directory);
+    const lines = (await readFile(filename, 'utf8')).trim().split('\n');
+    const notification = JSON.parse(lines.find(line => line.includes('<task-notification>'))!);
+    const diagnostic = {
+      type: 'api-request-blob', sessionId: SESSION_ID,
+      message: { role: 'user', content: notification.message.content[0].text
+        .replace('completed', 'failed').replace('The repo has two packages.', 'diagnostic outcome') },
+    };
+    await writeFile(filename, JSON.stringify(diagnostic) + '\n', { flag: 'a' });
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession(SESSION_ID, 'claude', directory, 'Task boundary', undefined, undefined, filename);
+      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID);
+      const task = history.messages.find(row => row.toolId === AGENT_TOOL_USE_ID);
+      assert.equal(task?.toolResult?.content, 'The repo has two packages.');
+      assert.equal(task?.subagent?.status, 'completed');
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -2064,6 +2242,30 @@ test('buildLookupMap returns first-seen value when key appears multiple times', 
   }
 });
 
+test('buildLookupMap returns the last value when preference is last', async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-lookup-'));
+  const filePath = path.join(tmp, 'session_index.jsonl');
+  try {
+    await writeFile(
+      filePath,
+      [
+        JSON.stringify({ id: 't1', thread_name: 'initial name' }),
+        JSON.stringify({ id: 't1', thread_name: 'renamed by engine' }),
+        JSON.stringify({ id: 't2', thread_name: 'only name' }),
+      ].join('\n'),
+      'utf8',
+    );
+
+    const map = await buildLookupMap(filePath, 'id', 'thread_name', 'last');
+
+    assert.equal(map.size, 2);
+    assert.equal(map.get('t1'), 'renamed by engine');
+    assert.equal(map.get('t2'), 'only name');
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('buildLookupMap returns empty map for missing file', async () => {
   const map = await buildLookupMap(path.join(os.tmpdir(), 'does-not-exist.jsonl'), 'k', 'v');
   assert.equal(map.size, 0);
@@ -2268,11 +2470,46 @@ test('synchronizeFile falls back to Untitled Claude Session when all sources are
 });
 
 // ---------------------------------------------------------------------------
-// Priority: DB custom_name > JSONL title > history.jsonl
+// Priority: user-locked name > engine-generated title > existing name > fallback
 // ---------------------------------------------------------------------------
 
-test('synchronizeFile preserves existing DB custom_name regardless of JSONL and history.jsonl', { concurrency: false }, async () => {
-  const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-dbwins-'));
+test('synchronizeFile follows a newer ai-title for an unlocked session', { concurrency: false }, async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-follow-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tmp);
+
+  try {
+    const claudeHome = path.join(tmp, '.claude');
+    await mkdir(claudeHome, { recursive: true });
+    await writeFile(path.join(claudeHome, 'history.jsonl'), '', 'utf8');
+
+    await writeSessionJsonl(workspacePath, 'test-session-1.jsonl', [
+      JSON.stringify({ type: 'ai-title', aiTitle: 'JSONL ai title', sessionId: 'test-session-1', cwd: workspacePath }),
+      JSON.stringify({ type: 'last-prompt', lastPrompt: 'first prompt', sessionId: 'test-session-1', cwd: workspacePath }),
+    ]);
+
+    await withIsolatedDatabase(async () => {
+      // Pre-seed the DB with the name an earlier sync derived before Claude
+      // generated its own title. The row is unlocked, so the engine title wins.
+      sessionsDb.createSession('test-session-1', 'claude', workspacePath, 'Earlier synced name');
+
+      const synchronizer = new ClaudeSessionSynchronizer();
+      const result = await synchronizer.synchronizeFile(
+        path.join(workspacePath, 'test-session-1.jsonl'),
+      );
+
+      assert.ok(result);
+      const session = sessionsDb.getSessionById(result!);
+      assert.equal(session?.custom_name, 'JSONL ai title');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('synchronizeFile keeps a user-locked name over JSONL ai-title and history.jsonl', { concurrency: false }, async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-locked-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tmp);
 
@@ -2285,7 +2522,6 @@ test('synchronizeFile preserves existing DB custom_name regardless of JSONL and 
       'utf8',
     );
 
-    // Write session JSONL with competing ai-title.
     await writeSessionJsonl(workspacePath, 'test-session-1.jsonl', [
       JSON.stringify({ type: 'ai-title', aiTitle: 'JSONL ai title', sessionId: 'test-session-1', cwd: workspacePath }),
       JSON.stringify({ type: 'last-prompt', lastPrompt: 'first prompt', sessionId: 'test-session-1', cwd: workspacePath }),
@@ -2293,12 +2529,8 @@ test('synchronizeFile preserves existing DB custom_name regardless of JSONL and 
 
     await withIsolatedDatabase(async () => {
       // Pre-seed the DB with a custom_name set via CloudCLI sidebar rename.
-      sessionsDb.createSession(
-        'test-session-1',
-        'claude',
-        workspacePath,
-        'Sidebar custom name',
-      );
+      sessionsDb.createSession('test-session-1', 'claude', workspacePath, 'Sidebar custom name');
+      sessionsDb.updateSessionCustomName('test-session-1', 'Sidebar custom name', { lockName: true });
 
       const synchronizer = new ClaudeSessionSynchronizer();
       const result = await synchronizer.synchronizeFile(
@@ -2307,8 +2539,41 @@ test('synchronizeFile preserves existing DB custom_name regardless of JSONL and 
 
       assert.ok(result);
       const session = sessionsDb.getSessionById(result!);
-      // DB custom_name must win over JSONL ai-title AND history.jsonl display.
+      // The locked user rename must win over JSONL ai-title AND history.jsonl.
       assert.equal(session?.custom_name, 'Sidebar custom name');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('synchronizeFile does not drift an existing name to the rotating last-prompt', { concurrency: false }, async () => {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'claude-sync-drift-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tmp);
+
+  try {
+    const claudeHome = path.join(tmp, '.claude');
+    await mkdir(claudeHome, { recursive: true });
+    await writeFile(path.join(claudeHome, 'history.jsonl'), '', 'utf8');
+
+    // A transcript whose only title-ish event is last-prompt, which changes
+    // every turn — following it would rename the session on every message.
+    await writeSessionJsonl(workspacePath, 'test-session-1.jsonl', [
+      JSON.stringify({ type: 'last-prompt', lastPrompt: 'the newest prompt', sessionId: 'test-session-1', cwd: workspacePath }),
+    ]);
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession('test-session-1', 'claude', workspacePath, 'Stable earlier name');
+
+      const synchronizer = new ClaudeSessionSynchronizer();
+      const result = await synchronizer.synchronizeFile(
+        path.join(workspacePath, 'test-session-1.jsonl'),
+      );
+
+      assert.ok(result);
+      assert.equal(sessionsDb.getSessionById(result!)?.custom_name, 'Stable earlier name');
     });
   } finally {
     restoreHomeDir();

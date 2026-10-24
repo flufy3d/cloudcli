@@ -499,6 +499,34 @@ const addScheduledJobRotateAfterDaysColumn = (db: Database): void => {
   addColumnToTableIfNotExists(db, 'scheduled_jobs', columnNames, 'rotate_after_days', 'INTEGER');
 };
 
+/**
+ * Adds the worktree columns that record where a session actually runs when an
+ * engine rebound it into a git worktree of its owning project.
+ *
+ * Existing rows stay NULL — correct by default, since only sessions whose
+ * synchronizer resolves a worktree placement ever write these columns, and
+ * each synchronizer scan refreshes them from engine state.
+ */
+const addSessionWorktreeColumns = (db: Database): void => {
+  const sessionsTableInfo = getTableInfo(db, 'sessions');
+  const columnNames = sessionsTableInfo.map((column) => column.name);
+
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'worktree_path', 'TEXT');
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'worktree_branch', 'TEXT');
+};
+
+/**
+ * Adds the `name_locked` flag that marks sessions the user renamed in the app.
+ *
+ * Existing rows default to 0 (follow the engine) on purpose: names synced from
+ * engine storage before this column existed were engine-derived, and pre-existing
+ * first-sentence names should still be able to grow into engine titles.
+ */
+const addSessionNameLockedColumn = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'name_locked', 'INTEGER DEFAULT 0');
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -598,6 +626,8 @@ export const runMigrations = (db: Database) => {
     addSessionEffortColumn(db);
     addSessionContextWindowColumn(db);
     addForkedFromSessionIdColumn(db);
+    addSessionWorktreeColumns(db);
+    addSessionNameLockedColumn(db);
     ensureProjectsForSessionPaths(db);
     db.exec(SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL);
     db.exec(SCHEDULED_JOBS_TABLE_SCHEMA_SQL);

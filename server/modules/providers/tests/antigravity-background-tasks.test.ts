@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { extractAntigravityBackgroundTasks } from '@/modules/providers/list/antigravity/antigravity-runtime.provider.js';
+import { extractAntigravitySubagents } from '@/modules/providers/list/antigravity/antigravity-subagent.js';
 
 // Step shapes below are verbatim agy 1.3.1 `--output-format stream-json`
 // output. The live stream names a subagent only once its invocation step is
@@ -20,23 +20,22 @@ const subagentStep = (state: string, conversationIds: Array<string | undefined>)
   },
 });
 
-test('a finished invoke_subagent step yields one card per created subagent', () => {
-  const tasks = extractAntigravityBackgroundTasks(subagentStep('DONE', ['sub-1', 'sub-2']));
-  assert.deepEqual(tasks.map((task) => [task.id, task.toolName, task.command]), [
-    ['sub-1', 'Subagent', 'Product Reviewer'],
-    ['sub-2', 'Subagent', 'Test Runner'],
+test('a finished invoke_subagent step yields one agent per created subagent, named by call and conversation', () => {
+  const agents = extractAntigravitySubagents(subagentStep('DONE', ['sub-1', 'sub-2']));
+  assert.deepEqual(agents.map((agent) => [agent.conversationId, agent.toolUseId, agent.role]), [
+    ['sub-1', 'tool_2:sub-1', 'Product Reviewer'],
+    ['sub-2', 'tool_2:sub-2', 'Test Runner'],
   ]);
-  assert.ok(tasks.every((task) => typeof task.startedAt === 'number'));
 });
 
-test('steps that do not name a running subagent yield no card', () => {
-  assert.deepEqual(extractAntigravityBackgroundTasks(subagentStep('ACTIVE', [undefined])), []);
-  assert.deepEqual(extractAntigravityBackgroundTasks({
+test('steps that do not name a running subagent yield no agent', () => {
+  assert.deepEqual(extractAntigravitySubagents(subagentStep('ACTIVE', [undefined])), []);
+  assert.deepEqual(extractAntigravitySubagents({
     step_type: 'tool', tool_name: 'run_command', state: 'ACTIVE',
     tool_info: { name: 'run_command', parameters: { CommandLine: 'sleep 25' } },
   }), []);
-  assert.deepEqual(extractAntigravityBackgroundTasks({ step_type: 'system_message', state: 'DONE' }), []);
-  assert.deepEqual(extractAntigravityBackgroundTasks({ step_type: 'subagent', state: 'DONE', subagent_info: { subagents: [null, 'x'] } }), []);
+  assert.deepEqual(extractAntigravitySubagents({ step_type: 'system_message', state: 'DONE' }), []);
+  assert.deepEqual(extractAntigravitySubagents({ step_type: 'subagent', state: 'DONE', subagent_info: { subagents: [null, 'x'] } }), []);
 });
 
 // The runtime resolves the agy path once per process, so every run in this
@@ -60,6 +59,7 @@ setInterval(() => {}, 1000);
 (async () => {
   for (const event of events) {
     if (typeof event === 'number') await new Promise((r) => setTimeout(r, event));
+    else if (event.__exit !== undefined) process.exit(event.__exit);
     else console.log(JSON.stringify(event));
   }
 })();
@@ -126,7 +126,7 @@ test('a subagent card shows while the turn waits and clears before the turn comp
   ], async () => {
     const { runtime, sent, done, waitForCard } = await createRun('conv-sub');
     await waitForCard();
-    assert.deepEqual(runtime.backgroundTasks.list('conv-sub').map((task) => [task.id, task.command]), [['subagent-999', 'Product Reviewer']]);
+    assert.deepEqual(runtime.backgroundTasks.list('conv-sub').map((task) => [task.id, task.command]), [['tool_2:subagent-999', 'Product Reviewer']]);
     assert.equal(sent.some((msg) => msg.kind === 'complete'), false, 'agy holds its result while the subagent runs');
 
     await done;
@@ -144,15 +144,13 @@ test('abort clears subagent cards and stops the process', async () => {
     { event: 'init', conversation_id: 'conv-abort', init: { cwd: '/tmp' } },
     step({ ...subagentStep('DONE', ['subagent-abort-1']), conversation_id: 'conv-abort' }),
   ], async () => {
-    const { runtime, sent, done, waitForCard } = await createRun('conv-abort');
+    const { runtime, done, waitForCard } = await createRun('conv-abort');
     await waitForCard();
     assert.equal(runtime.backgroundTasks.list('conv-abort').length, 1);
     assert.equal(await runtime.abort('conv-abort'), true);
-    assert.equal(runtime.backgroundTasks.list('conv-abort').length, 0);
+    // The process exit settles the cards and empties the list.
     assert.equal((await done as any).aborted, true);
-    // The strip only clears on a frame; without one it stayed until a reload.
-    const statuses = sent.filter((msg) => msg.kind === 'status' && msg.text === 'background_tasks');
-    assert.deepEqual(statuses.map((msg) => msg.backgroundTasks.length), [1, 0]);
+    assert.equal(runtime.backgroundTasks.list('conv-abort').length, 0);
   }, false);
 });
 
@@ -172,4 +170,194 @@ test('an interrupted-stream result keeps the subagent cards of the resumed turn'
     await done;
     assert.deepEqual(runtime.backgroundTasks.list('conv-resume'), []);
   });
+});
+
+/** Gives each conversation a transcript of its own, ending as `ending` says, under a temp data dir. */
+async function withChildTranscripts<T>(endings: Record<string, 'normal' | 'error'>, run: () => Promise<T>): Promise<T> {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-children-'));
+  for (const [id, ending] of Object.entries(endings)) {
+    const logs = path.join(root, 'brain', id, '.system_generated', 'logs');
+    await fs.mkdir(logs, { recursive: true });
+    const last = ending === 'normal'
+      ? { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Done.' }
+      : { step_index: 1, source: 'SYSTEM', type: 'ERROR_MESSAGE', status: 'DONE', error: 'API error' };
+    await fs.writeFile(path.join(logs, 'transcript.jsonl'), [{ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'go' }, last].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  }
+  const previous = process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+  process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = root;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+    else process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = previous;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+const agentCards = (sent: any[]) => sent.filter((msg) => msg.kind === 'tool_use' && msg.toolName === 'Agent');
+const taskStatuses = (sent: any[]) => sent.filter((msg) => msg.kind === 'task_status');
+
+test('at the turn result each agent settles by how its own transcript ended: finished is completed, errored is failed', async () => {
+  await withChildTranscripts({ 'sub-1': 'normal', 'sub-2': 'error' }, () => withStub([
+    { event: 'init', conversation_id: 'conv-two', init: { cwd: '/tmp' } },
+    step({ ...subagentStep('DONE', ['sub-1', 'sub-2']), conversation_id: 'conv-two' }),
+    step({ conversation_id: 'conv-two', step_index: 3, state: 'DONE', step_type: 'agent_response', text_delta: 'Waiting\n' }),
+    300,
+    { event: 'result', result: { conversation_id: 'conv-two', status: 'SUCCESS', usage: { total_tokens: 5 } } },
+  ], async () => {
+    const { sent, done, waitForCard } = await createRun('conv-two');
+    await waitForCard();
+
+    const cards = agentCards(sent);
+    assert.deepEqual(cards.map((card) => card.toolId), ['tool_2:sub-1', 'tool_2:sub-2']);
+    assert.deepEqual(cards.map((card) => card.toolInput.subagent_type), ['Product Reviewer', 'Test Runner']);
+    assert.deepEqual(taskStatuses(sent).map((msg) => [msg.event, msg.toolUseId, msg.taskId]), [
+      ['started', 'tool_2:sub-1', 'sub-1'],
+      ['started', 'tool_2:sub-2', 'sub-2'],
+    ]);
+
+    await done;
+    const settled = taskStatuses(sent).filter((msg) => msg.event === 'notification');
+    assert.deepEqual(settled.map((msg) => [msg.toolUseId, msg.status]), [
+      ['tool_2:sub-1', 'completed'],
+      ['tool_2:sub-2', 'failed'],
+    ]);
+    const completeAt = sent.findIndex((msg) => msg.kind === 'complete');
+    assert.ok(sent.indexOf(settled[1]) < completeAt, 'both cards settle before the turn completes');
+  }));
+});
+
+test('agents still outstanding when the engine process dies are settled as stopped', async () => {
+  await withStub([
+    { event: 'init', conversation_id: 'conv-crash', init: { cwd: '/tmp' } },
+    step({ ...subagentStep('DONE', ['sub-crash']), conversation_id: 'conv-crash' }),
+    100,
+    { __exit: 1 },
+  ], async () => {
+    const { runtime, sent, done } = await createRun('conv-crash');
+    await assert.rejects(done);
+
+    const settled = taskStatuses(sent).filter((msg) => msg.event === 'notification');
+    assert.deepEqual(settled.map((msg) => [msg.toolUseId, msg.status]), [['tool_2:sub-crash', 'stopped']]);
+    assert.deepEqual(runtime.backgroundTasks.list('conv-crash'), []);
+  });
+});
+
+test('an abort settles the outstanding agents as stopped', async () => {
+  await withStub([
+    { event: 'init', conversation_id: 'conv-abort-2', init: { cwd: '/tmp' } },
+    step({ ...subagentStep('DONE', ['sub-a']), conversation_id: 'conv-abort-2' }),
+  ], async () => {
+    const { runtime, sent, done, waitForCard } = await createRun('conv-abort-2');
+    await waitForCard();
+    await runtime.abort('conv-abort-2');
+    await done;
+
+    const settled = taskStatuses(sent).filter((msg) => msg.event === 'notification');
+    assert.deepEqual(settled.map((msg) => msg.status), ['stopped']);
+  }, false);
+});
+
+test('an aborted run leaves no session-key aliases behind', async () => {
+  const { getAntigravityBackgroundKeyAliasCount } = await import('@/modules/providers/list/antigravity/antigravity-runtime.provider.js');
+  const before = getAntigravityBackgroundKeyAliasCount();
+  await withStub([
+    { event: 'init', conversation_id: 'conv-alias', init: { cwd: '/tmp' } },
+    step({ ...subagentStep('DONE', ['sub-alias']), conversation_id: 'conv-alias' }),
+  ], async () => {
+    const { runtime, done, waitForCard } = await createRun('conv-alias');
+    await waitForCard();
+    await runtime.abort('conv-alias');
+    await done;
+    assert.equal(getAntigravityBackgroundKeyAliasCount(), before);
+  }, false);
+});
+
+test('while an agent works, its own steps stream into its card and stop when it settles', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-live-'));
+  const logs = path.join(root, 'brain', 'sub-live', '.system_generated', 'logs');
+  await fs.mkdir(logs, { recursive: true });
+  const rows = [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\ngo\n</USER_REQUEST>' },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/a.ts' } }] },
+    { step_index: 2, source: 'MODEL', type: 'VIEW_FILE', status: 'DONE', content: 'Created At: x\nCompleted At: y\nFile Path: `/tmp/a.ts`\n1: body' },
+    { step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Read it.' },
+  ];
+  await fs.writeFile(path.join(logs, 'transcript.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const previous = process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+  process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = root;
+  try {
+    await withStub([
+      { event: 'init', conversation_id: 'conv-live', init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', ['sub-live']), conversation_id: 'conv-live' }),
+      2500,
+      { event: 'result', result: { conversation_id: 'conv-live', status: 'SUCCESS', usage: { total_tokens: 1 } } },
+    ], async () => {
+      const { sent, done, waitForCard } = await createRun('conv-live');
+      await waitForCard();
+      const deadline = Date.now() + 2000;
+      while (!sent.some((msg) => msg.parentToolUseId === 'tool_2:sub-live' && msg.kind === 'text') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const steps = sent.filter((msg) => msg.parentToolUseId === 'tool_2:sub-live');
+      assert.deepEqual(steps.map((msg) => [msg.kind, msg.toolName ?? msg.content]), [['tool_use', 'view_file'], ['text', 'Read it.']]);
+      assert.match(steps[0].toolResult?.content ?? '', /body/);
+      await done;
+      const countAtEnd = sent.length;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(sent.length, countAtEnd, 'nothing is sent for the agent once it settled');
+    });
+  } finally {
+    if (previous === undefined) delete process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+    else process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = previous;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an agent\'s last steps arrive before its card settles and before the turn completes', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-order-'));
+  const logs = path.join(root, 'brain', 'sub-order', '.system_generated', 'logs');
+  await fs.mkdir(logs, { recursive: true });
+  const file = path.join(logs, 'transcript.jsonl');
+  const head = [{ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: 'go' }];
+  const write = (rows: unknown[]) => fs.writeFile(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const previous = process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+  process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = root;
+  try {
+    await withStub([
+      { event: 'init', conversation_id: 'conv-order', init: { cwd: '/tmp' } },
+      step({ ...subagentStep('DONE', ['sub-order']), conversation_id: 'conv-order' }),
+      700,
+      { event: 'result', result: { conversation_id: 'conv-order', status: 'SUCCESS', usage: { total_tokens: 1 } } },
+    ], async () => {
+      const { sent, done, waitForCard } = await createRun('conv-order');
+      await waitForCard();
+      // The transcript appears only now, a moment before the turn result: there
+      // was nothing to watch yet and the next poll is seconds away, so only the
+      // final read at settle can find these steps.
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      await write([...head, { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Last words.' }]);
+      await done;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const lastWords = sent.findIndex((msg) => msg.parentToolUseId === 'tool_2:sub-order' && msg.content === 'Last words.');
+      const settled = sent.findIndex((msg) => msg.kind === 'task_status' && msg.event === 'notification');
+      const complete = sent.findIndex((msg) => msg.kind === 'complete');
+      assert.ok(lastWords >= 0, 'the final step reaches the page');
+      assert.ok(lastWords < settled && settled < complete, 'final step, then settle, then complete');
+    });
+  } finally {
+    if (previous === undefined) delete process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR;
+    else process.env.CLOUDCLI_ANTIGRAVITY_DATA_DIR = previous;
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

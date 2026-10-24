@@ -15,6 +15,14 @@ export { providerTokenUsageService } from './services/provider-token-usage.servi
 export { executeCodexSandboxCommand } from './list/codex/codex-runtime.provider.js';
 export { listCodexThreadTurns } from './list/codex/codex-app-server.client.js';
 
+// closeCodexResidentSessions: used by the server entrypoint to stop the
+// Codex processes that stay alive between rounds.
+export { closeCodexResidentSessions } from './list/codex/codex-session-manager.js';
+
+// closeClaudeResidentSessions: used by the server entrypoint to stop the
+// Claude processes kept alive between turns or for background work.
+export { closeClaudeResidentSessions } from './list/claude/claude-runtime.provider.js';
+
 export { initializeSessionsWatcher } from './services/sessions-watcher.service.js';
 export { closeSessionsWatcher } from './services/sessions-watcher.service.js';
 
@@ -48,6 +56,11 @@ export { getClaudeExternalReadOnlyRoots } from './list/claude/claude-data-root.j
 // read-only allowlist for workspace-external ZCode files (memories, skills,
 // AGENTS.md) referenced from chat.
 export { getZcodeExternalReadOnlyRoots } from './list/zcode/index.js';
+
+// setSessionWorktreeHomeResolver: used by the server entrypoint to wire the
+// Worktrees module's git resolver into the session worktree placement policy
+// (injected rather than statically imported to keep the module graph acyclic).
+export { setSessionWorktreeHomeResolver } from './shared/sessions/session-worktree-placement.js';
 
 export type {
   AntigravityQuotaData,

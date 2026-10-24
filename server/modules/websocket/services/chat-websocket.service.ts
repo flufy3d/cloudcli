@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 
 import type { WebSocket } from 'ws';
 
+import { isValidReplaySeq, isValidStreamEpoch } from '../../../../shared/protocol/frameNarrowing.js';
+
 import { sessionsDb } from '@/modules/database/index.js';
 import { providerModelsService, sessionsService } from '@/modules/providers/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
@@ -88,6 +90,8 @@ export type ProviderRuntimeGateway = {
   stopBackgroundTask(provider: LLMProvider, sessionId: string, taskId: string): Promise<boolean>;
   /** Whether a provider runtime still holds background work for the session after its turn ended. */
   hasBackgroundWork(sessionId: string): boolean;
+  /** Full provider activity, including resident initialization, reports and approvals. */
+  hasSessionWork?(sessionId: string): boolean;
   /** Narrower than `hasBackgroundWork`: only work whose end the runtime broadcasts, including the reply after it. */
   isBackgroundWorkPending(sessionId: string): boolean;
   /** Wider than `hasBackgroundWork`: also while the composer strip still lists a task, whose clearing frame the run's writer carries. */
@@ -102,6 +106,10 @@ export type ProviderRuntimeGateway = {
    */
   reconcilePendingInteractions?(sessionId: string): void;
   getBackgroundTasksForSession?(sessionId: string): ActiveBackgroundTask[];
+  /** False when the session's background work is held by a runtime that can no longer stop it. */
+  canInterruptBackgroundWork?(sessionId: string): boolean;
+  /** False when the provider takes a new turn alongside the session's background work. */
+  backgroundWorkQueuesInput?(provider: LLMProvider, sessionId: string): boolean;
 };
 
 type ChatWebSocketDependencies = {
@@ -127,6 +135,12 @@ function readClientRuntimeOptions(value: unknown): AnyRecord {
   return Object.fromEntries(
     Object.entries(value).filter(([key]) => !CLIENT_RESERVED_RUNTIME_OPTIONS.has(key)),
   );
+}
+
+/** The session title the client put in its send options, if any. */
+function readSessionSummary(options: unknown): string | null {
+  const summary = options && typeof options === 'object' ? (options as AnyRecord).sessionSummary : undefined;
+  return typeof summary === 'string' && summary.trim() ? summary.trim() : null;
 }
 
 /**
@@ -377,6 +391,9 @@ function buildRuntimeOptions(
     sessionId,
     cwd: clientOptions.cwd ?? session.project_path ?? undefined,
     projectPath: session.project_path ?? clientOptions.projectPath,
+    // The conversation's later turns come through here too, so a runtime may
+    // keep its engine process alive for them (Claude's idle residency).
+    residentBetweenTurns: true,
   };
 }
 
@@ -452,6 +469,8 @@ async function dispatchRun(
     providerSessionId: session.provider_session_id,
     connection: ws,
     userId,
+    // The composer sends the title it shows; a stored name is the fallback.
+    sessionName: readSessionSummary(data.options) ?? session.custom_name,
   });
 
   if (!run) {
@@ -553,6 +572,9 @@ async function dispatchRun(
 
   const outcome = readObjectRecord(runtimeOutcome);
   const terminalStatus = outcome?.terminalStatus;
+  if (extraRuntimeOptions.taskContinuation && outcome?.busy === true && !outcome.engineTurnId) {
+    return { started: false, busy: true, error: 'The engine is busy; the tool result has not been submitted.' };
+  }
   return {
     started: true,
     error: failure,
@@ -769,6 +791,15 @@ async function handleChatStopTask(
   }
 }
 
+/** Whether the session's provider holds a new message back while background work runs; true when unknown. */
+function readBackgroundWorkQueuesInput(sessionId: string, dependencies: ChatWebSocketDependencies): boolean {
+  const provider = sessionsDb.getSessionById(sessionId)?.provider;
+  if (!provider || !dependencies.runtime.backgroundWorkQueuesInput) {
+    return true;
+  }
+  return dependencies.runtime.backgroundWorkQueuesInput(provider as LLMProvider, sessionId);
+}
+
 /**
  * Handles `chat.subscribe`: for each requested session, reports whether a run
  * is processing, re-attaches the live stream to this socket, replays missed
@@ -797,9 +828,13 @@ function handleChatSubscribe(
     }
 
     const lastSeqRaw = (target as AnyRecord).lastSeq;
-    const lastSeq = typeof lastSeqRaw === 'number' && Number.isFinite(lastSeqRaw)
-      ? Math.max(0, Math.floor(lastSeqRaw))
-      : 0;
+    const epoch = (target as AnyRecord).streamEpoch;
+    if ((lastSeqRaw !== undefined && !isValidReplaySeq(lastSeqRaw, true))
+      || ('streamEpoch' in target && !isValidStreamEpoch(epoch))) {
+      sendProtocolError(ws, 'INVALID_SUBSCRIPTION', 'Invalid replay cursor.', sessionId);
+      continue;
+    }
+    const lastSeq = lastSeqRaw ?? 0;
 
     const isProcessing = chatRunRegistry.isProcessing(sessionId);
 
@@ -809,13 +844,13 @@ function handleChatSubscribe(
     // keeps producing events through the same writer (task progress, the
     // turn the CLI pushes when a task reports), so a tab opened during that
     // work attaches too; the registry keeps the run while the work lasts.
-    // The strip's own list counts as well: it can outlive the task tracker,
-    // and a socket left off the writer never hears the frame that clears it.
-    const hasLiveBackgroundState = dependencies.runtime.hasLiveBackgroundState?.(sessionId)
-      ?? dependencies.runtime.hasBackgroundWork(sessionId);
-    if (isProcessing || hasLiveBackgroundState) {
-      chatRunRegistry.attachConnection(sessionId, ws);
-    }
+    // The socket joins the session's audience whenever there is one: a
+    // resident engine can report after its run is over, and that report
+    // travels on the session's channel. The run itself only keeps the socket
+    // while it is running or while its session still has background work.
+    chatRunRegistry.attachConnection(sessionId, ws, {
+      includeRun: isProcessing || dependencies.runtime.hasBackgroundWork(sessionId),
+    });
 
     // Remembered even while idle: an engine-initiated run that starts later
     // (opencode resuming the session on its own) attaches this socket through
@@ -840,17 +875,23 @@ function handleChatSubscribe(
     // `lastSeq` is the session's authoritative watermark (clients realign to
     // it); `stale` tells the client its `lastSeq` predates the replay buffer
     // and it must refresh history over REST instead of trusting the replay.
-    const replay = chatRunRegistry.replayEvents(sessionId, lastSeq);
+    let replay = chatRunRegistry.replayEvents(sessionId, lastSeq);
+    const changedEpoch = epoch !== undefined && epoch !== replay.streamEpoch;
+    if (changedEpoch) replay = chatRunRegistry.replayEvents(sessionId, 0);
 
     sendJson(ws, {
       kind: 'chat_subscribed',
       sessionId,
       isProcessing,
       lastSeq: replay.lastSeq,
-      stale: replay.stale,
+      streamEpoch: replay.streamEpoch,
+      replayFromSeq: isProcessing ? replay.replayFromSeq : replay.lastSeq + 1,
+      stale: changedEpoch || replay.stale || (!isProcessing && lastSeq < replay.lastSeq),
       pendingPermissions,
       backgroundTasks,
       backgroundWorkPending: dependencies.runtime.isBackgroundWorkPending(sessionId),
+      backgroundCanInterrupt: dependencies.runtime.canInterruptBackgroundWork?.(sessionId) ?? true,
+      backgroundWorkQueuesInput: readBackgroundWorkQueuesInput(sessionId, dependencies),
       timestamp: new Date().toISOString(),
     });
 
@@ -961,6 +1002,10 @@ export async function runDetachedChatTurn(
   const provider = session.provider as LLMProvider;
   if (!dependencies.runtime.hasRuntime(provider)) {
     return { started: false, error: `Provider "${provider}" is not available.` };
+  }
+
+  if (input.taskContinuation && dependencies.runtime.hasSessionWork?.(input.sessionId)) {
+    return { started: false, busy: true, error: 'The conversation still has engine work; task delivery will wait.' };
   }
 
   const activeRun = chatRunRegistry.getRun(input.sessionId);

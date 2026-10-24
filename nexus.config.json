@@ -1,0 +1,15 @@
+{
+  "worktree": {
+    "dir": ".worktrees",
+    "base": "main",
+    "portBase": 3001,
+    "portStep": 10,
+    "share": [],
+    "disposable": [".husky/_", "dist-server", "dist-server.next", "dist-server.old", "release", ".desktop-build"],
+    "postCreate": [["npm", "ci", "--include=dev"]],
+    "postMerge": [
+      ["npm", "ci", "--include=dev"],
+      ["npm", "run", "build"]
+    ]
+  }
+}

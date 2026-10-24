@@ -15,6 +15,8 @@ import type { IProviderSessionSynchronizer } from '@/shared/interfaces.js';
 import type { ProviderSessionWatchTarget } from '@/shared/types.js';
 
 import { admitsWorkspacePath } from '../../shared/sessions/workspace-admission.js';
+import { applySessionWorktreePlacement } from '../../shared/sessions/session-worktree-placement.js';
+import { resolveSessionTitle } from '../../shared/sessions/session-title-resolution.js';
 
 type ParsedSession = {
   sessionId: string;
@@ -70,14 +72,16 @@ export class CursorSessionSynchronizer implements IProviderSessionSynchronizer {
       }
 
       const timestamps = await readFileTimestamps(filePath);
+      const placement = await applySessionWorktreePlacement(parsed.projectPath);
       sessionsDb.createSession(
         parsed.sessionId,
         this.provider,
-        parsed.projectPath,
+        placement.projectPath,
         parsed.sessionName,
         timestamps.createdAt,
         timestamps.updatedAt,
-        filePath
+        filePath,
+        placement.worktree
       );
       processed += 1;
     }
@@ -99,14 +103,16 @@ export class CursorSessionSynchronizer implements IProviderSessionSynchronizer {
     }
 
     const timestamps = await readFileTimestamps(filePath);
+    const placement = await applySessionWorktreePlacement(parsed.projectPath);
     return sessionsDb.createSession(
       parsed.sessionId,
       this.provider,
-      parsed.projectPath,
+      placement.projectPath,
       parsed.sessionName,
       timestamps.createdAt,
       timestamps.updatedAt,
-      filePath
+      filePath,
+      placement.worktree
     );
   }
 
@@ -168,10 +174,21 @@ export class CursorSessionSynchronizer implements IProviderSessionSynchronizer {
         .trim()
         .split('\n')[0];
 
+      // Cursor generates no title of its own: the first line is a placeholder
+      // that fills a nameless row and never overwrites a synced or locked name.
+      const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId)
+        ?? sessionsDb.getSessionById(sessionId);
+      const resolvedName = resolveSessionTitle({
+        nameLocked: existingSession?.name_locked === 1,
+        existingName: existingSession?.custom_name,
+        fallbackTitle: 'Untitled Cursor Session',
+        derived: { name: firstLine || null, generated: false },
+      });
+
       return {
         sessionId,
         projectPath,
-        sessionName: normalizeSessionName(firstLine, 'Untitled Cursor Session'),
+        sessionName: normalizeSessionName(resolvedName ?? undefined, 'Untitled Cursor Session'),
       };
     });
   }

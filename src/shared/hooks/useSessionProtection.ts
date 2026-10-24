@@ -23,6 +23,8 @@ const sessionActivitiesMatch = (left: SessionActivity, right: SessionActivity): 
   && left.canInterrupt === right.canInterrupt
   && left.startedAt === right.startedAt
   && Boolean(left.background) === Boolean(right.background)
+  && Boolean(left.queued) === Boolean(right.queued)
+  && Boolean(left.reporting) === Boolean(right.reporting)
   && backgroundTasksKey(left.tasks) === backgroundTasksKey(right.tasks);
 
 const sessionActivityMapsMatch = (
@@ -70,6 +72,14 @@ export function useSessionProtection() {
 
     setProcessingSessions((prev) => {
       const existing = prev.get(sessionId);
+      if (activity?.awaitingApproval) {
+        if (existing) {
+          return prev;
+        }
+        const updated = new Map(prev);
+        updated.set(sessionId, { statusText: null, canInterrupt: false, startedAt: Date.now(), background: true });
+        return updated;
+      }
       // A new turn on a session that was only doing background work starts
       // its own clock: the stale idle-ack guard compares against it, and the
       // tasks' start is not when this response began.
@@ -84,12 +94,24 @@ export function useSessionProtection() {
         // The tasks keep running under the new turn; they are reported again
         // when it ends.
         ...(existing?.tasks ? { tasks: existing.tasks } : {}),
+        // A status frame that says nothing about the engine's queue state
+        // must not clear it.
+        ...(activity?.queued !== undefined
+          ? { queued: activity.queued }
+          : continuing?.queued ? { queued: true } : {}),
+        ...(activity?.reporting !== undefined
+          ? { reporting: activity.reporting }
+          : continuing?.reporting ? { reporting: true } : {}),
       };
 
       if (
         continuing
         && continuing.statusText === next.statusText
         && continuing.canInterrupt === next.canInterrupt
+        // The engine's state is part of the activity: a frame that only says
+        // "the round started" must still land.
+        && Boolean(continuing.queued) === Boolean(next.queued)
+        && Boolean(continuing.reporting) === Boolean(next.reporting)
       ) {
         return prev;
       }
@@ -197,6 +219,10 @@ export function useSessionProtection() {
           startedAt: snapshotStartedAt ?? existing?.startedAt ?? now,
           ...(snapshot.background ? { background: true } : {}),
           ...(snapshot.tasks ? { tasks: snapshot.tasks } : {}),
+          // The engine's own state only changes when the server says so, so a
+          // poll that does not mention it keeps the last known value.
+          ...(snapshot.queued !== undefined ? { queued: snapshot.queued } : existing?.queued ? { queued: true } : {}),
+          ...(snapshot.reporting !== undefined ? { reporting: snapshot.reporting } : existing?.reporting ? { reporting: true } : {}),
         });
       }
 

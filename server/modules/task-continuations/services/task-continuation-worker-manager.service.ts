@@ -109,6 +109,38 @@ async function finishResultFile(taskId: string, taskToken: string, taskDirectory
 /**
  * Registers and starts one task from an active trusted Codex run. The request identity makes MCP retries return the same task instead of executing its command twice.
  */
+/**
+ * Registers an asynchronous task for a trusted run.
+ *
+ * A run reaches the host through two entries: the per-round capability and
+ * the narrow bridge a resident process carries. Both go through this one
+ * function, so the validation and the registration cannot drift apart.
+ */
+export async function handleTaskRegisterForRun(input: {
+  context: TaskRunCapabilityContext;
+  capabilityToken: string;
+  requestId: string;
+  title: string;
+  command: string[];
+  autoNotify: boolean;
+}): Promise<{ taskId: string; title: string; status: TaskRunReceiptStatus; duplicate: boolean }> {
+  if (!input.title || input.title.length > 200) {
+    throw new AppError('Task title is invalid.', { code: 'INVALID_TASK_REGISTRATION', statusCode: 400 });
+  }
+  if (!input.requestId || input.requestId.length > 256) {
+    throw new AppError('Task registration requires a request id.', {
+      code: 'INVALID_TASK_REGISTRATION',
+      statusCode: 400,
+    });
+  }
+  if (input.command.length < 1 || input.command.length > 129
+    || input.command.some((argument) => typeof argument !== 'string' || argument.length > 4096 || argument.includes('\0'))
+    || typeof input.command[0] !== 'string' || !input.command[0].trim()) {
+    throw new AppError('Task command is invalid.', { code: 'INVALID_TASK_REGISTRATION', statusCode: 400 });
+  }
+  return registerAndStartTaskFromRun(input);
+}
+
 export async function registerAndStartTaskFromRun(input: {
   context: TaskRunCapabilityContext;
   capabilityToken: string;

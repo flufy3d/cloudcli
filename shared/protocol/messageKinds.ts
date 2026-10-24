@@ -125,6 +125,18 @@ export type MessageFieldsByKind = {
     tokenBudget?: unknown;
     backgroundTasks?: ActiveBackgroundTask[];
     backgroundWorkPending?: boolean;
+    /**
+     * False when a message sent during the background work does not disturb it
+     * (Claude takes it as a turn of the held process), so the page sends it at
+     * once. Omitted means the message waits for the work.
+     */
+    backgroundWorkQueuesInput?: boolean;
+    /**
+     * What the engine is doing with the round: `queued` means the engine holds
+     * it and has not started its turn, `reporting` means the engine runs a
+     * turn of its own, which is why it waits.
+     */
+    activityState?: { queued?: boolean; reporting?: boolean };
   };
   permission_request: {
     requestId?: string;

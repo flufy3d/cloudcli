@@ -34,7 +34,7 @@ const hasErrorCode = (error: unknown, code: string): boolean => (
 
 /**
  * The macOS login keychain item Claude Code stores its account credential in.
- * The account attribute is left as `unknown`, so only the service is matched.
+ * Account attributes differ across installations, so the presence probe matches only the service.
  */
 const CLAUDE_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
@@ -156,7 +156,7 @@ export class ClaudeProviderAuth implements IProviderAuth {
       // billed pay-as-you-go to the key (issue #568). Surface the bypassed
       // login so the settings page can warn about it; an expired or missing
       // login is not being bypassed, so it stays silent.
-      const subscription = await this.readCredentialsFile();
+      const subscription = await this.readSubscriptionStatus();
       if (subscription.authenticated) {
         status.subscriptionOverride = {
           variable: apiKey.variable,
@@ -176,7 +176,30 @@ export class ClaudeProviderAuth implements IProviderAuth {
       return { authenticated: true, email: 'OAuth Token (long-lived)', method: 'environment' };
     }
 
-    return this.readCredentialsFile();
+    return this.readSubscriptionStatus();
+  }
+
+  /** Adds the local account label to a detected subscription; metadata never proves authentication. */
+  private async readSubscriptionStatus(): Promise<ClaudeCredentialsStatus> {
+    const status = await this.readCredentialsFile();
+    if (!status.authenticated || status.email) {
+      return status;
+    }
+
+    try {
+      const content = await readFile(path.join(os.homedir(), '.claude.json'), 'utf8');
+      const config = readObjectRecord(JSON.parse(content));
+      const account = readObjectRecord(config?.oauthAccount);
+      return { ...status, email: readOptionalString(account?.emailAddress) ?? null };
+    } catch (error) {
+      if (!hasErrorCode(error, 'ENOENT')) {
+        // Do not log file contents or parse-error excerpts: the config may contain secrets.
+        console.warn('Unable to read Claude account metadata', {
+          reason: error instanceof SyntaxError ? 'invalid_json' : 'read_failed',
+        });
+      }
+      return status;
+    }
   }
 
   /**
@@ -264,9 +287,9 @@ export class ClaudeProviderAuth implements IProviderAuth {
    * every macOS login while chats kept working, because the chat path
    * authenticates through the CLI/SDK instead of this detection chain.
    *
-   * The keychain item is opaque on purpose: reading the secret would raise an
-   * authorization dialog, and its account attribute is `unknown`, so email
-   * stays null.
+   * The keychain item is opaque on purpose: reading the secret may raise an
+   * authorization dialog. readSubscriptionStatus adds an optional display email
+   * from the local account metadata without opening the keychain secret.
    */
   private keychainFallback(fileVerdict: ClaudeCredentialsStatus): ClaudeCredentialsStatus {
     if (this.hasKeychainCredentials()) {

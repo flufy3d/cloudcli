@@ -7,6 +7,7 @@ import test from 'node:test';
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { CodexSessionSynchronizer } from '@/modules/providers/list/codex/codex-session-synchronizer.provider.js';
 import { AppError } from '@/shared/utils.js';
+import { codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
 import { readCodexProposedPlan } from '@/modules/providers/list/codex/codex-thread-items.js';
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
@@ -147,6 +148,99 @@ test('Codex synchronizer leaves indexed sessions untitled when no name is availa
       await synchronizer.synchronize();
 
       assert.equal(sessionsDb.getSessionById('codex-indexed-1')?.custom_name, 'Untitled Codex Session');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex synchronizer follows the engine rename recorded last in session_index.jsonl', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-rename-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeCodexTranscript(tempRoot, 'codex-rename-1', workspacePath);
+    // Codex appends one record when the thread is created and another when its
+    // AI title lands seconds later; the last record is the current name.
+    const codexHome = path.join(tempRoot, '.codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      path.join(codexHome, 'session_index.jsonl'),
+      [
+        JSON.stringify({ id: 'codex-rename-1', thread_name: 'hello', updated_at: '2026-07-07T10:00:00Z' }),
+        JSON.stringify({ id: 'codex-rename-1', thread_name: '真正的智能标题', updated_at: '2026-07-07T10:00:04Z' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      const synchronizer = new CodexSessionSynchronizer();
+      await synchronizer.synchronize();
+
+      assert.equal(sessionsDb.getSessionById('codex-rename-1')?.custom_name, '真正的智能标题');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex synchronizer replaces an earlier synced name with the engine thread name', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-follow-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeCodexTranscript(tempRoot, 'codex-follow-1', workspacePath);
+    const codexHome = path.join(tempRoot, '.codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      path.join(codexHome, 'session_index.jsonl'),
+      JSON.stringify({ id: 'codex-follow-1', thread_name: 'Codex generated name', updated_at: '2026-07-07T10:00:00Z' }) + '\n',
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      // A name an earlier pass derived (fallback upgrade path) must not stick
+      // once the engine has generated its own.
+      sessionsDb.createSession('codex-follow-1', 'codex', workspacePath, 'Earlier synced name');
+
+      const synchronizer = new CodexSessionSynchronizer();
+      await synchronizer.synchronize();
+
+      assert.equal(sessionsDb.getSessionById('codex-follow-1')?.custom_name, 'Codex generated name');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex synchronizer keeps a user-locked name over the engine thread name', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-locked-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeCodexTranscript(tempRoot, 'codex-locked-1', workspacePath);
+    const codexHome = path.join(tempRoot, '.codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      path.join(codexHome, 'session_index.jsonl'),
+      JSON.stringify({ id: 'codex-locked-1', thread_name: 'Codex generated name', updated_at: '2026-07-07T10:00:00Z' }) + '\n',
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession('codex-locked-1', 'codex', workspacePath, 'My rename');
+      sessionsDb.updateSessionCustomName('codex-locked-1', 'My rename', { lockName: true });
+
+      const synchronizer = new CodexSessionSynchronizer();
+      await synchronizer.synchronize();
+
+      assert.equal(sessionsDb.getSessionById('codex-locked-1')?.custom_name, 'My rename');
     });
   } finally {
     restoreHomeDir();
@@ -360,7 +454,7 @@ test('Codex history renders one file row per patched file, from the applied diff
   }
 });
 
-test('Codex history attaches a spawned agent\'s own transcript to the Task row', { concurrency: false }, async () => {
+test('Codex history attaches a spawned agent\'s own transcript to the Agent row', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-history-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
@@ -373,7 +467,7 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
     await writeFile(transcriptPath, `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
       // A spawn reaches the item stream only as this lifecycle event, so the
-      // Task row is built from it and keeps its id.
+      // Agent row is built from it and keeps its id.
       JSON.stringify({
         type: 'event_msg',
         payload: {
@@ -430,9 +524,9 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
       await new CodexSessionSynchronizer().synchronize();
 
       const history = await new CodexSessionsProvider().fetchHistory('app-parent-2');
-      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Task');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
 
-      assert.ok(task, 'a spawned agent must produce a Task row');
+      assert.ok(task, 'a spawned agent must produce a Agent row');
       assert.equal(task.subagent?.id, agentThreadId);
       assert.equal(task.subagent?.name, 'Hegel');
       assert.equal(task.subagent?.status, 'completed');
@@ -443,7 +537,7 @@ test('Codex history attaches a spawned agent\'s own transcript to the Task row',
       assert.equal(task.subagentTools?.[0].kind, 'tool');
       assert.equal(task.subagentTools?.[0].toolName, 'Bash');
       assert.equal(task.subagentTools?.[0].toolResult?.content, 'README.md\n');
-      assert.equal(task.id, 'spawn-1', 'the Task row is named after the lifecycle item');
+      assert.equal(task.id, 'spawn-1', 'the Agent row is named after the lifecycle item');
     });
   } finally {
     restoreHomeDir();
@@ -489,14 +583,77 @@ test('Codex history closes a still-running subagent when its turn was aborted', 
       await new CodexSessionSynchronizer().synchronize();
 
       const history = await new CodexSessionsProvider().fetchHistory('app-parent-3');
-      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Task');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
 
-      assert.ok(task, 'the spawned agent must produce a Task row');
-      assert.equal(task.subagent?.status, 'completed', 'an aborted turn must not leave the Task card running forever');
-      assert.ok(task.toolResult, 'the Task card needs a result row to settle its spinner');
+      assert.ok(task, 'the spawned agent must produce a Agent row');
+      assert.equal(task.subagent?.status, 'stopped', 'an aborted turn ends the agent without a result, as the live stream settles it');
+      assert.ok(task.toolResult, 'the Agent card needs a result row to settle its spinner');
       assert.equal(task.toolResult?.isError, true, 'an agent the abort cut off did not finish its work');
     });
   } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+/** Writes a rollout whose only agent has a start record and no end record. */
+async function writeUnfinishedAgentRollout(tempRoot: string, workspacePath: string, providerSessionId: string): Promise<void> {
+  const transcriptPath = await writeCodexTranscript(tempRoot, providerSessionId, workspacePath);
+  await writeFile(transcriptPath, `${[
+    JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+    JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        item: { type: 'SubAgentActivity', id: 'spawn-open', kind: 'started', agent_thread_id: 'codex-agent-open', agent_path: '/root/open_agent' },
+      },
+    }),
+  ].join('\n')}\n`, 'utf8');
+}
+
+test('Codex history reads an agent with no end record as stopped when no run tracks it', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-open-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeUnfinishedAgentRollout(tempRoot, workspacePath, 'codex-parent-open');
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-parent-open', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-parent-open', 'codex-parent-open');
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-parent-open');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
+      assert.equal(task?.subagent?.status, 'stopped', 'the app-server that ran it is gone, so it can never report');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex history reads an agent with no end record as running while the runtime tracks it', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-live-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    await writeUnfinishedAgentRollout(tempRoot, workspacePath, 'codex-parent-live');
+    codexBackgroundWork.start('app-parent-live', {
+      taskId: 'codex-agent-open', toolUseId: 'spawn-open', taskType: 'collab_agent', description: 'Open agent',
+    });
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-parent-live', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-parent-live', 'codex-parent-live');
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-parent-live');
+      const task = history.messages.find((message) => message.kind === 'tool_use' && message.toolName === 'Agent');
+      assert.equal(task?.subagent?.status, 'running');
+    });
+  } finally {
+    codexBackgroundWork.clearSession('app-parent-live');
     restoreHomeDir();
     await rm(tempRoot, { recursive: true, force: true });
   }
@@ -575,7 +732,7 @@ test('a plan followed by a memory citation is still recognized as a plan', async
   }
 });
 
-test('an interrupted subagent closes its Task row instead of running forever', async () => {
+test('an interrupted subagent closes its Agent row instead of running forever', async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-interrupted-'));
   const workspacePath = await createWorkspaceFixture();
   const restoreHomeDir = patchHomeDir(tempRoot);
@@ -586,7 +743,7 @@ test('an interrupted subagent closes its Task row instead of running forever', a
     await mkdir(sessionsDir, { recursive: true });
     // Event shapes mirror a real rollout: the `started` activity carries the
     // agent path, and the agent later dies without ever sending a
-    // FINAL_ANSWER that would close its Task card.
+    // FINAL_ANSWER that would close its Agent card.
     await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${[
       JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
       JSON.stringify({
@@ -623,12 +780,57 @@ test('an interrupted subagent closes its Task row instead of running forever', a
       await new CodexSessionSynchronizer().synchronize();
 
       const history = await new CodexSessionsProvider().fetchHistory('app-subagent-interrupted-1');
-      const task = history.messages.find((message) => message.toolName === 'Task');
+      const task = history.messages.find((message) => message.toolName === 'Agent');
 
-      assert.ok(task, 'the spawn must render as a Task row');
+      assert.ok(task, 'the spawn must render as a Agent row');
       assert.ok(task.toolResult, 'an interrupted subagent must not leave its card running');
       assert.match(String(task.toolResult?.content), /interrupted/i);
       assert.equal(task.toolResult?.isError, false);
+      assert.equal(task.subagent?.status, 'stopped', 'live settles an interrupted agent as stopped; history must agree');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('a subagent whose completed activity is on record stays completed through a later turn abort', async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-completed-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-subagent-completed-1';
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    // Real rollouts carry agent reports the reader cannot parse as a
+    // FINAL_ANSWER; the `completed` activity is then the only word that the
+    // agent finished, and live settles the card on it.
+    const activity = (id: string, kind: string) => JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        item: { type: 'SubAgentActivity', id, agent_path: '/root/reviewer', agent_thread_id: 'thread-1', kind },
+      },
+    });
+    await writeFile(path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`), `${[
+      JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+      activity('call_spawn_1', 'started'),
+      activity('done-1', 'completed'),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-1', reason: 'interrupted' } }),
+    ].join('\n')}\n`, 'utf8');
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createAppSession('app-subagent-completed-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-subagent-completed-1', providerSessionId);
+      await new CodexSessionSynchronizer().synchronize();
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-subagent-completed-1');
+      const agent = history.messages.find((message) => message.toolName === 'Agent');
+
+      assert.ok(agent, 'the spawn must render as an Agent row');
+      assert.equal(agent.subagent?.status, 'completed', 'live settles a completed activity as completed; history must agree');
+      assert.notEqual(agent.toolResult?.isError, true);
     });
   } finally {
     restoreHomeDir();

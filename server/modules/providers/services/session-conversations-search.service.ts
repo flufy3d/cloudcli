@@ -5,7 +5,8 @@ import readline from 'node:readline';
 import { spawn } from 'cross-spawn';
 import { rgPath } from '@vscode/ripgrep';
 
-import { isClaudeApiRequestLogRow, stripAnsiSequences } from '@/shared/utils.js';
+import { stripAnsiSequences } from '@/shared/utils.js';
+import { isClaudeConversationRecord } from '@/shared/index.js';
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { readCodexRolloutItem } from '@/modules/providers/list/codex/codex-thread-items.js';
 
@@ -422,7 +423,7 @@ type ClaudeSearchableMessage = {
  * of those rows rather than the raw wrapper syntax.
  */
 function extractClaudeSearchableMessage(entry: AnyRecord): ClaudeSearchableMessage | null {
-  if (!entry.message?.content || entry.isApiErrorMessage || isClaudeApiRequestLogRow(entry)) {
+  if (!isClaudeConversationRecord(entry) || !entry.message?.content || entry.isApiErrorMessage) {
     return null;
   }
 

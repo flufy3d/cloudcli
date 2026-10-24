@@ -1,6 +1,7 @@
 import { getConnection } from '@/modules/database/connection.js';
 import { projectsDb } from '@/modules/database/repositories/projects.db.js';
-import { normalizeProjectPath } from '@/shared/utils.js';
+import type { SessionWorktreeInfo } from '@/shared/types.js';
+import { isDefaultProjectDisplayName, normalizeProjectPath } from '@/shared/utils.js';
 
 type SessionRow = {
   session_id: string;
@@ -9,9 +10,11 @@ type SessionRow = {
   project_path: string | null;
   jsonl_path: string | null;
   custom_name: string | null;
+  /** 1 when the user renamed the session; engine titles never overwrite it. */
+  name_locked: number;
   /** Model this session runs with; NULL until the app records one for it. */
   model: string | null;
-  /** Reasoning effort this session runs with; NULL until the app records one. */
+  /** Reasoning effort this session runs with; NULL until the app records one for it. */
   effort: string | null;
   /**
    * Context window in tokens the provider engine reported for this session;
@@ -20,6 +23,10 @@ type SessionRow = {
   context_window: number | null;
   /** The app session this one was branched from; NULL unless it is a fork. */
   forked_from_session_id: string | null;
+  /** Git worktree the session runs in; NULL for main-checkout sessions. */
+  worktree_path: string | null;
+  /** Branch checked out in that worktree; NULL when detached or main-checkout. */
+  worktree_branch: string | null;
   isArchived: number;
   created_at: string;
   updated_at: string;
@@ -31,7 +38,34 @@ type RecentSessionsPage = {
 };
 
 const SESSION_ROW_COLUMNS =
-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, context_window, forked_from_session_id, isArchived, created_at, updated_at';
+  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, name_locked, model, effort, context_window, forked_from_session_id, worktree_path, worktree_branch, isArchived, created_at, updated_at';
+
+/**
+ * Archives the project row a session just moved away from, but only when it
+ * has the shape of an auto-registered shell: default name (directory
+ * basename), zero remaining active sessions. This is the leftover of the old
+ * directory-keyed indexing — a session whose engine rebound it into a
+ * worktree used to strand an empty phantom project in the sidebar.
+ *
+ * Deliberately-named projects and projects that still hold sessions are kept.
+ * Archiving (not deleting) keeps any preserved history recoverable.
+ */
+function archiveOrphanedDefaultNamedProject(projectPath: string): void {
+  const projectRow = projectsDb.getProjectPath(projectPath);
+  if (!projectRow || projectRow.isArchived) {
+    return;
+  }
+
+  if (!isDefaultProjectDisplayName(projectRow.custom_project_name, projectRow.project_path)) {
+    return;
+  }
+
+  if (sessionsDb.countSessionsByProjectPath(projectPath) > 0) {
+    return;
+  }
+
+  projectsDb.updateProjectIsArchived(projectPath, true);
+}
 
 const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
@@ -81,9 +115,10 @@ export const sessionsDb = {
    * The given id is the provider-native session id. Rows are keyed by
    * `provider_session_id` so a session that was first created by the app
    * (with an app-allocated `session_id`) is updated in place once its
-   * transcript shows up on disk, instead of producing a duplicate row. An
-   * app-created row keeps its existing name; synchronizer names only update
-   * rows that were themselves created by indexing provider storage.
+   * transcript shows up on disk, instead of producing a duplicate row. The
+   * synchronizer's name wins on every rescan unless the row is locked —
+   * `name_locked = 1` marks a user rename, which no synchronizer may
+   * overwrite.
    */
   createSession(
     providerSessionId: string,
@@ -92,7 +127,8 @@ export const sessionsDb = {
     customName?: string,
     createdAt?: string,
     updatedAt?: string,
-    jsonlPath?: string | null
+    jsonlPath?: string | null,
+    worktree?: SessionWorktreeInfo | null
   ): string {
     const db = getConnection();
     const createdAtValue = normalizeTimestamp(createdAt);
@@ -105,11 +141,11 @@ export const sessionsDb = {
 
     const existing = db
       .prepare(
-        `SELECT session_id FROM sessions
+        `SELECT session_id, project_path FROM sessions
          WHERE provider_session_id = ? AND provider = ?
          LIMIT 1`
       )
-      .get(providerSessionId, provider) as { session_id: string } | undefined;
+      .get(providerSessionId, provider) as { session_id: string; project_path: string | null } | undefined;
 
     if (existing) {
       // CASE 意图: 只有时间前进（或旧行无时间戳）的事件才解除归档，防止迟到的
@@ -121,9 +157,11 @@ export const sessionsDb = {
            updated_at = COALESCE(?, CURRENT_TIMESTAMP),
            project_path = ?,
            jsonl_path = ?,
+           worktree_path = ?,
+           worktree_branch = ?,
            isArchived = CASE WHEN ? IS NULL OR updated_at IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
            custom_name = CASE
-             WHEN session_id <> provider_session_id AND custom_name IS NOT NULL THEN custom_name
+             WHEN name_locked = 1 THEN custom_name
              ELSE COALESCE(?, custom_name)
            END
          WHERE session_id = ?`
@@ -132,11 +170,21 @@ export const sessionsDb = {
         updatedAtValue,
         normalizedProjectPath,
         jsonlPath ?? null,
+        worktree?.path ?? null,
+        worktree?.branch ?? null,
         updatedAtValue,
         updatedAtValue,
         customName ?? null,
         existing.session_id
       );
+
+      // A session that moved between projects strands its old project row;
+      // when that row is an auto-registered default-named shell it is now
+      // empty and only litters the sidebar.
+      const previousProjectPath = existing.project_path;
+      if (previousProjectPath && previousProjectPath !== normalizedProjectPath) {
+        archiveOrphanedDefaultNamedProject(previousProjectPath);
+      }
 
       return existing.session_id;
     }
@@ -146,19 +194,21 @@ export const sessionsDb = {
     // covers legacy rows that predate the provider_session_id mapping.
     // CASE 意图: 只有时间前进（或旧行无时间戳）的事件才解除归档，防止迟到的
     // watcher 旧事件误恢复刚归档的会话。`sessions.updated_at IS NULL` 兜底存量
-    // 无时间戳的旧行——否则与 NULL 比较恒为假，这类行永远无法解档。
+    // 的旧行——否则与 NULL 比较恒为假，这类行永远无法解档。
     db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, isArchived, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, worktree_path, worktree_branch, isArchived, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
        ON CONFLICT(session_id) DO UPDATE SET
          provider = excluded.provider,
          provider_session_id = excluded.provider_session_id,
          updated_at = excluded.updated_at,
          project_path = excluded.project_path,
          jsonl_path = excluded.jsonl_path,
+         worktree_path = excluded.worktree_path,
+         worktree_branch = excluded.worktree_branch,
          isArchived = CASE WHEN ? IS NULL OR sessions.updated_at IS NULL OR julianday(excluded.updated_at) > julianday(sessions.updated_at) THEN 0 ELSE sessions.isArchived END,
          custom_name = CASE
-           WHEN sessions.session_id <> sessions.provider_session_id AND sessions.custom_name IS NOT NULL
+           WHEN sessions.name_locked = 1
              THEN sessions.custom_name
            ELSE COALESCE(excluded.custom_name, sessions.custom_name)
          END`
@@ -169,6 +219,8 @@ export const sessionsDb = {
       customName ?? null,
       normalizedProjectPath,
       jsonlPath ?? null,
+      worktree?.path ?? null,
+      worktree?.branch ?? null,
       createdAtValue,
       updatedAtValue,
       updatedAtValue
@@ -218,6 +270,8 @@ export const sessionsDb = {
     provider: string;
     projectPath: string;
     customName: string | null;
+    /** True when the fork name was typed by the user; locks it against engine titles. */
+    nameLocked: boolean;
     providerSessionId: string;
     jsonlPath: string | null;
     forkedFromSessionId: string;
@@ -236,13 +290,14 @@ export const sessionsDb = {
       db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
         .run(input.providerSessionId, input.sessionId);
       db.prepare(
-        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, forked_from_session_id, isArchived, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, name_locked, project_path, jsonl_path, model, effort, forked_from_session_id, isArchived, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
       ).run(
         input.sessionId,
         input.provider,
         input.providerSessionId,
         input.customName,
+        input.nameLocked ? 1 : 0,
         normalizedProjectPath,
         input.jsonlPath,
         input.model,
@@ -479,13 +534,62 @@ export const sessionsDb = {
     ).run(effort, sessionId);
   },
 
-  updateSessionCustomName(sessionId: string, customName: string): void {
+  /**
+   * Renames one session. Callers acting for the user (the rename API, the
+   * fork dialog's typed title) pass `lockName` so no synchronizer may
+   * overwrite the name afterwards; synchronizer-side name upgrades leave the
+   * lock untouched.
+   */
+  updateSessionCustomName(
+    sessionId: string,
+    customName: string,
+    options: { lockName?: boolean } = {}
+  ): void {
     const db = getConnection();
     db.prepare(
       `UPDATE sessions
-       SET custom_name = ?
+       SET custom_name = ?,
+           name_locked = CASE WHEN ? = 1 THEN 1 ELSE name_locked END
        WHERE session_id = ?`
+    ).run(customName, options.lockName ? 1 : 0, sessionId);
+  },
+
+  /**
+   * Applies a name the engine generated for one session.
+   *
+   * A user rename (`name_locked = 1`) is final, so the engine's name is
+   * dropped and the call reports that nothing was written — the caller then
+   * leaves the page showing the name the user chose.
+   *
+   * The row's activity time is left alone: a name is not something the user
+   * did in the conversation, so it must not move the session in a list that
+   * is ordered by activity.
+   *
+   * Returns true when the row was written.
+   */
+  applyEngineSessionName(sessionId: string, customName: string): boolean {
+    const db = getConnection();
+    const result = db.prepare(
+      `UPDATE sessions
+       SET custom_name = ?
+       WHERE session_id = ? AND name_locked = 0`
     ).run(customName, sessionId);
+    return result.changes > 0;
+  },
+
+  /**
+   * Providers' title jobs use this compare-and-write after inference. The
+   * mapping, provider, archive state and user lock must still match. Naming
+   * changes no activity/project fields and never inserts or revives a row.
+   */
+  applyAutomaticSessionName(sessionId: string, provider: string, nativeThreadId: string, name: string): boolean {
+    const result = getConnection().prepare(
+      `UPDATE sessions SET custom_name = ?
+       WHERE session_id = ? AND provider = ? AND provider_session_id = ?
+         AND name_locked = 0 AND isArchived = 0 AND forked_from_session_id IS NULL
+         AND custom_name IS NOT ?`
+    ).run(name, sessionId, provider, nativeThreadId, name);
+    return result.changes > 0;
   },
 
   getSessionById(sessionId: string): SessionRow | null {
@@ -744,26 +848,47 @@ export const sessionsDb = {
   },
 
   /**
-   * Batch-archives unarchived sessions whose last activity (updated_at or created_at)
-   * occurred before the specified cutoff timestamp string (or is null/invalid).
-   * Returns the session_id of every row newly archived by this call, so the
-   * caller can broadcast the removal to websocket clients.
-   * Used by Providers module (sessionsAutoArchiveService).
+   * Lists the sessions that are older than the cutoff and not archived yet.
+   *
+   * The caller decides which of them may be archived, so the list comes
+   * before the update. Used by Providers module (sessionsAutoArchiveService).
    */
-  archiveSessionsOlderThanCutoff(cutoffIsoString: string): string[] {
+  listSessionsOlderThanCutoff(cutoffIsoString: string): string[] {
     const db = getConnection();
     const rows = db
       .prepare(
-        `UPDATE sessions
-         SET isArchived = 1
+        `SELECT session_id FROM sessions
          WHERE isArchived = 0
            AND (
              datetime(COALESCE(updated_at, created_at)) < datetime(?)
              OR datetime(COALESCE(updated_at, created_at)) IS NULL
-           )
-         RETURNING session_id`
+           )`,
       )
       .all(cutoffIsoString) as { session_id: string }[];
+    return rows.map((row) => row.session_id);
+  },
+
+  /**
+   * Archives the given sessions and returns the ids that were archived.
+   *
+   * Used by Providers module (sessionsAutoArchiveService) after it decided
+   * that these sessions have no work left.
+   */
+  archiveSessionsByIds(sessionIds: string[]): string[] {
+    if (sessionIds.length === 0) {
+      return [];
+    }
+    const db = getConnection();
+    const placeholders = sessionIds.map(() => '?').join(', ');
+    const rows = db
+      .prepare(
+        `UPDATE sessions
+         SET isArchived = 1
+         WHERE session_id IN (${placeholders})
+           AND isArchived = 0
+         RETURNING session_id`,
+      )
+      .all(...sessionIds) as { session_id: string }[];
     return rows.map((row) => row.session_id);
   },
 

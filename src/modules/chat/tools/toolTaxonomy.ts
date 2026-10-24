@@ -56,7 +56,7 @@ export function isSubagentSpawnTool(toolName: string): boolean {
     return false;
   }
   const canonical = canonicalToolName(toolName);
-  return canonical === 'Subagent' || canonical === 'Task' || canonical === 'Agent';
+  return canonical === 'Subagent' || canonical === 'Agent';
 }
 
 const COMMAND_TOOLS = new Set(['Bash']);
@@ -91,7 +91,7 @@ const DISPLAY_CATEGORIES: ReadonlyArray<readonly [string, ReadonlySet<string>]> 
   ['bash', new Set(['Bash', 'run_command'])],
   ['todo', new Set(['TodoWrite', 'TodoRead'])],
   ['task', new Set(['TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'manage_task'])],
-  ['agent', new Set(['Task', 'Subagent', 'subagent', 'task', 'invoke_subagent', 'manage_subagents', 'send_message'])],
+  ['agent', new Set(['Agent', 'Subagent', 'subagent', 'task', 'invoke_subagent', 'manage_subagents', 'send_message'])],
   ['plan', new Set(['exit_plan_mode', 'ExitPlanMode'])],
   ['question', new Set(['AskUserQuestion'])],
 ];

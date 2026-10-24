@@ -31,7 +31,6 @@ test('getNormalizedToolGroupKey normalizes Antigravity tool names to standard na
   assert.equal(getNormalizedToolGroupKey('search_web'), 'WebSearch');
   assert.equal(getNormalizedToolGroupKey('read_url_content'), 'WebFetch');
   assert.equal(getNormalizedToolGroupKey('manage_task'), 'Task');
-  assert.equal(getNormalizedToolGroupKey('invoke_subagent'), 'Subagent');
   assert.equal(getNormalizedToolGroupKey('manage_subagents'), 'Subagent');
   assert.equal(getNormalizedToolGroupKey('Bash'), 'Bash');
   assert.equal(getNormalizedToolGroupKey('Read'), 'Read');

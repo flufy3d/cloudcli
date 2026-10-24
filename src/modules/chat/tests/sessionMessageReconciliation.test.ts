@@ -163,6 +163,73 @@ test('a vanished anchor blocks pairing only until the run ends', () => {
   assert.deepEqual(survivingPrompts([persisted], [local], pending, true), []);
 });
 
+/**
+ * A long session only keeps the newest page of the transcript loaded. Once
+ * the first prompts' persisted copies scroll out of that page, re-pairing
+ * them from scratch let each one take the next turn's row instead: every
+ * pairing slid down two turns and the newest prompt, left with nothing to
+ * claim, rendered next to its own copy. A pairing already made is a fact
+ * about the transcript and stays made.
+ */
+test('prompts paired earlier keep their pairing after their copies leave the window', () => {
+  const user = (id: string) => createUserMessage(id, '2026-10-22T00:00:00.000Z');
+  const reply = (id: string) => createUserMessage(id, '2026-10-22T00:00:00.000Z', { role: 'assistant' });
+  const prompts = ['local_t1', 'local_t2', 'local_t3', 'local_t4', 'local_t5']
+    .map((id) => createUserMessage(id, '2026-10-22T00:00:00.000Z'));
+  const pendingPrompts = new Map<string, PendingPrompt>([
+    ['local_t1', { afterRowId: null }],
+    ['local_t2', { afterRowId: 'srv-r1' }],
+    ['local_t3', { afterRowId: 'srv-r2' }],
+    ['local_t4', { afterRowId: 'srv-r3' }],
+    ['local_t5', { afterRowId: 'srv-r4' }],
+  ]);
+  // Paired while every turn was still loaded.
+  const priorPairings = new Map([
+    ['local_t1', 'srv-u1'],
+    ['local_t2', 'srv-u2'],
+    ['local_t3', 'srv-u3'],
+    ['local_t4', 'srv-u4'],
+  ]);
+  // The newest page now starts at turn 3; turns 1 and 2 are not loaded.
+  const window = [user('srv-u3'), reply('srv-r3'), user('srv-u4'), reply('srv-r4'), user('srv-u5')];
+
+  const { retiredAnchors, provenAnchors } = reconcileOptimisticPrompts(
+    window,
+    prompts,
+    pendingPrompts,
+    true,
+    priorPairings,
+  );
+
+  assert.equal(retiredAnchors.get('local_t3'), 'srv-u3');
+  assert.equal(retiredAnchors.get('local_t4'), 'srv-u4');
+  assert.equal(retiredAnchors.get('local_t5'), 'srv-u5', 'the newest prompt still finds its own copy');
+  assert.equal(retiredAnchors.get('local_t1'), 'srv-u1');
+  assert.equal(retiredAnchors.get('local_t2'), 'srv-u2');
+  assert.equal(provenAnchors.get('local_t5'), 'srv-u5');
+  assert.equal(provenAnchors.get('local_t4'), 'srv-u4');
+  assert.equal(provenAnchors.has('local_t1'), false, 'a pairing whose row is not loaded proves no turn');
+});
+
+test('an earlier pairing that sits above its own anchor proves no turn', () => {
+  const older = createUserMessage('srv-older', '2026-10-22T00:00:00.000Z');
+  const anchor = createUserMessage('srv-anchor', '2026-10-22T00:00:01.000Z', { role: 'assistant' });
+  const local = createUserMessage('local_p', '2026-10-22T00:00:02.000Z');
+
+  // Paired on the run-ended escape hatch while the anchor was out of the
+  // window; paging older history back in must not turn that guess into proof.
+  const { retiredAnchors, provenAnchors } = reconcileOptimisticPrompts(
+    [older, anchor],
+    [local],
+    new Map([['local_p', { afterRowId: 'srv-anchor' }]]),
+    true,
+    new Map([['local_p', 'srv-older']]),
+  );
+
+  assert.equal(retiredAnchors.get('local_p'), 'srv-older');
+  assert.equal(provenAnchors.has('local_p'), false);
+});
+
 test('upsertToolUseRow: a blank re-announce frame never blanks a populated card', () => {
   const toolRow = (id: string, toolId: string, toolInput: Record<string, unknown>) => ({
     id,

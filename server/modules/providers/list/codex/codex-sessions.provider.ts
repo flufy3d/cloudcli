@@ -1,14 +1,15 @@
 import fsSync from 'node:fs';
 import fsp from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
+import { getCodexHome } from '@/shared/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
+import { codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
 import {
+  buildCodexSubagentAgentRow,
   codexThreadItemToRows,
-  humanizeCodexToolName,
   readCodexItemText,
   readCodexProposedPlan,
   readCodexRolloutItem,
@@ -27,14 +28,18 @@ import type {
     SubagentInfo,
 } from '@/shared/types.js';
 import {
+  ProviderDisplayAssetError,
+  readJsonlRecords,
+  parseProviderJson,
   AppError,
   createNormalizedMessage,
   generateMessageId,
   readObjectRecord,
-    readUsageNumber,
-    removePathIfExists,
-    sliceTailPage,
-    truncateSubagentActivity,
+  readUsageNumber,
+  removePathIfExists,
+  sliceTailPage,
+  MAX_TRANSMITTED_SUBAGENT_ACTIVITIES,
+  truncateSubagentActivity,
 } from '@/shared/utils.js';
 
 const PROVIDER = 'codex';
@@ -46,14 +51,6 @@ const PROVIDER = 'codex';
  * already covers a run that crosses midnight.
  */
 const SUBAGENT_LOOKUP_PARENT_LEVELS = 2;
-
-/**
- * Upper bound on how much of a subagent's timeline is sent to the client. A
- * long-running agent can record hundreds of tool calls, and the transcript only
- * ever shows them behind a collapsed header, so shipping the whole history on
- * every load costs far more than it shows.
- */
-const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
 
 type CodexHistoryResult = {
   messages: AnyRecord[];
@@ -143,7 +140,8 @@ async function readCodexLiveTurnIds(filePath: string): Promise<string[]> {
     let entry: AnyRecord;
     try {
       entry = JSON.parse(line) as AnyRecord;
-    } catch {
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       continue;
     }
     const payload = readObjectRecord(entry.payload);
@@ -163,6 +161,14 @@ type CodexSubagentRecord = {
   agentPath?: string;
   agentThreadId?: string;
   isComplete: boolean;
+  /** Closed by an interruption or abort rather than by a final answer: it ended with no result. */
+  wasStopped?: boolean;
+  /**
+   * The engine's `completed` activity is on record. Its FINAL_ANSWER can be
+   * missing or unreadable (real rollouts carry encrypted reports), so this
+   * alone settles the card as completed — the word live settles it on.
+   */
+  reportedComplete?: boolean;
 };
 
 function parseCodexSubagentMessage(payload: AnyRecord): {
@@ -283,8 +289,9 @@ async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubag
 
     let entry: AnyRecord;
     try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
+      entry = parseProviderJson(line) as AnyRecord;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       continue;
     }
 
@@ -312,7 +319,7 @@ async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubag
 
     const item = readCodexRolloutItem(payload.item);
     // The agent's own prompt is the task it was given, which the parent's
-    // `Task` card already states; its lifecycle events belong to the parent.
+    // `Agent` card already states; its lifecycle events belong to the parent.
     if (!item || item.kind === 'user_message' || item.kind === 'subagent_activity') {
       continue;
     }
@@ -441,24 +448,21 @@ function buildCodexTokenUsage(info: AnyRecord): ProviderTokenUsageResult {
  * Codex appends cumulative totals over time, so the scan walks from the end
  * and stops at the first readable token_count entry.
  */
-function readCodexTokenUsage(fileContent: string): ProviderTokenUsageResult {
-  const lines = fileContent.trim().split('\n');
+async function readCodexTokenUsage(filename: string): Promise<ProviderTokenUsageResult> {
+  let latest: ProviderTokenUsageResult | null = null;
 
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    try {
-      const entry = JSON.parse(lines[index]) as AnyRecord;
-      const tokenInfo = entry.type === 'event_msg' && entry.payload?.type === 'token_count'
-        ? entry.payload.info
-        : null;
-      if (tokenInfo) {
-        return buildCodexTokenUsage(tokenInfo);
-      }
-    } catch {
-      // A provider may be writing the last JSONL line while this read happens.
+  for await (const entry of readJsonlRecords(filename)) {
+    const tokenInfo = entry.type === 'event_msg' && entry.payload?.type === 'token_count'
+      ? entry.payload.info
+      : null;
+    if (!tokenInfo) {
+      continue;
     }
+
+    latest = buildCodexTokenUsage(tokenInfo);
   }
 
-  return {
+  return latest ?? {
     used: 0,
     total: 200_000,
     inputTokens: 0,
@@ -482,7 +486,7 @@ function readCodexTokenUsage(fileContent: string): ProviderTokenUsageResult {
  * Two records are read outside the item stream because nothing in it carries
  * them: `token_count` (the context budget) and a spawned agent's
  * `agent_message`, whose FINAL_ANSWER never becomes an item and is folded
- * into the result of the `Task` row that started the agent.
+ * into the result of the `Agent` row that started the agent.
  */
 async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryResult> {
   const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
@@ -500,7 +504,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
   const anchoredTurnIds = new Set<string>();
 
   /**
-   * Every spawned agent's `Task` row, indexed by each handle it can later be
+   * Every spawned agent's `Agent` row, indexed by each handle it can later be
    * addressed by: the lifecycle event's own id, the agent's path, and the
    * thread id its transcript lives under.
    */
@@ -518,17 +522,19 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     }
   };
 
-  /** Settles a `Task` row; without a result the card renders as running forever. */
+  /** Settles a `Agent` row; without a result the card renders as running forever. */
   const closeSubagent = (
     record: CodexSubagentRecord,
     timestamp: string,
     output: string,
     isError: boolean,
+    stopped = false,
   ): void => {
     if (record.isComplete) {
       return;
     }
     record.isComplete = true;
+    record.wasStopped = stopped;
     messages.push({
       uuid: `${record.toolCallId}_result`,
       type: 'tool_result',
@@ -549,8 +555,9 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
 
     let entry: AnyRecord;
     try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
+      entry = parseProviderJson(line) as AnyRecord;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       continue;
     }
 
@@ -593,10 +600,12 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     if (payload.type === 'turn_aborted') {
       // An abort ends the whole agent tree — a spawned agent that never
       // reported back will receive no FINAL_ANSWER later in the file, so it
-      // is settled here or its Task card renders as running forever. The
+      // is settled here or its Agent card renders as running forever. The
       // result is an error row: the agent did not finish its work.
       for (const record of subagentsByCallId.values()) {
-        closeSubagent(record, timestamp, 'Subagent ended when the turn was interrupted.', true);
+        if (!record.reportedComplete) {
+          closeSubagent(record, timestamp, 'Subagent ended when the turn was interrupted.', true, true);
+        }
       }
       messages.push({
         // No item is written for an abort, so the row is named after the
@@ -628,16 +637,8 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
 
       if (item.activity === 'started' && !existing) {
         // The spawn itself reaches the item stream only as this lifecycle
-        // event, so the `Task` row is built from it and keeps its id.
-        const label = item.agentPath?.split('/').filter(Boolean).pop() ?? 'agent';
-        const taskMessage: AnyRecord = {
-          uuid: item.id,
-          type: 'tool_use',
-          timestamp,
-          toolName: 'Task',
-          toolInput: JSON.stringify({ description: humanizeCodexToolName(label) }),
-          toolCallId: item.id,
-        };
+        // event, so the `Agent` row is built from it and keeps its id.
+        const taskMessage = buildCodexSubagentAgentRow(item, timestamp);
         messages.push(taskMessage);
         indexSubagent({
           toolCallId: item.id,
@@ -657,8 +658,10 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
       existing.agentThreadId = existing.agentThreadId ?? item.agentThreadId;
       indexSubagent(existing);
 
-      if (item.activity === 'interrupted') {
-        closeSubagent(existing, timestamp, 'Subagent was interrupted before returning a final answer.', false);
+      if (item.activity === 'completed') {
+        existing.reportedComplete = true;
+      } else if (item.activity === 'interrupted' && !existing.reportedComplete) {
+        closeSubagent(existing, timestamp, 'Subagent was interrupted before returning a final answer.', false, true);
       }
       continue;
     }
@@ -706,7 +709,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
 
 /**
  * Loads each spawned agent's own rollout and hangs its timeline off the
- * `Task` row that started it.
+ * `Agent` row that started it.
  */
 async function attachCodexSubagentTranscripts(
   parentFilePath: string,
@@ -727,7 +730,14 @@ async function attachCodexSubagentTranscripts(
     const subagent: SubagentInfo = {
       id: record.agentThreadId ?? record.toolCallId,
       description: readNonEmptyString(parsedInput.description as string | undefined) ?? agentName,
-      status: record.isComplete ? 'completed' : 'running',
+      // An agent with no end record is running only while the runtime still
+      // tracks it (its turn is in flight); otherwise the app-server that ran it
+      // is gone and it can never report, so the card must not spin forever.
+      status: record.isComplete
+        ? (record.wasStopped ? 'stopped' : 'completed')
+        : record.reportedComplete
+          ? 'completed'
+          : codexBackgroundWork.has(record.agentThreadId ?? record.toolCallId) ? 'running' : 'stopped',
     };
 
     if (record.agentThreadId) {
@@ -1032,6 +1042,7 @@ export class CodexSessionsProvider implements IProviderSessions {
     try {
       result = await getCodexSessionMessages(sessionId);
     } catch (error) {
+      if (error instanceof ProviderDisplayAssetError) throw error;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[CodexProvider] Failed to load session ${sessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
@@ -1088,7 +1099,7 @@ export class CodexSessionsProvider implements IProviderSessions {
       ? input.jsonlPath
       : null;
     const sessionFilePath = indexedFilePath ?? await findCodexSessionFile(
-      path.join(os.homedir(), '.codex', 'sessions'),
+      path.join(getCodexHome(), 'sessions'),
       input.nativeSessionId,
     );
 
@@ -1099,8 +1110,7 @@ export class CodexSessionsProvider implements IProviderSessions {
       });
     }
 
-    const fileContent = await fsp.readFile(sessionFilePath, 'utf8');
-    return readCodexTokenUsage(fileContent);
+    return readCodexTokenUsage(sessionFilePath);
   }
 
   /**

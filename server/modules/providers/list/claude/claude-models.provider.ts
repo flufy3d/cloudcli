@@ -1,4 +1,7 @@
 import { readFile } from 'node:fs/promises';
+import os from 'node:os';
+
+import { query, type ModelInfo, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
 import { sessionsDb } from '@/modules/database/index.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
@@ -7,9 +10,12 @@ import type {
   ProviderModelOption,
   ProviderModelsDefinition,
 } from '@/shared/types.js';
+import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import {
+  AppError,
   buildDefaultProviderCurrentActiveModel,
   isPlaceholderProviderModel,
+  readOptionalString,
   stripAnsiSequences,
 } from '@/shared/utils.js';
 
@@ -26,151 +32,156 @@ const ULTRACODE_EFFORT_OPTION = {
   description: 'Highest effort plus standing workflow orchestration.',
 };
 
+const ADJUSTABLE_EFFORT = {
+  default: 'high',
+  values: [
+    { value: 'low' },
+    { value: 'medium' },
+    { value: 'high' },
+    { value: 'xhigh' },
+    { value: 'max' },
+    ULTRACODE_EFFORT_OPTION,
+  ],
+};
+
+/**
+ * The runtime's effort check falls back to this list when the installed Claude Code cannot
+ * be asked for its model list; the picker never shows it. It mirrors the CLI's `/model`
+ * picker, which no longer lists separate 1M-context variants.
+ */
 export const CLAUDE_PREDEFINED_MODELS: ProviderModelsDefinition = {
   OPTIONS: [
     {
       value: 'default',
       label: 'Default (recommended)',
       description: 'Use the recommended model for your Claude account and deployment.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'max' },
-        ],
-      },
-    },
-    {
-      value: 'best',
-      label: 'Best available',
-      description: 'Use Fable 5 when available, otherwise the latest Opus model.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          ULTRACODE_EFFORT_OPTION,
-        ],
-      },
-    },
-    {
-      value: 'fable',
-      label: 'Fable 5',
-      description: 'Most capable Claude model for the hardest, longest-running tasks.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          ULTRACODE_EFFORT_OPTION,
-        ],
-      },
-    },
-    {
-      value: 'sonnet',
-      label: 'Sonnet',
-      description: 'Latest Sonnet model for everyday coding tasks.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          ULTRACODE_EFFORT_OPTION,
-        ],
-      },
-    },
-    {
-      value: 'sonnet[1m]',
-      label: 'Sonnet (1M context)',
-      description: 'Latest Sonnet model with a 1M context window.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          ULTRACODE_EFFORT_OPTION,
-        ],
-      },
+      effort: ADJUSTABLE_EFFORT,
     },
     {
       value: 'opus',
       label: 'Opus',
       description: 'Latest Opus model for complex reasoning and coding tasks.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          ULTRACODE_EFFORT_OPTION,
-        ],
-      },
+      effort: ADJUSTABLE_EFFORT,
     },
     {
-      value: 'opus[1m]',
-      label: 'Opus (1M context)',
-      description: 'Latest Opus model with a 1M context window.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          ULTRACODE_EFFORT_OPTION,
-        ],
-      },
+      value: 'fable',
+      label: 'Fable',
+      description: 'Most capable Claude model for the hardest, longest-running tasks.',
+      effort: ADJUSTABLE_EFFORT,
+    },
+    {
+      value: 'sonnet',
+      label: 'Sonnet',
+      description: 'Latest Sonnet model for everyday coding tasks.',
+      effort: ADJUSTABLE_EFFORT,
     },
     {
       value: 'haiku',
       label: 'Haiku',
       description: 'Fast and efficient Claude model for simple tasks.',
     },
-    {
-      value: 'opusplan',
-      label: 'Opus Plan',
-      description: 'Use Opus while planning, then switch to Sonnet for execution.',
-      effort: {
-        default: 'high',
-        values: [
-          { value: 'low' },
-          { value: 'medium' },
-          { value: 'high' },
-          { value: 'xhigh' },
-          { value: 'max' },
-          ULTRACODE_EFFORT_OPTION,
-        ],
-      },
-    },
   ],
   DEFAULT: 'default',
 };
 
-export const findClaudeModelOption = (model: string | undefined | null): ProviderModelOption | null => {
-  const normalizedModel = typeof model === 'string' ? model.trim() : '';
-  if (!normalizedModel) {
-    return null;
-  }
+const invalidCatalog = () => new AppError('Claude Code returned an invalid or empty model list.', {
+  code: 'CLAUDE_MODEL_CATALOG_INVALID', statusCode: 502,
+});
 
-  return CLAUDE_PREDEFINED_MODELS.OPTIONS.find((option) => option.value === normalizedModel) ?? null;
+/** Claude Code 2.1.303 also reports the concrete model each entry runs; the SDK types predate it. */
+export type ClaudeCliModel = ModelInfo & { resolvedModel?: string };
+
+/**
+ * A pinned version id (`claude-opus-4-8`) resolves to itself; a picker entry is an alias
+ * (`opus` -> `claude-opus-5-5`) or carries a suffix (`claude-fable-5-1[1m]`).
+ */
+const isPinnedVersion = (model: ClaudeCliModel): boolean => model.resolvedModel === model.value;
+
+/**
+ * Turns the CLI's model list into the picker catalog, keeping its order and wording. The CLI
+ * may append every pinned version after its `/model` entries; those are dropped so the picker
+ * matches the CLI's own, and a pinned id stays reachable as a custom model.
+ */
+export const buildClaudeModelsDefinition = (models: ClaudeCliModel[]): ProviderModelsDefinition => {
+  const pickerModels = models.filter((model) => !isPinnedVersion(model));
+  const options = new Map<string, ProviderModelOption>();
+  for (const model of pickerModels.length ? pickerModels : models) {
+    const value = readOptionalString(model.value);
+    const label = readOptionalString(model.displayName);
+    if (!value || !label) throw invalidCatalog();
+    const levels = model.supportsEffort === false ? [] : model.supportedEffortLevels ?? [];
+    const values = levels.map((level) => ({ value: level as string }));
+    if (levels.includes('xhigh')) values.push(ULTRACODE_EFFORT_OPTION);
+    const description = readOptionalString(model.description);
+    if (options.has(value)) continue;
+    options.set(value, {
+      value, label,
+      ...(description ? { description } : {}),
+      ...(values.length
+        ? { effort: { ...(levels.includes('high') ? { default: 'high' } : {}), values } }
+        : {}),
+    });
+  }
+  const first = options.values().next().value;
+  if (!first) throw invalidCatalog();
+  return { OPTIONS: [...options.values()], DEFAULT: options.has('default') ? 'default' : first.value };
 };
+
+const MODEL_LIST_TIMEOUT_MS = 20_000;
+
+type ClaudeModelQuery = (params: Parameters<typeof query>[0]) => Pick<ReturnType<typeof query>, 'supportedModels' | 'close'>;
+
+/**
+ * Asks the same Claude Code binary conversations run on for its model list. The prompt
+ * stream never yields, so no turn starts and Claude Code writes no session transcript;
+ * the process is closed as soon as the initialize handshake has answered. Measured on
+ * 2.1.303: without `disableAllHooks` the user's SessionStart hooks run, and without
+ * `strictMcpConfig` every configured and plugin MCP server is launched.
+ */
+export const fetchClaudeCliModels = async (
+  createQuery: ClaudeModelQuery = query,
+  timeoutMs = MODEL_LIST_TIMEOUT_MS,
+): Promise<ClaudeCliModel[]> => {
+  let releasePrompt = () => {};
+  const idlePrompt: AsyncIterable<SDKUserMessage> = {
+    [Symbol.asyncIterator]: () => ({
+      next: () => new Promise<IteratorResult<SDKUserMessage>>((resolve) => {
+        releasePrompt = () => resolve({ done: true, value: undefined });
+      }),
+    }),
+  };
+  const claudeExecutablePath = resolveClaudeCodeExecutablePath(process.env.CLAUDE_CLI_PATH);
+  const instance = createQuery({
+    prompt: idlePrompt,
+    options: {
+      cwd: os.tmpdir(),
+      env: { ...process.env },
+      // Without user settings the CLI lists every model id instead of the `/model` picker.
+      settingSources: ['user', 'project', 'local'],
+      settings: { disableAllHooks: true },
+      strictMcpConfig: true,
+      mcpServers: {},
+      ...(claudeExecutablePath ? { pathToClaudeCodeExecutable: claudeExecutablePath } : {}),
+    },
+  });
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      instance.supportedModels(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Claude Code did not list its models within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    instance.close();
+    releasePrompt();
+  }
+};
+
 type ClaudeInitEvent = {
   sessionId?: string;
   session_id?: string;
@@ -277,24 +288,54 @@ const readClaudeSessionModelFromJsonl = async (
 };
 
 export class ClaudeProviderModels implements IProviderModels {
+  private cachedModels: ProviderModelsDefinition | null = null;
+  private cacheExpiry = 0;
+  private pending: Promise<ProviderModelsDefinition> | null = null;
+  private lastFailure: unknown = null;
+
+  constructor(private readonly fetchCliModels: () => Promise<ClaudeCliModel[]> = fetchClaudeCliModels) {}
+
+  /**
+   * Every send validates its effort against this list, so an expired list is returned at
+   * once and refreshed behind it; only the first load waits for the CLI. A failed first
+   * load is an error, so the picker offers a retry instead of the built-in guess, which
+   * would make the page reset a saved choice the guess does not contain.
+   */
   async getSupportedModels(): Promise<ProviderModelsDefinition> {
-    // claude creates a new jsonl file as a separate session for this request.
-    // As a result, it lists the workspace where this is invoked when it shouldn't.
-    //
-    // Disabled for now:
-    // const queryInstance = query({
-    //   prompt: 'Get supported models',
-    //   options: buildClaudeQueryOptions(),
-    // });
-    // const supportedModels = await queryInstance.supportedModels();
-    // queryInstance.close();
-    // return buildClaudeModelsDefinition(supportedModels);
-    return CLAUDE_PREDEFINED_MODELS;
+    if (this.cachedModels) {
+      if (Date.now() >= this.cacheExpiry && !this.pending) void this.refresh().catch(() => {});
+      return this.cachedModels;
+    }
+    if (this.pending) return this.pending;
+    // A CLI that just failed (or hung for the full timeout) is not asked again inside the back-off.
+    if (this.lastFailure && Date.now() < this.cacheExpiry) throw this.lastFailure;
+    return this.refresh();
+  }
+
+  private refresh(): Promise<ProviderModelsDefinition> {
+    this.pending = this.fetchCliModels().then((models) => {
+      this.cachedModels = buildClaudeModelsDefinition(models);
+      this.cacheExpiry = Date.now() + 5 * 60_000;
+      this.lastFailure = null;
+      return this.cachedModels;
+    }).catch((error: unknown) => {
+      console.error('[Claude] Model list refresh failed:', error);
+      this.cacheExpiry = Date.now() + 30_000;
+      this.lastFailure = error;
+      throw error;
+    }).finally(() => { this.pending = null; });
+    return this.pending;
+  }
+
+  /** Only the default id is read here, so the built-in list stands in when the CLI is unreachable. */
+  private async defaultActiveModel(): Promise<ProviderCurrentActiveModel> {
+    const models = await this.getSupportedModels().catch(() => CLAUDE_PREDEFINED_MODELS);
+    return buildDefaultProviderCurrentActiveModel(models);
   }
 
   async getCurrentActiveModel(sessionId?: string): Promise<ProviderCurrentActiveModel> {
     if (!sessionId?.trim()) {
-      return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+      return this.defaultActiveModel();
     }
 
     try {
@@ -309,6 +350,6 @@ export class ClaudeProviderModels implements IProviderModels {
       // Fall through to the provider default when the session-backed lookup fails.
     }
 
-    return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+    return this.defaultActiveModel();
   }
 }

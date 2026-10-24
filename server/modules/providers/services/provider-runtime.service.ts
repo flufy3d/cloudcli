@@ -4,8 +4,10 @@ import { sessionsService } from '@/modules/providers/services/sessions.service.j
 import type { IProvider } from '@/shared/interfaces.js';
 import type {
   ActiveBackgroundTask,
+  TaskBridgeEngineCall,
   AnyRecord,
   LLMProvider,
+  NormalizedMessage,
   ProviderPermissionDecision,
   ProviderRunFunction,
   ProviderRuntimeContext,
@@ -16,6 +18,7 @@ type ProviderRuntimeServiceDependencies = {
   listProviders(): IProvider[];
   resolveProvider(provider: string): IProvider;
   resolveProviderSessionId(sessionId: string | null | undefined): string | null;
+  resolveTranscriptPath(sessionId: string): string | null;
   resolveResumeModel(
     provider: LLMProvider,
     sessionId: string | undefined,
@@ -28,6 +31,7 @@ const defaultDependencies: ProviderRuntimeServiceDependencies = {
   listProviders: () => providerRegistry.listProviders(),
   resolveProvider: (provider) => providerRegistry.resolveProvider(provider),
   resolveProviderSessionId: (sessionId) => sessionsService.resolveProviderSessionId(sessionId),
+  resolveTranscriptPath: (sessionId) => sessionsService.resolveTranscriptPath(sessionId),
   resolveResumeModel: (provider, sessionId, requestedModel) =>
     providerModelsService.resolveResumeModel(provider, sessionId, requestedModel),
   getProviderModels: (provider) => providerModelsService.getProviderModels(provider),
@@ -45,14 +49,55 @@ export function createProviderRuntimeService(
 ) {
   const dependencies = { ...defaultDependencies, ...dependencyOverrides };
 
+  /**
+   * The entry that publishes an event to a session outside any run.
+   *
+   * The gateway owns it, and the composition root installs it after both
+   * modules exist. Until it is installed a runtime has no way to reach a
+   * session that has no round in flight.
+   */
+  let sessionEventPublisher: ((appSessionId: string, message: NormalizedMessage) => void) | undefined;
+
+  /**
+   * The entry that issues and revokes the narrow credential a resident
+   * process carries.
+   *
+   * The composition root installs it with the task bridge, so the providers
+   * module never imports the task-continuations module.
+   */
+  let bridgeCredentialIssuer: ((input: {
+    userId: string;
+    appSessionId: string;
+    generation: number;
+  }) => { token: string } | null) | undefined;
+  let bridgeCredentialRevoker: ((token: string) => void) | undefined;
+
+  /**
+   * The entry that records an MCP tool call the engine made.
+   *
+   * The composition root installs it with the task bridge's registry.
+   */
+  let engineToolCallRegistrar: ((call: TaskBridgeEngineCall) => void) | undefined;
+
   const createRuntimeContext = (
     provider: IProvider,
   ): ProviderRuntimeContext => ({
     resolveProviderSessionId: dependencies.resolveProviderSessionId,
+    resolveTranscriptPath: dependencies.resolveTranscriptPath,
     resolveResumeModel: (sessionId, requestedModel) =>
       dependencies.resolveResumeModel(provider.id, sessionId, requestedModel),
     getProviderModels: async () => dependencies.getProviderModels(provider.id),
     normalizeMessage: (raw, sessionId) => provider.sessions.normalizeMessage(raw, sessionId),
+    publishSessionEvent: (appSessionId, message) => {
+      sessionEventPublisher?.(appSessionId, message);
+    },
+    createBridgeCredential: (input) => bridgeCredentialIssuer?.(input) ?? null,
+    revokeBridgeCredential: (token) => {
+      bridgeCredentialRevoker?.(token);
+    },
+    registerEngineToolCall: (call) => {
+      engineToolCallRegistrar?.(call);
+    },
     resetLiveMessageState: provider.sessions.resetLiveMessageState
       ? (sessionId) => provider.sessions.resetLiveMessageState?.(sessionId)
       : undefined,
@@ -118,6 +163,40 @@ export function createProviderRuntimeService(
     compact,
     injectInput,
 
+    /**
+     * Installs the entry that publishes an event to a session outside any
+     * run. The composition root calls it with the gateway's publisher, so the
+     * providers module never imports the websocket module.
+     */
+    setSessionEventPublisher(publisher: (appSessionId: string, message: NormalizedMessage) => void): void {
+      sessionEventPublisher = publisher;
+    },
+
+    /**
+     * Installs the entry that records an MCP tool call the engine made. The
+     * composition root calls it with the task bridge's registry.
+     */
+    setBridgeCredentialIssuer(issuer: (input: {
+      userId: string;
+      appSessionId: string;
+      generation: number;
+    }) => { token: string } | null): void {
+      bridgeCredentialIssuer = issuer;
+    },
+
+    /**
+     * Installs the entry that revokes a bridge credential, for example when
+     * the process that carried it is gone.
+     */
+    setBridgeCredentialRevoker(revoker: (token: string) => void): void {
+      bridgeCredentialRevoker = revoker;
+    },
+
+    /** Used by server composition to connect observed native calls to task authorization. */
+    setEngineToolCallRegistrar(registrar: (call: TaskBridgeEngineCall) => void): void {
+      engineToolCallRegistrar = registrar;
+    },
+
     hasRuntime(providerName: string): boolean {
       try {
         return Boolean(dependencies.resolveProvider(providerName).runtime);
@@ -136,6 +215,55 @@ export function createProviderRuntimeService(
 
     getRunner(provider: LLMProvider): ProviderRunFunction {
       return (command, options, writer) => run(provider, command, options, writer);
+    },
+
+    /**
+     * What the engines report about the session's round.
+     */
+    getSessionActivity(sessionId: string): { queued: boolean; reporting: boolean } | null {
+      for (const provider of dependencies.listProviders()) {
+        const activity = provider.runtime.getSessionActivity?.(sessionId);
+        if (activity) {
+          return activity;
+        }
+      }
+      return null;
+    },
+
+    /**
+     * Whether any engine still has work in the session.
+     */
+    hasSessionWork(sessionId: string): boolean {
+      return dependencies.listProviders()
+        .some((provider) => provider.runtime.hasSessionWork?.(sessionId) === true);
+    },
+
+    /**
+     * Stops new work from starting in the session, so a caller can look at
+     * its state and act on it without a run slipping in.
+     */
+    closeSessionAdmission(sessionId: string): void {
+      for (const provider of dependencies.listProviders()) {
+        provider.runtime.closeSessionAdmission?.(sessionId);
+      }
+    },
+
+    /**
+     * Releases the resources the session holds in every engine.
+     */
+    releaseSession(sessionId: string): void {
+      for (const provider of dependencies.listProviders()) {
+        provider.runtime.releaseSession?.(sessionId);
+      }
+    },
+
+    /**
+     * Opens the session's admission again in every engine.
+     */
+    openSessionAdmission(sessionId: string): void {
+      for (const provider of dependencies.listProviders()) {
+        provider.runtime.openSessionAdmission?.(sessionId);
+      }
     },
 
     async abort(providerName: LLMProvider, sessionId: string): Promise<boolean> {
@@ -185,6 +313,15 @@ export function createProviderRuntimeService(
       for (const provider of dependencies.listProviders()) {
         provider.runtime.permissions?.reconcilePending?.(sessionId);
       }
+    },
+
+    backgroundWorkQueuesInput(providerName: LLMProvider, sessionId: string): boolean {
+      return dependencies.resolveProvider(providerName).runtime.backgroundTasks?.queuesInput?.(sessionId) ?? true;
+    },
+
+    canInterruptBackgroundWork(sessionId: string): boolean {
+      return dependencies.listProviders()
+        .every((provider) => provider.runtime.backgroundTasks?.canInterrupt?.(sessionId) !== false);
     },
 
     getBackgroundTasksForSession(sessionId: string): ActiveBackgroundTask[] {

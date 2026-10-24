@@ -141,6 +141,10 @@ rl.on('line', (line) => {
         send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
       }
     }
+    if (msg.id === 'server-perm-bg') {
+      log('perm_answer', msg);
+      send({ method: 'session/event', params: { sessionId, type: 'subagent_stopped', payload: { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg', status: 'completed', totalDurationMs: 10, totalToolUseCount: 1, totalTokens: 5 } } });
+    }
     if (msg.id === 'server-perm-e2e') {
       log('perm_answer', msg);
       // Late re-announcement of the SAME business requestId under a fresh
@@ -168,6 +172,20 @@ rl.on('line', (line) => {
     return;
   }
 
+  // mode "handover-window": answers session/subscribe only after emitting a
+  // text delta and the stop of the background agent an earlier turn left
+  // running, so both land while the runtime is still setting a new run up —
+  // between its start and the moment it sends the prompt.
+  if (msg.method === 'session/subscribe' && readMode() === 'handover-window') {
+    const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
+    ev('model_streaming', { kind: 'text_delta', delta: 'window text' });
+    ev('subagent_stopped', { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg', status: 'completed', totalDurationMs: 1500, totalToolUseCount: 2, totalTokens: 300 });
+    // A turn-ending event of the earlier turn, straggling in.
+    ev('turn_complete', { usage: { inputTokens: 1, outputTokens: 1 } });
+    send({ id: msg.id, result: {} });
+    return;
+  }
+
   if (msg.method === 'session/create') {
     if (readMode() === 'create-fail') {
       send({ id: msg.id, error: { code: -32022, message: 'Client request timed out: session/requestRuntimePreferences', data: { timeoutMs: 15000 } } });
@@ -192,6 +210,59 @@ rl.on('line', (line) => {
     send({ id: msg.id, result: {} });
     if (readMode() === 'send-fail') {
       send({ method: 'session/event', params: { sessionId, type: 'turn.failed', payload: { error: { message: 'provider auth failed', attribution: { statusCode: 401, reason: 'auth_failed' } } } } });
+      return;
+    }
+    if (readMode() === 'subagent-run-crash') {
+      // The engine dies while a turn is still in flight with an agent running.
+      const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
+      const agent = { agentId: 'agent_run_1', agentType: 'general-purpose', background: false, childSessionId: 'sess_subagent_agent_run_1', parentToolCallId: 'call_agent_run' };
+      ev('model_streaming', { kind: 'tool_call', toolCallId: 'call_agent_run', toolName: 'Agent', input: { description: 'Audit', prompt: 'look', subagent_type: 'general-purpose' } });
+      ev('subagent_spawned', { ...agent, description: 'Audit', prompt: 'look', status: 'running' });
+      setTimeout(() => process.exit(1), 100);
+      return;
+    }
+    if (readMode() === 'handover-window') {
+      send({ method: 'session/event', params: { sessionId, type: 'model_streaming', payload: { kind: 'text_delta', delta: 'hi there' } } });
+      send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
+      return;
+    }
+    if (readMode() === 'subagent-bg' || readMode() === 'subagent-bg-crash' || readMode() === 'subagent-bg-permission' || readMode() === 'subagent-bg-permission-orphan') {
+      // A background agent: the engine announces the Agent call, reports the
+      // spawn on the parent session once the child is ready, returns the
+      // launch acknowledgement as the tool result and ends the turn. The
+      // agent keeps working and reports its stop well after the turn settled
+      // — or, in the crash variant, the engine dies with the agent still
+      // running and never reports.
+      const crash = readMode() === 'subagent-bg-crash';
+      const asksPermission = readMode() === 'subagent-bg-permission' || readMode() === 'subagent-bg-permission-orphan';
+      const orphansPermission = readMode() === 'subagent-bg-permission-orphan';
+      const ev = (type, payload) => send({ method: 'session/event', params: { sessionId, type, payload } });
+      const agent = { agentId: 'agent_bg_1', agentType: 'general-purpose', background: true, childSessionId: 'sess_subagent_agent_bg_1', parentToolCallId: 'call_agent_bg' };
+      ev('model_streaming', { kind: 'tool_call', toolCallId: 'call_agent_bg', toolName: 'Agent', input: { description: 'Review the fix', prompt: 'look', run_in_background: true, subagent_type: 'general-purpose' } });
+      ev('subagent_spawned', { ...agent, description: 'Review the fix', prompt: 'look', status: 'running' });
+      ev('model_streaming', { kind: 'tool_result', toolCallId: 'call_agent_bg', result: { success: true, content: 'Async agent launched successfully.\\nagentId: agent_bg_1' } });
+      ev('turn_complete', { usage: { inputTokens: 3, outputTokens: 4 } });
+      setTimeout(() => {
+        if (crash) {
+          process.exit(1);
+        }
+        if (asksPermission) {
+          // The engine rewrites a subagent's request to the PARENT session id
+          // and tags it with the subagent as its origin; the parent turn is
+          // over by now.
+          send({ id: 'server-perm-bg', method: 'interaction/requestPermission', params: {
+            requestId: orphansPermission ? 'perm_bg_orphan' : 'perm_bg_1', sessionId, toolCallId: 'call_child_bash', toolName: 'Bash',
+            input: { command: 'touch /tmp/bg' }, reason: 'Tool Bash requires approval', riskLevel: 'medium',
+            origin: { kind: 'subagent', agentId: 'agent_bg_1', agentType: 'general-purpose', description: 'Review the fix', childSessionId: 'sess_subagent_agent_bg_1', parentSessionId: sessionId, parentToolCallId: 'call_agent_bg' },
+          } });
+          if (orphansPermission) {
+            // The agent ends while its request is still unanswered.
+            setTimeout(() => ev('subagent_stopped', { ...agent, status: 'stopped', totalDurationMs: 10 }), 200);
+          }
+          return;
+        }
+        ev('subagent_stopped', { ...agent, status: 'completed', totalDurationMs: 1500, totalToolUseCount: 2, totalTokens: 300 });
+      }, 400);
       return;
     }
     if (readMode() === 'perm-bridge') {
@@ -1010,3 +1081,4 @@ test('runtime delivers native tool outputs before turn completion without fetchi
   for (const message of results) assert.ok(messages.indexOf(message) < nextTextIndex);
   assert.equal(messages.at(-1)?.kind, 'complete');
 });
+

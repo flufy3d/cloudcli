@@ -38,6 +38,8 @@
 - **附件上传幂等**（`server/modules/assets/services/upload-replay.service.ts`）：一次上传生成一个标识，同一次上传的自动重试复用该标识；普通发送与排队发送走同一上传函数。后端在解析 multipart、写入文件前登记上传，按已鉴权用户和上传入口隔离，同标识的并发请求等待首次结果，成功响应丢失后也复用已存文件。
 - **会话网关幂等**（`sessionsService.createAppSession`）：每次提交携带一个 `clientRequestId`，短 TTL 内重复请求返回首次分配的同一个 session（若该会话已被删除则重新分配）。这挡的是前端闩看不见的重放——请求重试、另一个标签页。
 - **run 登记**（`chatRunRegistry.startRun`）：同一会话已有 run 在跑时，重复的 `chat.send` 得到 `RUN_IN_PROGRESS` 协议错误而不是第二次运行。唯一例外是带 `injectInput` 切面且 `inputWhileBusy: 'always'` 的引擎（当前无；opencode 迁移前曾如此）：网关先把消息交给 `injectInput`，成功则不登记新 run——消息搭原 run 的 writer 输出、由原 run 的 `complete` 一并收尾，发送方 socket 补挂到该 run；返回 false（回合已结束/已中止）才回落到 `dispatchRun`。
+- **引擎自发的回合**（`chatRunRegistry.adoptExternalRun`）：常驻引擎（codex / claude 的 idle 常驻、opencode 从 inbox 恢复）会在用户没有发送的情况下自己开一轮汇报。runtime 在事件流里发现后向网关要一个 run；网关按正常 run 登记（无属主 socket、`isProcessing` 对所有人可见、可回放），再把当前订阅者接到 writer 上，页面因此看到的是正常时间线而不是刷新后才出现的孤儿消息。会话 id 映射不到行、行已归档、provider 不符或已有 run 在跑时返回 null，runtime 不重试。
+- **订阅与频道**（`chatRunRegistry.attachConnection`）：`chat.subscribe` 总是把 socket 挂到会话的 audience，`includeRun` 只决定它是否同时挂到当前 run 上——常驻引擎在 run 结束后仍会往会话频道上报（后台 agent 的后续、晚到的批准），把 socket 提前摘掉就会丢帧。
 
 `POST /api/providers/sessions` 的 `initialMessage` 只作标题来源，客户端只发前缀，不发整条消息——它正处在用户等待的那段窗口里。
 

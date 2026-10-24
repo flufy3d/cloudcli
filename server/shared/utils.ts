@@ -23,8 +23,10 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
 import type { MessageInputForKind, VolatileMessageId } from '../../shared/protocol/messageKinds.js';
 import { VOLATILE_MESSAGE_ID_PREFIX } from '../../shared/protocol/messageKinds.js';
+import { SUBAGENT_TOOL_NAME } from '../../shared/protocol/subagent.js';
 
 import { parseFrontMatter } from './frontmatter.js';
+import { getGlobalImageAssetsDir } from './image-attachments.js';
 import type {
   AnyRecord,
   ApiSuccessShape,
@@ -42,6 +44,205 @@ import type {
 /** Returns the lowercase SHA-256 hex digest for opaque tokens and content. */
 export function sha256Hex(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+//----------------- CLAUDE CONVERSATION RECORDS ------------
+/**
+ * Used by provider history, subagent activity and conversation search to accept
+ * actual Claude conversation records only. API request diagnostics also embed
+ * `message.role` and content, but are copies rather than conversation events.
+ * This deliberately does not require a UUID: record identity and supported
+ * realtime control events are validated by their respective consumers.
+ */
+export function isClaudeConversationRecord(value: unknown): value is AnyRecord & { type: 'user' | 'assistant'; message: AnyRecord } {
+  const record = readObjectRecord(value);
+  return Boolean(record && (record.type === 'user' || record.type === 'assistant')
+    && readObjectRecord(record.message)?.role === record.type);
+}
+
+// ---------------------------
+//----------------- PROVIDER DISPLAY PAYLOADS ------------
+const INLINE_IMAGE_EXTENSIONS: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+  'image/webp': 'webp', 'image/svg+xml': 'svg',
+};
+
+/** Provider history readers propagate display-storage failures rather than treating them as malformed JSON. */
+export class ProviderDisplayAssetError extends Error {
+  constructor(cause: unknown) {
+    super(`Provider display asset failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'ProviderDisplayAssetError';
+  }
+}
+
+function storeDisplayAsset(bytes: Buffer | string, filename: string): void {
+  const directory = getGlobalImageAssetsDir();
+  fs.mkdirSync(directory, { recursive: true });
+  const assetPath = path.join(directory, filename);
+  const expectedSize = typeof bytes === 'string' ? Buffer.byteLength(bytes) : bytes.length;
+  try {
+    const existing = fs.lstatSync(assetPath);
+    if (!existing.isFile() || existing.isSymbolicLink()) throw new Error('Invalid stored display asset');
+    if (existing.size === expectedSize) return;
+    // A previous interrupted write may have left a short final file.
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const temporaryPath = `${assetPath}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, bytes, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporaryPath, assetPath);
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new AggregateError([error, cleanupError], 'Display asset write and cleanup failed');
+      }
+    }
+    throw error;
+  }
+}
+
+function storeInlineImage(mimeType: string, encoded: string): string {
+  const extension = INLINE_IMAGE_EXTENSIONS[mimeType.toLowerCase()];
+  if (!extension) throw new Error(`Unsupported inline image type: ${mimeType}`);
+  if (!encoded || encoded.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    throw new Error('Invalid inline image base64');
+  }
+  const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.length === 0 || bytes.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) {
+    throw new Error('Invalid inline image base64');
+  }
+  const filename = `inline-${sha256Hex(bytes)}.${extension}`;
+  // Exclusive creation never follows a pre-existing symlink. Identical
+  // results from live/history reuse the same file without a heap cache.
+  storeDisplayAsset(bytes, filename);
+  return `/api/assets/images/${filename}`;
+}
+
+/**
+ * Blank-check for engine display text. Zero-width format characters
+ * (U+200B-U+200D, U+2060, U+FEFF) render as nothing in the transcript, yet
+ * JavaScript `.trim()` treats them as content, so an engine that emits one as
+ * a whole text part would surface as a transcript row carrying only its copy
+ * control. Consumers: the opencode live translator and history reader, which
+ * must agree on what counts as an empty segment.
+ */
+const INVISIBLE_TEXT_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
+
+export function hasVisibleText(text: string): boolean {
+  return text.replace(INVISIBLE_TEXT_RE, '').trim().length > 0;
+}
+
+/**
+ * Providers and the websocket gateway compact display copies before retaining
+ * or serializing them. Recognized inline images become content-addressed,
+ * authenticated asset references; engine-owned inputs are never mutated.
+ * JSON strings are inspected only when they contain an image marker. The
+ * operation is idempotent and intentionally has no in-memory image cache.
+ * Invalid base64 and storage failures propagate to the caller.
+ */
+export function compactProviderPayload<T>(value: T): T {
+  const seen = new WeakMap<object, unknown>();
+  function visit(input: unknown, field = '', previewText = true): unknown {
+    if (typeof input === 'string') {
+      // User text is also the source for edit/resend and copy. Compact image
+      // descriptors in that turn, but never replace the prompt with a preview.
+      if (!previewText && /^(content|text|message)$/.test(field)) return input;
+      if (input.startsWith('data:image/')) {
+        const match = /^data:([^;,]+);base64,([\s\S]*)$/.exec(input);
+        if (!match) throw new Error('Invalid inline image base64 URI');
+        return storeInlineImage(match[1], match[2]);
+      }
+      if ((input.startsWith('{') || input.startsWith('['))
+        && (input.includes('"image"') || input.includes('data:image/'))) {
+        let parsed: unknown;
+        try { parsed = JSON.parse(input); } catch { /* Non-JSON tool logs still need a bounded preview below. */ }
+        if (parsed !== undefined) {
+          const compact = visit(parsed, field, previewText);
+          if (compact !== parsed) return JSON.stringify(compact);
+        }
+      }
+      if (previewText && input.length > 256 * 1024 && /^(content|output|result|text|stdout|stderr)$/.test(field)) {
+        const filename = `output-${sha256Hex(input)}.txt`;
+        storeDisplayAsset(input, filename);
+        return `${input.slice(0, 64 * 1024)}\n\n/api/assets/files/${filename}`;
+      }
+      return input;
+    }
+    if (!input || typeof input !== 'object' || Buffer.isBuffer(input)) return input;
+    if (seen.has(input)) return seen.get(input);
+    // Provider payloads are JSON records; leave runtime instances untouched.
+    if (!Array.isArray(input) && Object.getPrototypeOf(input) !== Object.prototype) return input;
+    const record = input as Record<string, unknown>;
+    const userTurn = record.role === 'user' || readObjectRecord(record.message)?.role === 'user'
+      || ['UserMessage', 'userMessage', 'user_message', 'USER_INPUT'].includes(String(record.type))
+      || record.source === 'USER_EXPLICIT';
+    const toolResult = record.type === 'tool_result' || record.type === 'tool-result' || record.role === 'tool';
+    const childPreviewText = toolResult || (previewText && !userTurn);
+    if (record.type === 'base64' && typeof record.media_type === 'string'
+      && record.media_type.startsWith('image/') && typeof record.data === 'string') {
+      const result = { type: 'url', url: storeInlineImage(record.media_type, record.data) };
+      seen.set(input, result);
+      return result;
+    }
+    if (record.type === 'image' && typeof record.data === 'string'
+      && typeof (record.mimeType ?? record.mime_type) === 'string') {
+      const { data, ...rest } = record;
+      const result = { ...rest, uri: storeInlineImage(String(record.mimeType ?? record.mime_type), data) };
+      seen.set(input, result);
+      return result;
+    }
+    seen.set(input, input);
+    let result: unknown = input;
+    for (const [key, child] of Object.entries(input)) {
+      const compact = visit(child, key, childPreviewText);
+      if (compact !== child) {
+        if (result === input) result = Array.isArray(input) ? [...input] : { ...record };
+        (result as Record<string, unknown>)[key] = compact;
+      }
+    }
+    seen.set(input, result);
+    return result;
+  }
+  try { return visit(value) as T; } catch (error) {
+    if (error instanceof ProviderDisplayAssetError) throw error;
+    throw new ProviderDisplayAssetError(error);
+  }
+}
+
+/**
+ * Provider history readers use this after parsing each record, before storing
+ * it in branch/pairing indexes. This avoids retaining inline media from the
+ * whole transcript while preserving every provider's native row identity.
+ */
+export function parseProviderJson(text: string): AnyRecord {
+  return compactProviderPayload(JSON.parse(text) as AnyRecord);
+}
+
+/**
+ * Provider history, usage and synchronization readers scan JSONL records one
+ * line at a time. Blank, primitive and incomplete JSON records are skipped;
+ * filesystem errors propagate. Closing the iterator closes its file stream.
+ * This reader does not materialize media: callers choose which display rows
+ * need compaction, while usage/indexing paths only inspect their metadata.
+ */
+export async function* readJsonlRecords(filename: string): AsyncGenerator<AnyRecord> {
+  const input = fs.createReadStream(filename);
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      let entry: unknown;
+      try { entry = JSON.parse(line); } catch (error) {
+        if (error instanceof SyntaxError) continue;
+        throw error;
+      }
+      if (entry && typeof entry === 'object' && !Array.isArray(entry)) yield entry as AnyRecord;
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
 }
 
 //----------------- ENVIRONMENT UTILITIES ------------
@@ -462,6 +663,25 @@ export type ValidateWorkspacePathOptions = {
 };
 
 /**
+ * A project display name is "default" when it equals the directory basename —
+ * exactly what `ensureProjectPath`/`createProjectPath` store when they
+ * auto-register a project for a session path. Anything else means a user (or
+ * the open-worktree-as-project flow) deliberately named the project.
+ *
+ * Two consumers must agree on this predicate: the session worktree placement
+ * policy keeps sessions under deliberately-named worktree projects, and the
+ * sessions write layer archives only default-named shells after a session
+ * moves away. Changing one side without the other breaks that pairing.
+ */
+export function isDefaultProjectDisplayName(
+  customName: string | null | undefined,
+  projectPath: string,
+): boolean {
+  const trimmedName = customName?.trim() ?? '';
+  return trimmedName !== '' && trimmedName === path.basename(projectPath);
+}
+
+/**
  * Validates that a user-supplied workspace path is safe to use.
  *
  * Call this before any filesystem mutation that creates or registers projects.
@@ -650,13 +870,14 @@ export function generateMessageId(prefix = 'msg'): VolatileMessageId {
 export function createNormalizedMessage<K extends MessageKind>(
   fields: MessageInputForKind<K>,
 ): NormalizedMessage {
-  return {
+  const message: NormalizedMessage = {
     ...fields,
     id: fields.id || generateMessageId(fields.kind),
     sessionId: fields.sessionId || '',
     timestamp: fields.timestamp || new Date().toISOString(),
     provider: fields.provider,
   };
+  return compactProviderPayload(message);
 }
 
 /**
@@ -708,6 +929,17 @@ export function createCompleteMessage(opts: {
  */
 const MAX_SUBAGENT_ACTIVITY_CONTENT = 4000;
 
+/**
+ * Most activities of one subagent sent with its card. A long-running agent can
+ * record hundreds of tool calls, and the transcript only shows them behind a
+ * collapsed header, so shipping the whole timeline on every load costs far more
+ * than it shows. The card reports the full count (`SubagentInfo.activityCount`)
+ * so the UI can say how many were left out.
+ *
+ * Consumers: the Claude, Codex and ZCode history readers.
+ */
+export const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
+
 function truncateForPreview(value: string | undefined): string | undefined {
   if (typeof value !== 'string' || value.length <= MAX_SUBAGENT_ACTIVITY_CONTENT) {
     return value;
@@ -733,6 +965,32 @@ export function truncateSubagentActivity(activity: SubagentActivity): SubagentAc
   }
 
   return { ...activity, content: truncatedContent, toolResult: truncatedResult };
+}
+
+// ---------------------------
+//----------------- SUBAGENT TOOL NAME UTILITIES ------------
+export { SUBAGENT_TOOL_NAME };
+
+/**
+ * The tool name older Claude CLIs gave the subagent spawn call. Current CLIs
+ * name it `Agent` and still resolve this name to `Agent` in permission rules.
+ */
+const LEGACY_CLAUDE_SUBAGENT_TOOL_NAME = 'Task';
+
+/**
+ * Translates Claude's legacy subagent tool name (`Task`) into the protocol's
+ * `Agent`; every other name, including the task-list tools (`TaskCreate`,
+ * `TaskUpdate`), passes through unchanged.
+ *
+ * Used by Claude's history reader and live normalizer (so old transcripts and
+ * live calls draw the same card), its background-work tracker (so both names
+ * count as a launch that outlives the turn) and its permission matcher (so a
+ * rule saved as `Task` still allows `Agent`). Do not apply it to the name in a
+ * `permission_request`: the client writes always-allow rules under the name the
+ * CLI asked about.
+ */
+export function canonicalClaudeSubagentToolName(toolName: string): string {
+  return toolName === LEGACY_CLAUDE_SUBAGENT_TOOL_NAME ? SUBAGENT_TOOL_NAME : toolName;
 }
 
 // ---------------------------
@@ -1648,16 +1906,20 @@ export async function readFileTimestamps(
 // ---------------------------
 //----------------- SESSION SYNCHRONIZER JSONL PARSING HELPERS ------------
 /**
- * Builds a first-seen key/value lookup map from a JSONL file.
+ * Builds a key/value lookup map from a JSONL file.
  *
  * Use this for provider index files where session id -> display name metadata
- * is stored line-by-line. The first value for each key wins, preserving the
- * earliest known label while avoiding repeated map overwrites.
+ * is stored line-by-line. With `prefer: 'first'` (the default) the first value
+ * for each key wins; with `prefer: 'last'` a later record for the same key
+ * replaces the earlier one — engines such as Codex append a rename record to
+ * their index when a generated title lands, so the last record is the current
+ * name.
  */
 export async function buildLookupMap(
   filePath: string,
   keyField: string,
-  valueField: string
+  valueField: string,
+  prefer: 'first' | 'last' = 'first'
 ): Promise<Map<string, string>> {
   const lookup = new Map<string, string>();
 
@@ -1675,7 +1937,7 @@ export async function buildLookupMap(
       const key = parsed[keyField];
       const value = parsed[valueField];
 
-      if (typeof key === 'string' && typeof value === 'string' && !lookup.has(key)) {
+      if (typeof key === 'string' && typeof value === 'string' && (prefer === 'last' || !lookup.has(key))) {
         lookup.set(key, value);
       }
     }
@@ -1962,6 +2224,60 @@ export function forwardToLoopbackService(
 }
 
 /**
+ * Codex title client/service bound waits to their shared abort deadline.
+ * Rejecting stops the wait, not the underlying I/O; callers must guard later
+ * writes and retain cleanup ownership. Source rejection is always observed.
+ */
+export function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason ?? new Error('Operation aborted.')); };
+    signal.addEventListener('abort', abort, { once: true });
+    operation.then((value) => { signal.removeEventListener('abort', abort); resolve(value); }, (error) => { signal.removeEventListener('abort', abort); reject(error); });
+    if (signal.aborted) abort();
+  });
+}
+
+//----------------- CODEX TITLE ISOLATION ------------
+/** The runtime injects this server; the title client's config must explicitly disable it. */
+export const CODEX_TASK_MCP_NAME = 'cloudcli_task_continuations';
+
+/** Runtime sandbox commands and manager-owned title workers exclude host-only credentials. */
+export const CODEX_HOST_CREDENTIAL_ENV_NAMES = [
+  'API_KEY', 'CLOUDCLI_TASK_API_KEY', 'CLOUDCLI_TASK_RUN_CONTEXT', 'CLOUDCLI_TASK_BRIDGE',
+  'CLOUDCLI_REGISTRATION_TOKEN', 'CLOUDCLI_TASK_TOKEN', 'JWT_SECRET',
+] as const;
+
+/**
+ * Codex title client and the real protocol probe use the terminal's isolation
+ * recipe. Input is config/read's effective config; an unreadable MCP table
+ * fails closed. This does not replace checking thread/start's actual sandbox.
+ */
+export function buildCodexTitleIsolationConfig(effectiveConfig: unknown): Record<string, unknown> {
+  const config = readObjectRecord(effectiveConfig);
+  if (!config || (config.mcp_servers != null && !readObjectRecord(config.mcp_servers))) {
+    throw new AppError('Codex title configuration could not be verified.', { code: 'CODEX_TITLE_ISOLATION', statusCode: 502 });
+  }
+  const features = [
+    'apps', 'code_mode', 'code_mode_only', 'context_management', 'current_time_reminder',
+    'deferred_executor', 'enable_fanout', 'goals', 'hooks', 'image_generation', 'memories',
+    'multi_agent', 'multi_agent_v2', 'plugins', 'request_permissions_tool', 'shell_snapshot',
+    'shell_tool', 'standalone_web_search', 'token_budget', 'tool_suggest', 'unified_exec', 'view_image',
+  ];
+  // Disable every configured server, including the host bridge when present.
+  // Creating an absent entry with only enabled=false fails transport validation.
+  const servers = Object.keys(readObjectRecord(config.mcp_servers) ?? {});
+  return {
+    ...Object.fromEntries(features.map((feature) => [`features.${feature}`, false])),
+    'cloud.skills.enabled': false, 'skills.include_instructions': false,
+    'tools.experimental_request_user_input.enabled': false, 'tools.update_plan.enabled': false,
+    web_search: 'disabled', default_permissions: ':read-only',
+    project_doc_max_bytes: 0, developer_instructions: '', instructions: '',
+    mcp_servers: Object.fromEntries(servers.map((server) => [server, { enabled: false }])),
+  };
+}
+
+// ---------------------------
+/**
  * Resolves the permission mode for Codex's app-server turn and any detached
  * command that must inherit that same sandbox. The chat gateway and Codex
  * adapter both use this mapping so task registration cannot claim a broader
@@ -1996,4 +2312,28 @@ export function resolveCodexExecutionPolicy(permissionMode: string): {
     approvalPolicy: 'on-request',
     sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
   };
+}
+
+//----------------- CANONICAL JSON ------------
+/**
+ * Recursively sorts object keys without changing arrays or JSON scalar values.
+ * Task result digests and bridge argument digests use this on parsed JSON so
+ * property insertion order cannot change equality. This is not a JSON validator.
+ */
+export function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeJson);
+  if (typeof value !== 'object' || value === null) return value;
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(Object.keys(record).sort().map((key) => [key, canonicalizeJson(record[key])]));
+}
+
+//----------------- CODEX CONFIGURATION ROOT ------------
+/**
+ * Codex auth, models, MCP, skills and history adapters use the same home as the
+ * engine process. Read at call time so isolated workers and probes can select
+ * CODEX_HOME without retaining another account's configuration. Workspace-local
+ * .codex directories and the independent ~/.agents directory are unaffected.
+ */
+export function getCodexHome(): string {
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 }

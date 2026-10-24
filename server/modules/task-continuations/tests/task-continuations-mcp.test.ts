@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
@@ -35,6 +37,64 @@ test('stdio MCP advertises run, status, and notification cancellation tools', as
   assert.equal((responses[1] as any).result.tools[0].annotations?.openWorldHint, undefined);
   assert.equal((responses[1] as any).result.tools[0].annotations?.destructiveHint, undefined);
   assert.equal((responses[1] as any).result.tools[1].annotations?.readOnlyHint, true);
+});
+
+test('a resident process calls the bridge with the engine own call identity', async () => {
+  const received: Array<{ url: string; headers: Record<string, string>; body: any }> = [];
+  const server = http.createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk) => chunks.push(chunk as Buffer));
+    request.on('end', () => {
+      received.push({
+        url: request.url ?? '',
+        headers: request.headers as Record<string, string>,
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ success: true, data: { taskId: 'task_1', status: 'completed' } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+
+  try {
+    const responses = await runProtocol([
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'cloudcli_task_status',
+          arguments: { taskId: 'task_1' },
+          _meta: {
+            callId: 'call-7',
+            threadId: 'native-thread-1',
+            sessionId: 'native-session-1',
+            'x-codex-turn-metadata': { thread_id: 'native-thread-1', turn_id: 'native-turn-1' },
+          },
+        },
+      },
+    ], {
+      CLOUDCLI_TASK_API_URL: `http://127.0.0.1:${port}`,
+      CLOUDCLI_TASK_BRIDGE: 'tbc_bridge-token',
+    });
+
+    assert.equal((responses[0] as any).result.isError, undefined);
+    assert.equal(received.length, 1);
+    assert.equal(received[0].url, '/api/tasks/mcp/invoke');
+    assert.equal(received[0].headers.authorization, 'Bearer tbc_bridge-token');
+    // The global API key never reaches a resident process.
+    assert.equal(received[0].headers['x-api-key'], undefined);
+    assert.deepEqual(received[0].body.identity, {
+      callId: 'call-7',
+      threadId: 'native-thread-1',
+      turnId: 'native-turn-1',
+    });
+    assert.equal(received[0].body.tool, 'cloudcli_task_status');
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test('tool calls fail closed when the host capability environment is absent', async () => {

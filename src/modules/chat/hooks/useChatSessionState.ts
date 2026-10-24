@@ -349,6 +349,9 @@ export function useChatSessionState({
       if (!hasMoreMessages || !selectedSession || !selectedProject) return false;
 
       isLoadingMoreRef.current = true;
+      // The spinner rides the same flag the guard uses: one page request at a
+      // time, and the affordance shows while it is out.
+      _setIsLoadingMoreMessages(true);
 
       try {
         const result = await sessionStore.fetchMore(selectedSession.id, {
@@ -368,6 +371,7 @@ export function useChatSessionState({
         return prependedCount > 0;
       } finally {
         isLoadingMoreRef.current = false;
+        _setIsLoadingMoreMessages(false);
       }
     },
     [hasMoreMessages, isActive, isLoadingMoreMessages, selectedProject, selectedSession, sessionStore],
@@ -540,7 +544,7 @@ export function useChatSessionState({
 
   // External message update (e.g. WebSocket reconnect, background refresh)
   useEffect(() => {
-    if (!externalMessageUpdate || !selectedSession || !selectedProject) return;
+    if (!externalMessageUpdate || !activeSessionId || !selectedProject) return;
 
     const reloadExternalMessages = async () => {
       try {
@@ -548,7 +552,7 @@ export function useChatSessionState({
         if (!isProcessing) {
           // Sticking is the viewport's default while pinned; a refresh that
           // replaces the tail needs no separate scroll choreography.
-          await requestLatestMessages(selectedSession.id);
+          await requestLatestMessages(activeSessionId);
         }
       } catch (error) {
         console.error('Error reloading messages from external update:', error);
@@ -560,7 +564,9 @@ export function useChatSessionState({
     externalMessageUpdate,
     requestLatestMessages,
     selectedProject,
-    selectedSession,
+    // The session's id, not the session itself: a title that arrives for the
+    // open session must not read as "the transcript changed".
+    activeSessionId,
     isProcessing,
   ]);
 
