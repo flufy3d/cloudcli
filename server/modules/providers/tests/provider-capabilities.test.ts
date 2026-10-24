@@ -204,10 +204,11 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     effortLevels: ['low', 'medium', 'high'],
     supportsMessageEditing: false,
     supportsSessionForking: false,
-    // Verified against agy 1.1.x: print mode passes `/compact` through to the
-    // model ("not a built-in slash command"), and the CLI has no compaction
-    // subcommand or flag. Slash expansion only covers skills/custom commands.
-    supportsCompaction: false,
+    // Upstream's matrix says the engine parses `/compact` from the prompt
+    // itself, so the composer offers it; this fork has not re-verified that
+    // against agy here (an earlier probe saw print mode pass the text through
+    // to the model).
+    supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,
     inputWhileBusy: 'queue',

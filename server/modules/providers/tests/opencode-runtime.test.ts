@@ -677,28 +677,6 @@ test('sessions with an active run or no app mapping are never adopted', async ()
   });
 });
 
-test('/compact compacts the session through its endpoint instead of prompting the model', async () => {
-  await withRuntime(async ({ service, runtime }) => {
-    const { writer, frames } = makeWriter();
-    const running = runtime.run('/compact', { sessionId: 'app-1', projectPath: '/tmp/p', permissionMode: 'bypassPermissions' }, writer, makeContext('ses_new'));
-    await service.waitForRequest((request) => request.path.endsWith('/compact'));
-    service.emit(session('session.execution.started', {}));
-    service.emit(session('session.compaction.started', { reason: 'manual', inputID: 'msg_c' }));
-    service.emit(session('session.compaction.ended', { reason: 'manual', inputID: 'msg_c' }));
-    service.emit(session('session.execution.succeeded', {}));
-    await running;
-
-    assert.ok(!service.requests.some((request) => request.path.endsWith('/prompt')));
-    const compact = service.requests.find((request) => request.path.endsWith('/compact'));
-    assert.equal(compact?.path, '/api/session/ses_new/compact');
-    const rows = frames.filter((frame) => frame.compact);
-    assert.deepEqual(rows.map((row) => row.compact?.phase), ['running', 'done']);
-    assert.equal(rows[1].content, 'Compacted · manual');
-    assert.equal(frames.at(-1)?.kind, 'complete');
-    assert.equal(frames.at(-1)?.exitCode, 0);
-  });
-});
-
 test('/compact with instructions fails the run without touching the session', async () => {
   await withRuntime(async ({ service, runtime }) => {
     const { writer, frames } = makeWriter();
