@@ -64,6 +64,8 @@ Every code change starts in its own worktree under `.worktrees/`, so multiple te
 
 `worktree:ls` lists trees, and `worktree:isolate` detaches a shared item. `.claude/settings.json` wires the WorktreeCreate and WorktreeRemove hooks to the same CLI, so `claude --worktree` and subagents with `isolation: "worktree"` get the same tree setup. Details: `docs/design/并行开发工作树.md`.
 
+> **This machine has no `nexus-devflow` on `PATH`** (checked 2026-10), so the `worktree:*` scripts and the `.claude/settings.json` hooks cannot run here yet. Until it is installed, use a throwaway `git worktree add` outside the repo (and a `node_modules` junction) for isolated work; the rules below still apply once the CLI is available.
+
 ## Frontend code
 
 For every task that creates, modifies, refactors, or reviews frontend code under `src/`, load and follow `$frontend-module-standards` from `.agents/skills/frontend-module-standards/SKILL.md`. Apply it only to frontend code; do not impose those architecture rules on the backend.
