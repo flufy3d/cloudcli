@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { sessionsDb } from '@/modules/database/index.js';
 import { parseFilesInputTag, parseImagesInputTag } from '@/shared/image-attachments.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import type {
@@ -31,13 +32,16 @@ import {
   unwrapJsonStringLiteral,
 } from '@/shared/utils.js';
 
+import type { OpenCodeApiClient } from './opencode-api.client.js';
 import {
   getOpenCodeDatabasePath,
+  readOpenCodeConversationOrder,
   resolveOpenCodeMessageLayout,
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
 import { readOpenCodeContextUsage } from './opencode-context-usage.js';
 import { buildOpenCodeTextRowKey } from './opencode-event-translator.js';
+import { connectOpenCodeApiClient } from './opencode-service.js';
 import { formatOpenCodeToolBlock } from './opencode-tool-output.js';
 
 const PROVIDER = 'opencode';
@@ -536,7 +540,18 @@ const readSubagentResultText = (state: AnyRecord, activity: SubagentActivity[] |
   return raw;
 };
 
+type OpenCodeSessionsDependencies = {
+  /** The client the edit rewind talks to; defaults to the production server. */
+  connectClient?: () => Promise<Pick<OpenCodeApiClient, 'revertSession'>>;
+};
+
 export class OpenCodeSessionsProvider implements IProviderSessions {
+  private readonly connectClient: () => Promise<Pick<OpenCodeApiClient, 'revertSession'>>;
+
+  constructor(dependencies: OpenCodeSessionsDependencies = {}) {
+    this.connectClient = dependencies.connectClient ?? connectOpenCodeApiClient;
+  }
+
   /**
    * Normalizes live `opencode run --format json` events into frontend messages.
    *
@@ -897,6 +912,9 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
             // disclosure, and the row above it says what the compaction was.
             ...(partData.isCompactSummary === true ? { isCompactSummary: true } : {}),
             ...(compactAnnotation ? { compact: compactAnnotation } : {}),
+            // The provider message id is what "edit this message" and "fork
+            // from here" address; the revert and fork cuts are named by it.
+            ...(messageRole === 'user' ? { transcriptAnchorId: row.message_id } : {}),
           }));
         }
         continue;
@@ -1006,6 +1024,93 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
     }
 
     return normalized;
+  }
+
+  /**
+   * Resolves the last message to keep when the message `anchorId` names is
+   * replaced: the conversation message before it, or `null` when the edited
+   * message opened the conversation.
+   *
+   * `anchorId` is the provider message id (`msg_…`) each user row carries as
+   * its transcript anchor.
+   */
+  async resolveEditAnchor(
+    sessionId: string,
+    anchorId: string,
+  ): Promise<{ found: boolean; resumeThroughId: string | null }> {
+    const providerSessionId = sessionsDb.getSessionById(sessionId)?.provider_session_id;
+    const db = providerSessionId ? openOpenCodeDatabase() : null;
+    if (!providerSessionId || !db) {
+      return { found: false, resumeThroughId: null };
+    }
+
+    try {
+      const order = readOpenCodeConversationOrder(db, providerSessionId);
+      const index = order.findIndex((message) => message.id === anchorId);
+      if (index < 0) {
+        return { found: false, resumeThroughId: null };
+      }
+      return { found: true, resumeThroughId: index === 0 ? null : order[index - 1].id };
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Rewinds an OpenCode session in place so `keepThroughId` is its last
+   * message (`null` keeps nothing).
+   *
+   * OpenCode cannot resume partway, but its service reverts a session at a
+   * message: the first user message after what is kept is dropped together
+   * with everything after it, and the files those turns changed are restored
+   * from the engine's snapshots (hence `editRevertsFiles`; the engine only
+   * snapshots inside a git repository, elsewhere only the conversation is
+   * rewound). The session keeps its provider id, so the replacement prompt is
+   * an ordinary resume.
+   */
+  async rewindSession(sessionId: string, keepThroughId: string | null): Promise<void> {
+    const providerSessionId = sessionsDb.getSessionById(sessionId)?.provider_session_id;
+    if (!providerSessionId) {
+      throw new AppError('This session has not produced a transcript yet.', {
+        code: 'EDIT_SOURCE_NOT_READY',
+        statusCode: 409,
+      });
+    }
+
+    const db = openOpenCodeDatabase();
+    if (!db) {
+      throw new AppError('OpenCode database was not found.', {
+        code: 'OPENCODE_DATABASE_NOT_FOUND',
+        statusCode: 409,
+      });
+    }
+
+    let dropMessageId: string | null;
+    try {
+      const order = readOpenCodeConversationOrder(db, providerSessionId);
+      const keepIndex = keepThroughId === null
+        ? -1
+        : order.findIndex((message) => message.id === keepThroughId);
+      // An unknown keep point must not fall through to "keep nothing" — that
+      // would wipe the whole conversation.
+      if (keepThroughId !== null && keepIndex < 0) {
+        throw new AppError('That message is no longer in the transcript.', {
+          code: 'ANCHOR_NOT_FOUND',
+          statusCode: 404,
+        });
+      }
+      dropMessageId = order.slice(keepIndex + 1).find((message) => message.role === 'user')?.id ?? null;
+    } finally {
+      db.close();
+    }
+
+    // Nothing follows what is being kept, so there is nothing to replace.
+    if (!dropMessageId) {
+      return;
+    }
+
+    const client = await this.connectClient();
+    await client.revertSession(providerSessionId, dropMessageId, { files: true });
   }
 
   /**

@@ -137,16 +137,16 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuotaReset: false,
     supportsEffort: true,
     effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
-    // The service-client runtime carries no edit/rewind or fork path yet, so
-    // neither capability is derived for this provider.
-    supportsMessageEditing: false,
-    supportsSessionForking: false,
+    // Editing rides the service's revert (sessions.resolveEditAnchor +
+    // rewindSession) and forking its fork endpoint (the fork facet).
+    supportsMessageEditing: true,
+    supportsSessionForking: true,
     // The runtime's `compact` facet drives the service's compaction request
     // (a synthetic message the engine runs as a summarization turn), which is
     // what puts `/compact` in the composer menu for this provider.
     supportsCompaction: true,
     supportsNativeScheduling: false,
-    editRevertsFiles: false,
+    editRevertsFiles: true,
     inputWhileBusy: 'queue',
     mcp: {
       scopes: ['user', 'project'],

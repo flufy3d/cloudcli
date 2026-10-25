@@ -143,9 +143,9 @@ export const PROVIDER_CATALOG = {
     supportsAbort: true,
     supportsEffort: true,
     supportsNativeScheduling: false,
-    // The service-client runtime has no message edit/rewind path yet, so the
-    // composer never opens the edit flow for this provider.
-    editRevertsFiles: false,
+    // The edit rewind is a service-side revert that restores the files the
+    // dropped turns changed from the engine's snapshots.
+    editRevertsFiles: true,
     inputWhileBusy: 'queue',
     // Passed on as OpenCode's `--variant`. `thinking` (MiniMax's on/off
     // variant, paired with `none`) is not a strength, so it sorts last.

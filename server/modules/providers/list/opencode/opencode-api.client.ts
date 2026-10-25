@@ -4,8 +4,9 @@
  * Thin typed wrapper over the handful of `opencode serve` HTTP endpoints the
  * runtime drives (verified against v2.0.31 with live probes; compaction
  * against v2.0.32): session creation, model/agent/permission switches,
- * prompting, compaction, interruption, and the permission/form replies that
- * answer the interactive cards.
+ * prompting, compaction, interruption, the permission/form replies that
+ * answer the interactive cards, and the revert/fork cuts behind message
+ * editing and "fork from here".
  *
  * Every call authenticates with HTTP Basic (`opencode:<password>`) — the
  * scheme the CLI's own standalone server uses — and surfaces non-2xx answers
@@ -140,7 +141,8 @@ type FetchLike = typeof fetch;
  * Typed client bound to one endpoint.
  *
  * Consumers: opencode runtime (session/prompt/interrupt), opencode
- * interaction bridge (permission/form replies). Tests inject `fetch`.
+ * interaction bridge (permission/form replies), opencode sessions and fork
+ * providers (revert/fork). Tests inject `fetch`.
  */
 export class OpenCodeApiClient {
   private readonly fetchImpl: FetchLike;
@@ -212,6 +214,45 @@ export class OpenCodeApiClient {
     );
     const messageId = result?.data?.id;
     return { messageId: typeof messageId === 'string' ? messageId : null };
+  }
+
+  /**
+   * `POST /api/session/:id/fork` — copies the conversation into a new
+   * top-level session and returns its id. The cut is **exclusive**: only the
+   * messages strictly before `before` are copied, and the whole conversation
+   * when it is null (verified against v2.1.4; the copy gets fresh message ids
+   * and no `parent_id`, so it indexes as an ordinary session).
+   *
+   * Consumer: opencode fork provider.
+   */
+  async forkSession(sessionId: string, before: string | null): Promise<{ id: string }> {
+    const path = `/api/session/${encodeURIComponent(sessionId)}/fork`;
+    const result = await this.request<{ data?: { id?: unknown } }>('POST', path, before ? { before } : {});
+    const id = result?.data?.id;
+    if (typeof id !== 'string' || !id) {
+      throw new OpenCodeApiError('POST', path, 200, 'response carried no session id');
+    }
+    return { id };
+  }
+
+  /**
+   * Drops `messageId` and everything after it from the session: stages the
+   * revert boundary (`POST /revert/stage`, restoring the files those turns
+   * changed when `files` is set) and commits it (`POST /revert/commit`), which
+   * deletes the rows (verified against v2.1.4). A commit that fails clears the
+   * staged boundary again so the session is not left half-reverted.
+   *
+   * Consumer: opencode sessions provider (message editing).
+   */
+  async revertSession(sessionId: string, messageId: string, options: { files: boolean }): Promise<void> {
+    const base = `/api/session/${encodeURIComponent(sessionId)}/revert`;
+    await this.request('POST', `${base}/stage`, { messageID: messageId, files: options.files });
+    try {
+      await this.request('POST', `${base}/commit`);
+    } catch (error) {
+      await this.request('DELETE', base).catch(() => undefined);
+      throw error;
+    }
   }
 
   /** `POST /api/session/:id/interrupt` — true when a run was actually stopped. */

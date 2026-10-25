@@ -69,7 +69,7 @@ import { OpenCodeEventStream } from './opencode-event-stream.js';
 import { OpenCodeInteractionBridge } from './opencode-interaction-bridge.js';
 import { buildOpenCodePromptFiles, buildOpenCodePromptText } from './opencode-prompt-attachments.js';
 import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker, type OpenCodeActiveRun, type OpenCodeRunSettlement } from './opencode-run-registry.js';
-import { OpenCodeServiceError, OpenCodeServiceSupervisor } from './opencode-service.js';
+import { OpenCodeServiceError, OpenCodeServiceSupervisor, opencodeServiceSupervisor } from './opencode-service.js';
 import {
   OpenCodeSessionSettingsApplier,
   resolveOpenCodeSessionSettings,
@@ -748,4 +748,4 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
  *
  * Consumer: `opencode.provider.ts`.
  */
-export const opencodeRuntime: IProviderRuntime = createOpenCodeRuntime();
+export const opencodeRuntime: IProviderRuntime = createOpenCodeRuntime({ supervisor: opencodeServiceSupervisor });

@@ -41,7 +41,7 @@ Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结�
 | `auth` | 安装/登录状态 | `getStatus()`（"未安装/未登录"是数据不是异常）；可选 `getQuota()`（配额）→ `providerAuthService` |
 | `mcp` | 引擎原生 MCP 配置读写 | `McpProvider` 基类（scope/transport 校验）→ `providerMcpService` |
 | `skills` | 技能发现/写入 | `SkillsProvider` 基类（SKILL.md 扫描）→ `providerSkillsService` |
-| `sessions` | 事件归一化 + 历史 | `normalizeMessage`、`fetchHistory`；可选 `getTokenUsage` / `resolveEditAnchor`（编辑锚点）/ `rewindSession`（codex 分支式回退）/ `cleanupSession` → `sessionsService` |
+| `sessions` | 事件归一化 + 历史 | `normalizeMessage`、`fetchHistory`；可选 `getTokenUsage` / `resolveEditAnchor`（编辑锚点）/ `rewindSession`（codex 分支式回退、opencode 原地 revert）/ `cleanupSession` → `sessionsService` |
 | `sessionSynchronizer` | 落盘索引 | `getSessionWatchTarget()`（声明 watch 根）、`synchronize()`、`synchronizeFile()` → `sessionSynchronizerService` + `sessions-watcher.service.ts` |
 | `fork?`（可选） | 会话分支复制 | `forkSession()`；**缺省即"该引擎无 fork 能力"** |
 
@@ -136,7 +136,8 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 - 附件：data-URI 文件块随 prompt 下发（模型真正看到内容），同时保留 `<images_input>`/`<files_input>` 路径标签供历史回读还原。
 - 历史、会话索引、模型目录、登录检测不变：仍读 `opencode.db`（双格式）与 CLI 探测；v2 的 `compaction` 消息行（v2.0.32 把压缩写在会话旁而非 assistant 消息里）渲染成"压缩行 + 摘要行"（`isCompactSummary`）。子代理历史：父转录的 `subagent`/`task` 工具块按 `state.metadata.sessionID` 找到子会话行（`parent_id`），把子会话自身的消息翻成 `subagentTools` 时间线（assistant 正文/reasoning/工具，工具结果优先读 v2 的 `state.content`），agent 名取自子会话 `agent`、状态以子会话最近一次 settle 为准——`idle_outcome`/`time_idle` 只在会话行没有比 idle 标记更新的写入时可信（被再次唤醒、仍在中途的子会话还戴着上一轮的 idle 标记，直读会把工作中的子代理误报成已完成），后台启动的父块 `metadata.status` 永远是 running；子会话不进侧边栏索引（同步器照旧剪枝）。契约探针：`scripts/probe/opencode-subagent-probe.mjs`。
 - `opencode-context-usage.ts`：上下文占用读取器（bridge 的 `step.ended` 令牌经 `OpenCodeTokenBudgetTracker` 变成实时 `token_budget` 帧；`/token-usage`、历史页与回合结束帧共用同一读数），语义与 v1/v2 布局差异见上方用量表。
-- **相对旧实现的缺口（待移植）**：消息编辑（`revert` 锚点/回滚）、会话 fork、空交付自动重试、回合中途插话（`injectInput`）。子代理卡片与审批桥上溯父会话已补（历史见上，实时见 registry / bridge 两条）。配额卡片已移植（`opencode-quota.provider.ts`）；`/compact` 已随服务客户端恢复（见上方「`/compact` 的引擎实现」）。
+- **消息编辑与 fork**（服务端原语，v2.1.4 探针 `scripts/probe/opencode-revert-fork-probe.mjs`）：历史里每条用户行带 `transcriptAnchorId = msg_…`；`readOpenCodeConversationOrder`（`opencode-data-root.ts`）给出只含 user/assistant 的消息序，跳过 v2 的 `model-switched`/`system`/`idle` 等簿记行——切点落在簿记行上会把一个回合劈开。编辑走 `rewindSession`：在保留点之后的第一条用户消息处 `revert/stage {files:true}` + `revert/commit`（删行并按引擎快照还原这些回合改过的文件，故 `editRevertsFiles: true`；快照只存在于 git 仓库内，非 git 目录只回退对话），provider 会话 id 不变，替换 prompt 是普通续写；未知保留点直接 404，绝不退化成"全部丢弃"。fork（`opencode-fork.provider.ts`）用 `POST /fork {before}`，该切点**不含** `before`，所以传锚点回合之后的第一条用户消息，得到含锚点整回合的副本（与 codex 一致）；副本无 `parent_id`，同步器不会当子会话剪掉。两者与 runtime 共用 `opencodeServiceSupervisor` 单例（`connectOpenCodeApiClient`），不会另起一个 `serve`。
+- **相对旧实现的缺口（待移植）**：空交付自动重试、回合中途插话（`injectInput`）。子代理卡片与审批桥上溯父会话已补（历史见上，实时见 registry / bridge 两条）。配额卡片已移植（`opencode-quota.provider.ts`）；`/compact` 已随服务客户端恢复（见上方「`/compact` 的引擎实现」）。
 
 
 ## 会话索引准入：哪些工作区能变成项目

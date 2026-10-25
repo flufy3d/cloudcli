@@ -47,6 +47,14 @@ const withFakeService = async (
         reply(200, { data: { id: 'msg_compaction', sessionID: 'ses_fake', type: 'compaction', payload: {}, delivery: 'steer' } });
         return;
       }
+      if (request.method === 'POST' && path.endsWith('/fork')) {
+        reply(200, { data: { id: 'ses_forked', fork: { sessionID: 'ses_fake' } } });
+        return;
+      }
+      if (request.method === 'POST' && path === '/api/session/ses_stuck/revert/commit') {
+        reply(500, { message: 'commit failed' });
+        return;
+      }
       if (request.method === 'POST' && path.endsWith('/interrupt')) {
         reply(200, { interrupted: true });
         return;
@@ -187,5 +195,32 @@ test('compact posts to the session compaction endpoint and returns the admitted 
     assert.equal(request?.method, 'POST');
     assert.equal(request?.path, '/api/session/ses_fake/compact');
     assert.deepEqual(request?.body, {});
+  });
+});
+
+test('forks with an exclusive `before` cut, or the whole conversation without one', async () => {
+  await withFakeService(async ({ client, requests }) => {
+    assert.deepEqual(await client.forkSession('ses_fake', 'msg_next'), { id: 'ses_forked' });
+    assert.deepEqual(await client.forkSession('ses_fake', null), { id: 'ses_forked' });
+
+    assert.deepEqual(requests.map((request) => [request.method, request.path, request.body]), [
+      ['POST', '/api/session/ses_fake/fork', { before: 'msg_next' }],
+      ['POST', '/api/session/ses_fake/fork', {}],
+    ]);
+  });
+});
+
+test('reverts by staging then committing, and clears a boundary whose commit failed', async () => {
+  await withFakeService(async ({ client, requests }) => {
+    await client.revertSession('ses_fake', 'msg_drop', { files: true });
+    await assert.rejects(client.revertSession('ses_stuck', 'msg_drop', { files: false }), OpenCodeApiError);
+
+    assert.deepEqual(requests.map((request) => [request.method, request.path, request.body]), [
+      ['POST', '/api/session/ses_fake/revert/stage', { messageID: 'msg_drop', files: true }],
+      ['POST', '/api/session/ses_fake/revert/commit', undefined],
+      ['POST', '/api/session/ses_stuck/revert/stage', { messageID: 'msg_drop', files: false }],
+      ['POST', '/api/session/ses_stuck/revert/commit', undefined],
+      ['DELETE', '/api/session/ses_stuck/revert', undefined],
+    ]);
   });
 });

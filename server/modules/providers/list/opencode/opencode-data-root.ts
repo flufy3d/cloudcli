@@ -195,6 +195,62 @@ export function resolveOpenCodeMessageLayout(
 }
 
 /**
+ * One conversation message of a session, reduced to what an edit or fork cut
+ * needs: its provider id (`msg_…`, the transcript anchor) and its role.
+ *
+ * Consumers: opencode sessions provider (edit anchor/rewind) and fork provider.
+ */
+export type OpenCodeConversationMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+};
+
+/**
+ * Lists a session's user and assistant messages, oldest first, in either
+ * storage layout.
+ *
+ * v2 interleaves bookkeeping rows (`model-switched`, `system`, `idle`,
+ * `compaction`, …) with the conversation in `session_message`; those are
+ * skipped, because the revert and fork cuts must be named by a conversation
+ * message — a cut placed on a bookkeeping row would split a turn. v1 keeps the
+ * role inside each `message` row's JSON payload.
+ *
+ * Consumers: opencode sessions provider (edit anchor/rewind) and fork provider.
+ */
+export function readOpenCodeConversationOrder(
+  db: OpenCodeReadableDatabase,
+  providerSessionId: string,
+): OpenCodeConversationMessage[] {
+  const layout = resolveOpenCodeMessageLayout(db);
+  if (layout === 'session_message') {
+    const rows = db.prepare(`
+      SELECT id, type
+      FROM session_message
+      WHERE session_id = ? AND type IN ('user', 'assistant')
+      ORDER BY seq
+    `).all(providerSessionId) as Array<{ id: string; type: 'user' | 'assistant' }>;
+    return rows.map((row) => ({ id: row.id, role: row.type }));
+  }
+  if (layout === 'message_part') {
+    const rows = db.prepare(`
+      SELECT id, data
+      FROM message
+      WHERE session_id = ?
+      ORDER BY COALESCE(time_created, 0), id
+    `).all(providerSessionId) as Array<{ id: string; data: string | null }>;
+    const messages: OpenCodeConversationMessage[] = [];
+    for (const row of rows) {
+      const role = readOptionalString(readJsonRecord(row.data)?.role);
+      if (role === 'user' || role === 'assistant') {
+        messages.push({ id: row.id, role });
+      }
+    }
+    return messages;
+  }
+  return [];
+}
+
+/**
  * When the session last went idle (epoch ms), `null` while a run is in
  * flight, or `undefined` when the database has no idle column (layouts that
  * predate v2) or no such session.
