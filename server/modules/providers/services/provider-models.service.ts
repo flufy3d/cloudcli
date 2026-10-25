@@ -123,6 +123,7 @@ const mergeProviderModels = (
     // Copied so no caller can mutate the shared capability matrix.
     EFFORT_LEVELS: [...readCustomModelEffortLevels(provider)],
     CUSTOM_MODELS_ONLY: customModelsOnly,
+    ...(predefined.FALLBACK ? { FALLBACK: true } : {}),
   };
 };
 

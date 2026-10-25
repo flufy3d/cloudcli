@@ -180,6 +180,20 @@ test('the custom-models-only flag is off by default and leaves the merged catalo
   assert.equal(models.CUSTOM_MODELS_ONLY, false);
 });
 
+test('a fallback adapter catalog stays flagged through the merge so clients refetch it', async () => {
+  const { service } = createTestService({
+    models: { opencode: { ...createModels('opencode/anchor'), FALLBACK: true } },
+  });
+  await service.createCustomModel('opencode', { model: 'Router', id: 'router/model' });
+
+  const fallback = await service.getProviderModels('opencode');
+  assert.equal(fallback.FALLBACK, true);
+  assert.deepEqual(fallback.OPTIONS.map((option) => option.value), ['opencode/anchor', 'router/model']);
+
+  // Live catalogs carry no flag at all.
+  assert.equal('FALLBACK' in await service.getProviderModels('codex'), false);
+});
+
 test('custom-models-only lists just the custom models and makes the first one the default', async () => {
   const { service, settings } = createTestService();
   await service.createCustomModel('claude', { model: 'Gateway Sonnet', id: 'gateway-sonnet' });

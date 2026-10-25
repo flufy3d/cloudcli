@@ -320,6 +320,15 @@ export type ProviderModelsDefinition = {
    * Adapter catalogs omit it.
    */
   CUSTOM_MODELS_ONLY?: boolean;
+  /**
+   * True when the adapter could not read its live catalog (CLI cold start,
+   * timeout, logged-out account) and returned its static anchor list instead.
+   * The Providers service carries it through the merge; clients should show
+   * the list but refetch later rather than treat it as the account's catalog,
+   * and must not overwrite a stored model selection that is missing from it.
+   * Omitted when the catalog is live.
+   */
+  FALLBACK?: boolean;
 };
 
 /**

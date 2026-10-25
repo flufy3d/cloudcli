@@ -47,7 +47,7 @@ Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结�
 
 **可选成员就是能力开关**，这是整个框架的核心设计。
 
-**模型目录特例（opencode）**：`list/opencode/opencode-models.provider.ts` 以 `opencode models` CLI 的账号级清单为准（后台服务在时约百毫秒返回；超时不计票），id 为 `<providerID>/<modelID>`，再叠加 OpenCode 自己缓存于数据库 `kv` 的 models.dev 条目补全推理档位与说明；CLI 缺失/失败/空答案时回退 `OPENCODE_PREDEFINED_MODELS` 预置表并按本机已连接 provider 过滤。会话模型值同样以目录的 `<providerID>/<modelID>` 为准，`providerModelsService` 负责把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原。此前的「读 `~/.cache/opencode/models.json` 实时目录」叠加层随本轮 client-mode 迁移一并移除（见「OpenCode 服务客户端」）。
+**模型目录特例（opencode）**：`list/opencode/opencode-models.provider.ts` 以 `opencode models` CLI 的账号级清单为准（后台服务在时约百毫秒返回；首次调用需冷启动该服务，故超时放宽到 15s），id 为 `<providerID>/<modelID>`，再叠加 OpenCode 自己缓存于数据库 `kv` 的 models.dev 条目补全推理档位与说明；CLI 缺失/失败/空答案时回退 `OPENCODE_PREDEFINED_MODELS` 预置表并按本机已连接 provider 过滤，且打上 `FALLBACK: true`（`ProviderModelsDefinition` 通用字段，`providerModelsService` 合并时透传），告诉前端这只是替身目录、需稍后重拉。会话模型值同样以目录的 `<providerID>/<modelID>` 为准，`providerModelsService` 负责把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原。此前的「读 `~/.cache/opencode/models.json` 实时目录」叠加层随本轮 client-mode 迁移一并移除（见「OpenCode 服务客户端」）。
 
 **模型目录特例（zcode）**：新版本 ZCode 把用户自建 provider/模型从 `~/.zcode/v2/config.json` 迁到了 `~/.zcode/v2/provider_config.json` + 引擎自带目录（`zcode-provider-config.ts` 定位 runtime 刷新副本或安装目录 `resources/config/provider/zcode-builtin.json`），因此 `getSupportedModels()` 以引擎为准：调一次 `session/create` 取响应里的 `settings.model.available`（即引擎已合并用户 provider 后的完整目录，用完即 `session/close`），失败才回退磁盘解析。会话模型值同样是 `<providerID>/<modelID>`，并把每个模型的 `reasoning.defaultLevel` 记进 `zcode-models.provider.ts` 的 `engineReasoningDefaults`；`setModel` 的 schema 是严格校验，reasoning 档位必须放 `model.options.reasoningLevel`（旧的 `model.variant` 会被拒），缺省取上面记下的 defaultLevel，否则引擎报 “Reasoning level is required”。
 

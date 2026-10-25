@@ -102,7 +102,7 @@ test('OpenCode falls back to the anchor catalog when nothing dynamic is readable
   await withOpenCodeHome(async () => {}, async (adapter) => {
     // Nothing readable about this install, so the picker keeps the anchor
     // entries rather than coming up empty.
-    assert.deepEqual(await adapter.getSupportedModels(), OPENCODE_PREDEFINED_MODELS);
+    assert.deepEqual(await adapter.getSupportedModels(), { ...OPENCODE_PREDEFINED_MODELS, FALLBACK: true });
     assert.equal(
       (await adapter.getCurrentActiveModel()).model,
       OPENCODE_PREDEFINED_MODELS.DEFAULT,
@@ -154,7 +154,7 @@ test('OpenCode offers only models the install can route to', async () => {
   await withOpenCodeHome(
     (homeDir) => writeOpenCodeAuth(homeDir, { anthropic: { type: 'api', key: 'test' } }),
     async (adapter) => {
-      assert.deepEqual(await adapter.getSupportedModels(), OPENCODE_PREDEFINED_MODELS);
+      assert.deepEqual(await adapter.getSupportedModels(), { ...OPENCODE_PREDEFINED_MODELS, FALLBACK: true });
     },
   );
 
@@ -336,6 +336,8 @@ test('OpenCode lists only the models the CLI reports for the account', async () 
       ]);
       // The curated default stays when the account has it enabled.
       assert.equal(catalog.DEFAULT, OPENCODE_PREDEFINED_MODELS.DEFAULT);
+      // A live catalog is never flagged, so clients stop polling once it lands.
+      assert.equal(catalog.FALLBACK, undefined);
     },
   );
 

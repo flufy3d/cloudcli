@@ -144,12 +144,15 @@ export type ProviderModelOption = {
  * library; the server derives it from the provider, not from the options, and it is empty without effort support.
  * `CUSTOM_MODELS_ONLY` is the user's "use only my models" flag: while it is on and a custom model exists, the
  * server lists only custom models and the first is `DEFAULT`. Older servers omit it, which means off.
+ * `FALLBACK` marks a static stand-in the server returned because the provider's live catalog was unreadable
+ * (CLI cold start, timeout): show it, keep refetching, and never overwrite a stored model missing from it.
  */
 export type ProviderModelsDefinition = {
   OPTIONS: ProviderModelOption[];
   DEFAULT: string;
   EFFORT_LEVELS?: string[];
   CUSTOM_MODELS_ONLY?: boolean;
+  FALLBACK?: boolean;
 };
 
 /**
