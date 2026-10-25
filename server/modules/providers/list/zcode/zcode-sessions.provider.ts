@@ -14,6 +14,7 @@ import type {
 } from '@/shared/types.js';
 import {
   AppError,
+  compactProviderPayload,
   createNormalizedMessage,
   generateMessageId,
   normalizeProjectPath,
@@ -442,7 +443,9 @@ export class ZCodeSessionsProvider implements IProviderSessions {
         continue;
       }
 
-      const partData = readJsonRecord(row.part_data);
+      const partData = compactProviderPayload(
+        messageRole === 'user' ? { ...(readJsonRecord(row.part_data) ?? {}), role: 'user' } : readJsonRecord(row.part_data),
+      );
       if (!partData) {
         continue;
       }

@@ -41,9 +41,13 @@ import {
 } from '@/modules/notifications/index.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
 import { recordClaudeSessionContextWindow, readClaudeSessionWindowSources } from '@/modules/providers/services/claude-context-window.js';
-import type { ClaudeSessionWindowSources } from '@/modules/providers/services/claude-context-window.js';
 import { createContextWindowCapture } from '@/modules/providers/services/claude-context-window.js';
-import { resolveClaudeContextWindow } from '@/modules/providers/services/claude-usage.js';
+import {
+  getReportedClaudeContextWindow,
+  rememberClaudeContextWindow,
+  resolveClaudeContextWindow
+} from '@/modules/providers/services/claude-usage.js';
+import type { ClaudeContextWindowSources } from '@/modules/providers/services/claude-usage.js';
 
 export { createContextWindowCapture } from '@/modules/providers/services/claude-context-window.js';
 import { canonicalClaudeSubagentToolName, createCompleteMessage, createNormalizedMessage, resolveModelEffort } from '@/shared/utils.js';
@@ -190,6 +194,10 @@ type ActiveClaudeSession = {
   status: 'active' | 'aborted';
   writer: ClaudeWriter | null;
   releaseInput: (() => void) | null;
+  /** A turn is being prepared for this process and must not be let go yet. */
+  incomingTurn?: boolean;
+  /** The turn being prepared was stopped before it reached the process. */
+  incomingAborted?: boolean;
   /** Set while background work owes the session a follow-up reply. */
   backgroundReplyPending?: boolean;
 } & ClaudeTurnHooks;
@@ -854,6 +862,35 @@ function readNumber(value: unknown): number {
 }
 
 /**
+ * Reads the context window the SDK measured for the model that served a turn.
+ *
+ * `result.modelUsage` has one entry per model the turn billed, subagents'
+ * included, so the entry has to be the main thread's model. Its key is the id
+ * the CLI requested, which for a 1M variant carries a `[1m]` suffix that the
+ * assistant rows' `message.model` lacks (`claude-sonnet-5-5[1m]` vs
+ * `claude-sonnet-5-5`); newer CLIs also state the bare id as `canonicalModel`.
+ */
+function readReportedContextWindow(sdkMessage: unknown, mainModel: string | null): number | null {
+  const streamMessage = sdkMessage as { type?: string; modelUsage?: Record<string, Record<string, unknown>> } | null;
+  const modelUsage = streamMessage?.type === 'result' ? streamMessage.modelUsage : null;
+  if (!modelUsage || typeof modelUsage !== 'object') {
+    return null;
+  }
+
+  const reported = Object.entries(modelUsage).filter(
+    ([, modelData]) => modelData && typeof modelData === 'object' && readNumber(modelData.contextWindow) > 0
+  );
+  const exactMatch = reported.find(([modelKey]) => modelKey === mainModel);
+  const variantMatch = reported.find(([modelKey, modelData]) => (
+    Boolean(mainModel)
+    && (modelData.canonicalModel === mainModel || modelKey.replace(/\[[^\]]*\]$/, '') === mainModel)
+  ));
+  // A turn that billed a single model was served by it, whatever it is called.
+  const entry = exactMatch ?? variantMatch ?? (reported.length === 1 ? reported[0] : null);
+  return entry ? readNumber(entry[1].contextWindow) : null;
+}
+
+/**
  * Builds a context-window budget from an Anthropic-shaped usage payload.
  *
  * `input_tokens + cache_read + cache_creation` is one request's whole prompt,
@@ -862,7 +899,7 @@ function readNumber(value: unknown): number {
 function buildTokenBudget(
   messageUsage: Record<string, unknown>,
   model: string | null = null,
-  windowSources?: ClaudeSessionWindowSources,
+  windowSources?: ClaudeContextWindowSources,
 ): TokenBudget {
   const directInputTokens = readNumber(messageUsage.input_tokens ?? messageUsage.inputTokens);
   const cacheCreationTokens = readNumber(messageUsage.cache_creation_input_tokens ?? messageUsage.cacheCreationInputTokens ?? messageUsage.cacheCreationTokens);
@@ -902,7 +939,7 @@ function buildTokenBudget(
  */
 export function extractTokenBudget(
   sdkMessage: unknown,
-  windowSources?: ClaudeSessionWindowSources,
+  windowSources?: ClaudeContextWindowSources,
 ): TokenBudget | null {
   if (!sdkMessage || typeof sdkMessage !== 'object') {
     return null;
@@ -949,7 +986,7 @@ export function extractTokenBudget(
  */
 export function extractCumulativeTokenBudget(
   sdkMessage: unknown,
-  windowSources?: ClaudeSessionWindowSources,
+  windowSources?: ClaudeContextWindowSources,
 ): TokenBudget | null {
   const streamMessage = sdkMessage as ClaudeStreamMessage | null | undefined;
   if (!streamMessage || typeof streamMessage !== 'object' || streamMessage.type !== 'result') {
@@ -1395,6 +1432,13 @@ async function runClaudeProcess(
   // Set once a turn publishes a budget read from an assistant message, so the
   // turn-ending `result` is only mined for usage when nothing better arrived.
   let assistantBudgetSent = false;
+  // The window the SDK reported for this session (a resumed session starts
+  // from the one its last run reported), the model the main thread's assistant
+  // rows name, and the budget last published — re-sent with the right total
+  // when the turn's `result` is the first to state the window.
+  let reportedContextWindow = getReportedClaudeContextWindow(providerSessionId) ?? null;
+  let mainThreadModel: string | null = null;
+  let lastSentTokenBudget: TokenBudget | null = null;
   // Idle-turn detection: a resumed turn that only acknowledges an injected
   // task-notification ("No response requested.") leaves the user's prompt
   // unacted upon. Signals are collected across the stream and evaluated once
@@ -1720,6 +1764,10 @@ async function runClaudeProcess(
       if (residentIdle) return;
       const idleMs = residentIdleMs();
       const key = sessionKey();
+      // A turn is being prepared for this process (its inputs are still being
+      // read): keep stdin open so it can take the turn, rather than letting it
+      // go and starting a fresh process under the relay's output.
+      if (key && getSession(key)?.incomingTurn) return;
       if (!options.residentBetweenTurns || idleMs <= 0 || residentMax() <= 0 || pendingIdleResend
         || processGoingAway() || !key || getSession(key)?.instance !== queryInstance) {
         releasePromptStream();
@@ -1943,7 +1991,10 @@ async function runClaudeProcess(
       },
     );
     /** Both sources the session row knows, read per frame so a fresh record lands at once. */
-    const readWindowSources = (): ClaudeSessionWindowSources => readClaudeSessionWindowSources(capturedSessionId || sessionId);
+    const readWindowSources = (): ClaudeContextWindowSources => ({
+      ...readClaudeSessionWindowSources(capturedSessionId || sessionId),
+      reported: reportedContextWindow,
+    });
 
     for await (const rawMessage of queryInstance) {
       const message = rawMessage as ClaudeStreamMessage;
@@ -2040,7 +2091,26 @@ async function runClaudeProcess(
         const reportedBudget = measuredContextWindow
           ? { ...tokenBudgetData, total: measuredContextWindow }
           : tokenBudgetData;
+        lastSentTokenBudget = reportedBudget;
         ws.send(createNormalizedMessage({ kind: 'status', text: 'token_budget', tokenBudget: reportedBudget, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
+      }
+
+      // The turn's `result` is the first frame to state the real window of the
+      // model that served it. Remember it for later turns, the history readers
+      // and the resumed run, and re-publish the last reading with the right
+      // total so the live counter stops using the launch-time guess.
+      const reportedWindow = readReportedContextWindow(message, mainThreadModel);
+      if (reportedWindow && reportedWindow !== reportedContextWindow) {
+        reportedContextWindow = reportedWindow;
+        const key = capturedSessionId || providerSessionId || sessionId;
+        if (key) {
+          rememberClaudeContextWindow(key, reportedWindow);
+          recordClaudeSessionContextWindow(key, reportedWindow);
+        }
+        if (lastSentTokenBudget && lastSentTokenBudget.total !== reportedWindow) {
+          lastSentTokenBudget = { ...lastSentTokenBudget, total: reportedWindow };
+          ws.send(createNormalizedMessage({ kind: 'status', text: 'token_budget', tokenBudget: lastSentTokenBudget, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
+        }
       }
 
       if (isTaskNotificationUserMessage(message)) {
@@ -2052,6 +2122,9 @@ async function runClaudeProcess(
       // counted there.
       if (message.type === 'assistant' && !message.parent_tool_use_id) {
         const content = message.message?.content;
+        if (typeof message.message?.model === 'string' && message.message.model) {
+          mainThreadModel = message.message.model;
+        }
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block?.type === 'text') {
@@ -2340,29 +2413,50 @@ async function continueOnHeldProcess(
   if (!held?.continueTurn) {
     return null;
   }
-  let prepared: ClaudeTurnPreparation;
+  // Reading the turn's inputs is asynchronous, and the run is between turns
+  // while it happens. Mark the process as having a turn on the way so a
+  // `result` that lands mid-read does not let the process go as idle.
+  held.incomingTurn = true;
+  held.incomingAborted = false;
   try {
-    prepared = await prepareTurnInputs(command, options, context, providerSessionId);
-  } catch {
-    // The fresh run surfaces the same failure to the client.
-    return null;
+    let prepared: ClaudeTurnPreparation;
+    try {
+      prepared = await prepareTurnInputs(command, options, context, providerSessionId);
+    } catch {
+      // The fresh run surfaces the same failure to the client.
+      return null;
+    }
+    // A stop that arrived while the inputs were read withdraws the turn before
+    // it reaches the CLI, leaving the process and its background work alone. A
+    // process with nothing else outstanding has no reason to stay open.
+    if (held.incomingAborted) {
+      if (!backgroundWork.hasPending(sessionId)) held.releaseInput?.();
+      return { turn: Promise.resolve() };
+    }
+    // Another turn may have replaced the process while the inputs were read.
+    if (getSession(sessionId) !== held) {
+      return null;
+    }
+    // Another process (the terminal) continued the conversation while this one
+    // was idle: it holds a stale conversation, so the turn resumes afresh.
+    if (await held.writtenByAnotherWhileIdle?.()) {
+      console.log(`[Claude SDK] Session ${sessionId} was continued elsewhere while idle; resuming it on a fresh process`);
+      held.releaseInput?.();
+      return null;
+    }
+    if (held.incomingAborted) {
+      if (!backgroundWork.hasPending(sessionId)) held.releaseInput?.();
+      return { turn: Promise.resolve() };
+    }
+    if (getSession(sessionId) !== held) {
+      return null;
+    }
+    const turn = held.continueTurn({ command, options, writer, ...prepared });
+    return turn ? { turn } : null;
+  } finally {
+    held.incomingTurn = false;
+    held.incomingAborted = false;
   }
-  // Another turn may have replaced the process while the inputs were read.
-  if (getSession(sessionId) !== held) {
-    return null;
-  }
-  // Another process (the terminal) continued the conversation while this one
-  // was idle: it holds a stale conversation, so the turn resumes afresh.
-  if (await held.writtenByAnotherWhileIdle?.()) {
-    console.log(`[Claude SDK] Session ${sessionId} was continued elsewhere while idle; resuming it on a fresh process`);
-    held.releaseInput?.();
-    return null;
-  }
-  if (getSession(sessionId) !== held) {
-    return null;
-  }
-  const turn = held.continueTurn({ command, options, writer, ...prepared });
-  return turn ? { turn } : null;
 }
 
 /**
@@ -2381,6 +2475,13 @@ export async function abortClaudeSDKSession(sessionId: string): Promise<boolean>
   // stop: withdraw it and leave the process, that turn and its background
   // work alone. Checked first, so a stop aimed at it is never swallowed.
   if (session.withdrawPendingTurn?.()) {
+    return true;
+  }
+
+  // A turn whose inputs are still being read has not reached the process yet.
+  // Mark it stopped; the handover then drops it instead of writing it in.
+  if (session.incomingTurn) {
+    session.incomingAborted = true;
     return true;
   }
 

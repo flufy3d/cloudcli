@@ -430,6 +430,15 @@ const toSubagentActivity = (rows: OpenCodeHistoryRow[]): SubagentActivity[] => {
   return activity;
 };
 
+// The task tool wraps the subagent's answer as `<task …><task_result>…</task_result></task>`.
+const TASK_OUTPUT_PATTERN = /<task_(result|error)>\n?([\s\S]*?)\n?<\/task_\1>/;
+
+/** The answer a `task` call carries, without the transport envelope. */
+const unwrapTaskOutput = (content: string): string => {
+  const match = TASK_OUTPUT_PATTERN.exec(content);
+  return match ? match[2] : content;
+};
+
 /** The child session ids the transcript's subagent tool blocks name. */
 const collectSubagentSessionIds = (rows: OpenCodeHistoryRow[]): Set<string> => {
   const ids = new Set<string>();
@@ -570,7 +579,11 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
     const type = readOptionalString(raw.type) ?? readOptionalString(raw.event);
     const eventSessionId = readOptionalString(raw.sessionID) ?? readOptionalString(raw.sessionId) ?? sessionId;
     const timestamp = normalizeProviderTimestamp(raw.time ?? raw.timestamp);
-    const baseId = readOptionalString(raw.id)
+    const partMessageId = readOptionalString(part?.messageID);
+    const partId = readOptionalString(part?.id);
+    // Same id the history reader gives this part, so a reload does not duplicate it.
+    const baseId = (partMessageId && partId ? `${partMessageId}_${partId}` : undefined)
+      ?? readOptionalString(raw.id)
       ?? readOptionalString(raw.messageID)
       ?? readOptionalString(part?.id)
       ?? generateMessageId('opencode');
@@ -640,6 +653,10 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
           content: formatToolContent(output ?? error),
           isError: error !== undefined,
         };
+      }
+
+      if (SUBAGENT_TOOL_NAMES.has(toolName)) {
+        this.attachLiveSubagent(toolMessage, partState ?? {}, eventSessionId);
       }
 
       return [toolMessage];
@@ -744,6 +761,85 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
     } finally {
       db.close();
     }
+  }
+
+  /**
+   * Attaches the subagent container to a live `task`/`subagent` tool event.
+   *
+   * `opencode run` reports the call with its child session id under
+   * `state.metadata`, and the child's own rows are where the agent name, its
+   * settled status and its timeline live. A live event may arrive before the
+   * database is readable (or name a child that is already gone), in which case
+   * the launch state alone is still enough to draw the card.
+   */
+  private attachLiveSubagent(
+    message: NormalizedMessage,
+    state: AnyRecord,
+    eventSessionId: string | null,
+  ): void {
+    if (!SUBAGENT_TOOL_NAMES.has(message.toolName ?? '')) {
+      return;
+    }
+
+    const input = readObjectRecord(state.input) ?? {};
+    const metadata = readObjectRecord(state.metadata) ?? {};
+    const childSessionId = readOptionalString(metadata.sessionId)
+      ?? readOptionalString(metadata.sessionID);
+    const toolResult = message.toolResult;
+    let status: SubagentInfo['status'] = 'running';
+    if (metadata.interrupted === true) {
+      status = 'stopped';
+    } else if (toolResult) {
+      status = toolResult.isError ? 'failed' : 'completed';
+    }
+
+    if (toolResult && typeof toolResult.content === 'string') {
+      toolResult.content = unwrapTaskOutput(toolResult.content);
+    }
+
+    const agentName = readOptionalString(input.subagent_type) ?? readOptionalString(input.agent);
+    const model = readOpenCodeChildModelLabel(metadata.model);
+    const subagent: SubagentInfo = {
+      id: childSessionId ?? message.toolId ?? message.id,
+      ...(agentName ? { name: agentName, type: agentName } : {}),
+      description: readOptionalString(input.description),
+      status,
+      ...(model ? { model } : {}),
+    };
+
+    if (childSessionId) {
+      let db: Database.Database | null = null;
+      try {
+        db = openOpenCodeDatabase();
+        if (db) {
+          const layout = resolveOpenCodeMessageLayout(db);
+          const activity = layout
+            ? toSubagentActivity(layout === 'session_message'
+              ? [...flattenOpenCodeV2HistoryRows(db, childSessionId)]
+              : this.readV1HistoryRows(db, childSessionId))
+            : [];
+          if (activity.length > 0) {
+            message.subagentTools = activity
+              .slice(-MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
+              .map(truncateSubagentActivity);
+            subagent.activityCount = activity.length;
+          }
+          // A background launch's tool content is only the acknowledgement;
+          // the child's last text is the answer the card should show.
+          if (toolResult && !toolResult.content) {
+            const lastText = [...activity].reverse().find((entry) => entry.kind === 'text');
+            if (lastText?.content) toolResult.content = lastText.content.trim();
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        console.warn(`[OpenCodeProvider] Failed to read subagent session ${childSessionId ?? eventSessionId}:`, reason);
+      } finally {
+        db?.close();
+      }
+    }
+
+    message.subagent = subagent;
   }
 
   /** The v1 message+part layout query, kept for databases predating v2. */

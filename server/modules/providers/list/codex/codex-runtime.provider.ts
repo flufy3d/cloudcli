@@ -1478,8 +1478,9 @@ async function queryCodex(
           });
       }
       // The connection is torn down on the next tick so the interrupt has a
-      // chance to leave the process before its pipes close.
-      setTimeout(() => connection?.close(), 250).unref?.();
+      // chance to leave the process before its pipes close. The timer is not
+      // unref'd: the run waits on this close to reach its terminal state.
+      setTimeout(() => connection?.close(), 250);
       return Promise.resolve('interrupted');
     };
 

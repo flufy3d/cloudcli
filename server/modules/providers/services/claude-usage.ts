@@ -2,6 +2,53 @@ import type { AnyRecord, ProviderTokenUsageResult } from '@/shared/types.js';
 import { readUsageNumber } from '@/shared/utils.js';
 
 /**
+ * Context windows the Claude SDK reported per provider session id.
+ *
+ * The SDK states the real window of the model that served a turn only in the
+ * turn's `result.modelUsage[model].contextWindow`; the transcript records the
+ * model id at most, and an id cannot tell a 200K from a 1M variant, nor what a
+ * self-hosted model behind ANTHROPIC_BASE_URL allows. Remembering the reported
+ * value lets the history-derived usage show the same window the live counter
+ * did. It is process memory on purpose: after a restart the counter falls back
+ * to CONTEXT_WINDOW until the session's next turn reports again.
+ */
+const reportedClaudeContextWindows = new Map<string, number>();
+
+/** One number per session; the cap only bounds a long-lived server's memory. */
+const MAX_REPORTED_CLAUDE_CONTEXT_WINDOWS = 1000;
+
+/**
+ * Used by the Claude runtime provider to record the window the SDK reported for
+ * a session's turn. Non-positive or non-numeric values are ignored so a build
+ * that reports no window never overwrites one that did.
+ */
+export function rememberClaudeContextWindow(providerSessionId: string, contextWindow: number): void {
+  if (!providerSessionId || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return;
+  }
+
+  // Re-insert so the most recently reported sessions are the last evicted.
+  reportedClaudeContextWindows.delete(providerSessionId);
+  reportedClaudeContextWindows.set(providerSessionId, contextWindow);
+  if (reportedClaudeContextWindows.size > MAX_REPORTED_CLAUDE_CONTEXT_WINDOWS) {
+    const oldestSessionId = reportedClaudeContextWindows.keys().next().value;
+    if (oldestSessionId !== undefined) {
+      reportedClaudeContextWindows.delete(oldestSessionId);
+    }
+  }
+}
+
+/**
+ * Used by the Claude runtime provider (a resumed run starts from the window its
+ * session last reported) and the Claude history reader.
+ */
+export function getReportedClaudeContextWindow(
+  providerSessionId: string | null | undefined,
+): number | undefined {
+  return providerSessionId ? reportedClaudeContextWindows.get(providerSessionId) : undefined;
+}
+
+/**
  * Latest context-window usage from a Claude transcript's already-parsed rows.
  *
  * Consumers: the Claude sessions provider, for both the usage it hands back on
@@ -92,6 +139,11 @@ export function summarizeClaudeTokenUsage(
  */
 export type ClaudeContextWindowSources = {
   /**
+   * Window the SDK reported for this exact session during this process,
+   * remembered in memory until a restart. Authoritative when present.
+   */
+  reported?: number | null;
+  /**
    * Window the SDK reported for this exact session, persisted on the app row
    * by `recordClaudeSessionContextWindow`. Authoritative when present.
    */
@@ -114,24 +166,34 @@ export type ClaudeContextWindowSources = {
  *
  * Precedence, and why:
  *
- * 1. The window the SDK reported for this session. It is a measurement of the
- *    run that actually happened, and it is the same number the live
- *    `token_budget` frames carry, so preferring it is what keeps the reload
- *    path and the realtime path in agreement.
+ * 1. The window the SDK reported for this session, in memory for the current
+ *    process or persisted on the app row. It is a measurement of the run that
+ *    actually happened, and it is the same number the live `token_budget`
+ *    frames carry, so preferring it is what keeps the reload path and the
+ *    realtime path in agreement.
  * 2. `CONTEXT_WINDOW`. A deployment-wide override, above the heuristics below
  *    so an operator can still pin a window, and below the measurement above
  *    because a measurement of this session beats a guess about all of them.
- * 3. The model. `[1m]` variants carry the 1M-context beta; every other current
- *    model is 200k. The session's *selected* model is tried first because it
- *    keeps the tag (`opus[1m]`), which is how a 1M session reopened before it
- *    has run here still reads as 1M; the transcript's model is the last
- *    resort, and it only ever decides anything for transcripts written outside
- *    CloudCLI, since it records the resolved id (`claude-opus-5`).
+ * 3. The model. `[1m]` variants carry the 1M-context beta; every other model
+ *    the Claude CLI knows is 200k, while an id that names no Anthropic family
+ *    or version (a self-hosted endpoint, e.g. `claude-local`) falls back to
+ *    the settings default (160k), which is what `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+ *    sessions are measured against. The session's *selected* model is tried
+ *    first because it keeps the tag (`opus[1m]`), which is how a 1M session
+ *    reopened before it has run here still reads as 1M; the transcript's model
+ *    is the last resort, and it only ever decides anything for transcripts
+ *    written outside CloudCLI, since it records the resolved id
+ *    (`claude-opus-5`).
  */
 export function resolveClaudeContextWindow(
   sources: ClaudeContextWindowSources,
   model: string | null,
 ): number {
+  const reported = sources.reported;
+  if (typeof reported === 'number' && Number.isFinite(reported) && reported > 0) {
+    return reported;
+  }
+
   const recorded = sources.recorded;
   if (typeof recorded === 'number' && Number.isFinite(recorded) && recorded > 0) {
     return recorded;
@@ -144,5 +206,15 @@ export function resolveClaudeContextWindow(
 
   const taggedModel = [sources.selectedModel, model]
     .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
-  return taggedModel?.includes('[1m]') ? 1_000_000 : 200_000;
+  if (taggedModel?.includes('[1m]')) {
+    return 1_000_000;
+  }
+  // A row that never names a model gets the current-model default. A known
+  // Anthropic family or version (`claude-opus-5`, `claude-3-5-sonnet-…`) is
+  // 200k; any other id is a self-hosted endpoint the CLI does not know, which
+  // the engine measures against its settings default instead.
+  if (!taggedModel || /^claude-(opus|sonnet|haiku|fable|\d)/.test(taggedModel)) {
+    return 200_000;
+  }
+  return 160_000;
 }

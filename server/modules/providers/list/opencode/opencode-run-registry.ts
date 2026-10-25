@@ -315,7 +315,9 @@ export class OpenCodeRunRegistry {
       this.backgroundDeadlineTimers.delete(appSessionId);
       this.recheckBackgroundWork(appSessionId, intervalMs);
     }, intervalMs);
-    timer.unref?.();
+    // Not unref'd: the caller is awaiting this deadline to settle or drop the
+    // work, so the timer is what keeps that wait alive. The server's other
+    // handles keep the process up in production either way.
     this.backgroundDeadlineTimers.set(appSessionId, timer);
   }
 

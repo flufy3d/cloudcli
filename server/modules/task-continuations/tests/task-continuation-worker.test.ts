@@ -64,6 +64,6 @@ test('real Codex command/exec writes a bounded result and task output without ho
     else process.env.JWT_SECRET = previousJwtSecret;
     if (previousApiKey === undefined) delete process.env.API_KEY;
     else process.env.API_KEY = previousApiKey;
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

@@ -527,11 +527,16 @@ function stripWindowsLongPathPrefix(inputPath: string): string {
 }
 
 function shouldUseWindowsPathNormalization(inputPath: string): boolean {
-  if (process.platform === 'win32') {
+  // A drive-qualified path, a UNC/long path, or anything already using a
+  // backslash: Windows rules.
+  if (/^[a-zA-Z]:([\\/]|$)/.test(inputPath) || inputPath.startsWith('\\\\') || inputPath.includes('\\')) {
     return true;
   }
 
-  return inputPath.startsWith('\\\\') || /^[a-zA-Z]:([\\/]|$)/.test(inputPath);
+  // A POSIX-style path names no drive, even when this process runs on Windows
+  // (session rows and worktree metadata can carry one across machines). Keep
+  // its separators instead of rewriting `/repo/wt` to `\repo\wt`.
+  return false;
 }
 
 /**

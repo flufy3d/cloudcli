@@ -343,7 +343,7 @@ test('a provider that has to branch to rewind is rewound before the run, not dur
         anchorId: 'turn-b',
         content: 'a better second prompt',
       }));
-      await settle();
+      await waitForRun(runs);
     } finally {
       sessionsService.rewindSessionForEdit = realRewind;
     }
