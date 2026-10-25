@@ -139,7 +139,12 @@ export function useSlashCommands({
     }
 
     const parsedHistory = readCommandHistory(selectedProject.projectId);
-    const allCommands = compactionCommand ? [compactionCommand, ...projectCommands] : projectCommands;
+    // The shared project list already injects `/compact` for compacting
+    // providers; only fall back to this entry when it doesn't carry one.
+    const hasCompactCommand = projectCommands.some((command) => command.name === '/compact');
+    const allCommands = compactionCommand && !hasCompactCommand
+      ? [compactionCommand, ...projectCommands]
+      : projectCommands;
     return [...allCommands].sort((commandA, commandB) => {
       const commandAUsage = parsedHistory[commandA.name] || 0;
       const commandBUsage = parsedHistory[commandB.name] || 0;
