@@ -146,7 +146,10 @@ export const PROVIDER_CATALOG = {
     // The edit rewind is a service-side revert that restores the files the
     // dropped turns changed from the engine's snapshots.
     editRevertsFiles: true,
-    inputWhileBusy: 'queue',
+    // Backgrounded shells and agents keep running when the user sends another
+    // message: the service files it into the session's inbox. A foreground
+    // turn still queues (inputWhileBusy !== 'always').
+    inputWhileBusy: 'background',
     // Passed on as OpenCode's `--variant`. `thinking` (MiniMax's on/off
     // variant, paired with `none`) is not a strength, so it sorts last.
     effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],

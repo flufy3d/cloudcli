@@ -1555,21 +1555,26 @@ export function useChatComposerState({
 
   /**
    * Stops background tasks by id: the one launched by `toolUseId`, or every
-   * task the session still has running when it is omitted.
+   * stoppable task the session still has running when it is omitted.
+   *
+   * Only an entry carrying `taskId` has a stop handle the engine accepts; a
+   * backgrounded command does not, so the strip never sends one.
    */
   const handleStopBackgroundTasks = useCallback((toolUseId?: string) => {
     const targetSessionId = selectedSession?.id || currentSessionId || null;
     if (!targetSessionId) {
       return;
     }
-    const tasks = processingSessions?.get(targetSessionId)?.tasks ?? [];
-    for (const task of tasks) {
-      if (toolUseId && task.toolUseId !== toolUseId) {
+    for (const task of backgroundTasks) {
+      if (!task.taskId) {
+        continue;
+      }
+      if (toolUseId && task.id !== toolUseId) {
         continue;
       }
       sendMessage({ type: 'chat.stop-task', sessionId: targetSessionId, taskId: task.taskId });
     }
-  }, [currentSessionId, processingSessions, selectedSession?.id, sendMessage]);
+  }, [backgroundTasks, currentSessionId, selectedSession?.id, sendMessage]);
 
   const handleGrantToolPermission = useCallback(
     (suggestion: { entry: string; toolName: string }) => {

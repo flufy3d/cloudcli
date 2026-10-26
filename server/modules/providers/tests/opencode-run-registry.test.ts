@@ -163,6 +163,34 @@ test('a running child session is background work for the composer until it settl
   assert.equal(await Promise.race([parent.settled, Promise.resolve('still-open')]), 'still-open');
 });
 
+test('background frames use the session publisher when one is supplied', () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-parent', 'ses_parent', writer);
+  const published: NormalizedMessage[] = [];
+  registry.setSessionPublisher('app-parent', (message) => published.push(message));
+
+  startBackgroundChild(registry, { title: 'Audit the repo' });
+
+  assert.ok(
+    published.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'
+      && frame.backgroundTasks?.[0]?.toolName === 'subagent'),
+    'the strip goes down the session channel so a tab opened later sees it',
+  );
+  assert.equal(
+    frames.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'),
+    false,
+    'the run writer is not used for session-level status frames',
+  );
+
+  registry.dispatch({ type: 'session.execution.succeeded', data: { sessionID: 'ses_child' } });
+  assert.ok(
+    published.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'
+      && (frame.backgroundTasks?.length ?? 0) === 0),
+    'the channel also hears that the work ended',
+  );
+});
+
 test('the background hold times out so a lost child terminal cannot pin the run', async () => {
   const registry = new OpenCodeRunRegistry();
   const { frames, writer } = writerOf();

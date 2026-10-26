@@ -5,10 +5,12 @@ import type { ActiveBackgroundTask } from '@/shared/types';
 
 type BackgroundTaskIndicatorProps = {
   tasks: ActiveBackgroundTask[];
-  /** Stops the task launched by `toolUseId`, or every task when omitted. */
+  /** Stops the task launched by `toolUseId`, or every stoppable task when omitted. */
   onStopTasks?: (toolUseId?: string) => void;
   /** Reveals the task's card in the transcript; omitted rows stay inert. */
   onRevealTask?: (task: ActiveBackgroundTask) => void;
+  /** A message sent now waits for the tasks; false for an engine that takes it mid-background-work. */
+  queuesInput?: boolean;
 };
 
 function formatElapsed(elapsedSeconds: number): string {
@@ -21,7 +23,7 @@ function formatElapsed(elapsedSeconds: number): string {
 }
 
 /** Used by ChatComposer to display running background tasks. */
-export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTask }: BackgroundTaskIndicatorProps) {
+export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTask, queuesInput = true }: BackgroundTaskIndicatorProps) {
   const { t } = useTranslation('chat');
   const [, setTick] = useState(0);
 
@@ -60,17 +62,25 @@ export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTa
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-muted-foreground/80">
             <span className="hidden sm:inline">
-              {t('composer.backgroundTasks.hint', {
-                defaultValue: '发送消息将排队，任务完成后自动发送',
-              })}
+              {queuesInput
+                ? t('composer.backgroundTasks.hint', {
+                  defaultValue: '发送消息将排队，任务完成后自动发送',
+                })
+                : t('composer.backgroundTasks.hintContinue', {
+                  defaultValue: '可直接发送，后台任务继续运行',
+                })}
             </span>
             <span className="sm:hidden">
-              {t('composer.backgroundTasks.hintShort', {
-                defaultValue: '发送将排队',
-              })}
+              {queuesInput
+                ? t('composer.backgroundTasks.hintShort', {
+                  defaultValue: '发送将排队',
+                })
+                : t('composer.backgroundTasks.hintContinueShort', {
+                  defaultValue: '可继续发送',
+                })}
             </span>
           </span>
-          {onStopTasks && (
+          {onStopTasks && tasks.some((task) => task.taskId) && (
             <button
               type="button"
               onClick={() => onStopTasks()}
@@ -128,7 +138,7 @@ export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTa
               <span className="shrink-0 tabular-nums text-muted-foreground/70">
                 {formatElapsed(elapsedSeconds)}
               </span>
-              {onStopTasks && (
+              {onStopTasks && task.taskId && (
                 <button
                   type="button"
                   onClick={() => onStopTasks(task.id)}

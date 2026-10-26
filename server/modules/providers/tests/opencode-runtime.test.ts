@@ -559,6 +559,58 @@ test('an execution the engine starts on its own is adopted and rides the run pip
   });
 });
 
+test('a backgrounded shell is listed until the engine reports it ended', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer, frames } = makeWriter();
+    const published: NormalizedMessage[] = [];
+    const context: ProviderRuntimeContext = {
+      ...makeContext('ses_new'),
+      publishSessionEvent: (_sessionId, message) => published.push(message),
+    };
+    const running = runtime.run('monitor it', { sessionId: 'app-shell', projectPath: '/tmp/p' }, writer, context);
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    service.emit(session('session.tool.called', {
+      assistantMessageID: 'm',
+      id: 'call_shell',
+      name: 'shell',
+      input: { command: 'while true; do sleep 60; done', description: 'Monitor batch 1' },
+    }));
+    service.emit(session('session.tool.success', {
+      assistantMessageID: 'm',
+      id: 'call_shell',
+      content: [{ type: 'text', text: 'Command running in the background (shellID: sh_1).' }],
+      metadata: { shellID: 'sh_1', status: 'running', truncated: false },
+      executed: false,
+    }));
+
+    await waitFor(() => (runtime.backgroundTasks?.list('app-shell') ?? []).length === 1);
+    const task = runtime.backgroundTasks?.list('app-shell')?.[0];
+    assert.equal(task?.toolName, 'Bash');
+    assert.equal(task?.command, 'Monitor batch 1');
+    assert.equal(task?.taskId, undefined, 'a shell job has no stop handle');
+    assert.ok(published.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'
+      && frame.backgroundTasks?.[0]?.toolName === 'Bash'),
+    'the strip goes down the session channel, not the round writer');
+
+    service.emit(session('session.inbox.enqueued', {
+      item: {
+        type: 'synthetic',
+        payload: { metadata: { source: 'shell', shellID: 'sh_1', state: 'completed' } },
+      },
+    }));
+
+    await waitFor(() => (runtime.backgroundTasks?.list('app-shell') ?? []).length === 0);
+    assert.ok(published.some((frame) => frame.kind === 'task_status' && frame.status === 'completed' && frame.taskId === 'sh_1'));
+    assert.ok(published.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'
+      && (frame.backgroundTasks?.length ?? 0) === 0));
+    assert.equal(frames.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'), false);
+
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+  });
+});
+
 test('the permission facet re-reads the service for asks the event feed never delivered', async () => {
   await withRuntime(async ({ service, runtime }) => {
     const { writer, frames } = makeWriter();

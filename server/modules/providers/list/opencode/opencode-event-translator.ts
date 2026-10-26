@@ -18,6 +18,9 @@
  *   result, which the runtime's own `/compact` run turns into a failure (an
  *   automatic compaction inside a normal turn changes nothing)
  * - `session.execution.{succeeded,failed,interrupted}` → run terminal
+ * - a `tool.success` whose metadata still says `running` with a `shellID` is
+ *   a backgrounded command: its card stays running until the engine's
+ *   synthetic notice (`session.inbox.enqueued`) says the job ended
  *
  * Ids on transcript rows (thinking / tool_use / tool_result) derive from the
  * engine's own identifiers (assistant message id + ordinal, tool call id) so
@@ -34,8 +37,14 @@
 import type { NormalizedMessage } from '@/shared/types.js';
 import { createNormalizedMessage, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
+import {
+  createTaskStatusMessage,
+  LOCAL_BASH_TASK_TYPE,
+} from '../../shared/background-work/task-status.js';
+
 import type { OpenCodeStepTokens } from './opencode-context-usage.js';
 import { readOpenCodeStepTokens } from './opencode-context-usage.js';
+import { readBackgroundLaunch, type OpenCodeBackgroundLaunch } from './opencode-background-work.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import { formatOpenCodeToolBlock } from './opencode-tool-output.js';
 
@@ -66,6 +75,12 @@ export type OpenCodeTranslatedEvent = {
   terminal?: OpenCodeRunOutcome;
   stepTokens?: OpenCodeStepTokens;
   compactionError?: string;
+  /**
+   * A shell call the engine moved to the background. The registry records it
+   * as background work and lists it in the composer's strip until the engine's
+   * synthetic notice arrives.
+   */
+  launch?: OpenCodeBackgroundLaunch;
 };
 
 /** A tool call the translator has seen; the interaction bridge labels permission cards with it. */
@@ -282,9 +297,28 @@ export class OpenCodeSessionEventTranslator {
         if (!callId) {
           return { frames: [] };
         }
-        const toolName = this.toolCalls.get(callId)?.name;
+        const known = this.toolCalls.get(callId);
+        const toolName = known?.name;
         const isSubagent = toolName ? SUBAGENT_TOOL_NAMES.has(toolName) : false;
         const content = formatToolOutput(data.content);
+        const launch = known
+          ? readBackgroundLaunch(callId, known.name, known.input, data.metadata)
+          : null;
+        if (launch?.taskType === LOCAL_BASH_TASK_TYPE) {
+          // A backgrounded command returns at once with metadata still
+          // `running`; the card must keep its spinner until the engine's
+          // synthetic notice reports the job's outcome.
+          return {
+            frames: [
+              this.toolResultFrame(callId, '', false, timestamp, { isAsync: true, taskId: launch.taskId }),
+              createTaskStatusMessage(
+                { provider: PROVIDER, sessionId: this.sessionId, taskId: launch.taskId, toolUseId: callId, taskType: launch.taskType },
+                { id: `${callId}_started`, timestamp, event: 'started', status: 'running', description: launch.description },
+              ),
+            ],
+            launch,
+          };
+        }
         if (isSubagent) {
           // A background launch's success is only its acknowledgement: the
           // agent is still running, and its answer arrives with the child's

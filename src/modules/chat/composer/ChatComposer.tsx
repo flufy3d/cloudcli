@@ -410,6 +410,7 @@ function ChatComposer({
           tasks={backgroundTasks}
           onStopTasks={onStopBackgroundTasks}
           onRevealTask={onRevealBackgroundTask}
+          queuesInput={backgroundWorkQueuesInput}
         />
       )}
 

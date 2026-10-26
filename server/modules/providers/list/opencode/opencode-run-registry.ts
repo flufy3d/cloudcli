@@ -8,6 +8,12 @@
  * stream drop (the session row's `time.idle`/`outcome`, verified live
  * against v2.0.31, say whether it already finished).
  *
+ * It also tracks work the engine moved to the background past its turn: a
+ * child session until its own terminal (or a deadline verdict), and a shell
+ * job until the engine's synthetic notice names it. The shell job does not
+ * hold the parent run — the report turn the engine starts when it ends is
+ * adopted as a run of its own.
+ *
  * @module opencode-run-registry
  */
 
@@ -15,12 +21,20 @@ import type {
   ActiveBackgroundTask,
   BackgroundTaskStatus,
   BackgroundTaskSummary,
+  NormalizedMessage,
   ProviderRuntimeWriter,
   ProviderTokenUsageResult,
 } from '@/shared/types.js';
 import { createNormalizedMessage, generateMessageId, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
+import { createBackgroundTasksStatusMessage, LOCAL_BASH_TASK_TYPE } from '../../shared/background-work/task-status.js';
+
 import { OpenCodeApiError, type OpenCodeApiClient, type OpenCodeSessionSnapshot } from './opencode-api.client.js';
+import {
+  readBackgroundNotice,
+  type OpenCodeBackgroundLaunch,
+  type OpenCodeBackgroundNotice,
+} from './opencode-background-work.js';
 import {
   buildOpenCodeTokenBudget,
   readOpenCodeStepTokens,
@@ -172,8 +186,22 @@ export class OpenCodeRunRegistry {
    * composer can show the work and the child can still ask a question.
    */
   private readonly backgroundByApp = new Map<string, Map<string, BackgroundTaskSummary>>();
+  /**
+   * Backgrounded shell jobs per app session. The engine ends one only by
+   * reporting it; unlike a child session it has no row to reconcile against,
+   * so it stays listed until its synthetic notice arrives.
+   */
+  private readonly shellBackgroundByApp = new Map<string, Map<string, BackgroundTaskSummary>>();
   private readonly backgroundWriterByApp = new Map<string, ProviderRuntimeWriter>();
-  private readonly backgroundAppByChild = new Map<string, string>();
+  /**
+   * Session-channel publisher per app session, supplied by the runtime when a
+   * run starts. Status frames sent after that run ends must use it: the run
+   * writer's audience is the sockets that watched the round, while the session
+   * channel reaches a tab that subscribed later.
+   */
+  private readonly sessionPublisherByApp = new Map<string, (message: NormalizedMessage) => void>();
+  /** Engine handle (a child session id or a shell id) → the app session that launched it. */
+  private readonly backgroundAppByTask = new Map<string, string>();
   /** Resolvers waiting for one app session's background work to clear. */
   private readonly backgroundClearWaiters = new Map<string, Set<() => void>>();
   /** The one pending deadline per app session whose background work is tracked. */
@@ -248,33 +276,63 @@ export class OpenCodeRunRegistry {
     this.clearBackgroundWork();
   }
 
-  /** The active children of one app session, in the wire shape the composer ack uses. */
+  /**
+   * Records the gateway's session-channel publisher for one app session.
+   * Consumer: the runtime's `run()`/`compact()`, so frames that outlive their
+   * run still reach a tab that subscribed after it ended.
+   */
+  setSessionPublisher(appSessionId: string, publisher: (message: NormalizedMessage) => void): void {
+    this.sessionPublisherByApp.set(appSessionId, publisher);
+  }
+
+  /** The active background work of one app session, in the wire shape the composer ack uses. */
   backgroundTasksFor(appSessionId: string): ActiveBackgroundTask[] {
-    return [...(this.backgroundByApp.get(appSessionId)?.values() ?? [])].map((task) => ({
-      // The card's identity is the spawn call, not the child session: the
+    const tasks = this.allBackgroundTasks(appSessionId);
+    return tasks.map((task) => ({
+      // The card's identity is the launch call, not the engine's handle: the
       // transcript anchors its card by the call and `chat.stop-task` is keyed
       // by the tool-use id the client compares against, so one handle on the
-      // strip both reveals the card and stops exactly this task. The child
-      // session id is only the engine's stop handle (`taskId`).
+      // strip both reveals the card and stops exactly this task. A shell job
+      // carries no stop handle because the engine offers no request that ends
+      // one; omitting `taskId` keeps the strip from offering a dead button.
       id: task.toolUseId || task.taskId,
-      taskId: task.taskId,
-      toolName: 'subagent',
+      ...(task.taskType === LOCAL_BASH_TASK_TYPE ? {} : { taskId: task.taskId }),
+      toolName: task.taskType === LOCAL_BASH_TASK_TYPE ? 'Bash' : 'subagent',
+      ...(task.taskType === LOCAL_BASH_TASK_TYPE ? { command: task.description } : {}),
       description: task.description,
       startedAt: task.startedAt,
     }));
   }
 
-  /** True while a child session of this app session still runs. */
+  /** True while any background work (an agent or a shell job) of this app session still runs. */
   isBackgroundWorkPending(appSessionId: string): boolean {
+    return this.backgroundByApp.has(appSessionId) || this.shellBackgroundByApp.has(appSessionId);
+  }
+
+  /**
+   * True while a background agent (a child session) still runs. The runtime
+   * holds a run's writer for this; a shell job does not hold the parent run,
+   * because the engine starts its report turn as a run of its own.
+   */
+  hasAgentBackgroundWork(appSessionId: string): boolean {
     return this.backgroundByApp.has(appSessionId);
   }
 
-  /** The same children in the shape the running-sessions list consumes. */
+  /** The same work in the shape the running-sessions list consumes. */
   listBackgroundWork(): Array<{ sessionId: string; tasks: BackgroundTaskSummary[] }> {
-    return [...this.backgroundByApp].map(([sessionId, tasks]) => ({
+    const sessionIds = new Set([...this.backgroundByApp.keys(), ...this.shellBackgroundByApp.keys()]);
+    return [...sessionIds].map((sessionId) => ({
       sessionId,
-      tasks: [...tasks.values()],
+      tasks: this.allBackgroundTasks(sessionId),
     }));
+  }
+
+  /** Every agent and shell task of one app session, oldest first. */
+  private allBackgroundTasks(appSessionId: string): BackgroundTaskSummary[] {
+    return [
+      ...(this.backgroundByApp.get(appSessionId)?.values() ?? []),
+      ...(this.shellBackgroundByApp.get(appSessionId)?.values() ?? []),
+    ].sort((left, right) => left.startedAt - right.startedAt);
   }
 
   /**
@@ -407,6 +465,14 @@ export class OpenCodeRunRegistry {
       return;
     }
 
+    // A backgrounded shell ends outside any run of ours, so its notice must be
+    // read before the run lookup: the parent turn has long completed and its
+    // writer is held by the background-work maps.
+    const notice = readInboxBackgroundNotice(event);
+    if (notice) {
+      this.finishBackgroundWork(notice.taskId, notice.outcome);
+    }
+
     const isChildTerminal = event.type === 'session.execution.succeeded'
       || event.type === 'session.execution.failed'
       || event.type === 'session.execution.interrupted';
@@ -492,7 +558,7 @@ export class OpenCodeRunRegistry {
     childSessionId: string,
     data: Record<string, unknown>,
   ): void {
-    if (this.backgroundAppByChild.has(childSessionId)) {
+    if (this.backgroundAppByTask.has(childSessionId)) {
       return;
     }
     let tasks = this.backgroundByApp.get(run.appSessionId);
@@ -507,34 +573,64 @@ export class OpenCodeRunRegistry {
       description: readOptionalString(data.title) ?? readOptionalString(data.agent) ?? childSessionId,
       startedAt: Date.now(),
     });
-    this.backgroundAppByChild.set(childSessionId, run.appSessionId);
+    this.backgroundAppByTask.set(childSessionId, run.appSessionId);
     this.backgroundWriterByApp.set(run.appSessionId, run.writer);
     this.broadcastBackgroundWork(run.appSessionId);
   }
 
   /**
-   * Drops a child from its parent's background list and tells the composer.
+   * Records a shell job the engine moved to the background.
    *
-   * `outcome` is set when the registry knows how the child ended (its own
-   * terminal, or a deadline verdict from its session row): the card reads its
-   * live word off `task_status`, so sending it here stops the card's spinner
-   * without waiting for the next history refresh. A child dropped because
-   * nothing could judge it gets no frame — its card keeps whatever the
-   * transcript says.
+   * The job has no child session and no row to poll: only the engine's
+   * synthetic notice ends it. The parent run is deliberately not held for it —
+   * the report the engine starts when the job ends is adopted as a new run.
    */
-  private finishBackgroundWork(childSessionId: string, outcome?: BackgroundTaskStatus): void {
-    const appSessionId = this.backgroundAppByChild.get(childSessionId);
+  private startShellBackgroundWork(run: OpenCodeActiveRun, launch: OpenCodeBackgroundLaunch): void {
+    if (this.backgroundAppByTask.has(launch.taskId)) {
+      return;
+    }
+    let tasks = this.shellBackgroundByApp.get(run.appSessionId);
+    if (!tasks) {
+      tasks = new Map();
+      this.shellBackgroundByApp.set(run.appSessionId, tasks);
+    }
+    tasks.set(launch.taskId, {
+      taskId: launch.taskId,
+      toolUseId: launch.callId,
+      taskType: launch.taskType,
+      description: launch.description,
+      startedAt: Date.now(),
+    });
+    this.backgroundAppByTask.set(launch.taskId, run.appSessionId);
+    this.backgroundWriterByApp.set(run.appSessionId, run.writer);
+    this.broadcastBackgroundWork(run.appSessionId);
+  }
+
+  /**
+   * Drops one background task from its parent's list and tells the composer.
+   *
+   * `outcome` is set when the registry knows how the work ended (a child's own
+   * terminal, a deadline verdict, or the engine's synthetic notice for a shell
+   * job): the card reads its live word off `task_status`, so sending it here
+   * stops the card's spinner without waiting for the next history refresh. A
+   * task dropped because nothing could judge it gets no frame — its card keeps
+   * whatever the transcript says.
+   */
+  private finishBackgroundWork(taskId: string, outcome?: BackgroundTaskStatus): void {
+    const appSessionId = this.backgroundAppByTask.get(taskId);
     if (!appSessionId) {
       return;
     }
-    this.backgroundAppByChild.delete(childSessionId);
-    const tasks = this.backgroundByApp.get(appSessionId);
-    const task = tasks?.get(childSessionId);
-    tasks?.delete(childSessionId);
-
+    this.backgroundAppByTask.delete(taskId);
+    const agentTasks = this.backgroundByApp.get(appSessionId);
+    const shellTasks = this.shellBackgroundByApp.get(appSessionId);
+    const task = agentTasks?.get(taskId) ?? shellTasks?.get(taskId);
+    agentTasks?.delete(taskId);
+    shellTasks?.delete(taskId);
     const writer = this.backgroundWriterByApp.get(appSessionId);
+
     if (outcome && task && task.toolUseId) {
-      writer?.send(createNormalizedMessage({
+      this.sendBackgroundFrame(appSessionId, createNormalizedMessage({
         id: generateMessageId(PROVIDER),
         sessionId: appSessionId,
         provider: PROVIDER,
@@ -545,60 +641,87 @@ export class OpenCodeRunRegistry {
         toolUseId: task.toolUseId,
         taskType: task.taskType,
         description: task.description,
-      }));
+      }), writer);
     }
-    if (!tasks || tasks.size === 0) {
+    if (!agentTasks || agentTasks.size === 0) {
       this.backgroundByApp.delete(appSessionId);
-      this.backgroundWriterByApp.delete(appSessionId);
       this.clearBackgroundDeadline(appSessionId);
       this.resolveBackgroundWaiters(appSessionId);
     }
-    writer?.send(createNormalizedMessage({
-      id: generateMessageId(PROVIDER),
-      sessionId: appSessionId,
-      provider: PROVIDER,
-      kind: 'status',
-      text: 'background_tasks',
-      backgroundTasks: this.backgroundTasksFor(appSessionId),
-      backgroundWorkPending: this.backgroundByApp.has(appSessionId),
-    }));
+    if (!shellTasks || shellTasks.size === 0) {
+      this.shellBackgroundByApp.delete(appSessionId);
+    }
+    if (!this.isBackgroundWorkPending(appSessionId)) {
+      this.backgroundWriterByApp.delete(appSessionId);
+    }
+    this.sendBackgroundFrame(appSessionId, {
+      ...createBackgroundTasksStatusMessage(
+        { provider: PROVIDER, sessionId: appSessionId },
+        this.backgroundTasksFor(appSessionId),
+        this.hasAgentBackgroundWork(appSessionId),
+        false,
+      ),
+      backgroundWorkPending: this.isBackgroundWorkPending(appSessionId),
+    }, writer);
   }
 
-  /** Publishes the current child list so the composer pill appears/clears live. */
+  /** Publishes the current background list so the composer strip appears/clears live. */
   private broadcastBackgroundWork(appSessionId: string): void {
-    this.backgroundWriterByApp.get(appSessionId)?.send(createNormalizedMessage({
-      id: generateMessageId(PROVIDER),
-      sessionId: appSessionId,
-      provider: PROVIDER,
-      kind: 'status',
-      text: 'background_tasks',
-      backgroundTasks: this.backgroundTasksFor(appSessionId),
-      backgroundWorkPending: this.backgroundByApp.has(appSessionId),
-    }));
+    this.sendBackgroundFrame(appSessionId, {
+      ...createBackgroundTasksStatusMessage(
+        { provider: PROVIDER, sessionId: appSessionId },
+        this.backgroundTasksFor(appSessionId),
+        this.hasAgentBackgroundWork(appSessionId),
+        false,
+      ),
+      backgroundWorkPending: this.isBackgroundWorkPending(appSessionId),
+    });
+  }
+
+  /**
+   * Sends one background-work frame down the session channel when the runtime
+   * supplied it, else through the run writer that launched the work. The
+   * channel is what makes a completion reach a tab opened after the run ended.
+   */
+  private sendBackgroundFrame(
+    appSessionId: string,
+    message: NormalizedMessage,
+    fallbackWriter: ProviderRuntimeWriter | undefined = this.backgroundWriterByApp.get(appSessionId),
+  ): void {
+    const publish = this.sessionPublisherByApp.get(appSessionId);
+    if (publish) {
+      publish(message);
+      return;
+    }
+    fallbackWriter?.send(message);
   }
 
   private clearBackgroundWorkForSession(appSessionId: string): void {
-    for (const [childSessionId, parentAppSessionId] of this.backgroundAppByChild) {
+    for (const [taskId, parentAppSessionId] of this.backgroundAppByTask) {
       if (parentAppSessionId === appSessionId) {
-        this.backgroundAppByChild.delete(childSessionId);
+        this.backgroundAppByTask.delete(taskId);
       }
     }
     this.backgroundByApp.delete(appSessionId);
+    this.shellBackgroundByApp.delete(appSessionId);
     // Announced before the writer is let go: the composer strip only clears
     // on a `background_tasks` frame, so dropping the list silently left it on
     // screen until a reload re-read the empty list from the subscribe ack.
     this.broadcastBackgroundWork(appSessionId);
     this.backgroundWriterByApp.delete(appSessionId);
+    this.sessionPublisherByApp.delete(appSessionId);
     this.clearBackgroundDeadline(appSessionId);
     this.resolveBackgroundWaiters(appSessionId);
   }
 
   private clearBackgroundWork(): void {
-    for (const appSessionId of [...this.backgroundByApp.keys()]) {
+    const sessionIds = new Set([...this.backgroundByApp.keys(), ...this.shellBackgroundByApp.keys()]);
+    for (const appSessionId of sessionIds) {
       this.clearBackgroundWorkForSession(appSessionId);
     }
-    this.backgroundAppByChild.clear();
+    this.backgroundAppByTask.clear();
     this.backgroundWriterByApp.clear();
+    this.sessionPublisherByApp.clear();
   }
 
   private resolveBackgroundWaiters(appSessionId: string): void {
@@ -617,9 +740,12 @@ export class OpenCodeRunRegistry {
     event: OpenCodeEventEnvelope,
     run: OpenCodeActiveRun,
   ): void {
-    const { frames, terminal, stepTokens, compactionError } = run.translator.translate(event);
+    const { frames, terminal, stepTokens, compactionError, launch } = run.translator.translate(event);
     for (const frame of frames) {
       run.writer.send(frame);
+    }
+    if (launch?.taskType === LOCAL_BASH_TASK_TYPE) {
+      this.startShellBackgroundWork(run, launch);
     }
     if (stepTokens && run.budgetTracker) {
       run.budgetTracker.report(stepTokens, run.writer, run.appSessionId);
@@ -659,21 +785,39 @@ export class OpenCodeRunRegistry {
     // A background child's own terminal can fall in the same gap, and nothing
     // else would retire its strip entry and card before the next deadline,
     // up to half an hour later. Same judgement as the deadline recheck.
-    for (const [childSessionId, appSessionId] of [...this.backgroundAppByChild]) {
-      const task = this.backgroundByApp.get(appSessionId)?.get(childSessionId);
+    for (const [taskId, appSessionId] of [...this.backgroundAppByTask]) {
+      const task = this.backgroundByApp.get(appSessionId)?.get(taskId);
       if (!task) {
         continue;
       }
       try {
-        const snapshot = await client.getSession(childSessionId);
+        const snapshot = await client.getSession(taskId);
         if (snapshot.idleAt !== null && snapshot.idleAt >= task.startedAt) {
-          this.finishBackgroundWork(childSessionId, settledStatusFromSnapshot(snapshot));
+          this.finishBackgroundWork(taskId, settledStatusFromSnapshot(snapshot));
         }
       } catch {
         // A failed read proves nothing; the child's deadline still judges it.
       }
     }
   }
+}
+
+/**
+ * Reads the engine's notice that background work ended. The notice is a
+ * synthetic item in the session's inbox; every other inbox item carries
+ * nothing the registry tracks. Read here rather than in the translator because
+ * a shell job ends long after its launch run was released, when there is no
+ * run left to translate the event.
+ */
+function readInboxBackgroundNotice(event: OpenCodeEventEnvelope): OpenCodeBackgroundNotice | null {
+  if (event.type !== 'session.inbox.enqueued') {
+    return null;
+  }
+  const item = readObjectRecord(readObjectRecord(event.data)?.item);
+  if (readOptionalString(item?.type) !== 'synthetic') {
+    return null;
+  }
+  return readBackgroundNotice(readObjectRecord(item?.payload)?.metadata);
 }
 
 function settlementFromSnapshot(snapshot: OpenCodeSessionSnapshot): OpenCodeRunSettlement {

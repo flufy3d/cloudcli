@@ -90,12 +90,12 @@ flowchart TD
 - **引擎后台驻留契约**：Claude 等引擎支持在回合中开启后台执行（如后台 `Bash`、Agent 或定时唤醒）。当前轮次的文本回复完成后发出 `complete`，但底层后台进程仍在运行，引擎 runtime 保持挂起。`TaskCreate` 只创建待办项，不属于后台执行。
 - **状态同步与广播**：
   - `ActiveBackgroundTask` 表示输入框需要展示的执行任务，具体字段以共享协议为准。
-  - `status(background_tasks)` 帧携带卡片列表 `backgroundTasks`；`chat_subscribed` 握手帧另带后台等待状态 `backgroundWorkPending`（由带 `backgroundTasks.isPending` 切面的引擎回答：opencode 的子会话与 antigravity 的后台任务实现该切面；claude 以任务列表为准，切面报 false）。归一化网关放行两者。
+  - `status(background_tasks)` 帧携带卡片列表 `backgroundTasks`；`chat_subscribed` 握手帧另带后台等待状态 `backgroundWorkPending`（由带 `backgroundTasks.isPending` 切面的引擎回答：opencode 的后台子会话/命令与 antigravity 的后台任务实现该切面；claude 以任务列表为准，切面报 false）。归一化网关放行两者。
   - 卡片描述任务本身，等待状态还包括任务完成后的汇报回复。任务完成或唤醒到期时卡片立即消失，后续回复结束后才解除等待。未提供等待字段的引擎按卡片列表判断。
 - **输入防打断与智能排队**：
-  - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），用户发送新消息自动转入 `queuedDraft` 排队，阻止过早发送打断正在运行的后台子进程。是否排队由能力矩阵 `inputWhileBusy` 决定：`backgroundWorkQueuesInput` = 有后台任务且为 `queue`；`turnQueuesInput` = 回合进行中且不是 `always`；两者之或即 `queuesInput`，composer 的排队、flush 与按钮形态都只看它。claude（`background`）后台任务期间直接注入活进程、任务条照常显示但不排队；opencode 随 client-mode 迁移后为 `queue`（回合中途插话暂缺），`always` 目前无引擎使用。注意 `useChatSessionState` 的 `isProcessing`（即 composer 的 `isLoading`）只表示"正在产出回复"，只剩后台任务的 `background` 活动条目不算——否则 `background` 档永远被回合排队吞掉；`hasActiveBackgroundTasks` 同时认这种条目，保证 `queue` 档照旧排队。
+  - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），是否把新消息转入 `queuedDraft` 由能力矩阵 `inputWhileBusy` 决定：`backgroundWorkQueuesInput` = 有后台任务且为 `queue`；`turnQueuesInput` = 回合进行中且不是 `always`；两者之或即 `queuesInput`，composer 的排队、flush 与按钮形态都只看它。claude、opencode（`background`）后台任务期间直接发送、任务条照常显示但不排队：claude 写进同一驻留进程，opencode 投进服务 inbox；codex/zcode/antigravity/cursor（`queue`）后台任务期间排队，避免新 run 取代在跑的后台子进程；`always` 目前无引擎使用。注意 `useChatSessionState` 的 `isProcessing`（即 composer 的 `isLoading`）只表示"正在产出回复"，只剩后台任务的 `background` 活动条目不算——否则 `background` 档永远被回合排队吞掉；`hasActiveBackgroundTasks` 同时认这种条目，保证 `queue` 档照旧排队。
   - `/compact` 不走 `inputWhileBusy`：压缩是一轮独立 run，网关在会话已有 run 时一律回 `RUN_IN_PROGRESS`，所以回合进行中发出的 `/compact` 写 `queued_compact_<sessionId>` 落盘排队（composer 显示"压缩已排队"、可取消），本轮 `complete` 后由当前会话的 flush 或 app 级 `useQueuedMessageAutoSend`（切走/未查看时）先发压缩帧；排队草稿随其后，等压缩这轮结束再发。存储键是两边共用的 claim，先清后发避免重复。
-  - 停止语义对齐 Claude Code 的 Esc：停止按钮只打断回合，后台任务由任务条单独停（表头停全部、每行停一个，都走 `chat.stop-task`）。只剩后台工作（`background` 条目）时停止按钮也发 `chat.abort`：服务端没有 running 的 run 但 `hasBackgroundWork` 为真时仍转给 `runtime.abort`，用来打断任务完成后 CLI 自己推的 follow-up 回合。
+  - 停止语义对齐 Claude Code 的 Esc：停止按钮只打断回合，后台任务由任务条单独停（表头停全部、每行停一个，都走 `chat.stop-task`；只有带 `taskId` 的条目可停，OpenCode 后台命令没有停止接口，条目不显示停止按钮）。只剩后台工作（`background` 条目）时停止按钮也发 `chat.abort`：服务端没有 running 的 run 但 `hasBackgroundWork` 为真时仍转给 `runtime.abort`，用来打断任务完成后 CLI 自己推的 follow-up 回合。
   - **自动释放**：后台任务结束且无新状态阻塞时，composer 的 flush 效应自动解冻排队草稿并发出。
   - **强制中断逃生通道**：排队卡片提供 `forceSendQueuedDraft`（`isForced: true`），允许用户在需要时显式跳过等待立即发送；新 run 会顶替仍在保活的进程，后台任务随之结束（`forceInterrupt: true` 只是随消息带上的标记，服务端不读）。
   - **停止失败**：找不到运行任务、缺少任务句柄、引擎拒绝停止和会话取消失败均保留现有活动，不解除排队。异常响应携带所属会话；`TASK_STOP_FAILED` 与 `ABORT_FAILED` 分别表示任务停止和会话取消的引擎异常，错误仍进入聊天记录。

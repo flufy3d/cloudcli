@@ -147,7 +147,7 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: true,
-    inputWhileBusy: 'queue',
+    inputWhileBusy: 'background',
     mcp: {
       scopes: ['user', 'project'],
       transports: ['stdio', 'http'],

@@ -178,6 +178,34 @@ test('a subagent result is unwrapped, and a background launch stays running', ()
   });
 });
 
+test('a backgrounded shell keeps its card running and reports the launch', () => {
+  const translator = new OpenCodeSessionEventTranslator(SESSION);
+  translator.translate(event('session.tool.input.started', {
+    assistantMessageID: MESSAGE,
+    id: CALL,
+    name: 'shell',
+  }));
+
+  const background = translator.translate(event('session.tool.success', {
+    assistantMessageID: MESSAGE,
+    id: CALL,
+    content: [{ type: 'text', text: 'Command running in the background (shellID: sh_1).' }],
+    metadata: { shellID: 'sh_1', status: 'running', truncated: false },
+    executed: false,
+  }));
+
+  assert.equal(background.launch?.taskId, 'sh_1');
+  assert.equal(background.launch?.taskType, 'local_bash');
+  assert.deepEqual(background.frames[0].toolResult, {
+    content: '',
+    isError: false,
+    toolUseResult: { isAsync: true, taskId: 'sh_1' },
+  });
+  assert.equal(background.frames[1]?.kind, 'task_status');
+  assert.equal(background.frames[1]?.status, 'running');
+  assert.equal(background.frames[1]?.taskId, 'sh_1');
+});
+
 test('reports a rejected permission as an error tool_result carrying the engine message', () => {
   const translator = new OpenCodeSessionEventTranslator(SESSION);
   translator.translate(event('session.tool.input.started', { assistantMessageID: MESSAGE, id: CALL, name: 'shell' }));

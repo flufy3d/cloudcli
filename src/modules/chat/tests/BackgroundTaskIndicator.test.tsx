@@ -56,6 +56,7 @@ describe('BackgroundTaskIndicator', () => {
     const tasks: ActiveBackgroundTask[] = [
       {
         id: 'task-1',
+        taskId: 'engine-task-1',
         toolName: 'Bash',
         command: 'pnpm run test',
         startedAt: Date.now(),
@@ -69,6 +70,23 @@ describe('BackgroundTaskIndicator', () => {
 
     screen.getByTitle('停止此任务').click();
     expect(onStopTasks).toHaveBeenLastCalledWith('task-1');
+  });
+
+  it('offers no stop for a task the engine cannot stop', () => {
+    const onStopTasks = vi.fn();
+    const tasks: ActiveBackgroundTask[] = [
+      {
+        id: 'toolu_shell_1',
+        toolName: 'Bash',
+        command: 'while true; do ...; done',
+        startedAt: Date.now(),
+      },
+    ];
+
+    render(<BackgroundTaskIndicator tasks={tasks} onStopTasks={onStopTasks} />);
+
+    expect(screen.queryByTitle('中止后台任务')).toBeNull();
+    expect(screen.queryByTitle('停止此任务')).toBeNull();
   });
 
   it('reveals the task whose label is clicked, and stopping it does not reveal', () => {

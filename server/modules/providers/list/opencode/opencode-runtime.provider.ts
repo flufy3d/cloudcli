@@ -20,7 +20,7 @@
  * permission/question cards and replays them after a reload.
  *
  * Executions the engine starts on its own are adopted instead of ignored: a
- * background subagent completing makes the service enqueue a synthetic
+ * background agent or command completing makes the service enqueue a synthetic
  * message and resume the parent session with no client prompt behind it, and
  * without adoption those frames, interaction cards and the terminal `complete`
  * would never reach the gateway (a question the model asks mid-resume stayed
@@ -422,6 +422,9 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     // One tracker per run: the window comes from the model this run switched
     // to, and the throttle state must not leak across runs.
     const activeRun = runs.create(appSessionId, providerSessionId, writer);
+    if (context.publishSessionEvent) {
+      runs.setSessionPublisher(appSessionId, (message) => context.publishSessionEvent?.(appSessionId, message));
+    }
     activeRun.budgetTracker = new OpenCodeTokenBudgetTracker(budgetTrackerModel?.providerID ?? null, budgetTrackerModel?.id ?? null);
     bridge.attach({
       appSessionId,
@@ -461,7 +464,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     } catch (error) {
       failure = error;
     }
-    if (runs.isBackgroundWorkPending(appSessionId)) {
+    if (runs.hasAgentBackgroundWork(appSessionId)) {
       await runs.whenBackgroundWorkClears(appSessionId);
     }
     runs.release(activeRun);
@@ -594,7 +597,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     }
     // Same hold as a dispatched run: a resumed turn can itself launch a
     // background subagent, whose frames and cards need this writer/bridge.
-    if (runs.isBackgroundWorkPending(run.appSessionId)) {
+    if (runs.hasAgentBackgroundWork(run.appSessionId)) {
       await runs.whenBackgroundWorkClears(run.appSessionId);
     }
     runs.release(run);
@@ -645,6 +648,9 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     client = activeClient;
 
     const activeRun = runs.create(appSessionId, providerSessionId, writer, 'compact');
+    if (context.publishSessionEvent) {
+      runs.setSessionPublisher(appSessionId, (message) => context.publishSessionEvent?.(appSessionId, message));
+    }
 
     // The feed must be live before the request: the compaction turn runs on
     // the service, and the events that report it (start, deltas, terminal)
@@ -724,6 +730,15 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       isPending(sessionId: string): boolean {
         return runs.isBackgroundWorkPending(sessionId);
       },
+      // A backgrounded agent can be stopped by interrupting its child session;
+      // a backgrounded command has no request that ends it, so the strip and
+      // the activity pill hide the stop affordance while only a command runs.
+      canInterrupt(sessionId: string): boolean {
+        return runs.hasAgentBackgroundWork(sessionId);
+      },
+      // The engine files a new message into the session's inbox; background
+      // work goes on.
+      queuesInput: () => false,
     },
     listBackgroundWork() {
       return runs.listBackgroundWork();
