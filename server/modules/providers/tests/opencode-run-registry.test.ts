@@ -10,6 +10,37 @@ const writerOf = () => {
   return { frames, writer: { send: (data: unknown) => { frames.push(data as NormalizedMessage); } } };
 };
 
+/** Polls until `predicate` holds; deadline re-checks are fire-and-forget. */
+const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error('condition was not met before the timeout');
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+  }
+};
+
+/**
+ * Registers one backgrounded shell the way the service announces it: the call
+ * the model made, then its success still saying `running` with the shell id.
+ */
+const startBackgroundShell = (
+  registry: OpenCodeRunRegistry,
+  { shellId = 'sh_1', callId = 'call_shell' } = {},
+) => {
+  registry.dispatch({
+    type: 'session.tool.called',
+    data: { sessionID: 'ses_parent', id: callId, name: 'shell', input: { command: 'sleep 600' } },
+  });
+  registry.dispatch({
+    type: 'session.tool.success',
+    data: { sessionID: 'ses_parent', id: callId, content: [], metadata: { shellID: shellId, status: 'running' } },
+  });
+};
+
 /**
  * Registers one background child the way the service announces it: the child's
  * own creation, the parent's launch acknowledgement, and a first child frame
@@ -523,4 +554,95 @@ test('reconcile retires a background child whose terminal fell in the stream gap
   assert.equal(settled[0]?.status, 'failed');
   const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
   assert.equal(announced.at(-1)?.backgroundTasks?.length, 2);
+});
+
+test('a background shell is listed with its stop handle and its checkout', () => {
+  const registry = new OpenCodeRunRegistry();
+  const { writer } = writerOf();
+  registry.create('app-shell', 'ses_parent', writer, 'chat', '/tmp/project');
+  startBackgroundShell(registry);
+
+  const [task] = registry.backgroundTasksFor('app-shell');
+  assert.equal(task?.id, 'call_shell', 'the card is anchored by the launching call');
+  assert.equal(task?.taskId, 'sh_1', 'the engine handle is what a stop sends');
+  assert.deepEqual(registry.backgroundStopRoute('app-shell', 'sh_1'), {
+    kind: 'shell',
+    directory: '/tmp/project',
+  });
+  assert.equal(registry.backgroundStopRoute('another-app', 'sh_1'), null, 'a handle belongs to its launcher only');
+  registry.settleBackgroundTask('app-shell', 'sh_1', 'stopped');
+});
+
+test('stopping a shell drops it at once and tells the card how it ended', () => {
+  const registry = new OpenCodeRunRegistry();
+  const { frames, writer } = writerOf();
+  registry.create('app-shell', 'ses_parent', writer, 'chat', '/tmp/project');
+  startBackgroundShell(registry);
+  frames.length = 0;
+
+  registry.settleBackgroundTask('app-shell', 'sh_1', 'stopped');
+
+  assert.equal(registry.isBackgroundWorkPending('app-shell'), false);
+  assert.equal(registry.backgroundTasksFor('app-shell').length, 0);
+  const settled = frames.filter((frame) => frame.kind === 'task_status');
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0]?.status, 'stopped');
+  assert.equal(settled[0]?.taskId, 'sh_1');
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(announced.at(-1)?.backgroundTasks?.length, 0);
+});
+
+test('a shell job the engine reports finished is retired at the deadline', async () => {
+  const registry = new OpenCodeRunRegistry({
+    backgroundWorkTimeoutMs: 5,
+    readShellSnapshot: async () => ({ status: 'completed', exitCode: 0 }),
+  });
+  const { frames, writer } = writerOf();
+  registry.create('app-shell', 'ses_parent', writer, 'chat', '/tmp/project');
+  startBackgroundShell(registry);
+  frames.length = 0;
+
+  await waitFor(() => registry.backgroundTasksFor('app-shell').length === 0);
+
+  const settled = frames.filter((frame) => frame.kind === 'task_status');
+  assert.equal(settled.at(-1)?.status, 'completed');
+  assert.equal(settled.at(-1)?.taskId, 'sh_1');
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(announced.at(-1)?.backgroundTasks?.length, 0);
+});
+
+test('a shell job the engine keeps reporting running is dropped at the hold cap', async () => {
+  const registry = new OpenCodeRunRegistry({
+    backgroundWorkTimeoutMs: 5,
+    maxBackgroundHoldMs: 0,
+    readShellSnapshot: async () => ({ status: 'running', exitCode: null }),
+  });
+  const { frames, writer } = writerOf();
+  registry.create('app-shell', 'ses_parent', writer, 'chat', '/tmp/project');
+  startBackgroundShell(registry);
+  frames.length = 0;
+
+  await waitFor(() => registry.backgroundTasksFor('app-shell').length === 0);
+
+  assert.equal(registry.isBackgroundWorkPending('app-shell'), false);
+  const announced = frames.filter((frame) => frame.kind === 'status' && frame.text === 'background_tasks');
+  assert.equal(announced.at(-1)?.backgroundTasks?.length, 0);
+});
+
+test('a shell the service no longer holds is retired as stopped', async () => {
+  const registry = new OpenCodeRunRegistry({
+    backgroundWorkTimeoutMs: 5,
+    readShellSnapshot: async () => {
+      throw new OpenCodeApiError('GET', '/api/shell/sh_1', 404, 'not found');
+    },
+  });
+  const { frames, writer } = writerOf();
+  registry.create('app-shell', 'ses_parent', writer, 'chat', '/tmp/project');
+  startBackgroundShell(registry);
+  frames.length = 0;
+
+  await waitFor(() => registry.backgroundTasksFor('app-shell').length === 0);
+
+  const settled = frames.filter((frame) => frame.kind === 'task_status');
+  assert.equal(settled.at(-1)?.status, 'stopped');
 });

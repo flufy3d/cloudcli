@@ -639,11 +639,13 @@ export const chatRunRegistry = {
    * Returns null when the provider session maps to no app session (subagent
    * and CLI-created sessions live only in the engine), the row is archived,
    * the provider disagrees, or a run is already in flight for the session.
+   * `directory` is the checkout the session runs in: a provider that scopes
+   * follow-up work (OpenCode's shell jobs) by directory needs it back.
    */
   adoptExternalRun(input: {
     provider: LLMProvider;
     providerSessionId: string;
-  }): { appSessionId: string; writer: ChatSessionWriter } | null {
+  }): { appSessionId: string; writer: ChatSessionWriter; directory?: string } | null {
     const session = sessionsDb.getSessionByProviderSessionId(input.providerSessionId);
     if (!session || session.provider !== input.provider || session.isArchived) {
       return null;
@@ -661,7 +663,11 @@ export const chatRunRegistry = {
     }
 
     this.attachSessionSubscribers(session.session_id);
-    return { appSessionId: session.session_id, writer: run.writer };
+    return {
+      appSessionId: session.session_id,
+      writer: run.writer,
+      ...(session.project_path ? { directory: session.project_path } : {}),
+    };
   },
 
   /**

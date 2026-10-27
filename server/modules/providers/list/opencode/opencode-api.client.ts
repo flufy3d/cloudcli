@@ -101,6 +101,21 @@ export type OpenCodePermissionReply = {
 /** Form answers keyed by field key (`q0`, `q1`, …); multiselect values are arrays. */
 export type OpenCodeFormAnswer = Record<string, string | string[]>;
 
+/**
+ * What `GET /api/shell/:id` tells the runtime about one backgrounded command
+ * (verified against v2.0.32): `running` while the job goes, `timeout` or
+ * `killed` once the engine ended it, and the process exit code for a job that
+ * ran to completion.
+ *
+ * Consumer: opencode run registry (background-work deadline re-check).
+ */
+export type OpenCodeShellSnapshot = {
+  /** The engine's word on the job; null when the response carried none. */
+  status: string | null;
+  /** Process exit code; null when the job never ran to completion. */
+  exitCode: number | null;
+};
+
 /** What `GET /api/session/:id` tells the runtime (verified against v2.0.31). */
 export type OpenCodeSessionSnapshot = {
   /** `succeeded` / `failed` / `interrupted` once a run finished; null while running or before any run. */
@@ -262,6 +277,46 @@ export class OpenCodeApiClient {
       `/api/session/${encodeURIComponent(sessionId)}/interrupt`,
     );
     return result?.interrupted === true;
+  }
+
+  /**
+   * `GET /api/shell/:id` — one backgrounded command as the engine holds it.
+   * `directory` scopes the read to the session's instance, which matters when
+   * one serve drives several projects.
+   *
+   * Consumer: opencode run registry (deadline re-check) — a command has no
+   * session row to poll, so this is its only re-readable verdict.
+   */
+  async getShell(shellId: string, directory?: string): Promise<OpenCodeShellSnapshot> {
+    const result = await this.request<{ data?: Record<string, unknown> }>(
+      'GET',
+      this.shellPath(shellId, directory),
+    );
+    const data = result?.data ?? {};
+    return {
+      status: typeof data.status === 'string' ? data.status : null,
+      exitCode: typeof data.exit === 'number' ? data.exit : null,
+    };
+  }
+
+  /**
+   * `DELETE /api/shell/:id` — stops one backgrounded command (the same request
+   * the CLI's own "kill shell command" uses). The engine answers 204; a handle
+   * it no longer holds throws `OpenCodeApiError` with status 404, which the
+   * caller judges (a stale record is already over, not a failure).
+   *
+   * Consumer: opencode runtime (`chat.stop-task` for a command's strip row).
+   */
+  async removeShell(shellId: string, directory?: string): Promise<void> {
+    await this.request('DELETE', this.shellPath(shellId, directory));
+  }
+
+  private shellPath(shellId: string, directory?: string): string {
+    const shellPath = `/api/shell/${encodeURIComponent(shellId)}`;
+    if (!directory) {
+      return shellPath;
+    }
+    return `${shellPath}?${new URLSearchParams({ 'location[directory]': directory }).toString()}`;
   }
 
   /** `POST /api/session/:id/permission/:requestId/reply`. */

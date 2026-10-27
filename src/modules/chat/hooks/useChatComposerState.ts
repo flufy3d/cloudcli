@@ -1557,8 +1557,8 @@ export function useChatComposerState({
    * Stops background tasks by id: the one launched by `toolUseId`, or every
    * stoppable task the session still has running when it is omitted.
    *
-   * Only an entry carrying `taskId` has a stop handle the engine accepts; a
-   * backgrounded command does not, so the strip never sends one.
+   * Only an entry carrying `taskId` has a stop handle the engine accepts —
+   * a child agent's session or a command's shell job.
    */
   const handleStopBackgroundTasks = useCallback((toolUseId?: string) => {
     const targetSessionId = selectedSession?.id || currentSessionId || null;

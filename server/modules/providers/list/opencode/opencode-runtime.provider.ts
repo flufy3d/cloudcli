@@ -87,6 +87,11 @@ const PROVIDER = 'opencode' as const;
 export type OpenCodeAdoptedRun = {
   appSessionId: string;
   writer: ProviderRuntimeWriter;
+  /**
+   * Checkout the adopted session runs in. A shell job launched on the report
+   * turn is scoped to it, so stopping that job must address the same instance.
+   */
+  directory?: string;
 };
 
 /**
@@ -188,6 +193,10 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     // reconnect reconciliation reads for a run whose terminal was lost.
     readChildSnapshot: (childSessionId) => client?.getSession(childSessionId)
       ?? Promise.reject(new OpenCodeApiError('GET', '/api/session', 503, 'OpenCode service is not running')),
+    // A shell job has no session row; its own service record is the verdict a
+    // missed completion notice can be checked against.
+    readShellSnapshot: (shellId, directory) => client?.getShell(shellId, directory)
+      ?? Promise.reject(new OpenCodeApiError('GET', '/api/shell', 503, 'OpenCode service is not running')),
   });
   const settings = new OpenCodeSessionSettingsApplier();
   /** App sessions whose pending set is being re-read right now. */
@@ -218,13 +227,10 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     try {
       // The run's own session plus the children still running: a question
       // asked inside a subagent is answered against the child session id but
-      // surfaces as the parent's card. A task without an engine handle names
-      // no session to ask.
+      // surfaces as the parent's card. A shell job is no session to ask.
       const sessionIds = [
         run.providerSessionId,
-        ...runs.backgroundTasksFor(appSessionId)
-          .map((task) => task.taskId)
-          .filter((taskId): taskId is string => typeof taskId === 'string' && taskId.length > 0),
+        ...runs.backgroundChildSessionIds(appSessionId),
       ];
       for (const providerSessionId of sessionIds) {
         let forms: unknown[];
@@ -421,7 +427,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
 
     // One tracker per run: the window comes from the model this run switched
     // to, and the throttle state must not leak across runs.
-    const activeRun = runs.create(appSessionId, providerSessionId, writer);
+    const activeRun = runs.create(appSessionId, providerSessionId, writer, 'chat', workingDir);
     if (context.publishSessionEvent) {
       runs.setSessionPublisher(appSessionId, (message) => context.publishSessionEvent?.(appSessionId, message));
     }
@@ -560,7 +566,7 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
       return;
     }
 
-    const run = runs.create(adopted.appSessionId, providerSessionId, adopted.writer);
+    const run = runs.create(adopted.appSessionId, providerSessionId, adopted.writer, 'chat', adopted.directory);
     // The engine accepted this execution long before we saw it; the run is
     // only a bookkeeping shell, so reconciliation may judge it right away.
     run.promptAccepted = true;
@@ -743,9 +749,27 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     listBackgroundWork() {
       return runs.listBackgroundWork();
     },
-    async stopBackgroundTask(_sessionId: string, taskId: string): Promise<boolean> {
+    async stopBackgroundTask(sessionId: string, taskId: string): Promise<boolean> {
       if (!client) {
         return false;
+      }
+      const route = runs.backgroundStopRoute(sessionId, taskId);
+      if (route?.kind === 'shell') {
+        try {
+          await client.removeShell(taskId, route.directory);
+        } catch (error) {
+          // A handle the engine no longer holds is already over: exactly the
+          // stale record this stop exists to clear, not a failed stop.
+          if (!(error instanceof OpenCodeApiError) || error.status !== 404) {
+            console.warn('[OpenCode] failed to stop background shell:', error);
+            return false;
+          }
+        }
+        // The engine only reports a killed job on its event feed, which may be
+        // the very delivery that was lost; settle on our own confirmation so
+        // the strip clears the moment the request succeeds.
+        runs.settleBackgroundTask(sessionId, taskId, 'stopped');
+        return true;
       }
       try {
         return await client.interrupt(taskId);

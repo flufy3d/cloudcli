@@ -31,7 +31,7 @@ const withFakeService = async (
         response.writeHead(status, payload === undefined ? {} : { 'content-type': 'application/json' });
         response.end(payload === undefined ? undefined : JSON.stringify(payload));
       };
-      if (path.includes('/api/session/ses_missing')) {
+      if (path.includes('/api/session/ses_missing') || path.startsWith('/api/shell/sh_missing')) {
         reply(404, { _tag: 'NotFoundError', message: 'Session ses_missing not found' });
         return;
       }
@@ -70,6 +70,14 @@ const withFakeService = async (
       }
       if (request.method === 'GET' && path === '/api/session/ses_running') {
         reply(200, { data: { id: 'ses_running', time: { created: 1, updated: 2 } } });
+        return;
+      }
+      if (request.method === 'GET' && path.startsWith('/api/shell/')) {
+        reply(200, { data: { id: 'sh_1', status: 'running', command: 'sleep 600' } });
+        return;
+      }
+      if (request.method === 'DELETE' && path.startsWith('/api/shell/')) {
+        reply(204);
         return;
       }
       reply(204);
@@ -222,5 +230,29 @@ test('reverts by staging then committing, and clears a boundary whose commit fai
       ['POST', '/api/session/ses_stuck/revert/commit', undefined],
       ['DELETE', '/api/session/ses_stuck/revert', undefined],
     ]);
+  });
+});
+
+test('reads and stops a background shell by its handle, scoped to the checkout', async () => {
+  await withFakeService(async ({ client, requests }) => {
+    assert.deepEqual(await client.getShell('sh_1', '/tmp/project'), { status: 'running', exitCode: null });
+
+    await client.removeShell('sh_1', '/tmp/project');
+    await assert.rejects(
+      () => client.getShell('sh_missing', '/tmp/project'),
+      (error: unknown) => error instanceof OpenCodeApiError && error.status === 404,
+    );
+
+    const query = new URLSearchParams({ 'location[directory]': '/tmp/project' }).toString();
+    assert.deepEqual(
+      requests
+        .filter((request) => request.path.startsWith('/api/shell/'))
+        .map((request) => [request.method, request.path]),
+      [
+        ['GET', `/api/shell/sh_1?${query}`],
+        ['DELETE', `/api/shell/sh_1?${query}`],
+        ['GET', `/api/shell/sh_missing?${query}`],
+      ],
+    );
   });
 });

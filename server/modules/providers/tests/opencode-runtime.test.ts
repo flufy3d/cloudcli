@@ -588,7 +588,7 @@ test('a backgrounded shell is listed until the engine reports it ended', async (
     const task = runtime.backgroundTasks?.list('app-shell')?.[0];
     assert.equal(task?.toolName, 'Bash');
     assert.equal(task?.command, 'Monitor batch 1');
-    assert.equal(task?.taskId, undefined, 'a shell job has no stop handle');
+    assert.equal(task?.taskId, 'sh_1', 'the shell id is the stop handle');
     assert.ok(published.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'
       && frame.backgroundTasks?.[0]?.toolName === 'Bash'),
     'the strip goes down the session channel, not the round writer');
@@ -605,6 +605,49 @@ test('a backgrounded shell is listed until the engine reports it ended', async (
     assert.ok(published.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'
       && (frame.backgroundTasks?.length ?? 0) === 0));
     assert.equal(frames.some((frame) => frame.kind === 'status' && frame.text === 'background_tasks'), false);
+
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+  });
+});
+
+test('stopping a shell job deletes its handle and clears the strip without waiting for the engine', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    const { writer } = makeWriter();
+    const published: NormalizedMessage[] = [];
+    const running = runtime.run('monitor it', { sessionId: 'app-stop-shell', projectPath: '/tmp/project-stop' }, writer, {
+      ...makeContext('ses_new'),
+      publishSessionEvent: (_sessionId, message) => published.push(message),
+    });
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+
+    service.emit(session('session.tool.called', {
+      assistantMessageID: 'm',
+      id: 'call_shell',
+      name: 'shell',
+      input: { command: 'sleep 600', description: 'Long monitor' },
+    }));
+    service.emit(session('session.tool.success', {
+      assistantMessageID: 'm',
+      id: 'call_shell',
+      content: [{ type: 'text', text: 'Command running in the background (shellID: sh_stop).' }],
+      metadata: { shellID: 'sh_stop', status: 'running', truncated: false },
+      executed: false,
+    }));
+
+    await waitFor(() => (runtime.backgroundTasks?.list('app-stop-shell') ?? []).length === 1);
+    assert.ok(runtime.stopBackgroundTask, 'the runtime exposes the stop facet');
+
+    const stopped = await runtime.stopBackgroundTask('app-stop-shell', 'sh_stop');
+    assert.equal(stopped, true);
+
+    const removal = await service.waitForRequest((request) => request.method === 'DELETE');
+    const query = new URLSearchParams({ 'location[directory]': '/tmp/project-stop' }).toString();
+    assert.equal(removal.path, `/api/shell/sh_stop?${query}`, 'the delete is scoped to the launching checkout');
+    assert.equal(runtime.backgroundTasks?.list('app-stop-shell').length, 0);
+    assert.ok(published.some((frame) => frame.kind === 'task_status'
+      && frame.status === 'stopped' && frame.taskId === 'sh_stop'),
+    'the card is settled locally, even if the engine report never arrives');
 
     service.emit(session('session.execution.succeeded', {}));
     await running;

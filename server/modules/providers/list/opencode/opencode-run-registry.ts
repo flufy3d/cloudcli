@@ -10,9 +10,10 @@
  *
  * It also tracks work the engine moved to the background past its turn: a
  * child session until its own terminal (or a deadline verdict), and a shell
- * job until the engine's synthetic notice names it. The shell job does not
- * hold the parent run — the report turn the engine starts when it ends is
- * adopted as a run of its own.
+ * job until the engine's synthetic notice names it — or until the service's
+ * own shell record contradicts it. The shell job does not hold the parent run
+ * — the report turn the engine starts when it ends is adopted as a run of its
+ * own — and it is stopped through `DELETE /api/shell/:id`.
  *
  * @module opencode-run-registry
  */
@@ -29,7 +30,7 @@ import { createNormalizedMessage, generateMessageId, readObjectRecord, readOptio
 
 import { createBackgroundTasksStatusMessage, LOCAL_BASH_TASK_TYPE } from '../../shared/background-work/task-status.js';
 
-import { OpenCodeApiError, type OpenCodeApiClient, type OpenCodeSessionSnapshot } from './opencode-api.client.js';
+import { OpenCodeApiError, type OpenCodeApiClient, type OpenCodeSessionSnapshot, type OpenCodeShellSnapshot } from './opencode-api.client.js';
 import {
   readBackgroundNotice,
   type OpenCodeBackgroundLaunch,
@@ -154,6 +155,12 @@ export type OpenCodeActiveRun = {
   /** Resolves on the first settlement; later settlements are ignored. */
   settled: Promise<OpenCodeRunSettlement>;
   settle: (settlement: OpenCodeRunSettlement) => void;
+  /**
+   * Checkout this run was sent to. Shell jobs the run moves to the background
+   * are scoped to it, so stopping or re-checking one addresses the service
+   * instance that owns the job rather than its default workspace.
+   */
+  directory?: string;
 };
 
 /**
@@ -163,8 +170,15 @@ export type OpenCodeActiveRun = {
  */
 export type OpenCodeRunRegistryOptions = {
   readChildSnapshot?: (childSessionId: string) => Promise<OpenCodeSessionSnapshot>;
-  /** Total wall-clock a child may stay tracked before its deadline drops it. */
+  /**
+   * The service's `GET /api/shell/:id` reader, wired by the runtime: a shell
+   * job has no session row, so its own record is the only verdict available.
+   */
+  readShellSnapshot?: (shellId: string, directory?: string) => Promise<OpenCodeShellSnapshot>;
+  /** Total wall-clock one background task may stay tracked before its deadline drops it. */
   maxBackgroundHoldMs?: number;
+  /** Interval a tracked task is re-judged at; default 30 minutes. Tests shorten it. */
+  backgroundWorkTimeoutMs?: number;
 };
 
 /**
@@ -187,11 +201,13 @@ export class OpenCodeRunRegistry {
    */
   private readonly backgroundByApp = new Map<string, Map<string, BackgroundTaskSummary>>();
   /**
-   * Backgrounded shell jobs per app session. The engine ends one only by
-   * reporting it; unlike a child session it has no row to reconcile against,
-   * so it stays listed until its synthetic notice arrives.
+   * Backgrounded shell jobs per app session. The engine ends one by reporting
+   * it, and the record behind `GET /api/shell/:id` is the only thing that can
+   * contradict a job whose notice never came.
    */
   private readonly shellBackgroundByApp = new Map<string, Map<string, BackgroundTaskSummary>>();
+  /** Checkout a shell job was launched from, for the directory-scoped shell routes. */
+  private readonly backgroundDirectoryByTask = new Map<string, string>();
   private readonly backgroundWriterByApp = new Map<string, ProviderRuntimeWriter>();
   /**
    * Session-channel publisher per app session, supplied by the runtime when a
@@ -207,7 +223,9 @@ export class OpenCodeRunRegistry {
   /** The one pending deadline per app session whose background work is tracked. */
   private readonly backgroundDeadlineTimers = new Map<string, NodeJS.Timeout>();
   private readonly readChildSnapshot: (childSessionId: string) => Promise<OpenCodeSessionSnapshot>;
+  private readonly readShellSnapshot: (shellId: string, directory?: string) => Promise<OpenCodeShellSnapshot>;
   private readonly maxBackgroundHoldMs: number;
+  private readonly backgroundWorkTimeoutMs: number;
 
   constructor(options: OpenCodeRunRegistryOptions = {}) {
     this.readChildSnapshot = options.readChildSnapshot ?? (async () => {
@@ -215,7 +233,13 @@ export class OpenCodeRunRegistry {
       // the backstop's original behavior, kept for tests and host-less use.
       throw new Error('No child session reader is configured.');
     });
+    this.readShellSnapshot = options.readShellSnapshot ?? (async () => {
+      // Same backstop for a shell job: without a reader the hold cap is the
+      // only verdict, so an unreadable job is kept until then.
+      throw new Error('No shell reader is configured.');
+    });
     this.maxBackgroundHoldMs = options.maxBackgroundHoldMs ?? BACKGROUND_WORK_MAX_HOLD_MS;
+    this.backgroundWorkTimeoutMs = options.backgroundWorkTimeoutMs ?? BACKGROUND_WORK_TIMEOUT_MS;
   }
 
   create(
@@ -223,6 +247,7 @@ export class OpenCodeRunRegistry {
     providerSessionId: string,
     writer: ProviderRuntimeWriter,
     purpose: OpenCodeActiveRun['purpose'] = 'chat',
+    directory?: string,
   ): OpenCodeActiveRun {
     let settle!: (settlement: OpenCodeRunSettlement) => void;
     const settled = new Promise<OpenCodeRunSettlement>((resolve) => {
@@ -239,6 +264,7 @@ export class OpenCodeRunRegistry {
       promptAccepted: false,
       settled,
       settle,
+      ...(directory ? { directory } : {}),
     };
     this.byApp.set(appSessionId, run);
     this.byProvider.set(providerSessionId, run);
@@ -292,11 +318,12 @@ export class OpenCodeRunRegistry {
       // The card's identity is the launch call, not the engine's handle: the
       // transcript anchors its card by the call and `chat.stop-task` is keyed
       // by the tool-use id the client compares against, so one handle on the
-      // strip both reveals the card and stops exactly this task. A shell job
-      // carries no stop handle because the engine offers no request that ends
-      // one; omitting `taskId` keeps the strip from offering a dead button.
+      // strip both reveals the card and stops exactly this task.
       id: task.toolUseId || task.taskId,
-      ...(task.taskType === LOCAL_BASH_TASK_TYPE ? {} : { taskId: task.taskId }),
+      // Both kinds carry a stop handle: an agent is interrupted by its child
+      // session id, a shell job by `DELETE /api/shell/:id` (see the runtime's
+      // `stopBackgroundTask`).
+      taskId: task.taskId,
       toolName: task.taskType === LOCAL_BASH_TASK_TYPE ? 'Bash' : 'subagent',
       ...(task.taskType === LOCAL_BASH_TASK_TYPE ? { command: task.description } : {}),
       description: task.description,
@@ -325,6 +352,57 @@ export class OpenCodeRunRegistry {
       sessionId,
       tasks: this.allBackgroundTasks(sessionId),
     }));
+  }
+
+  /**
+   * Child sessions this app session still tracks as background agents.
+   *
+   * Consumer: the runtime's pending-interaction reconcile, which re-reads each
+   * child's forms and permissions. A shell job is no session to ask, so its
+   * id must not be queried as one.
+   */
+  backgroundChildSessionIds(appSessionId: string): string[] {
+    return [...(this.backgroundByApp.get(appSessionId)?.keys() ?? [])];
+  }
+
+  /**
+   * How the engine ends one tracked handle, or null when this session does not
+   * track it:
+   * - `agent`: `POST /api/session/:id/interrupt` on the child session id;
+   * - `shell`: `DELETE /api/shell/:id`, scoped to the checkout it was launched
+   *   from.
+   *
+   * Consumer: the runtime's `stopBackgroundTask` (the strip's ✕).
+   */
+  backgroundStopRoute(
+    appSessionId: string,
+    taskId: string,
+  ): { kind: 'agent' | 'shell'; directory?: string } | null {
+    if (this.backgroundAppByTask.get(taskId) !== appSessionId) {
+      return null;
+    }
+    if (this.backgroundByApp.get(appSessionId)?.has(taskId)) {
+      return { kind: 'agent' };
+    }
+    if (this.shellBackgroundByApp.get(appSessionId)?.has(taskId)) {
+      const directory = this.backgroundDirectoryByTask.get(taskId);
+      return { kind: 'shell', ...(directory ? { directory } : {}) };
+    }
+    return null;
+  }
+
+  /**
+   * Drops one tracked task on the caller's verdict — a stop the engine
+   * confirmed, or a handle it no longer knows. The card reads the matching
+   * `task_status` frame, so its spinner stops without waiting for a refresh.
+   *
+   * Consumer: the runtime's `stopBackgroundTask`.
+   */
+  settleBackgroundTask(appSessionId: string, taskId: string, status: BackgroundTaskStatus): void {
+    if (this.backgroundAppByTask.get(taskId) !== appSessionId) {
+      return;
+    }
+    this.finishBackgroundWork(taskId, status);
   }
 
   /** Every agent and shell task of one app session, oldest first. */
@@ -395,31 +473,46 @@ export class OpenCodeRunRegistry {
    * gets the outcome the engine reports, and tracking ends. A child still
    * mid-turn is left alone and re-judged at the next deadline, so work that
    * legitimately outlives the window (an hour-long batch monitor, say) keeps
-   * its composer entry, its card's live frames and its question cards. A child
-   * nothing can describe — the service is gone, or the row is unreadable — is
-   * dropped: that is the backstop a plain timeout used to be, for the state no
-   * verdict can be had about. The hold cap keeps a session row that reads
-   * mid-turn forever — the engine died under it — from pinning the run.
+   * its composer entry, its card's live frames and its question cards. A
+   * backgrounded shell is judged the same way through its own service record.
+   * The hold cap is the last backstop for a record that reads live forever —
+   * the engine lost the process, or died under it — and covers both kinds, so
+   * a phantom can never pin the strip for good.
    */
   private recheckBackgroundWork(appSessionId: string, intervalMs: number): void {
-    const tasks = this.backgroundByApp.get(appSessionId);
-    if (!tasks || tasks.size === 0) {
+    const tasks = this.allBackgroundTasks(appSessionId);
+    if (tasks.length === 0) {
       // Settled naturally while the timer was pending; waiters are resolved.
       return;
     }
 
-    const oldestStartedAt = Math.min(...[...tasks.values()].map((task) => task.startedAt));
+    const oldestStartedAt = Math.min(...tasks.map((task) => task.startedAt));
     if (Date.now() - oldestStartedAt >= this.maxBackgroundHoldMs) {
-      for (const childSessionId of [...tasks.keys()]) {
-        this.finishBackgroundWork(childSessionId);
+      for (const task of tasks) {
+        this.finishBackgroundWork(task.taskId);
       }
       return;
     }
 
-    void this.recheckChildren(appSessionId, intervalMs);
+    void this.judgeBackgroundWork(appSessionId, intervalMs);
   }
 
-  private async recheckChildren(appSessionId: string, intervalMs: number): Promise<void> {
+  /**
+   * Judges every tracked kind in one pass: a child by its session row, a shell
+   * job by the service's shell record. Whatever is still alive is re-judged at
+   * the next deadline.
+   */
+  private async judgeBackgroundWork(appSessionId: string, intervalMs: number): Promise<void> {
+    await Promise.all([
+      this.recheckChildren(appSessionId),
+      this.recheckShells(appSessionId),
+    ]);
+    if (this.isBackgroundWorkPending(appSessionId)) {
+      this.armBackgroundDeadline(appSessionId, intervalMs);
+    }
+  }
+
+  private async recheckChildren(appSessionId: string): Promise<void> {
     const tasks = this.backgroundByApp.get(appSessionId);
     if (!tasks) {
       return;
@@ -440,9 +533,37 @@ export class OpenCodeRunRegistry {
       }
       // Otherwise it is mid-turn: still running, re-judged next deadline.
     }
+  }
 
-    if (this.backgroundByApp.has(appSessionId)) {
-      this.armBackgroundDeadline(appSessionId, intervalMs);
+  /**
+   * Re-judges backgrounded shell jobs by the service's own record. A handle the
+   * service no longer holds (404) is over — that is the stale entry a lost
+   * completion notice leaves behind — and a job it reports finished is settled
+   * with that verdict. One it still reports running keeps its place; the hold
+   * cap above bounds a record the engine itself never updates. A read that
+   * merely failed says nothing either way, so the job is kept for the next
+   * deadline rather than dropped on a transient error.
+   */
+  private async recheckShells(appSessionId: string): Promise<void> {
+    const tasks = this.shellBackgroundByApp.get(appSessionId);
+    if (!tasks) {
+      return;
+    }
+
+    for (const shellId of [...tasks.keys()]) {
+      let snapshot: OpenCodeShellSnapshot;
+      try {
+        snapshot = await this.readShellSnapshot(shellId, this.backgroundDirectoryByTask.get(shellId));
+      } catch (error) {
+        if (error instanceof OpenCodeApiError && error.status === 404) {
+          this.finishBackgroundWork(shellId, 'stopped');
+        }
+        continue;
+      }
+      if (snapshot.status === 'running') {
+        continue;
+      }
+      this.finishBackgroundWork(shellId, shellStatusToOutcome(snapshot));
     }
   }
 
@@ -581,8 +702,9 @@ export class OpenCodeRunRegistry {
   /**
    * Records a shell job the engine moved to the background.
    *
-   * The job has no child session and no row to poll: only the engine's
-   * synthetic notice ends it. The parent run is deliberately not held for it —
+   * The job has no child session: the engine's synthetic notice is the live
+   * word that it ended, and `GET /api/shell/:id` is the record a missed notice
+   * can be judged against. The parent run is deliberately not held for it —
    * the report the engine starts when the job ends is adopted as a new run.
    */
   private startShellBackgroundWork(run: OpenCodeActiveRun, launch: OpenCodeBackgroundLaunch): void {
@@ -602,8 +724,13 @@ export class OpenCodeRunRegistry {
       startedAt: Date.now(),
     });
     this.backgroundAppByTask.set(launch.taskId, run.appSessionId);
+    if (run.directory) {
+      this.backgroundDirectoryByTask.set(launch.taskId, run.directory);
+    }
     this.backgroundWriterByApp.set(run.appSessionId, run.writer);
     this.broadcastBackgroundWork(run.appSessionId);
+    // A shell job does not hold the run, so nothing else would arm its deadline.
+    this.armBackgroundDeadline(run.appSessionId, this.backgroundWorkTimeoutMs);
   }
 
   /**
@@ -622,6 +749,7 @@ export class OpenCodeRunRegistry {
       return;
     }
     this.backgroundAppByTask.delete(taskId);
+    this.backgroundDirectoryByTask.delete(taskId);
     const agentTasks = this.backgroundByApp.get(appSessionId);
     const shellTasks = this.shellBackgroundByApp.get(appSessionId);
     const task = agentTasks?.get(taskId) ?? shellTasks?.get(taskId);
@@ -645,13 +773,14 @@ export class OpenCodeRunRegistry {
     }
     if (!agentTasks || agentTasks.size === 0) {
       this.backgroundByApp.delete(appSessionId);
-      this.clearBackgroundDeadline(appSessionId);
+      // Only the agent side has waiters: a shell job never holds the run.
       this.resolveBackgroundWaiters(appSessionId);
     }
     if (!shellTasks || shellTasks.size === 0) {
       this.shellBackgroundByApp.delete(appSessionId);
     }
     if (!this.isBackgroundWorkPending(appSessionId)) {
+      this.clearBackgroundDeadline(appSessionId);
       this.backgroundWriterByApp.delete(appSessionId);
     }
     this.sendBackgroundFrame(appSessionId, {
@@ -700,6 +829,7 @@ export class OpenCodeRunRegistry {
     for (const [taskId, parentAppSessionId] of this.backgroundAppByTask) {
       if (parentAppSessionId === appSessionId) {
         this.backgroundAppByTask.delete(taskId);
+        this.backgroundDirectoryByTask.delete(taskId);
       }
     }
     this.backgroundByApp.delete(appSessionId);
@@ -720,6 +850,7 @@ export class OpenCodeRunRegistry {
       this.clearBackgroundWorkForSession(appSessionId);
     }
     this.backgroundAppByTask.clear();
+    this.backgroundDirectoryByTask.clear();
     this.backgroundWriterByApp.clear();
     this.sessionPublisherByApp.clear();
   }
@@ -843,6 +974,24 @@ function settledStatusFromSnapshot(snapshot: OpenCodeSessionSnapshot): Backgroun
     return 'stopped';
   }
   return 'completed';
+}
+
+/**
+ * How a shell job ended, from its service record, for the card's settled
+ * status. `killed` is a stop, `timeout` is a failure, and an exit code decides
+ * the rest (a job that merely went away without one is a failure too).
+ */
+function shellStatusToOutcome(snapshot: OpenCodeShellSnapshot): BackgroundTaskStatus {
+  if (snapshot.status === 'killed') {
+    return 'stopped';
+  }
+  if (snapshot.status === 'timeout') {
+    return 'failed';
+  }
+  if (snapshot.status === 'completed' || snapshot.exitCode === 0) {
+    return 'completed';
+  }
+  return 'failed';
 }
 
 /** How a child ended, from its own terminal event, for the card's settled status. */
