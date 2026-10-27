@@ -13,6 +13,10 @@
  *   question text, multi-select joined with ", ") are mapped back onto the
  *   form's field keys. Skip/Deny dismiss the form with a message so the
  *   model continues instead of the step dying.
+ * - `form.created` with `metadata.kind: "websearch.provider"` (the web-search
+ *   setup gate) is answered by the bridge itself, never rendered: the gate
+ *   only picks which provider backs the search, and an unanswered gate expires
+ *   after a minute as "Web search cancelled".
  *
  * The bridge keeps every pending card so `chat.subscribe` can replay it
  * after a reload, retracts cards the moment they are answered (here or in
@@ -42,6 +46,19 @@ const DEFAULT_PENDING_TTL_MS = 30 * 60 * 1000;
 const SKIPPED_FORM_MESSAGE = 'The user skipped these questions. Continue without the answers; make reasonable assumptions and state them.';
 const DECLINED_PERMISSION_MESSAGE = 'The user declined this action.';
 const EXPIRED_MESSAGE = 'The request expired without an answer.';
+/**
+ * The engine's web-search setup gate. The first search of a session asks which
+ * provider should back it, and an unanswered gate is cancelled after one
+ * minute (the tool then fails with "Web search cancelled"). It is a setup
+ * wizard, not a permission — the tool's own `permission.asked` card already
+ * decides whether the model may search — so the bridge answers `allow` and the
+ * engine records its "random available provider" default for later searches.
+ */
+const WEBSEARCH_GATE_KIND = 'websearch.provider';
+const WEBSEARCH_GATE_FIELD = 'choice';
+const WEBSEARCH_GATE_ALLOW = 'allow';
+/** Answered gate ids kept only so the reconcile replay does not answer twice. */
+const WEBSEARCH_GATE_MEMORY = 256;
 
 //----------------- SESSION ATTACHMENT ------------
 
@@ -167,6 +184,8 @@ export class OpenCodeInteractionBridge {
   private readonly pending = new Map<string, PendingInteraction>();
   /** Child session → parent run links, so a card raised inside an agent is the parent's. */
   private readonly subagents = new OpenCodeSubagentIndex();
+  /** Gate ids already answered, so the reconcile replay does not answer twice. */
+  private readonly answeredWebSearchGates = new Set<string>();
 
   constructor(dependencies: BridgeDependencies) {
     this.getClient = dependencies.getClient;
@@ -407,6 +426,13 @@ export class OpenCodeInteractionBridge {
     }
     const metadata = readObjectRecord(form.metadata);
     const kind = readOptionalString(metadata?.kind);
+    const fields = readFormFields(form.fields);
+    if (kind === WEBSEARCH_GATE_KIND) {
+      // Answered rather than rendered: the gate has no card shape, and leaving
+      // it pending makes the engine cancel the tool a minute later.
+      this.answerWebSearchGate(replySessionId, requestId, fields);
+      return false;
+    }
     if (kind !== 'question') {
       // Only the question tool's form has the panel shape; anything else the
       // service adds later must not be rendered as an answerable survey.
@@ -416,7 +442,6 @@ export class OpenCodeInteractionBridge {
       return false;
     }
     const tool = readObjectRecord(metadata?.tool);
-    const fields = readFormFields(form.fields);
     this.announce(session, {
       requestId,
       kind: 'form',
@@ -431,6 +456,49 @@ export class OpenCodeInteractionBridge {
       writer: session.writer,
     });
     return true;
+  }
+
+  /**
+   * Answers an opencode web-search gate so the engine never waits out its
+   * one-minute form timeout. The engine stores the resulting "random available
+   * provider" default, so the next search skips the gate entirely.
+   *
+   * Ids already answered are skipped: the reconcile path re-reads the
+   * service's pending list after every reconnect and subscribe, and an
+   * engine-side gate that reshapes its fields falls back to the old
+   * ignore-and-expire behaviour instead of answering blind.
+   *
+   * Consumer: `announceForm` (event path and reconcile).
+   */
+  private answerWebSearchGate(replySessionId: string, formId: string, fields: FormField[]): void {
+    const choice = fields.find((field) => field.key === WEBSEARCH_GATE_FIELD);
+    const canAllow = (choice?.options ?? []).some((option) => option.value === WEBSEARCH_GATE_ALLOW);
+    if (!canAllow) {
+      console.warn(`[OpenCode] web search gate ${formId} has no "${WEBSEARCH_GATE_ALLOW}" choice`);
+      return;
+    }
+    const client = this.getClient();
+    if (!client || this.answeredWebSearchGates.has(formId)) {
+      return;
+    }
+    this.rememberAnsweredGate(formId);
+    void client
+      .replyForm(replySessionId, formId, { [WEBSEARCH_GATE_FIELD]: WEBSEARCH_GATE_ALLOW })
+      .catch((error: unknown) => {
+        console.warn(`[OpenCode] failed to answer web search gate ${formId}:`, error);
+      });
+  }
+
+  /** Bounds the answered-gate memory; the oldest id is dropped first. */
+  private rememberAnsweredGate(formId: string): void {
+    this.answeredWebSearchGates.add(formId);
+    if (this.answeredWebSearchGates.size <= WEBSEARCH_GATE_MEMORY) {
+      return;
+    }
+    const oldest = this.answeredWebSearchGates.values().next().value;
+    if (oldest !== undefined) {
+      this.answeredWebSearchGates.delete(oldest);
+    }
   }
 
   private announce(session: OpenCodeInteractionSession, entry: PendingInteraction): void {

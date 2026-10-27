@@ -79,6 +79,39 @@ const formCreated = (): OpenCodeEventEnvelope => ({
   },
 });
 
+/**
+ * The engine's web-search setup gate: a `form.created` whose metadata kind is
+ * `websearch.provider`, captured from v2.0.32. The bridge answers `allow` so
+ * the engine never hits its one-minute cancellation.
+ */
+const webSearchGate = (form: Record<string, unknown> = {}): OpenCodeEventEnvelope => ({
+  id: 'evt_gate_1',
+  created: 1792203581706,
+  type: 'form.created',
+  location: { directory: '/tmp/project' },
+  data: {
+    form: {
+      id: 'frm_gate_1',
+      sessionID: PROVIDER_SESSION,
+      title: 'Web Search',
+      metadata: { kind: 'websearch.provider' },
+      fields: [{
+        key: 'choice',
+        description: 'Allow OpenCode to search the web for up-to-date information?',
+        type: 'string',
+        required: true,
+        custom: false,
+        options: [
+          { value: 'allow', label: 'Allow search via OpenCode Web Search' },
+          { value: 'choose', label: 'Choose another provider' },
+          { value: 'disable', label: 'Disable web search' },
+        ],
+      }],
+      ...form,
+    },
+  },
+});
+
 test('permission.asked becomes a permission_request card labelled with the guarded tool call', () => {
   const { bridge, frames } = makeHarness();
   bridge.handleEvent(permissionAsked());
@@ -420,6 +453,50 @@ test('a question asked inside a subagent becomes the parent\'s card and replies 
 
   assert.equal(calls[0].method, 'cancelForm');
   assert.deepEqual(calls[0].args, [CHILD_SESSION, 'frm_147a8690a001Bf0LdLSgutFhNT', 'later']);
+});
+
+test('the web-search gate is answered automatically instead of expiring as "Web search cancelled"', async () => {
+  const { bridge, calls, frames } = makeHarness();
+  bridge.handleEvent(webSearchGate());
+  await flush();
+
+  assert.deepEqual(calls, [{
+    method: 'replyForm',
+    args: [PROVIDER_SESSION, 'frm_gate_1', { choice: 'allow' }],
+  }]);
+  assert.equal(frames.length, 0, 'the gate is a setup wizard, not a card');
+  assert.equal(bridge.listPending(APP_SESSION).length, 0);
+
+  // The reconcile path re-lists the same gate until the engine settles it; a
+  // second answer would be rejected as "not pending".
+  const { form } = webSearchGate().data as { form: Record<string, unknown> };
+  assert.equal(bridge.adoptPending(PROVIDER_SESSION, { forms: [form] }), 0);
+  await flush();
+  assert.equal(calls.length, 1);
+});
+
+test('a gate the bridge cannot answer is left alone instead of answered blind', async () => {
+  const { bridge, calls, frames } = makeHarness();
+  bridge.handleEvent(webSearchGate({
+    id: 'frm_gate_reshaped',
+    fields: [{ key: 'provider', options: [{ value: 'tavily', label: 'Tavily' }] }],
+  }));
+  await flush();
+
+  assert.deepEqual(calls, [], 'no allow choice, no guess');
+  assert.equal(frames.length, 0);
+});
+
+test('a web-search gate raised inside a subagent is answered against the child session', async () => {
+  const { bridge, calls } = makeHarness();
+  linkChildSession(bridge);
+  bridge.handleEvent(webSearchGate({ id: 'frm_gate_child', sessionID: CHILD_SESSION }));
+  await flush();
+
+  assert.deepEqual(calls, [{
+    method: 'replyForm',
+    args: [CHILD_SESSION, 'frm_gate_child', { choice: 'allow' }],
+  }]);
 });
 
 test('without a live service the card is retracted instead of hanging', async () => {
