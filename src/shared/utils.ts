@@ -802,3 +802,4 @@ export const fileReferenceFromMarkdownHref = (href?: string): string | undefined
     return href;
   }
 };
+

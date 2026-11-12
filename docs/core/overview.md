@@ -53,7 +53,7 @@ server/
     agent/                 无头 Agent API（API key / 平台模式鉴权）
     notifications/         Web Push（VAPID）+ 桌面通知 WS
     plugins/               插件注册表、插件子进程、WS 代理
-    scheduled-messages/    定时消息（一次性：调度器 → 无附着 chat turn）
+    scheduled-messages/    定时消息与排队消息（调度器 → 无附着 chat turn）
     scheduled-jobs/        定时任务（cron 循环或 run_at 仅一次 + 运行历史；reuse/new 两种会话模式，reuse 可设 rotate_after_days 到龄换新会话并归档旧会话；永不打断在跑回合）
                            含 agent 侧受管 MCP 桥 `cloudcli-scheduled-tasks`（Settings 全局开关 + 启动对账）
     browser-use/           浏览器自动化 service + 本地 MCP 桥接
@@ -99,6 +99,7 @@ docs/
 ## 认证与安全边界
 
 - **JWT**：`server/modules/auth/auth.middleware.ts`。密钥取 env `JWT_SECRET`，否则自动生成入库（`app_config.jwt_secret`）。token 7 天有效，半衰期自动刷新（响应头 `X-Refreshed-Token`）。`/api/*` 一律 `Cache-Control: no-store` 且关闭 ETag——304 会让浏览器把缓存里旧 200 的过期刷新 token 交回前端；前端对响应头 token 也只接受未过期且不早于当前 token 的（`storeRefreshedAuthToken`）。WS 走 query string 或 Authorization 头鉴权（`websocket-auth.service.ts`）。
+- **执行 MCP**：`/mcp/execution` 在通用 `/api` 鉴权之外单独挂载，默认关闭。专用令牌、本机连接、Host 和代理头校验由 execution 模块负责；执行目录、记录及生命周期见 providers.md「本机执行 MCP」。
 - **可选 API key**：`validateApiKey` 作用于全部 `/api`；agent 模块另走 API key / 平台双模鉴权。
 - **上传白名单**：`chat.send` 的附件只放行 `~/.cloudcli/assets` 直接子文件，防止任意路径读。
 - **`file:` 链接白名单**：会话里引擎产出的本地文件链接走只读端点，目录白名单含工作区根（`WORKSPACES_ROOT`，默认用户主目录）、`~/Downloads`、各引擎数据根与系统临时目录（`server/modules/file-tree` 的 `externalReadOnlyRoots` 与 `resolveReadablePath`），防止越权读盘；全部只读，realpath 前缀比对防符号链接逃逸，写路径仍只锁项目根。运维可用环境变量 `CLOUDCLI_EXTRA_READ_ROOTS`（按 `path.delimiter` 分隔的绝对路径，Windows 为 `;`）追加只读根，只应列具体目录，勿放开整个 home；工作区根落在系统禁止目录时整项禁用并在启动时报错。

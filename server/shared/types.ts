@@ -1508,6 +1508,9 @@ export type FileTreeServiceDependencies = {
    * linked Git worktrees without relaxing project write boundaries.
    */
   resolveWorktreeRoots?: (projectRoot: string) => Promise<string[]>;
+  /**
+   * Optional provider for available system drive roots (e.g. on Windows).
+   */
 };
 
 /**

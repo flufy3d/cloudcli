@@ -26,6 +26,10 @@ const IGNORED_DIRECTORY_NAMES = new Set([
   '.gradle', '.idea', 'coverage', '.nyc_output',
 ]);
 
+// Volume-level Windows metadata folders (E:\$RECYCLE.BIN, E:\System Volume
+// Information) are not user projects, so browsing a drive root skips them.
+const WINDOWS_SYSTEM_VOLUME_DIRECTORY_RE = /^\$(recycle\.bin|system volume information)$/i;
+
 const COMMON_WORKSPACE_DIRECTORY_NAMES = [
   'Desktop',
   'Documents',
@@ -608,14 +612,16 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
    * `createWorkspaceFolder` deliberately does not do this, which is what keeps
    * them read-only.
    */
-  async function resolveBrowsablePath(targetPath: string): Promise<string> {
+  async function resolveBrowsablePath(
+    targetPath: string,
+    options?: { allowDriveRoot?: boolean },
+  ): Promise<string> {
     const readOnlyPath = await dependencies.workspace.resolveReadOnlyRootPath(targetPath);
     if (readOnlyPath) {
       return readOnlyPath;
     }
 
-    // Browsing may stop at a drive root to switch drives on Windows.
-    const validation = await dependencies.workspace.validatePath(targetPath, { allowDriveRoot: true });
+    const validation = await dependencies.workspace.validatePath(targetPath, options);
     if (!validation.valid) {
       throw createFileTreeError(validation.error ?? 'Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
     }
@@ -721,7 +727,7 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         ? expandWorkspacePath(dependencies.workspace.rootPath, inputPath)
         : dependencies.workspace.rootPath;
       const targetPath = path.resolve(requestedPath);
-      const resolvedPath = await resolveBrowsablePath(targetPath);
+      const resolvedPath = await resolveBrowsablePath(targetPath, { allowDriveRoot: true });
 
       try {
         await fileSystem.access(resolvedPath);
@@ -740,9 +746,11 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
       await acquire();
       try {
         for await (const entry of fileSystem.openDirectory(resolvedPath)) {
-          if (entry.isDirectory()
+          if (
+            entry.isDirectory()
             && !IGNORED_DIRECTORY_NAMES.has(entry.name)
-            && !/^\$(recycle\.bin|system volume information)$/i.test(entry.name)) {
+            && !WINDOWS_SYSTEM_VOLUME_DIRECTORY_RE.test(entry.name)
+          ) {
             directoryNames.push(entry.name);
             if (directoryNames.length >= MAXIMUM_DIRECTORY_ENTRIES) break;
           }

@@ -60,6 +60,7 @@ const SCHEDULED_TAB: BuiltInTab = {
   labelKey: 'tabs.scheduled',
   icon: Clock,
 };
+
 /** Rendered by WorkspaceHeader to show the built-in workspace tabs plus any enabled plugin tabs. */
 export default function WorkspaceTabs({
   activeTab,

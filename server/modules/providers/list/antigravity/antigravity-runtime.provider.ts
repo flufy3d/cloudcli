@@ -643,7 +643,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
             return;
           }
 
-          // Extract and broadcast token budget from step_update or result
           const stepUpdateRecord = readObjectRecord(rawRecord?.step_update);
           if (stepUpdateRecord) {
             const startedAgents = extractAntigravitySubagents(stepUpdateRecord);

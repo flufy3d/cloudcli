@@ -104,9 +104,6 @@ test('AntigravityProviderAuth only reports authenticated with an OAuth token fil
   // test, even on a machine whose real store holds live agy credentials.
   const restoreSkipKeychain = withEnvValue('CLOUDCLI_ANTIGRAVITY_SKIP_CREDENTIAL_STORE', '1');
   await fs.writeFile(path.join(tempRoot, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
-  // A previous test may have cached a "not found" resolution for the real
-  // machine; clear it so this fixture's engine path is what resolves.
-  clearEnginePathCache();
   try {
     const auth = new AntigravityProviderAuth();
 
@@ -147,6 +144,15 @@ test('credential-store probes detect macOS keychain and Windows Credential Manag
       '    User: antigravity',
     ].join('\r\n')),
     true,
+  );
+  // A suffixed target is a different credential, not this one.
+  assert.equal(
+    hasWindowsCredentialManagerCredential(() => [
+      'Currently stored credentials:',
+      '',
+      '    Target: LegacyGeneric:target=gemini:antigravity-foo',
+    ].join('\r\n')),
+    false,
   );
   assert.equal(
     hasWindowsCredentialManagerCredential(() => 'Currently stored credentials:\r\n\r\n* NONE *\r\n'),
@@ -1577,9 +1583,6 @@ test('AntigravityProviderAuth validates token expiry and extracts the account em
   // the verdict.
   const restoreSkipKeychain = withEnvValue('CLOUDCLI_ANTIGRAVITY_SKIP_CREDENTIAL_STORE', '1');
   await fs.writeFile(path.join(tempRoot, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
-  // A previous test may have cached a "not found" resolution for the real
-  // machine; clear it so this fixture's engine path is what resolves.
-  clearEnginePathCache();
   const jwtPayload = (payload: Record<string, unknown>) =>
     Buffer.from(JSON.stringify(payload)).toString('base64url');
 

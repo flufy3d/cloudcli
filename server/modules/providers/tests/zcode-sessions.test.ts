@@ -974,8 +974,9 @@ test('fetchHistory replays cancelled request errors as quiet notifications, real
 
 test('fetchHistory materializes user image attachments into the asset store', async () => {
   await withZCodeStorage(async (storageDir) => {
-    // The shared asset store lives under the user's home; redirect HOME into
-    // the temp storage dir so the test never touches the real ~/.cloudcli.
+    // The shared asset store lives under the user's home; redirect HOME (and
+    // USERPROFILE, which os.homedir() prefers on Windows) into the temp
+    // storage dir so the test never touches the real ~/.cloudcli.
     const previousHome = process.env.HOME;
     const previousUserProfile = process.env.USERPROFILE;
     process.env.HOME = storageDir;
@@ -1054,8 +1055,9 @@ test('fetchHistory materializes user image attachments into the asset store', as
 
 test('fetchHistory restores non-image file attachments as downloadable file cards', async () => {
   await withZCodeStorage(async (storageDir) => {
-    // Non-image uploads stay in cloudcli's own asset store; redirect HOME so
-    // the fixture never touches the real ~/.cloudcli.
+    // Non-image uploads stay in cloudcli's own asset store; redirect HOME (and
+    // USERPROFILE, which os.homedir() prefers on Windows) into the temp storage
+    // dir so the fixture never touches the real ~/.cloudcli.
     const previousHome = process.env.HOME;
     const previousUserProfile = process.env.USERPROFILE;
     process.env.HOME = storageDir;

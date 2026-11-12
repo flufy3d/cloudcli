@@ -30,6 +30,7 @@ import {
   WORKSPACES_ROOT,
   createByteLimitTransform,
   getAvailableWindowsDrives,
+  getConfiguredWorkspaceRoots,
   normalizeProjectPath,
   resolveReadOnlyRootPath,
   validateWorkspacePath,
@@ -56,30 +57,6 @@ function readFileSystemConcurrency(): number {
  */
 function getExternalTempRoots(): string[] {
   return Array.from(new Set([os.tmpdir(), '/tmp']));
-}
-
-/**
- * Operator-configured extra read-only roots from `CLOUDCLI_EXTRA_READ_ROOTS`,
- * separated by the platform path delimiter (`;` on Windows, `:` elsewhere).
- * Lets chat links to tool caches outside the workspace (for example a
- * screenshot cache under the home directory) open in the editor. Relative
- * entries are dropped because they would silently resolve against the server
- * cwd; list narrow directories, never the whole home, since every file under
- * a root becomes readable.
- */
-function getConfiguredExtraReadRoots(): string[] {
-  const configuredRoots = (process.env.CLOUDCLI_EXTRA_READ_ROOTS ?? '')
-    .split(path.delimiter)
-    .map((rootPath) => rootPath.trim())
-    .filter(Boolean);
-
-  return configuredRoots.filter((rootPath) => {
-    if (path.isAbsolute(rootPath)) {
-      return true;
-    }
-    console.warn(`[file-tree] Ignoring non-absolute CLOUDCLI_EXTRA_READ_ROOTS entry: ${rootPath}`);
-    return false;
-  });
 }
 
 /**
@@ -110,6 +87,34 @@ function resolveWorkspaceReadOnlyRoot(): string | null {
     return null;
   }
   return WORKSPACES_ROOT;
+}
+
+/**
+ * Operator-configured extra read-only roots from `CLOUDCLI_EXTRA_READ_ROOTS`,
+ * separated by the platform path delimiter (`;` on Windows, `:` elsewhere).
+ * Lets chat links to tool caches outside the workspace (for example a
+ * screenshot cache under the home directory) open in the editor. Relative
+ * entries are dropped because they would silently resolve against the server
+ * cwd; list narrow directories, never the whole home, since every file under
+ * a root becomes readable.
+ */
+function getConfiguredExtraReadRoots(): string[] {
+  const configuredRoots = (process.env.CLOUDCLI_EXTRA_READ_ROOTS ?? '')
+    .split(path.delimiter)
+    .map((rootPath) => rootPath.trim())
+    .filter(Boolean);
+
+  return configuredRoots.filter((rootPath) => {
+    if (!path.isAbsolute(rootPath)) {
+      console.warn(`[file-tree] Ignoring non-absolute CLOUDCLI_EXTRA_READ_ROOTS entry: ${rootPath}`);
+      return false;
+    }
+    if (path.parse(rootPath).root === rootPath) {
+      console.warn(`[file-tree] Ignoring filesystem/drive-root CLOUDCLI_EXTRA_READ_ROOTS entry: ${rootPath}`);
+      return false;
+    }
+    return true;
+  });
 }
 
 /**
@@ -177,13 +182,17 @@ const fileTreeServices = createFileTreeService({
   logger: fileTreeLogger,
   fileIndexer: createRipgrepFileIndexer(rgPath),
   now: () => Date.now(),
-  getAvailableDrives: getAvailableWindowsDrives,
+  // Drive browsing is the opt-in for a multi-root setup: with no
+  // WORKSPACES_ROOTS/WORKSPACES_ROOT the browser stays confined to the home
+  // directory, so advertising other drives would only lead to 403s.
+  getAvailableDrives: getConfiguredWorkspaceRoots() ? getAvailableWindowsDrives : async () => [],
   // Providers store chat-referenced artifacts outside the active workspace:
   // Antigravity uses brain directories, Claude uses its per-project tree, and
   // ZCode uses narrow memory/skill/instruction paths. Attachments live in
   // ~/.cloudcli/assets, while provider runtimes stage temporary reports under
-  // OS temp directories. The editor may open these roots read-only without
-  // widening project-scoped write access.
+  // OS temp directories; operators may add more via CLOUDCLI_EXTRA_READ_ROOTS.
+  // The editor may open these roots read-only without widening project-scoped
+  // write access.
   //
   // The workspace root itself (the default is the user's home directory) and
   // ~/Downloads join the list so chat links to files an engine drops outside
@@ -199,9 +208,9 @@ const fileTreeServices = createFileTreeService({
     getGlobalImageAssetsDir(),
     ...getExternalTempRoots(),
     ...getZcodeExternalReadOnlyRoots(),
+    ...getConfiguredExtraReadRoots(),
     ...(workspaceReadOnlyRoot ? [workspaceReadOnlyRoot] : []),
     path.join(os.homedir(), 'Downloads'),
-    ...getConfiguredExtraReadRoots(),
   ],
   resolveWorktreeRoots: (projectRoot) => getProjectWorktreeRoots(projectRoot),
 });

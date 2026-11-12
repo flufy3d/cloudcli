@@ -126,6 +126,7 @@ const appBranding = createAppBrandingService({
     readFile: (filePath) => fs.readFileSync(filePath, 'utf8'),
     fileExists: (filePath) => fs.existsSync(filePath),
     logError: (message, detail) => console.error(message, detail ?? ''),
+    logWarn: (message, detail) => console.warn(message, detail ?? ''),
 });
 console.log('SERVER_PORT from env:', process.env.SERVER_PORT);
 
@@ -323,6 +324,10 @@ app.use('/api/scheduled-jobs', authenticateToken, scheduledJobsRoutes);
 app.use('/api/scheduled-jobs-mcp', scheduledJobsMcpRoutes);
 
 app.use('/api/tasks', taskContinuationsRouter);
+app.use('/api/scheduled-jobs', authenticateToken, scheduledJobsRoutes);
+
+// Scheduled Tasks MCP bridge API (local token protected)
+app.use('/api/scheduled-jobs-mcp', scheduledJobsMcpRoutes);
 
 // Agent API Routes (uses API key authentication)
 app.use('/api/agent', agentRoutes);
@@ -358,6 +363,9 @@ function sendSpaIndexHtml(request: Request, response: Response) {
 // Per-node PWA identity: served before the static manifest so each machine
 // installs under its own name (CLOUDCLI_NODE_NAME or the hostname).
 app.get('/manifest.json', (_request, response) => {
+    response.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    response.setHeader('Pragma', 'no-cache');
+    response.setHeader('Expires', '0');
     response.type('application/manifest+json').send(appBranding.getManifestJson());
 });
 
@@ -556,6 +564,12 @@ async function startServer() {
             });
 
             activeContinuationWorker = continuationWorker;
+
+            // Reconcile the scheduled-tasks MCP bridge when the feature is on,
+            // so engines installed after the toggle still get it.
+            await scheduledJobsSettingsService.syncAgentMcpIfNeeded().catch((err) => {
+                console.warn('[ScheduledJobs] Failed to sync MCP configuration during startup:', getErrorMessage(err));
+            });
         });
 
         let activeContinuationWorker: { stop: () => void } | null = null;

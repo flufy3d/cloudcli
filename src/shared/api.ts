@@ -2,7 +2,6 @@ import type { ImageMediaRequest, PathExistenceRequest } from '@/shared/types';
 import {
   expireAuthSession,
   getStoredAuthToken,
-  storeAuthToken,
   storeRefreshedAuthToken,
 } from '@/shared/authToken';
 import { collectStoredOutputAssets, IS_PLATFORM } from '@/shared/utils';
@@ -99,7 +98,7 @@ export const authenticatedUpload = (
     settle();
     const refreshedToken = xhr.getResponseHeader('X-Refreshed-Token');
     if (refreshedToken) {
-      storeAuthToken(refreshedToken);
+      storeRefreshedAuthToken(refreshedToken);
     }
     if (xhr.status === 401 && xhr.getResponseHeader('X-Auth-Error')) {
       expireAuthSession();
