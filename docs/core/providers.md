@@ -159,7 +159,7 @@ ZCode 的 `SendMessage` 能把已结束的 agent 复活到后台。引擎把这�
 - `provider-capabilities.test.ts` 把推导结果钉在显式基线上：切面增删会以"评审过的测试差异"呈现，而不是静默改能力。
 - **`supportsNativeScheduling` 只是提示位，不参与启停**：CloudCLI 的循环定时任务（`scheduled-jobs`）对所有引擎可用；该位为 true（目前仅 claude 的 CronCreate/ScheduleWakeup）时，任务表单与 composer 重复入口提示"引擎自身也有会话内定时、冲突回合会被跳过"，行为不变。
 - **前端零 provider 分支**：composer/设置页完全按 `GET /api/providers/capabilities` 渲染。首屏与请求失败时的回退镜像在 `src/shared/providerCatalogFallback.ts`（`PROVIDER_FALLBACK_CATALOG`），由跨树 parity 测试（`server/modules/providers/tests/provider-catalog-parity.test.ts`）钉住与后端目录一致；**其 key 顺序就是全应用的引擎规范顺序**。
-- **账号配额（`auth.getQuota`）现状**：antigravity（`agy` CLI）、codex（app-server JSON-RPC）、zcode（BigModel / Z.AI HTTP）、opencode（OpenCode Go 官方 `GET /zen/go/v1/usage`，`list/opencode/opencode-quota.provider.ts`；key 优先读 v2 `opencode.db` 的 `credential` 表，v1 `auth.json` 仅作回退，避免轮换后的旧 key 遮蔽新 key；Zen 按量账号无公开端点，返回 null 即不渲染卡片）。前端按 `supportsQuota` 能力位渲染配额卡片，不再维护同名名单。
+- **账号配额（`auth.getQuota`）现状**：antigravity（`agy` CLI）、codex（app-server JSON-RPC）、zcode（BigModel / Z.AI HTTP）、opencode（OpenCode Go 官方 `GET /zen/go/v1/usage`，`list/opencode/opencode-quota.provider.ts`；凭证顺序：v2 `opencode.db` 的 `opencode-go` API key → 同库 `opencode` 控制台 OAuth（需 orgID）→ v1 `auth.json` 的 key；key 不带 org 头。Zen 按量账号无公开端点，返回 null 即不渲染卡片）。前端按 `supportsQuota` 能力位渲染配额卡片，不再维护同名名单。
 
 ## 上下文占用与按需压缩
 
@@ -310,7 +310,9 @@ claude 直连 `/api/oauth/usage?cedar_ember=1`（本地 OAuth token + CLI User-A
 一次取回窗口和 reset 卡；直连失败时退回 Agent SDK 的 control request，由它刷新 token
 并照常返回窗口。
 opencode 打 Go 套餐的内部端点 `/zen/go/v1/usage`（官方文档未列，随 CLI 版本可能变动），
-凭证读 CLI 共享库 credential 表的令牌与工作区 id，令牌续期归 CLI 管，403/401/超时一律降级为"无配额"。
+凭证先取 CLI 共享库 `credential` 表的 `opencode-go` API key（v1 `auth.json` 仅作回退），
+再回退 `opencode` 控制台 OAuth 行（必须有工作区 id）；key 已绑定工作区，只有 OAuth 才附带 org 头。
+令牌续期归 CLI 管，403/401/超时一律降级为"无配额"。
 各家都要拉起进程或走网络，因此统一用 `createProviderQuotaCache`（TTL 两分钟）挡在前面，
 `?refresh=true` 才穿透。claude 那条路额外有一点要守住：喂给 SDK 的输入流一条消息都不产出，
 CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在汇报的额度。
