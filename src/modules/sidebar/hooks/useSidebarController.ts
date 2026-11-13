@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 
-import { api } from '@/shared/api';
+import { api, readApiErrorMessage } from '@/shared/api';
 import { useSessionFork } from '@/shared/hooks/useSessionFork';
 import { subscribeToUserPreferences } from '@/shared/userSettings';
 import { usePaletteOps } from '@/modules/command-palette';
@@ -91,6 +91,19 @@ type UseSidebarControllerArgs = {
   sidebarVisible: boolean;
   keepProjectsExpanded?: boolean;
 };
+
+/**
+ * The server's reason for a refused archive or delete (for example, work still
+ * running in the conversation), or null when the body names none. The generic
+ * "please retry" text alone hides why retrying would not help.
+ */
+function readSessionDeleteFailure(responseText: string): string | null {
+  try {
+    return readApiErrorMessage(JSON.parse(responseText));
+  } catch {
+    return null;
+  }
+}
 
 /** Used by Sidebar to coordinate project navigation, expansion and session actions. */
 export function useSidebarController({
@@ -943,7 +956,7 @@ export function useSidebarController({
           status: response.status,
           error: errorText,
         });
-        alert(t('messages.deleteSessionFailed'));
+        alert(readSessionDeleteFailure(errorText) ?? t('messages.deleteSessionFailed'));
         return;
       }
       onSessionDelete?.(sessionId);
@@ -991,7 +1004,7 @@ export function useSidebarController({
           status: response.status,
           error: errorText,
         });
-        alert(t('messages.deleteSessionFailed'));
+        alert(readSessionDeleteFailure(errorText) ?? t('messages.deleteSessionFailed'));
       }
     } catch (error) {
       console.error('[Sidebar] Error deleting session:', error);
