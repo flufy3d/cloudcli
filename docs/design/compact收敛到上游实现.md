@@ -2,7 +2,20 @@
 
 ## 状态
 
-评估中（未实施）。依据：`main`（7495a21d，已合入 `upstream/main` 030d320f）与 `upstream/main` 的代码对读，2026-11-13。
+已实施（2026-11-13）。依据：`main`（7495a21d，已合入 `upstream/main` 030d320f）与 `upstream/main` 的代码对读，2026-11-13。
+
+实施结果：
+- 与上游的差异（`server` `src` `shared`，不含 json）从 23623 行降到 22544 行。`codex-app-server.client.ts`、`useSlashCommands.ts`、`chatStorage.ts` 与上游一致；zcode `run()` 与上游逐字一致。
+- 验证：typecheck 通过；lint 无新增（warning 283 → 279）；服务端 2465 个用例 0 失败；前端 231 个文件 / 1724 个用例全部通过；构建通过，vendor chunk 无循环。
+- 未手测：没有在 dev 实例里逐引擎手测 `/compact`。zcode 本机未安装，文本路径的等价性依据上游文档。
+
+### 实施决定
+
+- **zcode 完全采用上游写法**：`run()` 恢复成上游的内联形状（与上游逐字一致），删除 `driveSessionTurn`、`compact` 切面、`requestCompaction` 和 `COMPACT_REQUEST_TIMEOUT_MS`；`/compact` 作为普通文本经 `session/send`/`sendText` 交给引擎解析。
+  - 理由：11-10 引入的轮次归属判断 `classifyTurnEvent` 只认 prompt 的 inputId。`session/compact` 起的压缩轮次不带这个 inputId，会被判成"未定"或"别人的轮次"，所以 fork 的压缩通道很可能从那以后就结束不了 run，只是没有测试覆盖。文本路径带 inputId，归属判断天然正确。
+  - 未验证：本机没装 zcode，文本 `/compact` 与 `session/compact` 是否等价只能依据上游文档（上游称引擎的 `session/compact` 内部就是 `submitPrompt("/compact")`）。以后用 zcode 手测时，如果发现文本被当成普通 prompt 发给模型，再回头在 `run()` 内处理。
+- **antigravity 不动**：目录值保持上游的 `true`，菜单路径本来就是文本透传；本次删掉兜底通道后，`COMPACTION_UNSUPPORTED` 的不一致随之消失。agy 实际行为的实测不阻塞本次删除。
+- **opencode 保留 1 行 `purpose`**：`run()` 里用 `compactCommand ? 'compact' : 'chat'`，压缩失败仍计为本轮失败。
 
 ## 目标
 

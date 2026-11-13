@@ -27,7 +27,6 @@ export type { ProviderCapabilities } from '@/shared/types.js';
  * - message editing rides `sessions.resolveEditAnchor` (the anchor lookup the
  *   edit flow needs; both integrations that have it also provide the rest).
  * - the token-usage endpoint rides `sessions.getTokenUsage`.
- * - on-demand compaction rides the runtime's optional `compact` primitive.
  * - account quota rides `auth.getQuota`, which is already how
  *   `provider-token-usage.service.ts` dispatches the request; spending a
  *   reset card rides `auth.consumeQuotaReset` the same way.
@@ -37,7 +36,7 @@ export type { ProviderCapabilities } from '@/shared/types.js';
  */
 function deriveCapabilities(providerId: LLMProvider, provider: {
   fork?: unknown;
-  runtime?: { permissions?: unknown; compact?: unknown; steer?: unknown; askSideQuestion?: unknown };
+  runtime?: { permissions?: unknown; steer?: unknown; askSideQuestion?: unknown };
   auth?: { getQuota?: unknown; consumeQuotaReset?: unknown };
   sessions?: { resolveEditAnchor?: unknown; getTokenUsage?: unknown };
   mcp: { capabilities: ProviderMcpCapabilities };

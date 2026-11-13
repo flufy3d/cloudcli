@@ -185,9 +185,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     // provider today.
     supportsMessageEditing: false,
     supportsSessionForking: false,
-    // The runtime's `compact` facet drives the engine's `session/compact` (a
-    // background summarization turn), which is what puts `/compact` in the
-    // composer menu for this provider.
+    // A bare `/compact` sent as a message runs the engine's `session/compact`
+    // (a background summarization turn) instead of a prompt.
     supportsCompaction: true,
     supportsNativeScheduling: false,
     editRevertsFiles: false,

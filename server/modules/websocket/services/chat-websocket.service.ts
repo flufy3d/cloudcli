@@ -91,12 +91,6 @@ export type ProviderRuntimeGateway = {
     options: AnyRecord,
     writer: ProviderRuntimeWriter,
   ): Promise<unknown>;
-  compact(
-    provider: LLMProvider,
-    options: AnyRecord,
-    writer: ProviderRuntimeWriter,
-  ): Promise<unknown>;
-  supportsCompaction(provider: string): boolean;
   /** Feeds a message into the session's running turn; false when the runtime cannot take it. */
   injectInput(provider: LLMProvider, command: string, options: AnyRecord): Promise<boolean>;
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
@@ -526,50 +520,6 @@ async function handleChatSend(
   await dispatchRun(ws, userId, resolved.sessionId, resolved.session, data, dependencies);
 }
 
-/**
- * Handles `chat.compact`: asks the session's engine to compact its carried
- * conversation into a summary, in place.
- *
- * Registered and dispatched exactly like a turn — same run reservation,
- * streaming writer, and terminal `complete` — but the provider-side execution
- * goes through the runtime's optional `compact` primitive instead of `run`.
- * That is what lets the frontend omit an optimistic user bubble while the
- * transcript still refreshes when the summary lands.
- */
-async function handleChatCompact(
-  ws: WebSocket,
-  userId: string | number | null,
-  data: AnyRecord,
-  dependencies: ChatWebSocketDependencies
-): Promise<void> {
-  const resolved = resolveSendTarget(ws, data, dependencies, 'chat.compact');
-  if (!resolved) {
-    return;
-  }
-
-  if (!dependencies.runtime.supportsCompaction(resolved.provider)) {
-    sendProtocolError(
-      ws,
-      'COMPACTION_UNSUPPORTED',
-      `Provider "${resolved.provider}" cannot compact conversations.`,
-      resolved.sessionId
-    );
-    return;
-  }
-
-  await dispatchRun(
-    ws,
-    userId,
-    resolved.sessionId,
-    resolved.session,
-    data,
-    dependencies,
-    {},
-    undefined,
-    'compact',
-  );
-}
-
 type ResolvedSendTarget = {
   sessionId: string;
   session: NonNullable<ReturnType<typeof sessionsDb.getSessionById>>;
@@ -712,7 +662,6 @@ async function dispatchRun(
   dependencies: ChatWebSocketDependencies,
   extraRuntimeOptions: AnyRecord = {},
   beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
-  execution: 'run' | 'compact' = 'run',
 ): Promise<{
   started: boolean;
   busy?: boolean;
@@ -782,46 +731,42 @@ async function dispatchRun(
     // run instead of leaving the session processing forever.
     await beforeRun?.(run);
 
-    if (execution === 'compact') {
-      await dependencies.runtime.compact(provider, runtimeOptions, run.writer);
-    } else {
-      if (provider === 'codex') {
-        const taskContinuationModule = await import('@/modules/task-continuations/index.js');
-        if (taskContinuationModule.areTaskContinuationsEnabled()) {
-          const ownerId = readTaskOwnerId(userId);
-          if (ownerId !== null) {
-            const permissionMode = typeof runtimeOptions.permissionMode === 'string'
-              ? runtimeOptions.permissionMode
-              : 'default';
-            const executionPolicy = resolveCodexExecutionPolicy(permissionMode);
-            const capability = taskContinuationModule.createTaskRunCapability({
-              userId: ownerId,
-              sessionId,
-              runId: randomUUID(),
-              providerThreadId: session.provider_session_id,
-              sessionProjectPath: path.resolve(session.project_path || runtimeOptions.cwd || process.cwd()),
-              cwd: path.resolve(typeof runtimeOptions.cwd === 'string' ? runtimeOptions.cwd : process.cwd()),
-              sandboxPolicy: executionPolicy.sandboxPolicy,
-              approvalPolicy: executionPolicy.approvalPolicy,
-            });
-            taskRunToken = capability.token;
-            revokeTaskCapability = taskContinuationModule.revokeTaskRunCapability;
-            runtimeOptions.taskExecutionContext = { token: taskRunToken };
-            const trustedLifecycle = readObjectRecord(runtimeOptions.taskContinuationLifecycle);
-            const onEngineTurnStarted = typeof trustedLifecycle?.onEngineTurnStarted === 'function'
-              ? trustedLifecycle.onEngineTurnStarted as (engineTurnId: string) => boolean
-              : undefined;
-            runtimeOptions.taskContinuationLifecycle = {
-              onNativeThreadResolved: (providerThreadId: string) =>
-                taskContinuationModule.setTaskRunProviderThreadId(taskRunToken!, providerThreadId),
-              ...(onEngineTurnStarted ? { onEngineTurnStarted } : {}),
-            };
-          }
-        }
+    if (provider === 'codex') {
+      const taskContinuationModule = await import('@/modules/task-continuations/index.js');
+      if (taskContinuationModule.areTaskContinuationsEnabled()) {
+      const ownerId = readTaskOwnerId(userId);
+      if (ownerId !== null) {
+        const permissionMode = typeof runtimeOptions.permissionMode === 'string'
+          ? runtimeOptions.permissionMode
+          : 'default';
+        const executionPolicy = resolveCodexExecutionPolicy(permissionMode);
+        const capability = taskContinuationModule.createTaskRunCapability({
+          userId: ownerId,
+          sessionId,
+          runId: randomUUID(),
+          providerThreadId: session.provider_session_id,
+          sessionProjectPath: path.resolve(session.project_path || runtimeOptions.cwd || process.cwd()),
+          cwd: path.resolve(typeof runtimeOptions.cwd === 'string' ? runtimeOptions.cwd : process.cwd()),
+          sandboxPolicy: executionPolicy.sandboxPolicy,
+          approvalPolicy: executionPolicy.approvalPolicy,
+        });
+        taskRunToken = capability.token;
+        revokeTaskCapability = taskContinuationModule.revokeTaskRunCapability;
+        runtimeOptions.taskExecutionContext = { token: taskRunToken };
+        const trustedLifecycle = readObjectRecord(runtimeOptions.taskContinuationLifecycle);
+        const onEngineTurnStarted = typeof trustedLifecycle?.onEngineTurnStarted === 'function'
+          ? trustedLifecycle.onEngineTurnStarted as (engineTurnId: string) => boolean
+          : undefined;
+        runtimeOptions.taskContinuationLifecycle = {
+          onNativeThreadResolved: (providerThreadId: string) =>
+            taskContinuationModule.setTaskRunProviderThreadId(taskRunToken!, providerThreadId),
+          ...(onEngineTurnStarted ? { onEngineTurnStarted } : {}),
+        };
       }
-
-      runtimeOutcome = await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
+      }
     }
+
+    runtimeOutcome = await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     deferred = !inputAccepted && error instanceof AppError && error.code === 'PROVIDER_INPUT_DEFERRED';
@@ -1205,7 +1150,6 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  *
  * Inbound protocol (client to server):
  * - `chat.send`                { sessionId, content, options? }
- * - `chat.compact`             { sessionId, options? }
  * - `chat.abort`               { sessionId }
  * - `chat.stop-task`           { sessionId, taskId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
@@ -1361,9 +1305,6 @@ export function handleChatConnection(
           return;
         case 'chat.send':
           await handleChatSend(ws, userId, data, dependencies);
-          return;
-        case 'chat.compact':
-          await handleChatCompact(ws, userId, data, dependencies);
           return;
         case 'chat.abort':
           await handleChatAbort(ws, data, dependencies);

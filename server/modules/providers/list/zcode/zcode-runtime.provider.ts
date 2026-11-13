@@ -96,14 +96,6 @@ import type { RunHandle, RunSettle } from './zcode-run-lifecycle.js';
 const LIVE_CONTEXT_MIN_INTERVAL_MS = 1500;
 
 /**
- * How long the engine may take to accept a `session/compact` request. The
- * response carries a session snapshot but no turn result, so this only bounds
- * the acceptance handshake — the summarization that follows is watched through
- * the session's event stream like any other turn.
- */
-const COMPACT_REQUEST_TIMEOUT_MS = 15_000;
-
-/**
  * Reads one session's current context occupancy straight from the engine store.
  *
  * The runtime cannot ask the engine for this mid-turn (no usage event exists
@@ -376,77 +368,6 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     writer: ProviderRuntimeWriter,
     context: ProviderRuntimeContext,
   ): Promise<unknown> {
-    return this.driveSessionTurn({
-      options,
-      writer,
-      context,
-      configureSession: true,
-      failureMessage: 'ZCode run failed',
-      startTurn: (_zcodeSessionId, handle, modelParams) => {
-        handle.promptSend = this.sendUserMessage(handle, command, options, modelParams);
-        return handle.promptSend;
-      },
-    });
-  }
-
-  /**
-   * Compacts a session's carried conversation into a summary the next turn
-   * builds on (`/compact`).
-   *
-   * `session/compact` answers as soon as the engine accepts the work
-   * (`compact.state === 'accepted'`) and then runs the summarization as a
-   * background prompt turn, so the turn's own terminal event — not that
-   * response — ends this run; that is why the request rides the same plumbing
-   * as `run` (subscribe → listener → settle → exactly one `complete`).
-   *
-   * `expectedRevision` is deliberately omitted: the engine only validates it
-   * when present (-32009 on a stale value), and the app never tracks a
-   * session's revision. The engine compacts with the session's current model
-   * and refuses while a prompt is running, which is why the request reports
-   * that state instead of starting a second turn.
-   */
-  async compact(
-    options: AnyRecord = {},
-    writer: ProviderRuntimeWriter,
-    context: ProviderRuntimeContext,
-  ): Promise<unknown> {
-    return this.driveSessionTurn({
-      options,
-      writer,
-      context,
-      // Summarization uses whatever model the session already runs with and
-      // needs no permission mode, so the engine's session is left untouched.
-      configureSession: false,
-      failureMessage: 'ZCode compaction failed',
-      startTurn: (zcodeSessionId) => this.requestCompaction(zcodeSessionId),
-    });
-  }
-
-  /**
-   * Drives one engine turn to its terminal event and reports it.
-   *
-   * Shared by `run` (a user prompt via `session/send`) and `compact` (a
-   * summarization turn via `session/compact`): resolve or create the session,
-   * register the run, subscribe to its event stream, hand the turn to
-   * `startTurn`, then translate the settle result into exactly one terminal
-   * `complete` frame plus the notification every other runtime emits.
-   */
-  private async driveSessionTurn(input: {
-    options: AnyRecord;
-    writer: ProviderRuntimeWriter;
-    context: ProviderRuntimeContext;
-    /** Whether the app's model/effort and permission mode are applied first. */
-    configureSession: boolean;
-    /** Failure text for the run notification when the engine ends the turn as failed. */
-    failureMessage: string;
-    /** Issues the turn itself; the settle wait observes its terminal event. */
-    startTurn: (
-      zcodeSessionId: string,
-      handle: RunHandle,
-      modelParams: ReturnType<typeof buildZCodeSendModelParams>,
-    ) => Promise<void>;
-  }): Promise<unknown> {
-    const { options, writer, context, configureSession, failureMessage, startTurn } = input;
     const appSessionId = readOptionalString(options.sessionId) ?? null;
     const sessionSummary = readOptionalString(options.sessionSummary);
 
@@ -454,11 +375,9 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     // session/create failure would never reach the chat stream and the page
     // would stay silent (the gateway only logs runtime rejections).
     let zcodeSessionId: string;
-    let resumedSession = false;
     try {
       const resolved = await this.resolveOrCreateSession(appSessionId, options, context, writer);
       zcodeSessionId = resolved.sessionId;
-      resumedSession = resolved.resumed;
     } catch (error) {
       this.sendRuntimeError(writer, appSessionId, error);
       this.notifyRunOutcome({
@@ -480,21 +399,19 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     try {
       // The run's listener owns the whole stream from the moment the run
       // starts, lifecycle events included. Stand the previous turn's watcher
-      // down and attach it before any await: while the setup awaits below are
-      // pending, an event for this session (a background agent's late stop, a
-      // delta) would otherwise reach the watcher — and through it the previous
-      // turn's writer — instead of this run's.
+      // down and attach it before any await: while the three setup awaits
+      // below are pending, an event for this session (a background agent's
+      // late stop, a delta) would otherwise reach the watcher — and through
+      // it the previous turn's writer — instead of this run's.
       const eventListener = this.createSessionEventListener(handle, writer, context);
       this.standDownSubagentWatcher(zcodeSessionId);
       protocolClient.addSessionListener(zcodeSessionId, eventListener);
 
-      let modelParams: ReturnType<typeof buildZCodeSendModelParams> = null;
+      let modelParams: Awaited<ReturnType<ZCodeRuntimeProvider['resolveSendModelParams']>>;
       try {
         await this.subscribeToSessionEvents(zcodeSessionId);
-        if (configureSession) {
-          await this.configureSessionMode(zcodeSessionId, options);
-          modelParams = await this.resolveSendModelParams(options, context);
-        }
+        await this.configureSessionMode(zcodeSessionId, options);
+        modelParams = await this.resolveSendModelParams(options, context);
       } catch (error) {
         this.releaseSessionListener(handle, eventListener, writer, context);
         throw error;
@@ -506,7 +423,8 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
         // A stop that landed during setup found nothing of this run to stop;
         // sending the prompt now would start a turn nothing stops.
         if (!handle.abortRequested) {
-          await startTurn(zcodeSessionId, handle, modelParams);
+          handle.promptSend = this.sendUserMessage(handle, command, options, modelParams);
+          await handle.promptSend;
         }
         settle = await runLifecycle.waitForSettle(handle, silenceTimeoutMs);
 
@@ -555,7 +473,7 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
             sessionId: notifySessionId,
             sessionSummary,
             outcome: completion.failed
-              ? { failed: true, error: completion.failedMessage ?? failureMessage }
+              ? { failed: true, error: completion.failedMessage ?? 'ZCode run failed' }
               : { failed: false, stopReason: 'completed' },
           });
           return { sessionId: zcodeSessionId, success: !completion.failed };
@@ -1287,34 +1205,6 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
       console.debug(`[ZCodeRuntime] Sent message to session ${handle.sessionId} via ${channel}`);
     } catch (error) {
       console.error(`[ZCodeRuntime] Failed to send message to session ${handle.sessionId}:`, error);
-      throw error;
-    }
-  }
-
-  /**
-   * Asks the engine to compact one session's carried conversation.
-   *
-   * The response only reports acceptance (`compact.state`), so this resolves as
-   * soon as the engine has taken the work; the following `turn.completed` (or
-   * `compact.failed`) is what ends the run. `already_running` is reported as an
-   * error rather than waited out: the user asked for a compaction that is
-   * already in flight, and silently attaching to it would leave the UI unable
-   * to tell whose progress it is showing.
-   */
-  private async requestCompaction(sessionId: string): Promise<void> {
-    try {
-      const result = await protocolClient.sendRequest<AnyRecord>(
-        'session/compact',
-        { sessionId },
-        COMPACT_REQUEST_TIMEOUT_MS,
-      );
-      const state = readOptionalString(readObjectRecord(result?.compact)?.state);
-      if (state === 'already_running') {
-        throw new Error('A compaction is already running for this session.');
-      }
-      console.debug(`[ZCodeRuntime] Requested compaction for session ${sessionId} (state: ${state ?? 'unknown'})`);
-    } catch (error) {
-      console.error(`[ZCodeRuntime] Failed to request compaction for session ${sessionId}:`, error);
       throw error;
     }
   }

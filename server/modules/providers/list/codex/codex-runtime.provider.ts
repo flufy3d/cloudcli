@@ -2017,31 +2017,6 @@ async function askCodexSideQuestion(
 export const codexRuntime = {
   run: queryCodex,
   abort: abortCodexSession,
-  /**
-   * Compacts the thread through the app-server primitive the Codex IDE clients
-   * use: `thread/compact/start`, waited out until the summary lands.
-   */
-  async compact(
-    options: AnyRecord,
-    writer: ProviderRuntimeWriter,
-    context: ProviderRuntimeContext,
-  ): Promise<unknown> {
-    const appSessionId = typeof options.sessionId === 'string' ? options.sessionId : null;
-    const providerSessionId = context.resolveProviderSessionId(appSessionId);
-    if (!providerSessionId) {
-      throw new Error('This Codex session has no stored conversation to compact yet.');
-    }
-
-    sendMessage(writer, createNormalizedMessage({
-      kind: 'status',
-      text: 'Compacting context…',
-      sessionId: appSessionId,
-      provider: 'codex',
-    }));
-
-    await codexAppServer.compactThread({ threadId: providerSessionId });
-    return undefined;
-  },
   askSideQuestion: askCodexSideQuestion,
   permissions: {
     /**

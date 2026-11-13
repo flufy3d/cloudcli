@@ -214,24 +214,6 @@ export class OpenCodeApiClient {
   }
 
   /**
-   * `POST /api/session/:id/compact` — admits a synthetic `compaction` message
-   * into the session's queue (verified against v2.0.32), which the engine then
-   * runs as a turn of its own: the summary streams over the service's
-   * `session.compaction.*` events and the turn ends with the usual
-   * `session.execution.*` terminal. The response only reports the admitted
-   * message, so the run's outcome comes from the event feed — not from here.
-   */
-  async compactSession(sessionId: string): Promise<{ messageId: string | null }> {
-    const result = await this.request<{ data?: { id?: unknown } }>(
-      'POST',
-      `/api/session/${encodeURIComponent(sessionId)}/compact`,
-      {},
-    );
-    const messageId = result?.data?.id;
-    return { messageId: typeof messageId === 'string' ? messageId : null };
-  }
-
-  /**
    * `POST /api/session/:id/fork` — copies the conversation into a new
    * top-level session and returns its id. The cut is **exclusive**: only the
    * messages strictly before `before` are copied, and the whole conversation
@@ -268,6 +250,21 @@ export class OpenCodeApiClient {
       await this.request('DELETE', base).catch(() => undefined);
       throw error;
     }
+  }
+
+  /**
+   * `POST /api/session/:id/compact` — queues a manual compaction of the
+   * session. It runs as an execution of its own and reports
+   * `session.compaction.*` events; returns the queued input's id.
+   */
+  async compact(sessionId: string): Promise<{ inputId: string | null }> {
+    const result = await this.request<{ data?: { id?: unknown } }>(
+      'POST',
+      `/api/session/${encodeURIComponent(sessionId)}/compact`,
+      {},
+    );
+    const inputId = result?.data?.id;
+    return { inputId: typeof inputId === 'string' ? inputId : null };
   }
 
   /** `POST /api/session/:id/interrupt` — true when a run was actually stopped. */

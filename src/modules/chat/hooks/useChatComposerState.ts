@@ -22,13 +22,7 @@ import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabiliti
 import { uploadAttachmentFiles } from '@/modules/chat/utils/attachmentUpload';
 import { createAttachmentUploadQueue } from '@/modules/chat/utils/attachmentUploadQueue';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
-import {
-  clearQueuedCompact,
-  readProviderToolsSettings,
-  readQueuedCompact,
-  safeLocalStorage,
-  writeQueuedCompact,
-} from '@/modules/chat/utils/chatStorage';
+import { readProviderToolsSettings, safeLocalStorage } from '@/modules/chat/utils/chatStorage';
 import {
   appendQueuedMessage,
   clearQueuedMessage,
@@ -448,10 +442,8 @@ export function useChatComposerState({
 }: UseChatComposerStateArgs) {
   const { t } = useTranslation('chat');
   const draftGenerationRef = useRef(getChatDraftSessionGeneration());
-  // Backend-owned capability for the active provider; while the matrix is
-  // loading the `/compact` entry simply stays hidden.
+  // Backend-owned capabilities for the active provider.
   const { capabilities: providerCapabilities } = useProviderCapabilitiesMap();
-  const supportsCompaction = providerCapabilities?.[provider]?.supportsCompaction ?? false;
   // A busy session only holds a new message back when sending would kill the
   // work in flight; how far the engine takes input is its own capability.
   // Until the matrix loads, everything queues.
@@ -537,19 +529,6 @@ export function useChatComposerState({
   // while `queuedDraft` still holds the old session's draft; the persistence
   // effect must not write across that gap.
   const queuedDraftSessionRef = useRef<string | null>(sessionKey);
-
-  /**
-   * The session whose `/compact` is parked until its running turn ends.
-   * Compaction is a run of its own, so the gateway refuses it while any run
-   * holds the session; parking it — rather than surfacing that refusal — is
-   * what lets the user ask mid-turn and have it happen automatically.
-   */
-  const [pendingCompactSession, setPendingCompactSession] = useState<string | null>(() => (
-    typeof window !== 'undefined' && sessionKey && readQueuedCompact(sessionKey)
-      ? sessionKey
-      : null
-  ));
-  const pendingCompact = Boolean(sessionKey) && pendingCompactSession === sessionKey;
 
   const handleBuiltInCommand = useCallback(
     (result: CommandExecutionResult) => {
@@ -675,52 +654,6 @@ export function useChatComposerState({
         return;
       }
 
-      // `/compact` is a runtime action, not a transcript command: it never
-      // reaches /api/commands/execute. The provider runtime consumes it over
-      // the chat socket, streams progress, and the terminal `complete`
-      // refreshes the transcript with the summary.
-      if (command.name === '/compact') {
-        const targetSessionId = currentSessionId || selectedSession?.id || null;
-        if (!targetSessionId) {
-          addMessage({
-            type: 'assistant',
-            content: t('chat:misc.compactNoSession', {
-              defaultValue: 'Start a conversation before compacting its context.',
-            }),
-            timestamp: Date.now(),
-          });
-          return;
-        }
-
-        const compactOptions = {
-          model: currentProviderModel,
-          effort: currentProviderEffort,
-        };
-
-        // Compaction is a run of its own — it cannot ride the turn in flight
-        // the way a message can, so the gateway would answer RUN_IN_PROGRESS.
-        // Park the request instead and let the turn-end flush dispatch it.
-        if (isLoading && targetSessionId === sessionKey) {
-          writeQueuedCompact(targetSessionId, { options: compactOptions });
-          setPendingCompactSession(targetSessionId);
-          if (!options?.preserveInput) {
-            updateInput('');
-          }
-          return;
-        }
-
-        sendMessage({
-          type: 'chat.compact',
-          sessionId: targetSessionId,
-          options: compactOptions,
-        });
-        onSessionProcessing?.(targetSessionId, { statusText: null, canInterrupt: false });
-        if (!options?.preserveInput) {
-          updateInput('');
-        }
-        return;
-      }
-
       // A built-in modal command opens its modal now, not after the round trip:
       // on a slow link that wait was seconds with nothing on screen.
       const modalKind = command.namespace === 'builtin' ? BUILTIN_MODAL_COMMAND_KINDS[command.name] : undefined;
@@ -825,18 +758,12 @@ export function useChatComposerState({
       handleBuiltInCommand,
       handleCustomCommand,
       input,
-      isLoading,
       provider,
       selectedProject,
       selectedSession?.id,
-      sessionKey,
       addMessage,
       tokenBudget,
       updateInput,
-      currentProviderEffort,
-      onSessionProcessing,
-      sendMessage,
-      t,
     ],
   );
 
@@ -873,7 +800,6 @@ export function useChatComposerState({
     setInput: updateInput,
     textareaRef,
     onExecuteCommand: executeCommand,
-    supportsCompaction,
   });
 
   const {
@@ -1649,56 +1575,6 @@ export function useChatComposerState({
     });
   }, [sessionKey]);
 
-  // A `/compact` asked mid-turn cannot ride the running turn — the gateway
-  // refuses a second run — so it is parked in localStorage and this page
-  // dispatches it once the turn (and any background work that queues input)
-  // settles. The server's queued-message dispatcher then sends queued text
-  // behind the compaction's own run.
-  // Whether the session was still busy on the previous render. A compact
-  // parked during a turn is dispatched immediately when that turn ends, ahead
-  // of the server's 2s queue poll (which would otherwise start a queued
-  // message first and make the gateway refuse this compaction).
-  const compactWasBusyRef = useRef(false);
-  useEffect(() => {
-    const wasBusy = compactWasBusyRef.current;
-    compactWasBusyRef.current = isLoading || queuesInput;
-    if (!sessionKey || !pendingCompact || isLoading || queuesInput) {
-      return undefined;
-    }
-    // Hold briefly so a `chat_subscribed` ack can flip `isLoading` when a run
-    // is actually still live; the cleanup cancels the dispatch in that case.
-    const timer = setTimeout(() => {
-      setPendingCompactSession((current) => (current === sessionKey ? null : current));
-      const parked = readQueuedCompact(sessionKey);
-      if (!parked) {
-        return;
-      }
-      clearQueuedCompact(sessionKey);
-      sendMessage({
-        type: 'chat.compact',
-        sessionId: sessionKey,
-        options: {
-          model: currentProviderModel,
-          effort: currentProviderEffort,
-          ...parked.options,
-        },
-      });
-      // Dispatching marks the session processing, which holds any queued
-      // message behind the compaction's own run.
-      onSessionProcessing?.(sessionKey, { statusText: null, canInterrupt: false });
-    }, wasBusy ? 0 : 750);
-    return () => clearTimeout(timer);
-  }, [
-    pendingCompact,
-    isLoading,
-    queuesInput,
-    sessionKey,
-    currentProviderModel,
-    currentProviderEffort,
-    sendMessage,
-    onSessionProcessing,
-  ]);
-
   const clearQueuedDraftOnServer = useCallback(async (owner: string | null, expected: QueuedDraft) => {
     if (!owner || draftGenerationRef.current !== getChatDraftSessionGeneration()) return false;
     const cleared = await clearQueuedMessage(owner, toStoredQueuedMessage(expected));
@@ -1840,21 +1716,6 @@ export function useChatComposerState({
       document.removeEventListener('visibilitychange', reconcile);
     };
   }, []);
-
-  // The parked `/compact` follows the session the same way: it belongs to the
-  // session it was requested for, not to whichever composer is mounted now.
-  useEffect(() => {
-    setPendingCompactSession(
-      sessionKey && readQueuedCompact(sessionKey) ? sessionKey : null,
-    );
-  }, [sessionKey]);
-
-  const cancelPendingCompact = useCallback(() => {
-    if (sessionKey) {
-      clearQueuedCompact(sessionKey);
-    }
-    setPendingCompactSession((current) => (current === sessionKey ? null : current));
-  }, [sessionKey]);
 
   useEffect(() => {
     if (!textareaRef.current) {
@@ -2195,9 +2056,6 @@ export function useChatComposerState({
     forceSendQueuedDraft,
     /** False for providers whose fresh run would stop the background work a force send relies on. */
     canForceSendQueuedDraft,
-    /** True while a `/compact` waits for the running turn to end. */
-    pendingCompact,
-    cancelPendingCompact,
     steerFromComposer,
     askSideQuestionFromComposer,
     backgroundSendPrompt,

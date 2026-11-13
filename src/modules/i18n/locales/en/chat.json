@@ -196,11 +196,6 @@
       "clearFailed": "Unable to cancel the queued message. Please try again later.",
       "confirmDelivery": "No server confirmation was received. Check both the queue and conversation history after refreshing before trying again.",
       "permission": "Whole queued message: {{mode}}. New additions apply the latest settings."
-    },
-    "compactQueued": {
-      "label": "Compaction queued",
-      "willRun": "Will compact when this turn finishes",
-      "cancel": "Cancel"
     }
   },
   "composer": {
@@ -539,11 +534,7 @@
     "next": "Next",
     "submit": "Submit",
     "contextUsedPercent": "{{percent}}% of the context window used",
-    "compactedSummarySize": "Compaction summary · {{size}}",
-    "compactNoSession": "Start a conversation before compacting its context.",
-    "commandDescriptions": {
-      "compact": "Summarize the conversation to free up context."
-    }
+    "compactedSummarySize": "Compaction summary · {{size}}"
   },
   "localProxy": {
     "linkHint": "This address only exists on the server; CloudCLI opens it through its local proxy.",

@@ -212,8 +212,6 @@ function ChatInterface({
     handleSubmit,
     isSubmitting,
     queuedDraft,
-    pendingCompact,
-    cancelPendingCompact,
     editingAnchorId,
     beginEditMessage,
     cancelEditMessage,
@@ -621,8 +619,6 @@ function ChatInterface({
           queuedDraft={queuedDraft}
           onEditQueuedDraft={editQueuedDraft}
           onDeleteQueuedDraft={deleteQueuedDraft}
-          pendingCompact={pendingCompact}
-          onCancelPendingCompact={cancelPendingCompact}
           attachments={attachments}
           attachmentQueue={attachmentQueue}
           attachmentBlock={attachmentBlock}

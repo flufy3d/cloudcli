@@ -125,21 +125,6 @@ export function createProviderRuntimeService(
     return provider.runtime.run(command, options, writer, createRuntimeContext(provider));
   };
 
-  const compact = (
-    providerName: LLMProvider,
-    options: AnyRecord,
-    writer: ProviderRuntimeWriter,
-  ): Promise<unknown> => {
-    const provider = dependencies.resolveProvider(providerName);
-    const compactFacet = provider.runtime.compact;
-    if (typeof compactFacet !== 'function') {
-      return Promise.reject(
-        new Error(`Provider "${providerName}" cannot compact conversations.`),
-      );
-    }
-    return compactFacet.call(provider.runtime, options, writer, createRuntimeContext(provider));
-  };
-
   /**
    * Feeds a message into the session's running turn. Resolves false for a
    * provider without the primitive, so the caller falls back to a new run.
@@ -164,7 +149,6 @@ export function createProviderRuntimeService(
 
   return {
     run,
-    compact,
     injectInput,
 
     /** 供排队调度器判断能否安全尝试续轮，避免替换仍有后台任务的进程。 */
@@ -221,14 +205,6 @@ export function createProviderRuntimeService(
     hasRuntime(providerName: string): boolean {
       try {
         return Boolean(dependencies.resolveProvider(providerName).runtime);
-      } catch {
-        return false;
-      }
-    },
-
-    supportsCompaction(providerName: string): boolean {
-      try {
-        return typeof dependencies.resolveProvider(providerName).runtime.compact === 'function';
       } catch {
         return false;
       }

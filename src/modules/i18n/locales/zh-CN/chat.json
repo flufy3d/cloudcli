@@ -196,11 +196,6 @@
       "clearFailed": "无法取消排队消息，请稍后重试。",
       "confirmDelivery": "未收到服务器确认，请刷新后同时检查排队卡片和对话记录，确认投递状态后再重试。",
       "permission": "整条排队消息使用：{{mode}}。追加消息时应用最新设置。"
-    },
-    "compactQueued": {
-      "label": "压缩已排队",
-      "willRun": "将在本轮回答结束后压缩上下文",
-      "cancel": "取消"
     }
   },
   "providerSelection": {

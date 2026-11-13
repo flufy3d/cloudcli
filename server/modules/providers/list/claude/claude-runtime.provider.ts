@@ -3232,15 +3232,6 @@ export const claudeRuntime = {
   __testSessionEntry: (sessionId: string) => getSession(sessionId),
   run: queryClaudeSDK,
   abort: abortClaudeSDKSession,
-  /**
-   * Compacts the conversation through the CLI's own `/compact` local command,
-   * fed into the same held input stream a normal turn uses.
-   */
-  compact: (
-    options: AnyRecord,
-    writer: ProviderRuntimeWriter,
-    context: ProviderRuntimeContext,
-  ) => queryClaudeSDK('/compact', options, writer, context),
   steer: steerClaudeSDKSession,
   /**
    * Answers a side question on a read-only fork of the session's native
