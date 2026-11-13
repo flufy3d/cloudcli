@@ -12,6 +12,8 @@ import type {
 import { useDropzone } from 'react-dropzone';
 import { useTranslation } from 'react-i18next';
 
+import { useAskSideQuestion } from '@/modules/chat/hooks/useSideQuestions';
+
 import { api, ApiRequestError, authenticatedFetch } from '@/shared/api';
 import { MAX_ATTACHMENT_COUNT } from '@/shared/constants';
 import { createClientRequestId, isEnginePromptCommand, isImageAttachment } from '@/shared/utils';
@@ -43,6 +45,7 @@ import type {
   BackgroundSendChoice,
   BackgroundSendPrompt,
   ChatAttachment,
+  PendingSteer,
   ChatMessage,
   ComposerAttachmentBlock,
   ComposerAttachmentItem,
@@ -50,6 +53,7 @@ import type {
   PendingPermissionRequest,
   PermissionMode,
   QueuedSendOptions,
+  SteerOutcome,
   SessionEstablishedContext,
   UploadedComposerAttachment,
 } from '@/shared/types';
@@ -82,6 +86,10 @@ type UseChatComposerStateArgs = {
   isConnected?: boolean;
   backgroundTasks?: ActiveBackgroundTask[];
   hasActiveBackgroundTasks?: boolean;
+  /** From the capability matrix: whether the provider can take a message into a running turn (`chat.steer`). Gates the composer's Steer affordance. */
+  supportsSteering?: boolean;
+  /** From the capability matrix: whether a side question can be asked beside this session (`chat.side_question`). Gates the composer's side-question affordance. */
+  supportsSideQuestions?: boolean;
   processingSessions?: SessionActivityMap;
   canAbortSession: boolean;
   tokenBudget: Record<string, unknown> | null;
@@ -251,6 +259,44 @@ function buildLocalCostData(
 class ComposerSubmitError extends Error {}
 
 /**
+ * A phone or tablet types through an on-screen keyboard: its return key is
+ * labelled "new line", and Shift+Enter — the desktop combination for a newline
+ * in Enter-to-send mode — cannot be typed on it at all. `(pointer: coarse)`
+ * marks exactly those primary inputs; a touch laptop keeps its fine primary
+ * pointer and with it the desktop Enter behaviour.
+ */
+function isSoftKeyboardEnvironment(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return false;
+  }
+  return window.matchMedia('(pointer: coarse)').matches;
+}
+
+/**
+ * A v4 UUID for a steered message. The id becomes the message's transcript
+ * uuid, so it must be a real one. `crypto.randomUUID` only exists in secure
+ * contexts, and the app is often opened over plain http on a LAN address
+ * (a phone on the same network), so this falls back to `getRandomValues`.
+ */
+const createSteerMessageId = (): string => {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
+
+/** Whether a live user message is the echo of the steered message with this id. */
+const isEchoOfSteer = (echoId: string, messageId: string): boolean => (
+  // A text-only message is echoed under its own id; one with images is split
+  // into parts named `<id>_text_<n>` / `<id>_images`.
+  echoId === messageId || echoId.startsWith(`${messageId}_`)
+);
+
+/**
  * How much of the first message the session gateway is given.
  *
  * The backend only reads it to title the session from its first few words, so
@@ -261,6 +307,13 @@ class ComposerSubmitError extends Error {}
 const SESSION_TITLE_SOURCE_CHARS = 200;
 
 type SubmitOptions = {
+  /**
+   * Send the message into the session's running turn (steering) instead of
+   * queueing or starting a new one. The composer's Steer affordance sets it;
+   * like Queue it goes through the submit's upload and validation and only
+   * diverges once the message is ready to leave the composer.
+   */
+  steerIntoTurn?: boolean;
   /**
    * Send the text as a chat message even when it starts with "/" (or is
    * "help"). Set only for the re-submit of a custom command's expanded body:
@@ -376,6 +429,8 @@ export function useChatComposerState({
   isConnected,
   backgroundTasks = [],
   hasActiveBackgroundTasks = false,
+  supportsSteering = false,
+  supportsSideQuestions = false,
   processingSessions,
   canAbortSession,
   tokenBudget,
@@ -968,6 +1023,7 @@ export function useChatComposerState({
     backgroundSendResolverRef.current = null;
   }, []);
 
+
   // Snapshot of everything `chat.send` needs beyond the text itself. Built at
   // send time for immediate sends and at queue time for queued ones, so a
   // queued message keeps the provider settings it was composed under even if
@@ -1013,6 +1069,169 @@ export function useChatComposerState({
    * another submit already in flight), which is how a caller that owns the message — the queued-draft
    * flush — knows to keep its draft instead of dropping it.
    */
+  // Messages this tab sent into a running turn that the agent has not read
+  // yet. Each is a card above the composer until its echo reaches the
+  // transcript; the run ending without it puts the text back in the composer,
+  // and a refusal (the turn had already ended) queues it as the next turn.
+  const [pendingSteers, setPendingSteers] = useState<PendingSteer[]>([]);
+  // Read by the outcome handler, which the realtime listener calls between
+  // renders: a refusal can follow an acceptance before React re-renders.
+  // Written only through `updatePendingSteers` below, with the state.
+  const pendingSteersRef = useRef(pendingSteers);
+
+  // Every change to the pending steers goes through here so the ref the
+  // outcome handler reads is never behind the state.
+  const updatePendingSteers = useCallback((update: (current: PendingSteer[]) => PendingSteer[]) => {
+    const next = update(pendingSteersRef.current);
+    pendingSteersRef.current = next;
+    setPendingSteers(next);
+  }, []);
+
+  // Sends a message into the session's running turn (`chat.steer`): the agent
+  // reads it at its next tool call, without the turn stopping. It leaves the
+  // composer at once, as a sent message does, and waits as a card until the
+  // agent reads it. Attachments must already be uploaded.
+  const steerIntoRunningTurn = useCallback(
+    (message: { content: string; attachments: File[]; uploadedAttachments: unknown[] }, steerSessionKey: string) => {
+      const messageId = createSteerMessageId();
+      updatePendingSteers((current) => [...current, {
+        messageId,
+        sessionKey: steerSessionKey,
+        content: message.content,
+        attachments: message.attachments,
+        uploadedAttachments: message.uploadedAttachments,
+        status: 'sending',
+      }]);
+      sendMessage({
+        type: 'chat.steer',
+        sessionId: steerSessionKey,
+        messageId,
+        content: message.content,
+        options: { attachments: message.uploadedAttachments },
+      });
+      recordSentMessage(message.content, steerSessionKey);
+
+      if (sessionKeyRef.current === steerSessionKey) {
+        clearComposerForSubmit();
+      } else if (readDraftText(steerSessionKey) === message.content) {
+        // The user changed sessions during the upload; the composer they left
+        // must not still hold the message as its draft.
+        writeDraftText(steerSessionKey, '');
+      }
+    },
+    [clearComposerForSubmit, recordSentMessage, sendMessage, updatePendingSteers],
+  );
+
+  /**
+   * Settles a steered message as the realtime handler reports on it. Used by
+   * ChatInterface, which hands it to the realtime handler.
+   */
+  const handleSteerOutcome = useCallback(
+    (_sessionId: string, messageId: string, outcome: SteerOutcome) => {
+      if (outcome === 'delivered') {
+        if (pendingSteersRef.current.some((steer) => isEchoOfSteer(messageId, steer.messageId))) {
+          updatePendingSteers((current) => current.filter((steer) => !isEchoOfSteer(messageId, steer.messageId)));
+        }
+        return;
+      }
+
+      const steer = pendingSteersRef.current.find((candidate) => candidate.messageId === messageId);
+      if (!steer) {
+        return;
+      }
+      if (outcome === 'accepted') {
+        updatePendingSteers((current) => current.map((candidate) => (
+          candidate.messageId === messageId ? { ...candidate, status: 'accepted' } : candidate
+        )));
+        return;
+      }
+
+      // Refused: the turn had already ended when it arrived. The user meant it
+      // for this conversation now, so it queues as the next turn — the
+      // server-side queue sends it as soon as the session is idle.
+      updatePendingSteers((current) => current.filter((candidate) => candidate.messageId !== messageId));
+      void (async () => {
+        try {
+          const response = await appendQueuedMessage(steer.sessionKey, {
+            content: steer.content,
+            options: buildSendOptions(steer.content),
+            attachments: steer.uploadedAttachments,
+          });
+          const durableDraft: QueuedDraft = {
+            content: response.queuedMessage.content,
+            options: response.queuedMessage.options,
+            uploadedAttachments: response.queuedMessage.attachments,
+            attachments: steer.attachments,
+          };
+          if (sessionKeyRef.current === steer.sessionKey) {
+            queuedDraftSessionRef.current = steer.sessionKey;
+            setQueuedDraft((previous) => ({
+              ...durableDraft,
+              attachments: response.appended && previous
+                ? [...previous.attachments, ...steer.attachments]
+                : steer.attachments,
+            }));
+          }
+        } catch (error) {
+          // The queue refused too (rare); put the message back so nothing
+          // typed is lost.
+          if (sessionKeyRef.current === steer.sessionKey) {
+            restoreComposerAfterFailedSubmit(
+              steer.content,
+              steer.attachments.map((file) => ({ file, uploaded: null as unknown })),
+              steer.sessionKey,
+            );
+          }
+          addMessage({ type: 'error', content: `Failed to queue the message: ${error instanceof Error ? error.message : String(error)}`, timestamp: new Date() });
+        }
+      })();
+    },
+    [addMessage, buildSendOptions, restoreComposerAfterFailedSubmit, updatePendingSteers],
+  );
+
+  // The run ended with a steered message the server took but the agent never
+  // read — the user stopped the run, or it failed. Nothing will send it now,
+  // so it goes back into the composer (ahead of anything typed since) rather
+  // than vanishing or being sent behind the user's back after a stop.
+  const wasLoadingRef = useRef(isLoading);
+  useEffect(() => {
+    const wasLoading = wasLoadingRef.current;
+    wasLoadingRef.current = isLoading;
+    if (!wasLoading || isLoading || !sessionKey) {
+      return;
+    }
+    const unread = pendingSteersRef.current.filter(
+      (steer) => steer.sessionKey === sessionKey && steer.status === 'accepted',
+    );
+    if (unread.length === 0) {
+      return;
+    }
+    updatePendingSteers((current) => current.filter((steer) => !unread.includes(steer)));
+    const restored = [...unread.map((steer) => steer.content), inputValueRef.current]
+      .filter((part) => part.trim())
+      .join('\n\n');
+    setInput(restored);
+    inputValueRef.current = restored;
+    if (sessionKey) {
+      attachmentQueue.restore(sessionKey, unread.flatMap((steer) => steer.attachments).map((file) => ({ file, uploaded: null as unknown })));
+      writeDraftText(sessionKey, restored);
+    }
+  }, [attachmentQueue, isLoading, sessionKey, setInput, updatePendingSteers]);
+
+  // Cards belong to the session they were sent into; switching away drops
+  // them (the messages themselves are already the run's, on the server).
+  useEffect(() => {
+    if (pendingSteersRef.current.some((steer) => steer.sessionKey !== sessionKey)) {
+      updatePendingSteers((current) => current.filter((steer) => steer.sessionKey === sessionKey));
+    }
+  }, [sessionKey, updatePendingSteers]);
+
+  // Only the open session's cards are shown.
+  const visiblePendingSteers = useMemo(
+    () => pendingSteers.filter((steer) => steer.sessionKey === sessionKey),
+    [pendingSteers, sessionKey],
+  );
+
   const handleSubmit = useCallback(
     async (
       event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
@@ -1071,6 +1290,20 @@ export function useChatComposerState({
       // immediately and the button stops looking dead. A queued flush carries
       // its own copy of the message and must leave the composer alone — the
       // user may already be typing the next one.
+      // `/btw <question>` never becomes a turn: checked before the queue take
+      // and the composer clear below, so a refusal (unsupported provider, a
+      // brand-new chat with no session yet) leaves the typed text and any
+      // attachments exactly as they were — and the raw `/btw …` text is never
+      // sent as a turn or queued. A queued re-dispatch never carries this
+      // prefix, so it is skipped.
+      if (!queuedSubmission && !submitOptions?.skipCommandInterception) {
+        const btwMatch = currentInput.trim().match(/^\/btw(?:\s+([\s\S]*))?$/i);
+        if (btwMatch) {
+          askSideQuestionFromComposer(sessionKey, btwMatch[1] ?? '');
+          return true;
+        }
+      }
+
       let takenAttachments: UploadedComposerAttachment[] = [];
       if (!queuedSubmission) {
         takenAttachments = attachmentQueue.take(submitScope)
@@ -1079,6 +1312,7 @@ export function useChatComposerState({
       }
 
       try {
+
         // Intercept slash commands only when "/" is the first input character.
         // Also accept exact "help" as a convenience alias for users who expect CLI-style help.
         // Pure local commands (built-in modals, help, etc.) execute immediately without queueing.
@@ -1109,10 +1343,24 @@ export function useChatComposerState({
           }
         }
 
-        // The session is busy with work this engine cannot take a message during:
-        // stash it instead of sending it.
-        // Upload attached files now so the queued record contains durable image
-        // descriptors that can be sent even if another session is open later.
+        // Steering sends the message into the running turn instead of after
+        // it, when the composer's Steer affordance asked for that and the
+        // provider can take it. A slash command is a turn of its own, so it
+        // always waits in the queue.
+        if (
+          submitOptions?.steerIntoTurn === true
+          && supportsSteering
+          && Boolean(sessionKey)
+          && !currentInput.trimStart().startsWith('/')
+        ) {
+          steerIntoRunningTurn({
+            content: currentInput,
+            attachments: currentAttachments,
+            uploadedAttachments,
+          }, sessionKey as string);
+          return true;
+        }
+
         // Set when the user picked "send anyway" over running background work:
         // the direct send below then carries forceInterrupt, matching the
         // queued card's force-send button.
@@ -1292,7 +1540,11 @@ export function useChatComposerState({
             attachments: uploadedAttachments,
           },
         });
-        setEditingAnchorId(null);
+        // Only the anchor this send read is cleared: an edit begun in another
+        // chat while this send waited must survive it (upstream #1775).
+        if (editingAnchorId) {
+          setEditingAnchorId(null);
+        }
 
         // Recorded under the (possibly just-allocated) session id, so the first
         // message of a new chat lands in the history of the session the user is
@@ -1341,8 +1593,11 @@ export function useChatComposerState({
       isConnected,
       hasActiveBackgroundTasks,
       backgroundTasks,
+      editingAnchorId,
       processingSessions,
       queuedDraft,
+      supportsSteering,
+      steerIntoRunningTurn,
       askBeforeSendingOverBackgroundWork,
       onSessionProcessing,
       onSessionEstablished,
@@ -1477,6 +1732,13 @@ export function useChatComposerState({
     const owner = queuedDraftSessionRef.current;
     if (queuedDraft && await clearQueuedDraftOnServer(owner, queuedDraft) && sessionKeyRef.current === owner) setQueuedDraft(null);
   }, [clearQueuedDraftOnServer, queuedDraft]);
+
+  // 定时消息撤回编辑用：把被撤回的文本放回一个会话的输入框并聚焦，排队消息的
+  // 编辑按钮走同一条恢复路径，只是那里还带附件。
+  const recallContentToComposer = useCallback((content: string, ownerScope: string) => {
+    restoreComposerAfterFailedSubmit(content, [], ownerScope);
+    textareaRef.current?.focus();
+  }, [restoreComposerAfterFailedSubmit]);
 
   // Force send starts a new run, which the server refuses while a reply is
   // still in flight (RUN_IN_PROGRESS); only a session whose turn has ended
@@ -1634,8 +1896,68 @@ export function useChatComposerState({
     [handleCommandInputChange, resetCommandMenuState, setCursorPosition, updateInput],
   );
 
+  // Also ends edit mode, matching `cancelEditMessage`: a side question asked
+  // while editing a sent message must not leave `editingAnchorId` set over
+  // the now-empty composer, which previously turned the next plain send into
+  // a `chat.edit-send` that replaced the edited turn and everything after it.
+  const clearComposerAfterSideQuestion = useCallback(() => {
+    updateInput('');
+    setEditingAnchorId(null);
+    resetCommandMenuState();
+    setIsTextareaExpanded(false);
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
+  }, [resetCommandMenuState, setEditingAnchorId, updateInput]);
+
+  const askSideQuestion = useAskSideQuestion(sendMessage);
+
+  /**
+   * Asks the current draft as a side question and, when the frame went out,
+   * empties the composer (edit mode included). Refusals — an unsupported
+   * provider, a session that does not exist yet — land as timeline errors so
+   * they read where the user is looking; nothing typed is lost.
+   */
+  const askSideQuestionFromComposer = useCallback(
+    (sessionId: string | null, text: string) => {
+      if (!supportsSideQuestions) {
+        addMessage({
+          type: 'error',
+          content: t('sideQuestion.unsupported'),
+          timestamp: Date.now(),
+        });
+        return;
+      }
+      if (!sessionId) {
+        addMessage({
+          type: 'error',
+          content: t('sideQuestion.noSession'),
+          timestamp: Date.now(),
+        });
+        return;
+      }
+      if (askSideQuestion(sessionId, text, { model: currentProviderModel }, isConnected)) {
+        clearComposerAfterSideQuestion();
+      }
+    },
+    [addMessage, askSideQuestion, clearComposerAfterSideQuestion, currentProviderModel, isConnected, supportsSideQuestions, t],
+  );
+
   const handleKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
+      // Option/Alt+Enter asks a side question in every state (loading,
+      // background, idle) and even with the command menu or file-mention
+      // dropdown open, so this has to run ahead of
+      // `handleCommandMenuKeyDown`/`handleFileMentionsKeyDown` below: both
+      // consume a plain Enter to select their highlighted entry and never
+      // check altKey, so they would otherwise run the highlighted command
+      // or mention instead of asking the side question.
+      if (event.key === 'Enter' && event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        askSideQuestionFromComposer(sessionKey, inputValueRef.current);
+        return;
+      }
+
       if (handleCommandMenuKeyDown(event)) {
         return;
       }
@@ -1662,13 +1984,23 @@ export function useChatComposerState({
         if ((event.ctrlKey || event.metaKey) && !event.shiftKey) {
           event.preventDefault();
           handleSubmit(event);
-        } else if (!event.shiftKey && !event.ctrlKey && !event.metaKey && !sendByCtrlEnter) {
+        } else if (
+          !event.shiftKey
+          && !event.ctrlKey
+          && !event.metaKey
+          && !sendByCtrlEnter
+          // Submitting on plain Enter strands the newline on a soft keyboard:
+          // the return key is the only Enter, and no Shift exists to combine
+          // with it. The send button still submits.
+          && !isSoftKeyboardEnvironment()
+        ) {
           event.preventDefault();
           handleSubmit(event);
         }
       }
     },
     [
+      askSideQuestionFromComposer,
       cyclePermissionMode,
       handleCommandMenuKeyDown,
       handleFileMentionsKeyDown,
@@ -1815,6 +2147,13 @@ export function useChatComposerState({
     updateInput('');
   }, [updateInput]);
 
+  /** Runs the current draft through the submit as a steer into the running turn. */
+  const steerFromComposer = useCallback(
+    () => handleSubmitRef.current?.(createFakeSubmitEvent(), undefined, undefined, { steerIntoTurn: true }),
+    [],
+  );
+
+
   return {
     input,
     setInput: updateInput,
@@ -1850,6 +2189,8 @@ export function useChatComposerState({
     isSubmitting,
     queuedDraft,
     editQueuedDraft,
+    /** Used by ChatInterface to recall a scheduled message's text into the composer. */
+    recallContentToComposer,
     deleteQueuedDraft,
     forceSendQueuedDraft,
     /** False for providers whose fresh run would stop the background work a force send relies on. */
@@ -1857,8 +2198,12 @@ export function useChatComposerState({
     /** True while a `/compact` waits for the running turn to end. */
     pendingCompact,
     cancelPendingCompact,
+    steerFromComposer,
+    askSideQuestionFromComposer,
     backgroundSendPrompt,
     resolveBackgroundSendPrompt,
+    pendingSteers: visiblePendingSteers,
+    handleSteerOutcome,
     backgroundTasks,
     hasActiveBackgroundTasks,
     backgroundWorkQueuesInput,
@@ -1883,3 +2228,4 @@ export function useChatComposerState({
     showCostModal,
   };
 }
+

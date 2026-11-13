@@ -10,7 +10,7 @@ import type {
   RefObject,
   TouchEvent,
 } from 'react';
-import { PaperclipIcon, MessageSquareIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon, CircleHelpIcon } from 'lucide-react';
+import { PaperclipIcon, MessageSquareIcon, SquareSlashIcon, MessageSquarePlusIcon, MessagesSquareIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon, CircleHelpIcon } from 'lucide-react';
 
 import { Tooltip } from '@/shared/ui/Tooltip';
 
@@ -18,7 +18,8 @@ import { useVoiceInput } from '@/modules/chat/hooks/useVoiceInput';
 import { useVoiceAvailable } from '@/modules/chat/hooks/useVoiceAvailable';
 import type { QueuedDraft } from '@/modules/chat/hooks/useChatComposerState';
 import type { LLMProvider, SessionActivity, ScheduledJob, ScheduledMessage } from '@/shared/types';
-import type { BackgroundSendChoice, BackgroundSendPrompt, PendingPermissionRequest, PermissionMode } from '@/shared/types';
+import { MCP_ELICITATION_TOOL_NAME } from '@/shared/constants';
+import type { BackgroundSendChoice, BackgroundSendPrompt, PendingPermissionRequest, PendingSteer, PermissionMode } from '@/shared/types';
 import type { ComposerAttachmentBlock, ComposerAttachmentItem, ComposerAttachmentQueue } from '@/shared/types';
 import type { ProviderModelOption } from '@/shared/types';
 import {
@@ -40,6 +41,7 @@ import PermissionRequestsBanner from '@/modules/chat/composer/PermissionRequests
 import TokenUsageSummary from '@/modules/chat/composer/TokenUsageSummary';
 import { ContextUsageBar } from '@/modules/chat/composer/ContextUsageBar';
 import QueuedMessageCard from '@/modules/chat/composer/QueuedMessageCard';
+import SteeredMessageCard from '@/modules/chat/composer/SteeredMessageCard';
 import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessagePopover';
 import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
 import BackgroundTaskIndicator from '@/modules/chat/composer/BackgroundTaskIndicator';
@@ -126,6 +128,8 @@ type ChatComposerProps = {
     /** Days before the bound session is rotated; omitted never rotates. */
     rotateAfterDays?: number;
   }) => void;
+  /** Cancels a scheduled message and puts its text back into the composer. */
+  onRecallScheduledMessage: (message: ScheduledMessage) => void;
   onCancelScheduledMessage: (id: string) => void;
   onDeleteScheduledJob: (id: string) => void;
   /** Whether the current provider schedules inside its own session (hint only). */
@@ -179,7 +183,23 @@ type ChatComposerProps = {
   backgroundSendPrompt: BackgroundSendPrompt | null;
   /** Answers the open prompt: send now (stopping the work), queue, or cancel. */
   onResolveBackgroundSendPrompt: (choice: BackgroundSendChoice) => void;
+  /** Whether the provider can take a message into a running turn; gates the composer's Steer button. */
+  supportsSteering?: boolean;
+  /** Sends the current draft into the running turn (chat.steer) instead of queueing it. */
+  onSteerFromComposer?: () => void;
+  /** Whether a question can be asked beside this session on a read-only fork; gates the composer's side-question button. */
+  supportsSideQuestions?: boolean;
+  /** Asks the current draft as a side question (chat.side_question); refuses with a timeline error when unsupported. */
+  onAskSideQuestion?: (sessionId: string | null, text: string) => void;
+  /** The session a side question would be asked beside; null hides the button. */
+  sideQuestionSessionId?: string | null;
+  /** Messages sent into the running turn that the agent has not read yet, each shown as a card above the composer until its echo lands in the transcript. */
+  pendingSteers?: PendingSteer[];
 }
+
+// A stable empty default, so a composer with no steered messages (every
+// caller but the chat tab) does not get a new array each render.
+const NO_PENDING_STEERS: PendingSteer[] = [];
 
 function ChatComposer({
   pendingPermissionRequests,
@@ -223,6 +243,7 @@ function ChatComposer({
   scheduledJobsEnabled = false,
   onScheduleMessage,
   onScheduleTask,
+  onRecallScheduledMessage,
   onCancelScheduledMessage,
   onDeleteScheduledJob,
   supportsNativeScheduling,
@@ -268,6 +289,12 @@ function ChatComposer({
   onForceSendQueuedDraft,
   backgroundSendPrompt,
   onResolveBackgroundSendPrompt,
+  supportsSteering = false,
+  pendingSteers = NO_PENDING_STEERS,
+  onSteerFromComposer,
+  supportsSideQuestions = false,
+  onAskSideQuestion,
+  sideQuestionSessionId = null,
 }: ChatComposerProps) {
   const { t } = useTranslation('chat');
   const fileDropdownRef = useRef<HTMLDivElement | null>(null);
@@ -324,9 +351,10 @@ function ChatComposer({
   const isRecording = voiceState === 'recording';
   const isTranscribing = voiceState === 'transcribing';
 
-  // Detect if the AskUserQuestion interactive panel is active
+  // Detect if an interactive panel that takes the person's answer is active:
+  // a question from the agent, or an MCP server's request for input.
   const hasQuestionPanel = pendingPermissionRequests.some(
-    (r) => r.toolName === 'AskUserQuestion'
+    (r) => r.toolName === 'AskUserQuestion' || r.toolName === MCP_ELICITATION_TOOL_NAME
   );
 
   // Hide the thinking/status bar while any permission request is pending
@@ -339,6 +367,16 @@ function ChatComposer({
   // The engine takes a message mid-turn: typed content is sent now, and the
   // button only turns back into stop once the input is empty.
   const canSendDuringTurn = isLoading && !queuesInput && hasDraftContent;
+  // A reply is still streaming (not just background work): the run holds the
+  // composer's input in the queue. Only then can a message be steered in.
+  const isReplyInFlight = isLoading && queuesInput;
+  // A reply is streaming and the provider can take a message into it: the
+  // composer offers Steer beside the queueing send button (upstream #1760).
+  const canSteerRunningTurn = supportsSteering && isReplyInFlight && hasDraftContent && !hasPendingPermissions;
+  // A side question is worth its button whenever the fork path exists and
+  // there is something to ask about — it does not need a running turn.
+  const canAskSideQuestion = supportsSideQuestions && hasDraftContent && !hasPendingPermissions
+    && Boolean(sideQuestionSessionId) && Boolean(onAskSideQuestion);
   const submitHint = canQueueDraft
     ? hasQueuedDraft
       ? sendByCtrlEnter
@@ -392,6 +430,7 @@ function ChatComposer({
       <ScheduledMessageList
         scheduledMessages={scheduledMessages}
         scheduledJobs={scheduledJobs}
+        onRecall={onRecallScheduledMessage}
         onCancel={onCancelScheduledMessage}
         onDeleteJob={onDeleteScheduledJob}
       />
@@ -446,6 +485,9 @@ function ChatComposer({
           </button>
         </div>
       )}
+      {pendingSteers.map((steer) => (
+        <SteeredMessageCard key={steer.messageId} steer={steer} providerLabel={providerLabel} />
+      ))}
 
       {queuedDraft && (
         <QueuedMessageCard
@@ -590,7 +632,7 @@ function ChatComposer({
               onClick={onToggleCommandMenu}
               className="relative"
             >
-              <MessageSquareIcon />
+              <SquareSlashIcon />
               {slashCommandsCount > 0 && (
                 <span
                   className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground"
@@ -656,6 +698,38 @@ function ChatComposer({
               onSelectPermissionMode={onSelectPermissionMode}
               providerLabel={providerLabel}
             />
+
+            {canSteerRunningTurn && onSteerFromComposer && (
+              <PromptInputButton
+                tooltip={{ content: t('input.steer.button', { provider: providerLabel, defaultValue: 'Send into the running {{provider}} turn' }) }}
+                onClick={(e: MouseEvent<HTMLButtonElement>) => {
+                  e.preventDefault();
+                  onSteerFromComposer();
+                }}
+                disabled={isSubmitting || Boolean(attachmentBlock)}
+                aria-label={t('input.steer.button', { provider: providerLabel, defaultValue: 'Send into the running {{provider}} turn' })}
+                title={t('input.steer.button', { provider: providerLabel, defaultValue: 'Send into the running {{provider}} turn' })}
+                className="h-10 w-10 sm:h-10 sm:w-10"
+              >
+                <MessageSquarePlusIcon className="h-4 w-4" />
+              </PromptInputButton>
+            )}
+
+            {canAskSideQuestion && (
+              <PromptInputButton
+                tooltip={{ content: t('sideQuestion.label', { defaultValue: 'Side question · not part of the session' }) }}
+                onClick={(e: MouseEvent<HTMLButtonElement>) => {
+                  e.preventDefault();
+                  onAskSideQuestion?.(sideQuestionSessionId, input);
+                }}
+                disabled={isSubmitting || Boolean(attachmentBlock)}
+                aria-label={t('sideQuestion.label', { defaultValue: 'Side question · not part of the session' })}
+                title={t('sideQuestion.label', { defaultValue: 'Side question · not part of the session' })}
+                className="h-10 w-10 sm:h-10 sm:w-10"
+              >
+                <MessagesSquareIcon className="h-4 w-4" />
+              </PromptInputButton>
+            )}
 
             <PromptInputSubmit
               onClick={

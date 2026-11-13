@@ -836,7 +836,13 @@ test('providerSkillsService manages opencode global skills under the native conf
     });
     assert.equal(removedSkill.removed, true);
     assert.equal(removedSkill.provider, 'opencode');
+    assert.equal(removedSkill.directoryName, 'opencode-global-dir');
     await assert.rejects(fs.stat(path.dirname(createdSkill.sourcePath)), { code: 'ENOENT' });
+
+    const removedMissingSkill = await providerSkillsService.removeProviderSkill('opencode', {
+      directoryName: 'opencode-global-dir',
+    });
+    assert.equal(removedMissingSkill.removed, false);
   } finally {
     restoreHomeDir();
     await fs.rm(tempRoot, { recursive: true, force: true });

@@ -40,6 +40,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
+    supportsSteering: true,
+    supportsSideQuestions: true,
     supportsPermissionRequests: true,
     supportsTokenUsage: true,
     supportsQuota: true,
@@ -71,6 +73,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
+    supportsSteering: false,
+    supportsSideQuestions: false,
     supportsPermissionRequests: false,
     supportsTokenUsage: false,
     supportsQuota: false,
@@ -96,6 +100,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
+    supportsSteering: false,
+    supportsSideQuestions: true,
     // `app-server` asks for sandbox escalations as JSON-RPC requests and
     // blocks the turn until one is answered, so they reach the same approval
     // card Claude's `canUseTool` callback raises.
@@ -127,6 +133,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
+    supportsSteering: false,
+    supportsSideQuestions: false,
     // The runtime mounts the permissions facet: permission asks and question
     // forms surface as cards answered through the service API.
     supportsPermissionRequests: true,
@@ -162,6 +170,8 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
+    supportsSteering: false,
+    supportsSideQuestions: false,
     // The zcode runtime carries the engine permission bridge (interaction/
     // requestPermission → chat cards), so its runtime.permissions facet is
     // present even though permission MODES are the primary gate.
@@ -195,12 +205,15 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsImages: true,
     supportsFiles: true,
     supportsAbort: true,
+    supportsSteering: false,
+    supportsSideQuestions: false,
     supportsPermissionRequests: false,
     supportsTokenUsage: true,
     supportsQuota: true,
     supportsQuotaReset: false,
     supportsEffort: true,
-    effortLevels: ['low', 'medium', 'high'],
+    // Runtime levels; a custom model may only declare from this list.
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     supportsMessageEditing: false,
     supportsSessionForking: false,
     // Upstream's matrix says the engine parses `/compact` from the prompt

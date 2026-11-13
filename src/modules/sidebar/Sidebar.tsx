@@ -122,6 +122,7 @@ function Sidebar({
     saveProjectName,
     showDeleteSessionConfirmation,
     confirmDeleteSession,
+    archiveSession,
     sessionSelection,
     setProjectSessionSelection,
     toggleSessionSelected,
@@ -219,6 +220,7 @@ function Sidebar({
     onDeleteProject: requestProjectDelete,
     onSessionSelect: handleSessionClick,
     onDeleteSession: showDeleteSessionConfirmation,
+    onArchiveSession: archiveSession,
     onForkSession: forkSession,
     onSetSessionPinned: setSessionPinned,
     onLoadMoreSessions: loadMoreSessionsForProject,
@@ -248,6 +250,7 @@ function Sidebar({
         onCancelDeletion={() => setPendingDeletion(null)}
         onConfirmDeleteProject={confirmDeleteProject}
         onConfirmDeleteSession={confirmDeleteSession}
+        onArchiveSession={archiveSession}
         onConfirmDeleteSessions={confirmDeleteSessions}
         showVersionModal={showVersionModal}
         onCloseVersionModal={() => setShowVersionModal(false)}

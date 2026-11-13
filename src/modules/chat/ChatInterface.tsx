@@ -19,7 +19,7 @@ import { useProviderCapabilitiesMap } from '@/shared/hooks/useProviderCapabiliti
 import { useQueuedMessageSync } from '@/modules/chat/hooks/useQueuedMessageSync';
 import ChatMessagesPane from '@/modules/chat/transcript/ChatMessagesPane';
 import ProviderSelectionEmptyState from '@/modules/chat/transcript/ProviderSelectionEmptyState';
-import type { ChatMessage, ActiveBackgroundTask } from '@/shared/types';
+import type { ChatMessage, ActiveBackgroundTask, ScheduledMessage } from '@/shared/types';
 import { useSessionFork } from '@/shared/hooks/useSessionFork';
 import ChatComposer from '@/modules/chat/composer/ChatComposer';
 import CommandResultModal from '@/modules/chat/modals/CommandResultModal';
@@ -70,6 +70,8 @@ function ChatInterface({
     providerModels,
     setProviderModel,
     supportsMessageEditing,
+    supportsSteering,
+    supportsSideQuestions,
     supportsSessionForking,
     editRevertsFiles,
     currentProviderEffort,
@@ -240,6 +242,11 @@ function ChatInterface({
     queuesInput,
     backgroundSendPrompt,
     resolveBackgroundSendPrompt,
+    pendingSteers,
+    handleSteerOutcome,
+    steerFromComposer,
+    recallContentToComposer,
+    askSideQuestionFromComposer,
   } = useChatComposerState({
     selectedProject,
     selectedSession,
@@ -250,6 +257,8 @@ function ChatInterface({
     currentProviderModel,
     currentProviderEffort,
     isLoading: isProcessing,
+    supportsSteering,
+    supportsSideQuestions,
     processingSessions,
     canAbortSession,
     tokenBudget,
@@ -312,6 +321,7 @@ function ChatInterface({
     statusCheckSentAtRef,
     onSessionProcessing,
     onSessionIdle,
+    onSteerOutcome: handleSteerOutcome,
     onWebSocketReconnect: handleWebSocketReconnect,
     requestLatestMessages,
     sessionStore,
@@ -376,7 +386,17 @@ function ChatInterface({
     schedule: scheduleMessage,
     cancel: cancelScheduledMessage,
     refresh: refreshScheduledMessages,
-  } = useScheduledMessages(currentSessionId || selectedSession?.id || null);
+  } = useScheduledMessages(currentSessionId || selectedSession?.id || null, subscribe);
+
+  // 撤回定时消息（排队消息的编辑按钮同款）：先让服务端取消，成功才把文本放回
+  // 输入框；失败时横幅原样保留，用户重试。定时消息不带附件，只还原文本。
+  const recallScheduledMessage = useCallback(async (message: ScheduledMessage) => {
+    if (!await cancelScheduledMessage(message.id)) {
+      addMessage({ type: 'error', content: t('schedule.recallFailed'), timestamp: new Date() });
+      return;
+    }
+    recallContentToComposer(message.content, currentSessionId || selectedSession?.id || '');
+  }, [cancelScheduledMessage, recallContentToComposer, addMessage, t, currentSessionId, selectedSession?.id]);
 
   const {
     jobs: scheduledJobs,
@@ -639,6 +659,7 @@ function ChatInterface({
           scheduledJobsEnabled={scheduledJobsEnabled}
           onScheduleMessage={handleScheduleMessage}
           onScheduleTask={handleScheduleTask}
+          onRecallScheduledMessage={recallScheduledMessage}
           onCancelScheduledMessage={cancelScheduledMessage}
           onDeleteScheduledJob={handleDeleteScheduledJob}
           supportsNativeScheduling={supportsNativeScheduling}
@@ -655,6 +676,12 @@ function ChatInterface({
           onForceSendQueuedDraft={canForceSendQueuedDraft ? forceSendQueuedDraft : undefined}
           backgroundSendPrompt={backgroundSendPrompt}
           onResolveBackgroundSendPrompt={resolveBackgroundSendPrompt}
+          supportsSteering={supportsSteering}
+          pendingSteers={pendingSteers}
+          onSteerFromComposer={supportsSteering ? steerFromComposer : undefined}
+          supportsSideQuestions={supportsSideQuestions}
+          onAskSideQuestion={supportsSideQuestions ? askSideQuestionFromComposer : undefined}
+          sideQuestionSessionId={currentSessionId}
         />
         </div>
       </div>

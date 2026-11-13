@@ -48,8 +48,8 @@ export default function AgentsSettingsTab({
 }: AgentsSettingsTabProps) {
   const [selectedAgent, setSelectedAgent] = useState<AgentProvider>('claude');
   const [selectedCategory, setSelectedCategory] = useState<AgentCategory>('account');
-  // Every provider exposes the same categories, including skills: OpenCode
-  // manages its native global skills under ~/.config/opencode/skills.
+  // Every provider exposes the same categories, including skills; OpenCode
+  // manages its native ~/.config/opencode/skills and labels the tab "Shared Skills".
   const visibleCategories = AGENT_CATEGORIES;
 
   const allAgents: AgentProvider[] = ['claude', 'cursor', 'codex', 'opencode', 'zcode', 'antigravity'];

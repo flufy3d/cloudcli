@@ -82,6 +82,12 @@
   "json": {
     "response": "Réponse JSON"
   },
+  "agentPrompts": {
+    "needsInput": "{{agent}} a besoin de votre réponse",
+    "dismiss": "Refuser",
+    "alwaysAllow": "Toujours autoriser",
+    "alwaysAllowCovers": "« Toujours autoriser » couvre"
+  },
   "permissions": {
     "grant": "Autoriser {{tool}}",
     "added": "Permission ajoutée",
@@ -292,7 +298,9 @@
     "pending": "Programmé pour {{when}}",
     "failed": "Non envoyé — {{reason}}",
     "cancel": "Annuler le message programmé",
-    "dismiss": "Masquer l'avis d'échec"
+    "dismiss": "Masquer l'avis d'échec",
+    "recall": "Rappeler pour modification",
+    "recallFailed": "Impossible de rappeler le message programmé. Veuillez réessayer."
   },
   "cost": {
     "totalTokensUsed": "Jetons totaux utilisés",

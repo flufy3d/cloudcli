@@ -17,7 +17,13 @@
     "outputAssets": "結果附件（{{count}}）",
     "fullOutput": "完整輸出.txt",
     "compacted": "已壓縮",
-    "compactionSummary": "完整摘要"
+    "compactionSummary": "完整摘要",
+    "needsInput": "{{provider}} 需要你的輸入",
+    "selectAllThatApply": "可多選",
+    "other": "其他…",
+    "back": "上一步",
+    "next": "下一步",
+    "submit": "提交"
   },
   "codeBlock": {
     "copy": "複製",
@@ -319,6 +325,13 @@
         "queue": "排隊",
         "sendAnyway": "仍要送出"
       }
+    },
+    "steer": {
+      "label": "插話",
+      "sending": "送出中…",
+      "willRead": "{{provider}} 會在下一個工具調用邊界讀取",
+      "attachments": "{{count}} 個附件",
+      "button": "插入正在執行的 {{provider}} 回合"
     }
   },
   "projectSelection": {
@@ -354,13 +367,13 @@
     "permissionCycleHint": "在輸入框中按 Tab 切換模式",
     "permissionTriggerLabel": "{{mode}}：{{heading}}"
   },
-  "misc": {
-    "needsInput": "{{provider}} 需要你的輸入",
-    "selectAllThatApply": "可多選",
-    "other": "其他…",
-    "back": "上一步",
-    "next": "下一步",
-    "submit": "提交"
+  "sideQuestion": {
+    "label": "旁路提問 · 不進入工作階段",
+    "pending": "正在旁路作答",
+    "failed": "旁路提問失敗了。",
+    "dismiss": "移除",
+    "unsupported": "此引擎不支援旁路提問。",
+    "noSession": "旁路提問需要一個已有對話；這個對話還沒開始。"
   },
   "export": {
     "trigger": "匯出對話",
@@ -377,7 +390,8 @@
     "json": {
       "label": "JSON (.json)",
       "description": "全部訊息原樣輸出，供工具使用。"
-    }
+    },
+    "includeSideQuestions": "同時匯出旁路提問"
   },
   "schedule": {
     "trigger": "排程這則訊息",
@@ -393,7 +407,9 @@
     "pending": "將於 {{when}} 傳送",
     "failed": "未傳送 — {{reason}}",
     "cancel": "取消排程訊息",
-    "dismiss": "關閉失敗提示"
+    "dismiss": "關閉失敗提示",
+    "recall": "撤回編輯",
+    "recallFailed": "無法撤回排程訊息，請重試。"
   },
   "cost": {
     "readingUsage": "正在讀取會話用量…",
@@ -494,5 +510,11 @@
     "customModelsOnlyHint": "在所有模型選擇器中隱藏 {{provider}} 的內建模型，並將您的第一個模型設為預設模型。在您新增模型之前，內建模型仍會顯示。",
     "builtInModelsHidden": "開啟「僅使用我的模型」時，這些模型不會出現在模型選擇器中。",
     "customModelsOnlyFailed": "無法變更此設定。"
+  },
+  "agentPrompts": {
+    "needsInput": "{{agent}} 需要你的輸入",
+    "dismiss": "拒絕",
+    "alwaysAllow": "一律允許",
+    "alwaysAllowCovers": "「一律允許」適用於"
   }
 }

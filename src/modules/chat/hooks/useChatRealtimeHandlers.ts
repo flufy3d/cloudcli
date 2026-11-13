@@ -2,7 +2,9 @@ import { useEffect, useRef } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
 import type { ServerEvent } from '@/shared/context/WebSocketContext';
+import type { SteerOutcome, SideQuestionEvent } from '@/shared/types';
 import { showCompletionTitleIndicator } from '@/shared/utils';
+import { sideQuestionStore } from '@/modules/chat/hooks/useSideQuestions';
 import { playChatCompletionSound, playNotificationSound } from '@/modules/chat/utils/notificationSound';
 import type { MarkSessionIdle, MarkSessionProcessing } from '@/shared/types';
 import type { PendingPermissionRequest } from '@/shared/types';
@@ -33,6 +35,12 @@ type UseChatRealtimeHandlersArgs = {
   onSessionProcessing?: MarkSessionProcessing;
   onSessionIdle?: MarkSessionIdle;
   onWebSocketReconnect?: () => void;
+  /**
+   * Reports what became of a message sent into a running turn, so the
+   * composer can settle its card: the server's acceptance or refusal, and —
+   * for every live user message, steered or not — `delivered` with its id.
+   */
+  onSteerOutcome?: (sessionId: string, messageId: string, outcome: SteerOutcome) => void;
   requestLatestMessages: (sessionId: string, allowNetwork?: boolean) => Promise<void>;
   sessionStore: SessionStore;
 }
@@ -63,6 +71,7 @@ export function useChatRealtimeHandlers({
   onSessionProcessing,
   onSessionIdle,
   onWebSocketReconnect,
+  onSteerOutcome,
   requestLatestMessages,
   sessionStore,
 }: UseChatRealtimeHandlersArgs) {
@@ -97,17 +106,55 @@ export function useChatRealtimeHandlers({
         return;
       }
 
+      // Steer bookkeeping — owned by useChatComposerState's pendingSteers.
+      // `chat_steer_accepted` and the STEER_UNAVAILABLE protocol error are
+      // free-shaped frames, never transcript rows.
+      const freeFrame = msg as unknown as { kind?: unknown; sessionId?: unknown; messageId?: unknown; code?: unknown };
+      if (freeFrame.kind === 'chat_steer_accepted') {
+        if (typeof freeFrame.sessionId === 'string' && typeof freeFrame.messageId === 'string') {
+          onSteerOutcome?.(freeFrame.sessionId, freeFrame.messageId, 'accepted');
+        }
+        return;
+      }
+      if (freeFrame.kind === 'protocol_error' && freeFrame.code === 'STEER_UNAVAILABLE') {
+        if (typeof freeFrame.sessionId === 'string' && typeof freeFrame.messageId === 'string') {
+          onSteerOutcome?.(freeFrame.sessionId, freeFrame.messageId, 'refused');
+        }
+        return;
+      }
+      // A user message on the live stream is a steered message the agent just
+      // read (the turn's own prompt is never echoed); the composer drops its
+      // card if it is one of its own.
+      const liveFrame = msg as unknown as { kind?: unknown; sessionId?: unknown; role?: unknown; id?: unknown };
+      if (liveFrame.kind === 'text' && liveFrame.role === 'user' && typeof liveFrame.id === 'string') {
+        onSteerOutcome?.(
+          typeof liveFrame.sessionId === 'string' ? liveFrame.sessionId : (activeViewSessionIdRef.current ?? ''),
+          liveFrame.id,
+          'delivered',
+        );
+      }
+
+      // A side question never touches the session's transcript: it goes to
+      // the side-question store, for whichever session it names, and never
+      // falls through to the transcript handling below.
+      if (msg.kind === 'side_question') {
+        sideQuestionStore.applyEvent(msg as unknown as SideQuestionEvent);
+        return;
+      }
+
       // Sidebar/global events — owned by useProjectsState; queued-message
       // starts — owned by useQueuedMessageSync. `session_removed` carries a
       // batch of `sessionIds` and no sessionId of its own, so the store must
       // never see it: the unknown-kind fallback would attach it to whichever
-      // session is being viewed.
+      // session is being viewed. Scheduled-list changes are owned by
+      // useScheduledMessages.
       if (
         msg.kind === 'session_upserted'
         || msg.kind === 'session_removed'
         || msg.kind === 'scheduled_jobs_changed'
         || msg.kind === 'loading_progress'
         || msg.kind === 'queued_message_dispatched'
+        || msg.kind === 'scheduled_messages_changed'
       ) {
         return;
       }

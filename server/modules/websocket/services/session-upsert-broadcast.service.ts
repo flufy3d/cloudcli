@@ -54,6 +54,8 @@ async function buildSessionUpsertedEvent(
       worktreePath: row.worktree_path,
       worktreeBranch: row.worktree_branch,
       isPinned: Boolean(row.isPinned),
+      forkedFromSessionId: row.forked_from_session_id ?? null,
+      forkAncestors: row.forked_from_session_id ? sessionsDb.getForkAncestors(row.session_id) : [],
     },
     project: project
       ? {
@@ -157,6 +159,26 @@ export function broadcastQueuedMessageDispatched(sessionId: string, messageFinge
   });
 }
 
+/**
+ * Announces that a session's scheduled-message list changed (created,
+ * cancelled, claimed by the dispatcher, or failed). Pages re-read that
+ * session's list; the broadcast carries no message text.
+ */
+export function broadcastScheduledMessagesChanged(sessionId: string): void {
+  const payload = JSON.stringify({
+    kind: 'scheduled_messages_changed', sessionId,
+    timestamp: new Date().toISOString(),
+  });
+  connectedClients.forEach((client) => {
+    if (client.readyState !== WS_OPEN_STATE) return;
+    try {
+      client.send(payload);
+    } catch (error) {
+      console.error('[ScheduledMessages] Change notification failed', { sessionId,
+        error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+}
 
 /**
  * Announces a batch of sessions. Used by the providers module's sessions

@@ -2,11 +2,15 @@ import type {
   ActiveBackgroundTask,
   AnyRecord,
   SessionBackgroundWork,
+  SideQuestionOutcome,
+  SideQuestionRequest,
+  SideQuestionSink,
   FetchHistoryOptions,
   FetchHistoryResult,
   LLMProvider,
   McpScope,
   NormalizedMessage,
+  CliVersionProbe,
   ProviderAuthStatus,
   ProviderCurrentActiveModel,
   ProviderMcpCapabilities,
@@ -155,6 +159,19 @@ export interface IProviderRuntime {
    * settled, or the id was never one of its own.
    */
   stopBackgroundTask?(sessionId: string, taskId: string): Promise<boolean>;
+  /**
+   * Delivers a message into a session's running turn ("steering", upstream
+   * #1760): the model reads it at its next tool-call boundary without the
+   * turn stopping. Resolves false when there is no live run that can take
+   * it — the caller sends the message the ordinary way instead.
+   */
+  steer?(sessionId: string, command: string, options: { messageId: string; images?: unknown; files?: unknown }): Promise<boolean>;
+  /**
+   * Answers a side question on a read-only fork of the provider's own
+   * session (upstream #1673): never rejects, all failures come back as
+   * error outcomes. Absent means the provider has no side questions.
+   */
+  askSideQuestion?(request: SideQuestionRequest, sink: SideQuestionSink, context: ProviderRuntimeContext): Promise<SideQuestionOutcome>;
 }
 
 /**
@@ -253,6 +270,13 @@ export interface IProviderAuth {
    * Checks whether the provider is installed and has usable credentials.
    */
   getStatus(): Promise<ProviderAuthStatus>;
+
+  /**
+   * Probes the installed CLI's version directly (`--version` or equivalent).
+   * Optional: providers whose status endpoint already reports a usable
+   * version may leave it out and let `getCliStatus` fall back to `getStatus`.
+   */
+  checkInstalled?(options?: { timeoutMs?: number }): CliVersionProbe;
 
   /**
    * Reads account-level quota and rate-limit status for this provider.

@@ -187,7 +187,7 @@ export const PROVIDER_CATALOG = {
     supportsNativeScheduling: false,
     editRevertsFiles: false,
     inputWhileBusy: 'queue',
-    effortLevels: ['low', 'medium', 'high'],
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
     supportsCompaction: true,
   },
 } as const satisfies Readonly<Record<LLMProvider, ProviderCatalogEntry>>;

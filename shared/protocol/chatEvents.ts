@@ -64,6 +64,8 @@ export type GatewayEventKind =
   | 'scheduled_jobs_changed'
   | 'loading_progress'
   | 'queued_message_dispatched'
+  | 'scheduled_messages_changed'
+  | 'side_question'
   | 'protocol_error';
 
 /**
@@ -366,9 +368,27 @@ export type SessionUpsertedEvent = {
     worktreeBranch?: string | null;
     /** True when the user pinned the session; sidebar lists order it first. */
     isPinned?: boolean;
+    /** App-facing parent id; null for a session without a recorded fork source. */
+    forkedFromSessionId?: string | null;
+    /** Active ancestors outside the current page, for the Projects tree only. */
+    forkAncestors?: SessionForkAncestor[];
   };
   project: SessionUpsertedProject | null;
   timestamp: string;
+};
+
+/**
+ * Minimal ancestor context for the Projects sidebar, shared by the database,
+ * projects and WebSocket modules. IDs are canonical app IDs. Only active
+ * ancestors in the same project and provider are included. These rows do not
+ * belong to the paginated session slice and must not advance its offset.
+ */
+export type SessionForkAncestor = {
+  id: string;
+  provider: LLMProvider;
+  summary: string;
+  lastActivity: string;
+  forkedFromSessionId: string | null;
 };
 
 /**
@@ -590,4 +610,59 @@ export type NormalizedMessage = {
   parentToolUseId?: string;
   sequence?: number;
   rowid?: number;
+};
+
+//----------------- SIDE QUESTION TYPES ------------
+/**
+ * Status of a side question being answered on the side in parallel.
+ */
+export type SideQuestionStatus = 'running' | 'done' | 'error';
+
+/**
+ * A question asked while a session runs, with its answer accumulated as it streams.
+ *
+ * Side questions run independently on the provider's runtime and are never
+ * part of the main conversation history. The client can inspect their state
+ * in real time and dismiss them if needed.
+ */
+export type SideQuestion = {
+  id: string;
+  /** App session id the question was asked beside. */
+  sessionId: string;
+  question: string;
+  /** '' until text arrives; partial while `running`. */
+  answer: string;
+  status: SideQuestionStatus;
+  error: string | null;
+  model: string | null;
+  /** ISO timestamp. */
+  createdAt: string;
+  /** ISO timestamp, set once the fork reaches `done` or `error`. */
+  finishedAt: string | null;
+};
+
+/**
+ * Real-time event for side question state changes, broadcast to all chat clients.
+ *
+ * `started` and `done` include the whole row; `delta` carries incremental text;
+ * `error` marks failure and may carry the existing row on a duplicate id or null
+ * on other refusals. `dismissed` is sent when a side question is dismissed,
+ * running or not, so every tab drops the id instead of leaving it pending
+ * until a full reload. Every event is broadcast to every connected chat client
+ * so side-by-side tabs stay in sync.
+ */
+export type SideQuestionEvent = {
+  kind: 'side_question';
+  /** App session id the question was asked beside. */
+  sessionId: string;
+  sideQuestionId: string;
+  phase: 'started' | 'delta' | 'done' | 'error' | 'dismissed';
+  /** Delta only: the next piece of the answer. */
+  text?: string;
+  /** Error only. */
+  error?: string;
+  /** started, done, and error when a row exists: the whole row. */
+  sideQuestion?: SideQuestion;
+  /** ISO timestamp, when the server sent it. */
+  timestamp: string;
 };

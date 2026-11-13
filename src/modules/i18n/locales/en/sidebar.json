@@ -39,6 +39,8 @@
     "clearSelection": "Clear",
     "deleteSelected_one": "Delete {{count}} session",
     "deleteSelected_other": "Delete {{count}} sessions",
+    "expandForks": "Expand forks of {{session}}",
+    "collapseForks": "Collapse forks of {{session}}",
     "pinSession": "Pin session",
     "unpinSession": "Unpin session",
     "pinned": "Pinned",
@@ -55,7 +57,8 @@
     "copyIdLoading": "Loading {{provider}} session ID…",
     "copyIdCopied": "{{provider}} session ID copied",
     "copyIdFailed": "Couldn't copy {{provider}} session ID",
-    "copyIdUnavailable": "{{provider}} session ID unavailable"
+    "copyIdUnavailable": "{{provider}} session ID unavailable",
+    "archiveSession": "Archive session"
   },
   "tooltips": {
     "viewEnvironments": "View Environments",
@@ -203,6 +206,8 @@
     "archiveSessions_one": "Archive {{count}} session",
     "archiveSessions_other": "Archive {{count}} sessions",
     "archiveSessionsNotice_one": "Archive keeps the session out of the active list while preserving its history.",
-    "archiveSessionsNotice_other": "Archive keeps the sessions out of the active list while preserving their history."
+    "archiveSessionsNotice_other": "Archive keeps the sessions out of the active list while preserving their history.",
+    "confirmDeleteSession": "Permanently delete",
+    "deleteSessionNotice": "The session and its history will be removed. This cannot be undone."
   }
 }

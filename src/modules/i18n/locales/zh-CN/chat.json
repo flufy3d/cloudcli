@@ -311,6 +311,13 @@
         "queue": "排队",
         "sendAnyway": "仍要发送"
       }
+    },
+    "steer": {
+      "label": "插话",
+      "sending": "发送中…",
+      "willRead": "{{provider}} 会在下一个工具调用边界读取",
+      "attachments": "{{count}} 个附件",
+      "button": "插入正在运行的 {{provider}} 回合"
     }
   },
   "projectSelection": {
@@ -346,6 +353,14 @@
     "permissionCycleHint": "在输入框中按 Tab 切换模式",
     "permissionTriggerLabel": "{{mode}}：{{heading}}"
   },
+  "sideQuestion": {
+    "label": "旁路提问 · 不进入会话",
+    "pending": "正在旁路作答",
+    "failed": "旁路提问失败了。",
+    "dismiss": "移除",
+    "unsupported": "该引擎不支持旁路提问。",
+    "noSession": "旁路提问需要一个已有的会话；这个会话还没有开始。"
+  },
   "export": {
     "trigger": "导出对话",
     "heading": "导出为",
@@ -361,7 +376,8 @@
     "json": {
       "label": "JSON (.json)",
       "description": "全部消息原样输出，供工具使用。"
-    }
+    },
+    "includeSideQuestions": "同时导出旁路提问"
   },
   "schedule": {
     "trigger": "定时发送这条消息",
@@ -377,7 +393,9 @@
     "pending": "将于 {{when}} 发送",
     "failed": "未发送 — {{reason}}",
     "cancel": "取消定时消息",
-    "dismiss": "关闭失败提示"
+    "dismiss": "关闭失败提示",
+    "recall": "撤回编辑",
+    "recallFailed": "无法撤回定时消息，请重试。"
   },
   "cost": {
     "readingUsage": "正在读取会话用量…",
@@ -485,5 +503,11 @@
     "customModelsOnlyHint": "在所有模型选择器中隐藏 {{provider}} 的内置模型，并将您的第一个模型设为默认模型。在您添加模型之前，内置模型仍会显示。",
     "builtInModelsHidden": "开启“仅使用我的模型”时，这些模型不会出现在模型选择器中。",
     "customModelsOnlyFailed": "无法更改此设置。"
+  },
+  "agentPrompts": {
+    "needsInput": "{{agent}} 需要你的输入",
+    "dismiss": "拒绝",
+    "alwaysAllow": "始终允许",
+    "alwaysAllowCovers": "“始终允许”适用于"
   }
 }

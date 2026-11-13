@@ -1,6 +1,6 @@
 import { memo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
-import { Check, CheckSquare, Edit2, GitBranch, Loader2, MoreHorizontal, Pin, PinOff, Square, Trash2, X } from 'lucide-react';
+import { Archive, Check, CheckSquare, Edit2, GitBranch, Loader2, MoreHorizontal, Pin, PinOff, Square, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 import { Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
@@ -8,6 +8,7 @@ import { cn, getSessionWorktreeLabel } from '@/shared/utils';
 import type { LLMProvider, Project, ProjectSession, SessionWithProvider } from '@/shared/types';
 import { createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
+import { useSessionForkingProviders } from '@/shared/hooks/useProviderCapabilities';
 import { getProviderDisplayName } from '@/shared/providerDisplay';
 import { useProviderSessionIdCopy } from '@/modules/sidebar/hooks/useProviderSessionIdCopy';
 import SessionOptions from '@/modules/sidebar/SessionOptions';
@@ -31,6 +32,8 @@ type SidebarSessionItemProps = {
   onProjectSelect: (project: Project) => void;
   onSessionSelect: (session: SessionWithProvider, projectName: string) => void;
   onDeleteSession: (sessionId: string, sessionTitle: string) => void;
+  /** Archives the session right away; it stays restorable from the archive list. */
+  onArchiveSession: (sessionId: string) => void;
   /** Branches this session into an independent one; absent when its provider cannot. */
   onForkSession?: (session: SessionWithProvider) => void;
   onSetSessionPinned?: (sessionId: string, isPinned: boolean) => void;
@@ -61,6 +64,7 @@ function SidebarSessionItem({
   onProjectSelect,
   onSessionSelect,
   onDeleteSession,
+  onArchiveSession,
   onForkSession,
   onSetSessionPinned,
   isSelecting,
@@ -157,6 +161,11 @@ function SidebarSessionItem({
     }
   };
 
+  // The mobile sheet follows the same capability and running-session rules as
+  // the desktop SessionOptions menu. The capability request is shared by rows.
+  const forkableProviders = useSessionForkingProviders();
+  const canForkMobile = Boolean(onForkSession) && forkableProviders.has(session.__provider) && !isProcessing;
+
   const startMobileRename = () => {
     onStartEditingSession(project.projectId, session.id, sessionView.sessionName);
   };
@@ -237,6 +246,12 @@ function SidebarSessionItem({
                 <div
                   className="min-w-0 flex-1 truncate text-sm font-normal text-foreground"
                   title={sessionView.sessionName}
+                  onDoubleClick={(event) => {
+                    if (isSelecting || isEditing || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onStartEditingSession(project.projectId, session.id, sessionView.sessionName);
+                  }}
                 >
                   {sessionView.sessionName}
                 </div>
@@ -355,6 +370,23 @@ function SidebarSessionItem({
                   <span className="text-sm font-medium">{t('sessions.renameSession')}</span>
                 </button>
 
+                {canForkMobile && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileOptionsOpen(false);
+                      onForkSession?.(session);
+                    }}
+                    className="flex min-h-12 w-full items-center gap-3 rounded-xl border border-border bg-muted/35 px-4 py-3 text-left text-foreground transition-colors active:bg-muted"
+                  >
+                    <GitBranch className="h-5 w-5 flex-shrink-0" />
+                    <span>
+                      <span className="block text-sm font-medium">{t('sessions.forkSession')}</span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">{t('sessions.forkSessionDescription')}</span>
+                    </span>
+                  </button>
+                )}
+
                 {onSetSessionPinned && (
                   <button
                     type="button"
@@ -397,6 +429,21 @@ function SidebarSessionItem({
                   </span>
                 </button>
 
+                {!isProcessing && onArchiveSession && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileOptionsOpen(false);
+                      // 与桌面菜单同语义:归档立即软删入回收站,不经过删除确认流。
+                      onArchiveSession(session.id);
+                    }}
+                    className="flex min-h-12 w-full items-center gap-3 rounded-xl border border-border bg-muted/35 px-4 py-3 text-left text-foreground transition-colors active:bg-muted"
+                  >
+                    <Archive className="h-5 w-5 flex-shrink-0" />
+                    <span className="text-sm font-medium">{t('sessions.archiveSession')}</span>
+                  </button>
+                )}
+
                 {!isProcessing && (
                   <button
                     type="button"
@@ -407,7 +454,7 @@ function SidebarSessionItem({
                     className="flex min-h-12 w-full items-center gap-3 rounded-xl px-4 py-3 text-left text-red-600 transition-colors active:bg-red-500/10 dark:text-red-400"
                   >
                     <Trash2 className="h-5 w-5 flex-shrink-0" />
-                    <span className="text-sm font-medium">{t('sessions.archiveOrDelete')}</span>
+                    <span className="text-sm font-medium">{t('sessions.deleteSession')}</span>
                   </button>
                 )}
               </div>
@@ -460,6 +507,7 @@ function SidebarSessionItem({
             }
             if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
             event.preventDefault();
+            if (event.detail > 1) return;
             onSessionSelect(session, project.projectId);
           }}
           onKeyDown={isSelecting ? handleSelectionKeyDown : undefined}
@@ -480,6 +528,12 @@ function SidebarSessionItem({
                 <div
                   className="min-w-0 flex-1 truncate text-sm font-normal text-foreground"
                   title={sessionView.sessionName}
+                  onDoubleClick={(event) => {
+                    if (isSelecting || isEditing || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onStartEditingSession(project.projectId, session.id, sessionView.sessionName);
+                  }}
                 >
                   {sessionView.sessionName}
                 </div>
@@ -530,6 +584,7 @@ function SidebarSessionItem({
             onCancelEditingSession={onCancelEditingSession}
             onSaveEditingSession={onSaveEditingSession}
             onDeleteSession={onDeleteSession}
+            onArchiveSession={onArchiveSession}
             onFork={onForkSession ? () => onForkSession(session) : undefined}
             isPinned={isPinned}
             onSetPinned={onSetSessionPinned}

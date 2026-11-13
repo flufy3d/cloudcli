@@ -62,7 +62,8 @@ const PROVIDER_SKILL_PATHS: Record<SkillsProvider, string> = {
   claude: '~/.claude/skills/<skill-name>/SKILL.md',
   codex: '~/.agents/skills/<skill-name>/SKILL.md',
   cursor: '~/.cursor/skills/<skill-name>/SKILL.md',
-  // OpenCode keeps its native global skills in its own config directory.
+  // OpenCode uploads land in its own canonical user skill directory; it also
+  // reads the shared .claude/.agents skill folders (see opencode-skills.provider).
   opencode: '~/.config/opencode/skills/<skill-name>/SKILL.md',
   // ZCode reads its native ~/.zcode/skills directory first, then the shared
   // .agents/skills ecosystem; uploads still target .agents/skills.
@@ -515,7 +516,11 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
           <FileCode2 className="h-4 w-4" strokeWidth={1.7} />
         </div>
         <div className="min-w-0 space-y-1">
-          <h3 className="text-lg font-medium text-foreground">{t('tabs.skills', { defaultValue: 'Skills' })}</h3>
+          <h3 className="text-lg font-medium text-foreground">
+            {selectedProvider === 'opencode'
+              ? t('tabs.sharedSkills', { defaultValue: 'Shared Skills' })
+              : t('tabs.skills')}
+          </h3>
           <p className="text-sm text-muted-foreground">
             {t('skillsPage.description', { provider: providerName })}
           </p>

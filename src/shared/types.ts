@@ -82,6 +82,9 @@ export type {
   SessionRemovedEvent,
   SessionUpsertedEvent,
   SessionUpsertedProject,
+  SideQuestion,
+  SideQuestionEvent,
+  SideQuestionStatus,
   SubagentActivity,
   SubagentInfo,
   TaskUsage,
@@ -285,6 +288,11 @@ export type ProjectSession = {
   // Tags the session with the owning project's DB `projectId` so UI handlers
   // (session switching, sidebar focus, etc.) can match against selectedProject.
   __projectId?: string;
+  // Canonical app id of the fork source; absent/null for unrelated sessions.
+  forkedFromSessionId?: string | null;
+  // Ancestor context for the Projects tree only; excluded from pagination and
+  // the Conversations feed (upstream #1621).
+  forkAncestors?: ProjectSession[];
   [key: string]: unknown;
 }
 
@@ -603,6 +611,13 @@ export type ChatMessage = {
    * a memory-derived claim stays traceable.
    */
   memoryCitations?: MemoryCitation[];
+  /**
+   * Set on the two rows spliced in for one side question (upstream #1673):
+   * the question row and its answer row carry the same marker, so the
+   * transcript draws them as one tinted aside and never groups them with the
+   * session's own rows. Absent on every row the session itself owns.
+   */
+  sideQuestion?: { sideQuestionId: string; sessionId: string; status: string };
 }
 
 /** The user's locally persisted Claude preferences (default permission mode and allowed/disallowed tool lists, plus project sort order) read from and written back to browser storage. */
@@ -776,6 +791,96 @@ export type BackgroundSendChoice = 'send' | 'queue' | 'cancel';
 export type BackgroundSendPrompt = {
   work: string[];
 };
+
+//----------------- SETTINGS CLI VERSION ------------
+
+/** One provider CLI's version state from `GET /api/providers/:provider/cli`: the installed version, the newest npm release (null when the CLI is not on npm or the registry did not answer), the command the update action runs, or why there is none ('bundled': it ships with CloudCLI; 'platform': the hosting platform manages it), whether an update run is going on, and the most recent finished run since the server started. A page that sees `updateInProgress` polls until it turns false and then shows `lastUpdate` as that run's result. Loaded by useProviderCliVersion and rendered by the settings account view. */
+export type ProviderCliStatus = {
+  provider: LLMProvider;
+  installed: boolean;
+  installedVersion: string | null;
+  latestVersion: string | null;
+  updateAvailable: boolean;
+  updateCommand: string | null;
+  updateUnavailableReason: 'bundled' | 'platform' | null;
+  updateInProgress: boolean;
+  lastUpdate: ProviderCliUpdateResult | null;
+};
+
+/** What one run of a CLI's own updater did, from `POST /api/providers/:provider/cli/update`: the command, its exit code (null when it could not start or timed out), the tail of its output, the version before and after, and why it failed (null when neither the exit code nor the output reports a failure). Returned by useProviderCliVersion and rendered by the settings account view. */
+export type ProviderCliUpdateResult = {
+  provider: LLMProvider;
+  command: string;
+  exitCode: number | null;
+  output: string;
+  previousVersion: string | null;
+  installedVersion: string | null;
+  failure: 'permission_denied' | 'timed_out' | 'failed' | null;
+};
+
+/** Viewport-relative placement box (right/bottom offsets plus max height and width) computed for a composer popover so the model and permission menus stay inside the window. */
+//----------------- SETTINGS NOTIFICATION WEBHOOK ------------
+
+/** Why a webhook delivery failed, exactly as the server stores it; the webhook card maps each value to a localized reason. */
+export type NotificationWebhookDeliveryError =
+  | 'invalidUrl'
+  | 'insecureUrl'
+  | 'blockedAddress'
+  | 'timeout'
+  | 'redirect'
+  | 'httpStatus'
+  | 'network'
+  | 'tls'
+  | 'dropped';
+
+/** The outcome of the most recent webhook event after its last attempt, as the server records it; `status` is the HTTP status when the receiver answered, `type` the event type (e.g. run.completed, webhook.test). */
+export type NotificationWebhookDelivery = {
+  eventId: string;
+  type: string;
+  ok: boolean;
+  status: number | null;
+  error: NotificationWebhookDeliveryError | null;
+  attempts: number;
+  at: string;
+};
+
+/** The saved webhook destination as the notifications API returns it. The signing secret is never part of it, only whether one is set; `configured` is false until a URL has been saved. */
+export type NotificationWebhookState = {
+  configured: boolean;
+  enabled: boolean;
+  url: string;
+  allowHttp: boolean;
+  hasSecret: boolean;
+  lastDelivery: NotificationWebhookDelivery | null;
+};
+
+/**
+ * A message sent into a running turn (steering) that the agent has not read
+ * yet. The composer shows it as a card until its echo reaches the transcript;
+ * `status` is `sending` until the server confirms it reached the turn, then
+ * `accepted`. Local to the tab that sent it.
+ */
+export type PendingSteer = {
+  /** The UUID the message was sent with; its transcript row and live echo carry it too. */
+  messageId: string;
+  /** The session whose turn it was sent into. */
+  sessionKey: string;
+  content: string;
+  /** Browser files kept so the message can go back into the composer intact. */
+  attachments: File[];
+  /** Descriptors uploaded before it was sent, reused if it has to be queued instead. */
+  uploadedAttachments: unknown[];
+  status: 'sending' | 'accepted';
+};
+
+/**
+ * What became of a steered message, as the realtime handler reports it to the
+ * composer: `accepted` (the server put it into the turn), `refused` (the turn
+ * had already ended, so it should go out as the next turn) or `delivered` (the
+ * agent read it; its echo is in the transcript). `delivered` is reported for
+ * every live user message, so the composer matches it against its own ids.
+ */
+export type SteerOutcome = 'accepted' | 'refused' | 'delivered';
 
 /** Viewport-relative placement box (right/bottom offsets plus max height and width) computed for a composer popover so the model and permission menus stay inside the window. */
 export type ComposerMenuAnchor = {
@@ -1315,6 +1420,8 @@ export type ProviderAuthSubscriptionOverride = {
 export type ProviderAuthStatus = {
   /** Whether the CLI binary is installed on this host. */
   installed: boolean;
+  /** Version of the CLI the provider runs, as its `--version` printed it, or null when it is not installed or printed no version. Present once the server has answered. */
+  installedVersion?: string | null;
   authenticated: boolean;
   email: string | null;
   method: string | null;
@@ -1500,6 +1607,8 @@ export type SessionRowActions = {
   onCancelEditingSession: () => void;
   onSaveEditingSession: (projectId: string, sessionId: string, summary: string, provider: LLMProvider) => void;
   onDeleteSession: (sessionId: string, sessionTitle: string) => void;
+  /** Archives the session right away; it stays restorable from the archive list. */
+  onArchiveSession: (sessionId: string) => void;
   /** Branches a session into an independent one. Rows hide it for providers that cannot. */
   onForkSession?: (session: SessionWithProvider) => void;
   /** Pins or unpins a session; pinned sessions sit at the top of every sidebar list. */

@@ -725,6 +725,11 @@ export function useChatProviderState({
   // here). Server matrix wins once loaded; until then assume supported, since
   // the primary providers (claude, codex) implement both.
   const supportsMessageEditing = providerCapabilities?.[provider]?.supportsMessageEditing ?? true;
+  const supportsSteering = providerCapabilities?.[provider]?.supportsSteering ?? false;
+  // Side questions default to false, unlike the gates above: asking one
+  // spawns a provider process, so the button only appears once the server
+  // matrix confirms the runtime can take it.
+  const supportsSideQuestions = providerCapabilities?.[provider]?.supportsSideQuestions ?? false;
   const supportsSessionForking = providerCapabilities?.[provider]?.supportsSessionForking ?? true;
   // Default false so an unloaded matrix never claims files will be reverted;
   // OpenCode is the one provider whose edit restores snapshot files.
@@ -870,6 +875,8 @@ export function useChatProviderState({
     provider,
     setProvider,
     supportsMessageEditing,
+    supportsSteering,
+    supportsSideQuestions,
     supportsSessionForking,
     editRevertsFiles,
     providerModels,

@@ -39,6 +39,7 @@
  * through `applyServerEvent`, history through the fetch methods.
  */
 
+import { sideQuestionStore } from '@/modules/chat/hooks/useSideQuestions';
 import { isVolatileMessageId } from '@shared/protocol/messageKinds';
 import { authenticatedFetch } from '@/shared/api';
 import type { ActiveBackgroundTask, LLMProvider, NormalizedMessage, ServerEvent } from '@/shared/types';
@@ -232,6 +233,13 @@ export const requestSessionHistoryPage: SessionPageFetcher = async (sessionId, o
     const body = await response.json();
     const data = body?.data ?? body;
     const messages: NormalizedMessage[] = Array.isArray(data.messages) ? data.messages : [];
+
+    // The server sends the session's whole side-question list on every page
+    // (not just the page's own rows), so the store is replaced here rather
+    // than merged, regardless of which page this request fetched.
+    if (Array.isArray(data.sideQuestions)) {
+      sideQuestionStore.replaceForSession(sessionId, data.sideQuestions);
+    }
 
     return {
       messages,
@@ -802,6 +810,8 @@ const SERVER_EVENT_ROUTES: Record<string, { flushesStream: boolean; action: Serv
   loading_progress: { flushesStream: false, action: 'none' },
   // Owned by useQueuedMessageSync.
   queued_message_dispatched: { flushesStream: false, action: 'none' },
+  // Owned by useScheduledMessages.
+  scheduled_messages_changed: { flushesStream: false, action: 'none' },
 };
 
 /**

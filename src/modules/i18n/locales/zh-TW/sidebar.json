@@ -39,6 +39,8 @@
     "clearSelection": "清除選取",
     "deleteSelected_one": "刪除 {{count}} 個工作階段",
     "deleteSelected_other": "刪除 {{count}} 個工作階段",
+    "expandForks": "展開 {{session}} 的分支",
+    "collapseForks": "收合 {{session}} 的分支",
     "pinSession": "置頂工作階段",
     "unpinSession": "取消置頂",
     "pinned": "已置頂",
@@ -55,7 +57,8 @@
     "copyIdLoading": "正在取得 {{provider}} 工作階段 ID…",
     "copyIdCopied": "已複製 {{provider}} 工作階段 ID",
     "copyIdFailed": "無法複製 {{provider}} 工作階段 ID",
-    "copyIdUnavailable": "{{provider}} 工作階段 ID 無法使用"
+    "copyIdUnavailable": "{{provider}} 工作階段 ID 無法使用",
+    "archiveSession": "歸檔會話"
   },
   "tooltips": {
     "viewEnvironments": "查看環境",
@@ -193,7 +196,7 @@
   },
   "archived": {
     "title": "封存",
-    "restoreHint": "隨時可以還原這些內容",
+    "restoreHint": "封存不會刪除資料，隨時可以還原",
     "loadingTitle": "封存載入中...",
     "loadingDescription": "正在取得已隱藏的工作區和工作階段，稍後可還原。",
     "emptyTitle": "沒有封存內容",

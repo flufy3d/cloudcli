@@ -84,10 +84,13 @@ import type {
   MessageKind,
   NormalizedMessage,
   ServerEventKind,
+  SessionForkAncestor,
   ScheduledJobsChangedEvent,
   SessionRemovedEvent,
   SessionUpsertedEvent,
   SessionUpsertedProject,
+  SideQuestion,
+  SideQuestionEvent,
   SubagentActivity,
   SubagentInfo,
   TaskUsage,
@@ -108,10 +111,13 @@ export type {
   MessageKind,
   NormalizedMessage,
   ServerEventKind,
+  SessionForkAncestor,
   ScheduledJobsChangedEvent,
   SessionRemovedEvent,
   SessionUpsertedEvent,
   SessionUpsertedProject,
+  SideQuestion,
+  SideQuestionEvent,
   SubagentActivity,
   SubagentInfo,
   TaskUsage,
@@ -864,6 +870,12 @@ export type ProviderAuthSubscriptionOverride = {
 export type ProviderAuthStatus = {
   installed: boolean;
   provider: LLMProvider;
+  /**
+   * Version of the CLI the provider runs, as its `--version` printed it
+   * (`2.1.295`, `2026.07.20-8cc9c0b`), or null when it is not installed or
+   * printed no version.
+   */
+  installedVersion?: string | null;
   authenticated: boolean;
   email: string | null;
   method: string | null;
@@ -892,6 +904,18 @@ export type ProviderAuthStatus = {
  * This intentionally excludes the raw credential secret while still exposing
  * metadata needed for UI rendering and management operations.
  */
+
+/**
+ * What one installed CLI's `--version` (or equivalent) answered, used by the
+ * Settings page's CLI-version card and its updater. `version` is null when the
+ * command did not exit 0 or printed nothing that looks like a version.
+ */
+export type CliVersionProbe = {
+  installed: boolean;
+  exitCode: number | null;
+  version: string | null;
+};
+
 export type CredentialPublicRow = {
   id: number;
   credential_name: string;
@@ -2049,4 +2073,82 @@ export type SessionPurgeResult = {
   deleted: { sessionId: string; bytes: number }[];
   kept: { sessionId: string; reason: 'running' | 'referenced' }[];
   failed: { sessionId?: string; code: string }[];
+};
+
+//----------------- SIDE QUESTION RUNTIME TYPES ------------
+/**
+ * Request payload for asking a side question on the provider runtime.
+ *
+ * `appSessionId` is the user-facing session being asked about; `providerSessionId`
+ * is the provider's own native session id needed for context (or null). `projectPath`
+ * is the working directory for read-only tools. `model` is what the client asked for.
+ */
+export type SideQuestionRequest = {
+  appSessionId: string;
+  providerSessionId: string | null;
+  projectPath: string | null;
+  question: string;
+  /** What the client asked for. */
+  model: string | null;
+  signal: AbortSignal;
+};
+
+/**
+ * Output callback for receiving streamed text of a side question answer.
+ *
+ * Implementations call `delta(text)` each time a piece of the answer arrives.
+ */
+export type SideQuestionSink = { delta(text: string): void };
+
+/**
+ * Result of asking a side question on the provider runtime.
+ *
+ * `status: 'done'` carries the complete final answer; `status: 'error'` carries
+ * what text was delivered before failure plus the error message.
+ */
+export type SideQuestionOutcome =
+  | { status: 'done'; answer: string }
+  | { status: 'error'; error: string; answer: string };
+
+/**
+ * Side-question capability of a provider runtime.
+ *
+ * The service layer calls this method on the runtime to ask a question on the
+ * side while a session is active, using whatever path the provider's own
+ * runtime implements. It never rejects: all failures are returned as error
+ * outcomes.
+ */
+export type SideQuestionRuntime = {
+  askSideQuestion(provider: LLMProvider, request: SideQuestionRequest, sink: SideQuestionSink): Promise<SideQuestionOutcome>;
+};
+
+/**
+ * The one place a side question's mutable state lives.
+ *
+ * It holds `SideQuestion` objects directly, so the service, the history
+ * route and the websocket handler all read and write the same object and no
+ * row-to-wire mapping is needed. Side questions are deliberately in memory
+ * only: a CloudCLI restart is a clean slate, and `createdAt`/`finishedAt` are
+ * ISO strings, not database timestamps. Used by
+ * `server/modules/providers/services/side-questions.store.ts` (the only
+ * implementation) and `side-questions.service.ts` (the only consumer).
+ */
+export type InMemorySideQuestionsStore = {
+  /** Inserts a fresh question as `running` and returns it. */
+  create(input: {
+    id: string;
+    sessionId: string;
+    question: string;
+    model: string | null;
+  }): SideQuestion;
+  /** The whole question, whatever its status, or null once deleted. */
+  getById(id: string): SideQuestion | null;
+  /** Appends streamed text to the answer; a no-op once deleted. */
+  appendAnswer(id: string, text: string): void;
+  /** Settles a running question; a no-op once deleted. */
+  finish(id: string, outcome: SideQuestionOutcome): void;
+  /** The session's questions, oldest first. */
+  listForSession(sessionId: string): SideQuestion[];
+  /** Deletes one question of one session. Reports whether anything went. */
+  delete(sessionId: string, id: string): boolean;
 };
