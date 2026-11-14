@@ -16,7 +16,6 @@ import type {
 import {
   buildDefaultProviderCurrentActiveModel,
   createStaleWhileRefreshValue,
-  readJsonRecord,
   readObjectRecord,
   readOptionalString,
   stripAnsiSequences,
@@ -25,6 +24,7 @@ import {
 
 import {
   getOpenCodeDatabasePath,
+  readOpenCodeModelCatalogEntries,
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
 import { tryResolveOpenCodeEnginePath } from './opencode-engine-path.js';
@@ -263,53 +263,14 @@ type OpenCodeCatalogModelEntry = {
   reasoning_options?: Array<{ type?: string; values?: string[] }>;
 };
 
-/** `kv` keys of the cached models.dev catalog, newest layout first (v2.2 renamed it). */
-const OPENCODE_CATALOG_KV_KEYS = ['models-dev:v2:catalog', 'models-dev:catalog'];
-
 /**
- * Reads the models.dev catalog OpenCode caches in its database (`kv` key
- * `models-dev:v2:catalog`, `models-dev:catalog` before v2.2) and maps
- * `<family>/<modelId>` to the display name and reasoning-effort values it
- * records for each model.
+ * Narrows the shared catalog records to the fields the model picker reads.
  *
- * This is where the reasoning-variant data lives in v2 — `opencode models`
- * prints ids only, but this catalog carries the effort tiers per model and
- * is refreshed by the CLI itself. A missing database, missing key, or a
- * `body` encoded as an embedded JSON string all degrade to an empty map, so
- * options fall back to synthesized labels without effort variants.
+ * Consumer: `buildOpenCodeModelOption` only.
  */
-const readOpenCodeCatalogEntries = (): Map<string, OpenCodeCatalogModelEntry> => {
-  const entries = new Map<string, OpenCodeCatalogModelEntry>();
-  try {
-    const db = new Database(getOpenCodeDatabasePath(), { readonly: true, fileMustExist: true });
-    try {
-      const readKey = db.prepare('SELECT value FROM kv WHERE key = ?');
-      const row = OPENCODE_CATALOG_KV_KEYS
-        .map((key) => readKey.get(key) as { value?: string } | undefined)
-        .find((candidate) => candidate?.value);
-      const parsed = readJsonRecord(row?.value);
-      let body: unknown = parsed?.body;
-      if (typeof body === 'string') {
-        body = JSON.parse(body);
-      }
-      const families = readObjectRecord(body) ?? {};
-      for (const [familyId, family] of Object.entries(families)) {
-        const models = readObjectRecord(readObjectRecord(family)?.models) ?? {};
-        for (const [modelId, model] of Object.entries(models)) {
-          const record = readObjectRecord(model);
-          if (record) {
-            entries.set(`${familyId}/${modelId}`, record as OpenCodeCatalogModelEntry);
-          }
-        }
-      }
-    } finally {
-      db.close();
-    }
-  } catch {
-    // No database or no cached catalog: options fall back to synthesis.
-  }
-  return entries;
-};
+const readOpenCodeCatalogEntries = (): Map<string, OpenCodeCatalogModelEntry> => (
+  new Map(readOpenCodeModelCatalogEntries())
+);
 
 const buildOpenCodeModelOption = (
   value: string,

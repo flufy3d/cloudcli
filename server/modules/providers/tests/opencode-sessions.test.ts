@@ -774,6 +774,108 @@ test('OpenCode sessions provider reads v2 session_message history and token colu
   }
 });
 
+test('OpenCode context windows prefer the database catalog over the legacy model file', { concurrency: false }, async () => {
+  // The CLI refreshes models.dev data inside its own `kv` table, while
+  // `~/.cache/opencode/models.json` is a legacy file that can miss newer
+  // account models entirely (`opencode-go/beam-free` on a real install).
+  // Without the database catalog those sessions show a token count but no
+  // context-window percentage.
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-window-'));
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const dataDir = path.join(tempRoot, '.local', 'share', 'opencode');
+    await mkdir(dataDir, { recursive: true });
+    // A conflicting stale file value proves the database reading wins.
+    const cacheDir = path.join(tempRoot, '.cache', 'opencode');
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(
+      path.join(cacheDir, 'models.json'),
+      JSON.stringify({
+        'opencode-go': { models: { 'beam-free': { limit: { context: 200_000 } } } },
+      }),
+    );
+
+    const db = new Database(path.join(dataDir, 'opencode.db'));
+    try {
+      db.exec(`
+        CREATE TABLE session_v2 (
+          id text PRIMARY KEY,
+          project_id text NOT NULL,
+          slug text NOT NULL,
+          directory text NOT NULL,
+          title text,
+          version text NOT NULL,
+          model text,
+          tokens_input integer DEFAULT 0 NOT NULL,
+          tokens_output integer DEFAULT 0 NOT NULL,
+          tokens_reasoning integer DEFAULT 0 NOT NULL,
+          tokens_cache_read integer DEFAULT 0 NOT NULL,
+          tokens_cache_write integer DEFAULT 0 NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        CREATE TABLE session_message (
+          id text PRIMARY KEY,
+          session_id text NOT NULL,
+          type text NOT NULL,
+          seq integer NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL,
+          data text NOT NULL
+        );
+        CREATE TABLE kv (
+          key text PRIMARY KEY,
+          value text NOT NULL,
+          time_created integer NOT NULL,
+          time_updated integer NOT NULL
+        );
+        INSERT INTO session_v2 (
+          id, project_id, slug, directory, title, version, model,
+          time_created, time_updated
+        ) VALUES (
+          'ses_catalog', 'proj_1', 'catalog-session', '/tmp/proj', 'Catalog session', '2.2.0',
+          '{"id":"beam-free","providerID":"opencode-go"}', 1000, 2000
+        );
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+          ('msg_a', 'ses_catalog', 'assistant', 1, 1100, 1200, '{"time":{"created":1100},"model":{"id":"beam-free","providerID":"opencode-go"},"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":500,"write":0}},"content":[{"type":"text","text":"done"}]}');
+      `);
+      db.prepare('INSERT INTO kv (key, value, time_created, time_updated) VALUES (?, ?, ?, ?)').run(
+        'models-dev:catalog',
+        JSON.stringify({
+          updatedAt: 1,
+          digest: 'd',
+          body: JSON.stringify({
+            'opencode-go': {
+              models: {
+                'beam-free': { name: 'Beam Free', limit: { context: 1_048_576 } },
+              },
+            },
+          }),
+        }),
+        1,
+        1,
+      );
+    } finally {
+      db.close();
+    }
+
+    const provider = new OpenCodeSessionsProvider();
+    const usage = await provider.getTokenUsage({
+      appSessionId: 'app-1',
+      nativeSessionId: 'ses_catalog',
+      jsonlPath: null,
+      projectPath: null,
+    });
+
+    assert.equal(usage.total, 1_048_576);
+    assert.equal(usage.used, 625);
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('persisted OpenCode text parts carry the row key the live stream publishes', { concurrency: false }, async () => {
   // A streamed bubble and its persisted row share no row id (the service
   // streams fragments of a row it never announces), so the client retires the

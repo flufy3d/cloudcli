@@ -44,6 +44,7 @@ import {
   readOpenCodeSessionModelKey,
   readOpenCodeSessionTokenTotals,
   readOpenCodeUsageMessageRows,
+  resolveOpenCodeCatalogContextWindow,
   resolveOpenCodeMessageLayout,
 } from './opencode-data-root.js';
 
@@ -95,15 +96,20 @@ export function readOpenCodeStepTokens(value: unknown): OpenCodeStepTokens | nul
 // ---------------------------
 
 /**
- * Context window for one `providerId/modelId` pair, read from OpenCode's model
- * cache (`~/.cache/opencode/models.json`, models.dev data with
- * `limit.context`).
+ * Context window for one `providerId/modelId` pair.
  *
- * The cache is multi-megabyte JSON that OpenCode rewrites on registry
- * refreshes, so the parsed window map is memoized by file identity (mtime +
- * size) and only re-read when that identity changes. Returns undefined when
- * the cache is missing, malformed, or carries no limit for the model — a
- * windowless reading simply shows no percentage.
+ * The running engine's own catalog (the models.dev copy in `opencode.db`'s
+ * `kv` table) is read first: it is refreshed by the CLI and carries models the
+ * legacy `~/.cache/opencode/models.json` file can lack outright — notably free
+ * account models such as `opencode-go/beam-free`. That file remains the
+ * fallback for installations whose database predates the catalog cache.
+ *
+ * The file is multi-megabyte JSON that OpenCode rewrites on registry
+ * refreshes, so its parsed window map is memoized by file identity (mtime +
+ * size) and only re-read when that identity changes; the database catalog is
+ * memoized separately by its own row identity. Returns undefined when neither
+ * source carries a limit for the model — a windowless reading simply shows no
+ * percentage.
  *
  * Consumers: opencode context usage (below) and the runtime (mid-turn budget
  * frames, which resolve the window once per run).
@@ -111,6 +117,11 @@ export function readOpenCodeStepTokens(value: unknown): OpenCodeStepTokens | nul
 let openCodeContextWindowCache: { key: string; windows: Map<string, number> } | null = null;
 
 export function resolveOpenCodeContextWindow(providerId: string, modelId: string): number | undefined {
+  const catalogWindow = resolveOpenCodeCatalogContextWindow(providerId, modelId);
+  if (catalogWindow) {
+    return catalogWindow;
+  }
+
   const cachePath = getOpenCodeModelsCachePath();
   let cacheKey: string;
   try {

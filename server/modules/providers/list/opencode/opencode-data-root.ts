@@ -20,6 +20,7 @@ import {
   readJsonRecord,
   readObjectRecord,
   readOptionalString,
+  readUsageNumber,
 } from '@/shared/utils.js';
 
 /**
@@ -363,6 +364,129 @@ export function readOpenCodeSessionModelKey(
     : [modelId, null];
   const resolvedProvider = providerId ?? inlineProvider;
   return resolvedProvider ? `${resolvedProvider}/${bare}` : bare;
+}
+
+const OPENCODE_MODEL_CATALOG_KV_KEYS = ['models-dev:v2:catalog', 'models-dev:catalog'] as const;
+
+type OpenCodeModelCatalogCache = {
+  /** Database, key, row version and byte size the parsed map came from. */
+  identity: string;
+  entries: Map<string, AnyRecord>;
+};
+
+let openCodeModelCatalogCache: OpenCodeModelCatalogCache | null = null;
+
+/**
+ * Parses one cached models.dev catalog payload into `<provider>/<model>`
+ * records.
+ *
+ * OpenCode stores the catalog under a `kv` value whose `body` is either the
+ * catalog object itself or a JSON string containing it (both layouts shipped).
+ * A malformed body contributes nothing rather than failing the reader.
+ */
+function parseOpenCodeModelCatalog(value: unknown): Map<string, AnyRecord> {
+  const entries = new Map<string, AnyRecord>();
+  const parsed = readJsonRecord(value);
+  let body: unknown = parsed?.body;
+  if (typeof body === 'string') {
+    try {
+      body = JSON.parse(body);
+    } catch {
+      return entries;
+    }
+  }
+
+  const families = readObjectRecord(body) ?? {};
+  for (const [familyId, family] of Object.entries(families)) {
+    const models = readObjectRecord(readObjectRecord(family)?.models) ?? {};
+    for (const [modelId, model] of Object.entries(models)) {
+      const record = readObjectRecord(model);
+      if (record) {
+        entries.set(`${familyId}/${modelId}`, record);
+      }
+    }
+  }
+  return entries;
+}
+
+/**
+ * Reads the models.dev catalog OpenCode caches in its own database (`kv` key
+ * `models-dev:v2:catalog`, or `models-dev:catalog` before v2.2), flattened to
+ * `<providerID>/<modelID>` records.
+ *
+ * This is the catalog the running engine actually refreshes, so it is the
+ * authoritative source for data the legacy `~/.cache/opencode/models.json`
+ * file may be missing entirely — notably free account models such as
+ * `opencode-go/beam-free`. The parsed map is memoized by the row's identity
+ * (database path, key, `time_updated` when the schema has it, byte size) and
+ * re-parsed only when the CLI rewrites the catalog.
+ *
+ * Consumers: opencode models (display names and effort tiers) and opencode
+ * context usage (a model's context window).
+ */
+export function readOpenCodeModelCatalogEntries(): Map<string, AnyRecord> {
+  const databasePath = getOpenCodeDatabasePath();
+  let db: SqliteDatabase;
+  try {
+    db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  } catch {
+    return new Map();
+  }
+
+  try {
+    const hasCatalogTable = Boolean(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'kv'",
+    ).get());
+    if (!hasCatalogTable) {
+      return new Map();
+    }
+
+    const columns = db.prepare('PRAGMA table_info(kv)').all() as Array<{ name?: string }>;
+    const hasUpdatedAt = columns.some((column) => column.name === 'time_updated');
+    const placeholders = OPENCODE_MODEL_CATALOG_KV_KEYS.map(() => '?').join(', ');
+    const identityRows = db.prepare(
+      hasUpdatedAt
+        ? `SELECT key, time_updated AS version, length(value) AS size FROM kv WHERE key IN (${placeholders})`
+        : `SELECT key, length(value) AS size FROM kv WHERE key IN (${placeholders})`,
+    ).all(...OPENCODE_MODEL_CATALOG_KV_KEYS) as Array<{ key: string; version?: number; size: number }>;
+    const identityRow = OPENCODE_MODEL_CATALOG_KV_KEYS
+      .map((key) => identityRows.find((candidate) => candidate.key === key))
+      .find((row): row is { key: string; version?: number; size: number } => Boolean(row));
+    if (!identityRow) {
+      return new Map();
+    }
+
+    const identity = `${databasePath}|${identityRow.key}|${identityRow.version ?? ''}|${identityRow.size}`;
+    if (openCodeModelCatalogCache?.identity === identity) {
+      return openCodeModelCatalogCache.entries;
+    }
+
+    const valueRow = db.prepare('SELECT value FROM kv WHERE key = ?').get(identityRow.key) as { value?: unknown } | undefined;
+    const entries = parseOpenCodeModelCatalog(valueRow?.value);
+    openCodeModelCatalogCache = { identity, entries };
+    return entries;
+  } catch {
+    // A missing or foreign database, an older layout without `kv`, or a
+    // malformed payload simply contributes no catalog.
+    return new Map();
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Resolves one model's context window from OpenCode's own cached catalog.
+ *
+ * Consumer: opencode context usage, which prefers this reading over the legacy
+ * `~/.cache/opencode/models.json` file.
+ */
+export function resolveOpenCodeCatalogContextWindow(
+  providerId: string,
+  modelId: string,
+): number | undefined {
+  const entry = readOpenCodeModelCatalogEntries().get(`${providerId}/${modelId}`);
+  const contextWindow = readUsageNumber(readObjectRecord(entry?.limit)?.context);
+  return contextWindow > 0 ? contextWindow : undefined;
 }
 
 export type OpenCodeUsageMessageRecord = {
