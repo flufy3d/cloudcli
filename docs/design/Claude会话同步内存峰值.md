@@ -1,7 +1,7 @@
 # Claude 会话同步内存峰值
 
 > 状态：已完成代码、定向测试、typecheck、lint 与 server 构建；未部署
-> 基准：2.21.0 / 2026-11-16
+> 基准：2.23.0 / 2026-11-16
 
 ## 现场
 
@@ -9,31 +9,31 @@
 
 ## 原因
 
-Claude 的三个回读入口都把整份 JSONL 读成字符串再 `split` / `JSON.parse`：
+Claude 的两个回读入口仍把整份 JSONL 读成字符串再 `split` / `JSON.parse`：
 
 - `claude-session-synchronizer.provider.ts` 的 `scanTranscript`：每次 watcher 触发同步都要扫描整份转录。
-- `claude-sessions.provider.ts` 的 `/token-usage`：`parseClaudeTranscriptEntries` 读取整份文件。
 - `claude-models.provider.ts` 的当前模型回读：同样先读整份文件再从后往前匹配。
 
-目标转录为 133 MB。实测整份读取一次峰值 452 MB，连续 5 次在 452 / 936 MB 之间摆动；watcher 以 6 秒间隔轮询，转录每次追加都会触发一次全量扫描。打开会话时 `/token-usage` 与 watcher 扫描可能同时发生，峰值超过 1 GB，PM2 随即终止进程。
+`/token-usage` 已在 2.23.0 的 `readClaudeTokenUsage` 中改为流式逐行读取，不在本修复范围。
+
+目标转录为 133 MB。实测整份读取一次峰值 452 MB，连续 5 次在 452 / 936 MB 之间摆动；watcher 以 6 秒间隔轮询，转录每次追加都会触发一次全量扫描。打开会话时当前模型回读与 watcher 扫描可能同时发生，峰值超过 1 GB，PM2 随即终止进程。
 
 ## 方案
 
-三个读取点统一改为 `readJsonlRecords` 流式逐行读取，只保留所需字段：
+两个读取点统一改为 `readJsonlRecords` 流式逐行读取，只保留所需字段：
 
 - 标题与最近活动时间：保留最后一个 `custom-title` / `ai-title` / `last-prompt` 和最新记录时间。
-- token usage：只收集 `assistant` 行的 usage/model 与 `system` / `compact_boundary` 行，再交给现有 `summarizeClaudeTokenUsage`。
 - 当前模型：流式读取并保留最后一个匹配的模型事件。
 
 解析结果、接口和数据库结构均不变。
 
 ## 验证
 
-- 复用 `server/modules/providers/tests/claude-sessions.test.ts` 中标题、活动时间与 usage 的回归用例。
-- 增加大体积转录用例：尾部包含大 tool result 时仍能同步标题与最近活动时间，token usage 仍取最后一条 assistant 或压缩边界。
+- 复用 `server/modules/providers/tests/claude-sessions.test.ts` 中标题、活动时间的回归用例。
+- 增加大体积转录用例：尾部包含大 tool result 时仍能同步标题与最近活动时间。
 - 运行 `npx tsx --tsconfig server/tsconfig.json --test server/modules/providers/tests/claude-sessions.test.ts`、`npx tsx --tsconfig server/tsconfig.json --test server/modules/providers/tests/claude-models.test.ts`、`npx tsc --noEmit -p server/tsconfig.json`、`npx oxlint <改动文件>`、`npm run build:server`。
-- 现场 133 MB 文件只读探针（同一进程）：整份读取每次峰值 452 MB，连续 5 次在 452 / 936 MB 之间摆动；改后 `synchronizeFile` 峰值 218 MB、`/token-usage` 峰值 298 MB，基线 130 MB，均只读同一份转录。
-- 定向结果：`claude-sessions.test.ts` 67 项、`claude-models.test.ts` 17 项全部通过；typecheck、lint 和 server 构建通过。
+- 现场 133 MB 文件只读探针（同一进程）：整份读取每次峰值 452 MB，连续 5 次在 452 / 936 MB 之间摆动；改后 `synchronizeFile` 峰值 218 MB，基线 130 MB。
+- 定向结果：`claude-sessions.test.ts` + `claude-models.test.ts` 共 82 项全部通过；typecheck、lint 和 server 构建通过。
 
 ## 风险与边界
 
