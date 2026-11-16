@@ -52,6 +52,9 @@ pids
 *.seed
 *.pid.lock
 
+# Local PM2 process config
+/ecosystem.config.cjs
+
 # Coverage directory used by tools like istanbul
 coverage/
 *.lcov
