@@ -926,8 +926,30 @@ type PersistedResumeCursor = {
   updatedAt: number;
 };
 
-const persistedResumeCursors = new Map<string, PersistedResumeCursor>();
-const lastWrittenResumeSeq = new Map<string, number>();
+type PersistedResumeCursorState = {
+  cursors: Map<string, PersistedResumeCursor>;
+  lastWrittenSeq: Map<string, number>;
+};
+
+/**
+ * Module-instance state is shared through `globalThis`: HMR and test module
+ * reloads create fresh copies of this module while old `pagehide` listeners
+ * stay registered. Independent maps let an old listener flush a pre-reset
+ * cursor over the current one, so every copy must read and write one map.
+ */
+type ResumeCursorGlobal = typeof globalThis & {
+  __cloudcliChatResumeCursorState?: PersistedResumeCursorState;
+};
+
+const resumeCursorGlobal = globalThis as ResumeCursorGlobal;
+const resumeCursorState = resumeCursorGlobal.__cloudcliChatResumeCursorState ?? {
+  cursors: new Map<string, PersistedResumeCursor>(),
+  lastWrittenSeq: new Map<string, number>(),
+};
+resumeCursorGlobal.__cloudcliChatResumeCursorState = resumeCursorState;
+
+const persistedResumeCursors = resumeCursorState.cursors;
+const lastWrittenResumeSeq = resumeCursorState.lastWrittenSeq;
 
 /** The gateway epoch a frame belongs to, or undefined on a legacy server. */
 function readFrameEpoch(event: ServerEvent): string | undefined {
@@ -972,10 +994,13 @@ function writePersistedResumeCursors(): void {
   try {
     if (typeof sessionStorage === 'undefined') return;
     // Another store instance in this tab may already have advanced a cursor
-    // (HMR, tests): never let a stale in-memory map roll it back.
+    // (HMR, tests): never let a stale in-memory map roll it back. A stored
+    // cursor from a different gateway epoch is a different sequence space and
+    // must not overwrite the reset this document already applied.
     for (const [sessionId, cursor] of parseStoredResumeCursors()) {
       const existing = persistedResumeCursors.get(sessionId);
-      if (!existing || cursor.updatedAt > existing.updatedAt) {
+      const sameEpoch = !existing?.epoch || !cursor.epoch || existing.epoch === cursor.epoch;
+      if (!existing || (sameEpoch && cursor.updatedAt > existing.updatedAt)) {
         persistedResumeCursors.set(sessionId, cursor);
       }
     }
