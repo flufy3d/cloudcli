@@ -69,6 +69,10 @@ import { getOpenCodeDatabasePath } from './opencode-data-root.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import { OpenCodeEventStream } from './opencode-event-stream.js';
 import { askOpenCodeSideQuestion } from './opencode-side-question.js';
+import {
+  applyEngineRename as applyEngineRenameToApp,
+  noteEngineSessionEvent,
+} from './opencode-engine-renames.js';
 import { OpenCodeInteractionBridge } from './opencode-interaction-bridge.js';
 import { buildOpenCodePromptFiles, buildOpenCodePromptText } from './opencode-prompt-attachments.js';
 import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker, type OpenCodeActiveRun, type OpenCodeRunSettlement } from './opencode-run-registry.js';
@@ -275,10 +279,50 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
     }
   };
 
+  /**
+   * The engine names a session itself (and renames it as the conversation
+   * evolves). The user's own rename stays final; otherwise the engine's title
+   * updates the app row and the sidebar. The websocket module pulls this
+   * module in, so load it on demand instead of closing the import cycle.
+   */
+  const applyEngineRename = async (event: OpenCodeEventEnvelope): Promise<void> => {
+    if (event.type !== 'session.renamed') {
+      return;
+    }
+    const data = readObjectRecord(event.data) ?? {};
+    const providerSessionId = readOptionalString(data.sessionID);
+    const title = readOptionalString(data.title);
+    if (!providerSessionId || !title) {
+      return;
+    }
+    // The engine stamps the rename with the event's own creation time, which
+    // is the value its session row carries from then on.
+    const engineUpdatedAtMs = typeof event.created === 'number' && Number.isFinite(event.created)
+      ? event.created
+      : Date.now();
+    const { applied } = applyEngineRenameToApp({ providerSessionId, title, engineUpdatedAtMs });
+    if (!applied) {
+      return;
+    }
+    const { broadcastSessionUpserted } = await import('@/modules/websocket/index.js');
+    await broadcastSessionUpserted(providerSessionId, { metadataOnly: true });
+  };
+
   eventStream.subscribe((event) => {
     adoptExternalExecution(event);
     bridge.handleEvent(event);
     runs.dispatch(event);
+    const data = readObjectRecord(event.data) ?? {};
+    const sessionId = readOptionalString(data.sessionID);
+    const created = typeof event.created === 'number' && Number.isFinite(event.created) ? event.created : null;
+    if (sessionId && created !== null && event.type !== 'session.renamed') {
+      noteEngineSessionEvent(sessionId, created);
+    }
+    // The engine's event feed is the runtime's lifeline, so a failure to
+    // apply one event must not take the process down with it.
+    void applyEngineRename(event).catch((error: unknown) => {
+      console.warn('[OpenCode] failed to apply the name the engine generated:', error);
+    });
   });
   eventStream.onReconnect(() => {
     void runs.reconcile({ getSession: (sessionId) => client?.getSession(sessionId)

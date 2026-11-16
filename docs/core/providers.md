@@ -246,6 +246,7 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 - `opencode-context-usage.ts`：上下文占用读取器（bridge 的 `step.ended` 令牌经 `OpenCodeTokenBudgetTracker` 变成实时 `token_budget` 帧；`/token-usage`、历史页与回合结束帧共用同一读数），语义与 v1/v2 布局差异见上方用量表。
 - **消息编辑与 fork**（服务端原语，v2.1.4 探针 `scripts/probe/opencode-revert-fork-probe.mjs`）：历史里每条用户行带 `transcriptAnchorId = msg_…`；`readOpenCodeConversationOrder`（`opencode-data-root.ts`）给出只含 user/assistant 的消息序，跳过 v2 的 `model-switched`/`system`/`idle` 等簿记行——切点落在簿记行上会把一个回合劈开。编辑走 `rewindSession`：在保留点之后的第一条用户消息处 `revert/stage {files:true}` + `revert/commit`（删行并按引擎快照还原这些回合改过的文件，故 `editRevertsFiles: true`；快照只存在于 git 仓库内，非 git 目录只回退对话），provider 会话 id 不变，替换 prompt 是普通续写；未知保留点直接 404，绝不退化成"全部丢弃"。fork（`opencode-fork.provider.ts`）用 `POST /fork {before}`，该切点**不含** `before`，所以传锚点回合之后的第一条用户消息，得到含锚点整回合的副本（与 codex 一致）；副本无 `parent_id`，同步器不会当子会话剪掉。两者与 runtime 共用 `opencodeServiceSupervisor` 单例（`connectOpenCodeApiClient`），不会另起一个 `serve`。
 - **旁问（side question）**：`askSideQuestion` 在会话的只读 fork 上回答问题（`opencode-side-question.ts`）：先给 fork 下发 `shell`/`edit`/`write`/`patch` 的 deny 规则，再用一条独立的 `/api/event` 连接只订阅该 fork，答完即删除 fork，不在引擎里留下副本。失败一律以 error outcome 返回，从不抛出；从未运行过的会话直接给出错误说明。上游 #1673 的入口，运行时切面已接。
+- **引擎标题**：`session.renamed` 事件经 `opencode-engine-renames.ts` 写回 app 会话行并广播 `session_upserted`；用户手动改过的名字是终态，引擎后续改名不覆盖。每轮的引擎事件时间戳同时记录在重命名状态里，用于判断引擎行和 app 行谁更新。
 - **相对旧实现的缺口（待移植）**：空交付自动重试、回合中途插话（`injectInput`）。子代理卡片与审批桥上溯父会话已补（历史见上，实时见 registry / bridge 两条）。配额卡片已移植（`opencode-quota.provider.ts`）；`/compact` 已随服务客户端恢复（见上方「`/compact` 的引擎实现」）。
 
 
