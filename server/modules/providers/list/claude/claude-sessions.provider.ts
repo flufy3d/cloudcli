@@ -1052,23 +1052,34 @@ function readTaskUsage(value: unknown): TaskUsage | undefined {
 }
 
 /**
- * Parses a Claude JSONL transcript into the rows the usage summarizer reads.
+ * Streams the rows `summarizeClaudeTokenUsage` needs from a Claude transcript.
  *
- * Malformed lines are dropped rather than aborting the scan: a transcript
- * whose tail is being appended to while it is read is normal, and the rows
- * before it still carry the session's usage.
+ * Consumers: `getTokenUsage`, which serves the `/token-usage` endpoint. Reading
+ * the whole file into one string made a 133 MB transcript peak at ~450 MB RSS
+ * per call; when that overlapped the session watcher's scan, PM2's memory limit
+ * killed the server mid-turn. Only assistant usage/model and compaction
+ * boundaries affect the summary, so project those fields while reading.
  */
-function parseClaudeTranscriptEntries(fileContent: string): AnyRecord[] {
+async function readClaudeUsageEntries(jsonlPath: string): Promise<AnyRecord[]> {
   const entries: AnyRecord[] = [];
-  for (const line of fileContent.split('\n')) {
-    if (!line.trim()) {
+  for await (const entry of readJsonlRecords(jsonlPath)) {
+    if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+      entries.push(entry);
       continue;
     }
-    try {
-      entries.push(JSON.parse(line) as AnyRecord);
-    } catch {
-      // Skip malformed lines without discarding usage from earlier messages.
+    if (entry.type !== 'assistant') {
+      continue;
     }
+    const message = readObjectRecord(entry.message);
+    const usage = message?.usage;
+    if (!usage) {
+      continue;
+    }
+    entries.push({
+      type: 'assistant',
+      isSidechain: entry.isSidechain,
+      message: { usage, model: message?.model },
+    });
   }
   return entries;
 }
@@ -1975,10 +1986,10 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       });
     }
 
-    const fileContent = await fsp.readFile(sessionFilePath, 'utf8');
+    const entries = await readClaudeUsageEntries(sessionFilePath);
     // Same summarizer the history page uses, so the endpoint and the page can
     // never report a different occupancy or a different window for one session.
-    return summarizeClaudeTokenUsage(parseClaudeTranscriptEntries(fileContent), {
+    return summarizeClaudeTokenUsage(entries, {
       ...readClaudeSessionWindowSources(input.appSessionId),
       reported: getReportedClaudeContextWindow(input.nativeSessionId),
       configured: process.env.CONTEXT_WINDOW,
