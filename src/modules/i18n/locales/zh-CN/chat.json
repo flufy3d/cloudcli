@@ -415,9 +415,9 @@
     "weeklyWindow": "周配额",
     "weeklyWindowAllModels": "周配额（所有模型）",
     "weeklyWindowScoped": "周配额（{{model}}）",
-    "cycleWindow": "周期调用限额",
+    "cycleWindow": "工具调用额度",
     "cycleCallsDesc": "总计 {{total}} 次，剩余 {{remaining}} 次",
-    "cycleGeneralDesc": "周期内模型与工具调用配额",
+    "cycleGeneralDesc": "模型与工具调用次数",
     "fiveHourRollingDesc": "5 小时滑动窗口 Token 配额",
     "groupDescBigModel": "智谱 BigModel Coding Plan 账号配额",
     "groupDescZai": "Z.AI Coding Plan 账号配额",
@@ -427,10 +427,15 @@
     "resetDaysHours": "{{days}} 天 {{hours}} 小时后重置",
     "resetHoursMinutes": "{{hours}} 小时 {{minutes}} 分钟后重置",
     "resetMinutes": "{{minutes}} 分钟后重置",
+    "expireSoon": "即将到期",
+    "expireDaysHours": "{{days}} 天 {{hours}} 小时后到期",
+    "expireHoursMinutes": "{{hours}} 小时 {{minutes}} 分钟后到期",
+    "expireMinutes": "{{minutes}} 分钟后到期",
     "emptyQuotaHint": {
       "claude": "API Key、Bedrock、Vertex 登录没有 claude.ai 订阅限额",
       "codex": "API Key 登录通常不会提供 ChatGPT 账号的 5 小时和周限额",
-      "opencode": "未开通 OpenCode Go 套餐，或 CLI 未登录到 Go 工作区"
+      "opencode": "未开通 OpenCode Go 套餐，或 CLI 未登录到 Go 工作区",
+      "zcode": "读不到 ZCode 账号配额：通常是桌面端登录后凭据密钥未同步，运行一次 scripts/zcode-stage-credential-key.mjs 即可恢复"
     },
     "resetCardTitle": "用量重置卡",
     "resetCardHint": "使用后立即补满对应额度，无需等待刷新窗口",

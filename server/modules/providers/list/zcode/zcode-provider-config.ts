@@ -31,7 +31,7 @@ import path from 'node:path';
 import type { AnyRecord } from '@/shared/types.js';
 import { readObjectRecord, readOptionalString, readTrimmedStringRecord } from '@/shared/utils.js';
 
-import { readDecryptedZCodeIndividualPlanApiKey, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
+import { readZCodeIndividualPlanAuthContext, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeStorageDir } from './zcode-data-root.js';
 
 /**
@@ -389,7 +389,7 @@ export function resolveZCodeBuiltinRevision(builtinConfigPath: string): string |
  *
  * In app-server mode, the engine starts fail-closed by marking all account
  * providers as `entitled: false`. A trial JWT entitles the start-plan (体验)
- * provider and an individual-plan API key entitles the individual provider in
+ * provider and usable personal-project credentials (or a legacy API key) entitle the individual provider in
  * the engine's executable registry view.
  *
  * The engine's registry takes an account provider's model list from
@@ -406,8 +406,9 @@ export function resolveZCodeBuiltinRevision(builtinConfigPath: string): string |
  */
 export function buildZCodeAccountSyncPayload(builtinConfigPath: string): Record<string, unknown> | null {
   const jwtToken = readDecryptedZCodeJwtToken();
-  const individualApiKey = readDecryptedZCodeIndividualPlanApiKey();
-  if (!jwtToken && !individualApiKey) return null;
+  const individual = readZCodeIndividualPlanAuthContext();
+  const hasIndividualCredential = individual && individual.kind !== 'unavailable';
+  if (!jwtToken && !hasIndividualCredential) return null;
 
   const basedOnZCodeBuiltinRevision = resolveZCodeBuiltinRevision(builtinConfigPath);
   if (!basedOnZCodeBuiltinRevision) return null;
@@ -416,7 +417,7 @@ export function buildZCodeAccountSyncPayload(builtinConfigPath: string): Record<
   // importing its constants back would form a cycle.
   const entitledProviderIds = [
     ...(jwtToken ? ['account:bigmodel-start-plan'] : []),
-    ...(individualApiKey ? ['account:bigmodel-individual-coding-plan'] : []),
+    ...(hasIndividualCredential ? ['account:bigmodel-individual-coding-plan'] : []),
   ];
   return {
     revision: '1',

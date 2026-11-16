@@ -208,8 +208,8 @@ test('compact posts to the session compaction endpoint and returns the queued in
 
 test('forks with an exclusive `before` cut, or the whole conversation without one', async () => {
   await withFakeService(async ({ client, requests }) => {
-    assert.deepEqual(await client.forkSession('ses_fake', 'msg_next'), { id: 'ses_forked' });
-    assert.deepEqual(await client.forkSession('ses_fake', null), { id: 'ses_forked' });
+    assert.deepEqual(await client.forkSession('ses_fake', { before: 'msg_next' }), { id: 'ses_forked' });
+    assert.deepEqual(await client.forkSession('ses_fake', {}), { id: 'ses_forked' });
 
     assert.deepEqual(requests.map((request) => [request.method, request.path, request.body]), [
       ['POST', '/api/session/ses_fake/fork', { before: 'msg_next' }],

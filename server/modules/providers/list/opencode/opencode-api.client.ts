@@ -214,25 +214,6 @@ export class OpenCodeApiClient {
   }
 
   /**
-   * `POST /api/session/:id/fork` — copies the conversation into a new
-   * top-level session and returns its id. The cut is **exclusive**: only the
-   * messages strictly before `before` are copied, and the whole conversation
-   * when it is null (verified against v2.1.4; the copy gets fresh message ids
-   * and no `parent_id`, so it indexes as an ordinary session).
-   *
-   * Consumer: opencode fork provider.
-   */
-  async forkSession(sessionId: string, before: string | null): Promise<{ id: string }> {
-    const path = `/api/session/${encodeURIComponent(sessionId)}/fork`;
-    const result = await this.request<{ data?: { id?: unknown } }>('POST', path, before ? { before } : {});
-    const id = result?.data?.id;
-    if (typeof id !== 'string' || !id) {
-      throw new OpenCodeApiError('POST', path, 200, 'response carried no session id');
-    }
-    return { id };
-  }
-
-  /**
    * Drops `messageId` and everything after it from the session: stages the
    * revert boundary (`POST /revert/stage`, restoring the files those turns
    * changed when `files` is set) and commits it (`POST /revert/commit`), which
@@ -378,6 +359,15 @@ export class OpenCodeApiClient {
   }
 
   /**
+   * `DELETE /api/session/:id` — removes the session and its children. The
+   * side question uses it to take its ephemeral fork back off disk once the
+   * answer is in, so the engine store never keeps a copy of the conversation.
+   */
+  async deleteSession(sessionId: string): Promise<void> {
+    await this.request('DELETE', `/api/session/${encodeURIComponent(sessionId)}`);
+  }
+
+  /**
    * `GET /api/session/:id` — the session row. `outcome` and `time.idle` are
    * set once a run has finished (the runtime uses them to reconcile a run
    * whose terminal event was missed during a stream drop); `tokens` are the
@@ -405,6 +395,57 @@ export class OpenCodeApiClient {
           cacheWrite: num(cache.write),
         }
         : null,
+    };
+  }
+
+  /**
+   * `GET /api/session/:id/message` — the session's messages in transcript
+   * order. Only ids matter for the fork translation, but the read returns the
+   * full rows; the sort mirrors the engine's chronological reply so the
+   * neighbor lookup behind an anchor cut is the true next message.
+   */
+  async listSessionMessages(sessionId: string): Promise<Array<{ id: string }>> {
+    const result = await this.request<{ data?: unknown }>(
+      'GET',
+      `/api/session/${encodeURIComponent(sessionId)}/message`,
+    );
+    const rows = Array.isArray(result?.data) ? result.data : [];
+    const messages = rows
+      .filter((row): row is Record<string, unknown> =>
+        typeof row === 'object' && row !== null && typeof (row as Record<string, unknown>).id === 'string')
+      .map((row) => {
+        const record = row as Record<string, unknown>;
+        const time = (record.time ?? {}) as Record<string, unknown>;
+        const created = typeof time.created === 'number' ? time.created : 0;
+        return { id: record.id as string, created };
+      });
+    messages.sort((left, right) => left.created - right.created);
+    return messages.map(({ id }) => ({ id }));
+  }
+
+  /**
+   * `POST /api/session/:id/fork` — copies the session into a new child one.
+   * `before` is the message the copy stops AT (exclusive of it); omitting it
+   * copies the whole conversation. The engine refuses an empty session.
+   */
+  async forkSession(sessionId: string, input: { before?: string } = {}): Promise<{ id: string; title?: string }> {
+    const body: Record<string, unknown> = {};
+    if (input.before) {
+      body.before = input.before;
+    }
+    const result = await this.request<{ data?: Record<string, unknown> }>(
+      'POST',
+      `/api/session/${encodeURIComponent(sessionId)}/fork`,
+      body,
+    );
+    const data = result?.data ?? {};
+    const id = typeof data.id === 'string' ? data.id : '';
+    if (!id) {
+      throw new OpenCodeApiError('POST', `/api/session/${encodeURIComponent(sessionId)}/fork`, 200, 'response carried no forked session id');
+    }
+    return {
+      id,
+      ...(typeof data.title === 'string' ? { title: data.title } : {}),
     };
   }
 

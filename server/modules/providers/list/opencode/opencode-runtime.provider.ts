@@ -45,6 +45,8 @@ import type {
   ProviderPermissionDecision,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
+  SideQuestionRequest,
+  SideQuestionSink,
 } from '@/shared/types.js';
 import {
   createCompleteMessage,
@@ -66,10 +68,11 @@ import { readOpenCodeContextUsage } from './opencode-context-usage.js';
 import { getOpenCodeDatabasePath } from './opencode-data-root.js';
 import type { OpenCodeEventEnvelope } from './opencode-event-stream.js';
 import { OpenCodeEventStream } from './opencode-event-stream.js';
+import { askOpenCodeSideQuestion } from './opencode-side-question.js';
 import { OpenCodeInteractionBridge } from './opencode-interaction-bridge.js';
 import { buildOpenCodePromptFiles, buildOpenCodePromptText } from './opencode-prompt-attachments.js';
 import { OpenCodeRunRegistry, OpenCodeTokenBudgetTracker, type OpenCodeActiveRun, type OpenCodeRunSettlement } from './opencode-run-registry.js';
-import { OpenCodeServiceError, OpenCodeServiceSupervisor, opencodeServiceSupervisor } from './opencode-service.js';
+import { OpenCodeServiceError, OpenCodeServiceSupervisor, connectOpenCodeApiClient, opencodeServiceSupervisor } from './opencode-service.js';
 import {
   OpenCodeSessionSettingsApplier,
   resolveOpenCodeSessionSettings,
@@ -167,6 +170,23 @@ type RuntimeDependencies = {
  * Consumers: `opencode.provider.ts` (module-level singleton via
  * `opencodeRuntime`) and the runtime tests (own supervisor + fake service).
  */
+/**
+ * A live OpenCode service client for callers outside a chat run, or null when
+ * the production runtime has not produced one yet. Set by the singleton
+ * factory below (test-built runtimes never touch it) and read by the fork
+ * facet, which must reuse the running service rather than start a second one.
+ */
+/**
+ * Returns the production service client, booting the service when no run has
+ * created one yet.
+ *
+ * Consumer: the opencode fork facet and side questions, which act outside a
+ * chat run and must reuse the runtime's own service instance.
+ */
+export async function ensureOpenCodeClient(): Promise<OpenCodeApiClient> {
+  return connectOpenCodeApiClient();
+}
+
 export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): IProviderRuntime {
   const supervisor = dependencies.supervisor ?? new OpenCodeServiceSupervisor();
   const createClient = dependencies.createClient ?? ((endpoint) => new OpenCodeApiClient(endpoint));
@@ -650,6 +670,24 @@ export function createOpenCodeRuntime(dependencies: RuntimeDependencies = {}): I
   return {
     run,
     abort,
+    /**
+     * Answers one side question on an ephemeral, read-only fork of the
+     * session (see `opencode-side-question.ts`). Never rejects; a session
+     * that has never run resolves as an error outcome.
+     */
+    askSideQuestion: (request: SideQuestionRequest, sink: SideQuestionSink) =>
+      askOpenCodeSideQuestion(request, sink, { client: client ?? undefined }),
+    /**
+     * Said outright while the conversation is known, `reporting: false`
+     * included: the page keeps the last value a poll reported, so a report
+     * that ended while a command still runs must be cleared.
+     */
+    getSessionActivity(sessionId: string) {
+      return runs.get(sessionId) ? { queued: false, reporting: false } : null;
+    },
+    hasSessionWork(sessionId: string): boolean {
+      return Boolean(runs.get(sessionId)) || runs.isBackgroundWorkPending(sessionId);
+    },
     permissions: {
       resolve(requestId: string, decision: ProviderPermissionDecision): void {
         bridge.resolve(requestId, decision);

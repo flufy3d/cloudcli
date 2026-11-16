@@ -134,7 +134,9 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsFiles: true,
     supportsAbort: true,
     supportsSteering: false,
-    supportsSideQuestions: false,
+    // The runtime answers on an ephemeral, read-only fork of the session
+    // (opencode-side-question.ts), taken back off disk once it is done.
+    supportsSideQuestions: true,
     // The runtime mounts the permissions facet: permission asks and question
     // forms surface as cards answered through the service API.
     supportsPermissionRequests: true,
@@ -181,10 +183,11 @@ const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
     supportsQuotaReset: true,
     supportsEffort: true,
     effortLevels: ['low', 'high', 'max'],
-    // No resolveEditAnchor/fork facets: transcripts are append-only for this
-    // provider today.
+    // No resolveEditAnchor facet: transcripts are append-only for this
+    // provider today, so editing stays unavailable even though forking
+    // (session/fork over the app-server, after a resume) works.
     supportsMessageEditing: false,
-    supportsSessionForking: false,
+    supportsSessionForking: true,
     // A bare `/compact` sent as a message runs the engine's `session/compact`
     // (a background summarization turn) instead of a prompt.
     supportsCompaction: true,

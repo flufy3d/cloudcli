@@ -1,66 +1,31 @@
-import fsSync from 'node:fs';
-
-import Database from 'better-sqlite3';
-
 import type { IProviderFork } from '@/shared/interfaces.js';
 import { AppError } from '@/shared/utils.js';
 
-import type { OpenCodeApiClient } from './opencode-api.client.js';
-import {
-  getOpenCodeDatabasePath,
-  readOpenCodeConversationOrder,
-  type OpenCodeConversationMessage,
-} from './opencode-data-root.js';
-import { connectOpenCodeApiClient } from './opencode-service.js';
+import { ensureOpenCodeClient } from './opencode-runtime.provider.js';
 
 /**
- * The message id to hand OpenCode's **exclusive** fork cut so the copy ends at
- * the anchor's turn.
+ * Branches an OpenCode conversation through the service's fork endpoint.
  *
- * The cut copies everything before the named message, so the answer is the
- * first *user* message after the anchor: that keeps the anchor's whole turn
- * (its answer included) and drops the next one. `null` means the anchor's turn
- * is the last, and the whole conversation is copied. Turn-inclusive is the same
- * choice Codex's fork makes — a turn is the smallest useful branch point.
+ * The engine's `before` parameter is exclusive — the copy stops AT the named
+ * message — while this app's anchor names the message the branch must keep.
+ * The facet therefore translates: it finds the message after the anchor and
+ * cuts before that one, so forking from a turn keeps the prompt and the
+ * answer it got. An anchor that is already the last message omits the cut,
+ * which the engine reads as "copy everything".
  *
- * Exported for tests only.
- */
-export function resolveOpenCodeForkCut(
-  order: OpenCodeConversationMessage[],
-  anchorId: string,
-): string | null {
-  const anchorIndex = order.findIndex((message) => message.id === anchorId);
-  if (anchorIndex < 0) {
-    throw new AppError('That message is no longer in the transcript.', {
-      code: 'ANCHOR_NOT_FOUND',
-      statusCode: 404,
-    });
-  }
-
-  return order.slice(anchorIndex + 1).find((message) => message.role === 'user')?.id ?? null;
-}
-
-type OpenCodeForkDependencies = {
-  /** The client the fork talks to; defaults to the production server. */
-  connectClient?: () => Promise<Pick<OpenCodeApiClient, 'forkSession'>>;
-};
-
-/**
- * Branches an OpenCode conversation through the service's `fork` primitive,
- * which copies the messages before the cut into an independent session.
- *
- * OpenCode keeps its transcript in a shared database rather than a file, so
- * `requiresTranscriptFile` is false and the fork returns no artifact path.
- *
- * Consumer: `opencode.provider.ts` (the provider's `fork` facet).
+ * Consumer: OpenCode's `fork` facet and the sessions fork endpoint.
  */
 export class OpenCodeForkProvider implements IProviderFork {
+  /** OpenCode keeps conversations in its own SQLite store, not a transcript file. */
   readonly requiresTranscriptFile = false;
 
-  private readonly connectClient: () => Promise<Pick<OpenCodeApiClient, 'forkSession'>>;
+  private readonly getClient: () => Promise<{
+    listSessionMessages: (sessionId: string) => Promise<Array<{ id: string }>>;
+    forkSession: (sessionId: string, input: { before?: string }) => Promise<{ id: string; title?: string }>;
+  }>;
 
-  constructor(dependencies: OpenCodeForkDependencies = {}) {
-    this.connectClient = dependencies.connectClient ?? connectOpenCodeApiClient;
+  constructor(dependencies: { getClient?: typeof ensureOpenCodeClient } = {}) {
+    this.getClient = dependencies.getClient ?? ensureOpenCodeClient;
   }
 
   async forkSession(input: {
@@ -70,30 +35,33 @@ export class OpenCodeForkProvider implements IProviderFork {
     upToAnchorId?: string;
     title?: string;
   }): Promise<{ providerSessionId: string; jsonlPath: string | null }> {
-    let cutMessageId: string | null = null;
-    if (input.upToAnchorId) {
-      const databasePath = getOpenCodeDatabasePath();
-      if (!fsSync.existsSync(databasePath)) {
-        throw new AppError('OpenCode database was not found.', {
-          code: 'OPENCODE_DATABASE_NOT_FOUND',
-          statusCode: 409,
-        });
-      }
-      const db = new Database(databasePath, { readonly: true, fileMustExist: true });
-      try {
-        cutMessageId = resolveOpenCodeForkCut(
-          readOpenCodeConversationOrder(db, input.providerSessionId),
-          input.upToAnchorId,
-        );
-      } finally {
-        db.close();
-      }
-    }
+    // `title` is deliberately not forwarded. The engine names a fork itself
+    // ("… (fork #1)") and the sidebar name lives in this app's session row.
+    try {
+      const client = await this.getClient();
 
-    // The fork's chosen title lives on this app's own session row, so the
-    // engine-side session keeps whatever it derives itself.
-    const client = await this.connectClient();
-    const forked = await client.forkSession(input.providerSessionId, cutMessageId);
-    return { providerSessionId: forked.id, jsonlPath: null };
+      let before: string | undefined;
+      if (input.upToAnchorId) {
+        const messages = await client.listSessionMessages(input.providerSessionId);
+        const anchorIndex = messages.findIndex((message) => message.id === input.upToAnchorId);
+        if (anchorIndex < 0) {
+          throw new Error(`the anchor message no longer exists in "${input.providerSessionId}"`);
+        }
+        before = messages[anchorIndex + 1]?.id;
+      }
+
+      // Omitting `before` entirely (no anchor, or the anchor ends the
+      // conversation) is the engine's "copy everything".
+      const forked = await client.forkSession(input.providerSessionId, before ? { before } : {});
+      // OpenCode keeps conversations in its own SQLite store; the session row
+      // stays path-less like every other session of this provider.
+      return { providerSessionId: forked.id, jsonlPath: null };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new AppError(`OpenCode could not fork this session: ${reason}`, {
+        code: 'FORK_FAILED',
+        statusCode: 502,
+      });
+    }
   }
 }

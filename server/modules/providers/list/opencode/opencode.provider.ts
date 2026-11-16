@@ -25,6 +25,7 @@ export class OpenCodeProvider extends AbstractProvider {
   readonly skills: IProviderSkills = new OpenCodeSkillsProvider();
   readonly sessions: IProviderSessions = new OpenCodeSessionsProvider();
   readonly sessionSynchronizer: IProviderSessionSynchronizer = new OpenCodeSessionSynchronizer();
+  /** POST /api/session/:id/fork through the shared service; enables "fork session". */
   readonly fork: IProviderFork = new OpenCodeForkProvider();
 
   constructor() {

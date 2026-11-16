@@ -7,7 +7,7 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
-import { OpenCodeForkProvider, resolveOpenCodeForkCut } from '@/modules/providers/list/opencode/opencode-fork.provider.js';
+import { OpenCodeForkProvider } from '@/modules/providers/list/opencode/opencode-fork.provider.js';
 import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
 
 /**
@@ -71,14 +71,14 @@ const withOpenCodeSession = async (run: () => Promise<void>): Promise<void> => {
   }
 };
 
-test('user rows carry their provider message id as the transcript anchor', { concurrency: false }, async () => {
+test('user rows anchor at the last message of their turn', { concurrency: false }, async () => {
   await withOpenCodeSession(async () => {
     const history = await new OpenCodeSessionsProvider().fetchHistory('app-1', { providerSessionId: 'ses_src' });
     const anchored = history.messages.filter((message) => message.transcriptAnchorId);
     assert.deepEqual(anchored.map((message) => [message.role, message.transcriptAnchorId]), [
-      ['user', 'msg_u1'],
-      ['user', 'msg_u2'],
-      ['user', 'msg_u3'],
+      ['user', 'msg_a1'],
+      ['user', 'msg_a2'],
+      ['user', 'msg_a3'],
     ]);
   });
 });
@@ -96,6 +96,10 @@ test('an edit keeps the conversation message before the anchor and reverts at th
 
     assert.deepEqual(await provider.resolveEditAnchor('app-1', 'msg_u2'), { found: true, resumeThroughId: 'msg_a1' });
     assert.deepEqual(await provider.resolveEditAnchor('app-1', 'msg_u1'), { found: true, resumeThroughId: null });
+    // The history's anchor is the turn-final assistant row; editing still
+    // cuts at the prompt that starts that turn.
+    assert.deepEqual(await provider.resolveEditAnchor('app-1', 'msg_a2'), { found: true, resumeThroughId: 'msg_a1' });
+    assert.deepEqual(await provider.resolveEditAnchor('app-1', 'msg_a1'), { found: true, resumeThroughId: null });
     assert.deepEqual(await provider.resolveEditAnchor('app-1', 'msg_gone'), { found: false, resumeThroughId: null });
 
     await provider.rewindSession('app-1', 'msg_a1');
@@ -114,42 +118,38 @@ test('an edit keeps the conversation message before the anchor and reverts at th
   });
 });
 
-test('a fork copies through the anchor turn by cutting before the next prompt', { concurrency: false }, async () => {
-  await withOpenCodeSession(async () => {
-    const forks: Array<[string, string | null]> = [];
-    const provider = new OpenCodeForkProvider({
-      connectClient: async () => ({
-        forkSession: async (sessionId, before) => {
-          forks.push([sessionId, before]);
-          return { id: 'ses_forked' };
-        },
-      }),
-    });
-    const input = { providerSessionId: 'ses_src', jsonlPath: null, projectPath: '/tmp/project' };
-
-    assert.deepEqual(
-      await provider.forkSession({ ...input, upToAnchorId: 'msg_u1' }),
-      { providerSessionId: 'ses_forked', jsonlPath: null },
-    );
-    await provider.forkSession({ ...input, upToAnchorId: 'msg_u3' });
-    await provider.forkSession(input);
-    assert.deepEqual(forks, [
-      ['ses_src', 'msg_u2'],
-      ['ses_src', null],
-      ['ses_src', null],
-    ]);
-    await assert.rejects(provider.forkSession({ ...input, upToAnchorId: 'msg_gone' }), /no longer in the transcript/);
+test('a fork copies through the anchor turn by cutting before the next prompt', async () => {
+  const forks: Array<[string, { before?: string }]> = [];
+  const provider = new OpenCodeForkProvider({
+    getClient: async () => ({
+      listSessionMessages: async () => [
+        { id: 'msg_u1' },
+        { id: 'msg_a1' },
+        { id: 'msg_u2' },
+        { id: 'msg_a3' },
+      ],
+      forkSession: async (sessionId: string, input: { before?: string } = {}) => {
+        forks.push([sessionId, input]);
+        return { id: 'ses_forked' };
+      },
+    } as never),
   });
-});
+  const input = { providerSessionId: 'ses_src', jsonlPath: null, projectPath: '/tmp/project' };
 
-test('resolveOpenCodeForkCut names the first prompt after the anchor', () => {
-  const order = [
-    { id: 'u1', role: 'user' as const },
-    { id: 'a1', role: 'assistant' as const },
-    { id: 'a1b', role: 'assistant' as const },
-    { id: 'u2', role: 'user' as const },
-  ];
-  assert.equal(resolveOpenCodeForkCut(order, 'u1'), 'u2');
-  assert.equal(resolveOpenCodeForkCut(order, 'a1'), 'u2');
-  assert.equal(resolveOpenCodeForkCut(order, 'u2'), null);
+  assert.deepEqual(
+    await provider.forkSession({ ...input, upToAnchorId: 'msg_u1' }),
+    { providerSessionId: 'ses_forked', jsonlPath: null },
+  );
+  // An anchor on the last message omits the cut: the whole conversation is copied.
+  await provider.forkSession({ ...input, upToAnchorId: 'msg_a3' });
+  await provider.forkSession(input);
+  assert.deepEqual(forks, [
+    ['ses_src', { before: 'msg_a1' }],
+    ['ses_src', {}],
+    ['ses_src', {}],
+  ]);
+  await assert.rejects(
+    provider.forkSession({ ...input, upToAnchorId: 'msg_gone' }),
+    /no longer exists/,
+  );
 });

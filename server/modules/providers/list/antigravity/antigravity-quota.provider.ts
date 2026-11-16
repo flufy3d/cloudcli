@@ -18,6 +18,7 @@ import type {
 import { createProviderQuotaCache } from '@/shared/utils.js';
 
 import { tryResolveEnginePath } from './antigravity-engine-path.js';
+import { buildAntigravitySubprocessEnv } from './antigravity-subprocess-env.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -56,13 +57,26 @@ type AntigravityQuotaDependencies = {
   now: () => number;
 };
 
+/**
+ * Wall-clock ceiling for the `agy /usage` subprocess.
+ *
+ * A healthy `agy /usage` on agy 1.5.9 (2026-11-14 build) takes ~8-11s — the CLI
+ * refreshes its token and round-trips the backend on every call — so the
+ * previous 10s ceiling intermittently killed healthy runs; the catch block then
+ * mapped that to null and the Token Usage modal showed "no quota data". 30s
+ * leaves headroom for the slow runs without hanging a manual refresh.
+ *
+ * Consumers: tests pin this lower bound (antigravity-quota.test.ts).
+ */
+export const ANTIGRAVITY_QUOTA_COMMAND_TIMEOUT_MS = 30_000;
+
 const defaultDependencies: AntigravityQuotaDependencies = {
   resolveEnginePath: tryResolveEnginePath,
   runCommand: async (executablePath, args) => {
     return execFileAsync(executablePath, args, {
-      timeout: 10_000,
+      timeout: ANTIGRAVITY_QUOTA_COMMAND_TIMEOUT_MS,
       encoding: 'utf8',
-      env: { ...process.env },
+      env: buildAntigravitySubprocessEnv(),
       windowsHide: true,
     });
   },
@@ -159,8 +173,11 @@ export async function fetchAntigravityQuota(
 
         const parsed = JSON.parse(stdout) as RawAgyUsageResponse;
         return normalizeQuotaPayload(parsed, deps.now());
-      } catch {
-        // Antigravity historically treats CLI failures as unavailable quota.
+      } catch (error) {
+        // Quota refresh is cache-gated (2 min TTL), so failures are infrequent:
+        // surface them instead of silently mapping to null, which only shows up
+        // as an empty quota card in the UI and leaves diagnosis nothing to read.
+        console.warn('[Antigravity] agy /usage quota fetch failed:', error);
         return null;
       }
     },

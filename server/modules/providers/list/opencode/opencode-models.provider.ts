@@ -263,6 +263,10 @@ type OpenCodeCatalogModelEntry = {
   reasoning_options?: Array<{ type?: string; values?: string[] }>;
 };
 
+/** `kv` keys of the cached models.dev catalog, newest layout first (v2.2 renamed it). */
+const OPENCODE_CATALOG_KV_KEYS = ['models-dev:v2:catalog', 'models-dev:catalog'];
+
+/**
 /**
  * Narrows the shared catalog records to the fields the model picker reads.
  *

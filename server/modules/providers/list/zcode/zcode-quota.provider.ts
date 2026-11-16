@@ -2,7 +2,11 @@
  * ZCode Quota and Rate Limit Provider
  *
  * Fetches account-level quota status (5-hour rolling token limits and cycle limits)
- * from BigModel / Z.AI monitoring endpoints using the decrypted OAuth token.
+ * from BigModel / Z.AI monitoring endpoints, authenticating with the coding-plan
+ * api-key plus the optional `org-…`/`proj_…` scoping headers (the OAuth Bearer
+ * tokens the endpoints used to accept were retired by the 2026-11 ZCode desktop
+ * upgrade). The provider-side rejection arrives as HTTP 200 with a non-200 body
+ * `code`, so the body envelope is always verified before normalization.
  *
  * Consumers:
  * - `ZCodeProviderAuth.getQuota` in `zcode-auth.provider.ts`
@@ -29,22 +33,34 @@ import {
   readOptionalString,
 } from '@/shared/utils.js';
 
-import { readDecryptedZCodeCredentials } from './zcode-credentials.js';
+import { readZCodeCodingPlanQuotaContext, type ZCodeCodingPlanQuotaContext } from './zcode-credentials.js';
+import { readZCodeAppVersion, tryResolveEnginePath } from './zcode-engine-path.js';
 
 export type ZCodeQuotaDependencies = {
   fetch: typeof globalThis.fetch;
-  readCredentials: typeof readDecryptedZCodeCredentials;
+  readQuotaContext: typeof readZCodeCodingPlanQuotaContext;
+  readAppVersion: () => string;
   now: () => number;
 };
 
 const DEFAULT_DEPENDENCIES: ZCodeQuotaDependencies = {
   fetch: globalThis.fetch,
-  readCredentials: readDecryptedZCodeCredentials,
+  readQuotaContext: () => readZCodeCodingPlanQuotaContext(),
+  readAppVersion: () => {
+    const enginePath = tryResolveEnginePath();
+    return (enginePath ? readZCodeAppVersion(enginePath) : null) ?? FALLBACK_APP_VERSION;
+  },
   now: () => Date.now(),
 };
 
 const BIGMODEL_QUOTA_URL = 'https://bigmodel.cn/api/monitor/usage/quota/limit';
 const ZAI_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
+// The ZCode MCP call quota lives on the zcode gateway, not on the bigmodel
+// monitor, and its envelope answers `code: 0` instead of `code: 200`.
+const ZCODE_MCP_USAGE_URL = 'https://zcode.z.ai/api/v1/mcp/usage';
+const ZCODE_PLAN_BALANCE_URL = 'https://zcode.z.ai/api/v1/zcode-plan/billing/balance';
+// The gateway validates the value loosely; the desktop app's own version passes.
+const FALLBACK_APP_VERSION = '3.18.2';
 // Reset-card ("用量重置额度") endpoints behind the coding-plan console; only the
 // personal plan segment is wired up — team accounts need org/project ids.
 const BIGMODEL_RESET_LIST_URL = 'https://bigmodel.cn/api/biz/customer-package-reset/list';
@@ -60,6 +76,25 @@ const quotaCache = createProviderQuotaCache<ProviderQuotaData>(CACHE_TTL_MS);
  */
 export function clearZCodeQuotaCache(): void {
   quotaCache.reset();
+}
+
+/**
+ * Builds the coding-plan auth headers: the raw api-key in `authorization`
+ * (no Bearer prefix, matching the desktop client) plus the org/project scoping
+ * headers when the account has a stored key location. Sending a *wrong*
+ * scoping header empties the payload, so absent ids are omitted entirely.
+ */
+function buildQuotaAuthHeaders(context: ZCodeCodingPlanQuotaContext): Record<string, string> {
+  return {
+    authorization: context.apiKey,
+    ...(context.organizationId ? { 'bigmodel-organization': context.organizationId } : {}),
+    ...(context.projectId ? { 'bigmodel-project': context.projectId } : {}),
+  };
+}
+
+/** Chooses the quota host from the plan family (`zai-*` plans live on api.z.ai). */
+function resolveQuotaUrl(planFamily: string): string {
+  return planFamily.startsWith('zai') ? ZAI_QUOTA_URL : BIGMODEL_QUOTA_URL;
 }
 
 type RawZCodeLimit = {
@@ -129,7 +164,7 @@ function normalizeQuotaLimit(limit: RawZCodeLimit): ProviderQuotaBucket | null {
 
     return {
       id: 'zcode-calls-limit',
-      name: 'Cycle Calls Limit',
+      name: 'Tool Calls Allowance',
       description: limit.usageDetails && limit.usageDetails.length > 0
         ? `${remaining} of ${usageTotal} calls remaining`
         : 'Cycle model and tool call quota',
@@ -147,7 +182,7 @@ function normalizeQuotaLimit(limit: RawZCodeLimit): ProviderQuotaBucket | null {
  */
 function normalizeQuotaPayload(
   payload: unknown,
-  providerFamily: 'bigmodel' | 'zai',
+  planFamily: string,
   nowTimestamp: number,
 ): ProviderQuotaData | null {
   const record = readObjectRecord(payload);
@@ -176,7 +211,7 @@ function normalizeQuotaPayload(
 
   const group: ProviderQuotaGroup = {
     name: groupName,
-    description: providerFamily === 'zai' ? 'Z.AI Coding Plan account quota' : 'BigModel Coding Plan account quota',
+    description: planFamily.startsWith('zai') ? 'Z.AI Coding Plan account quota' : 'BigModel Coding Plan account quota',
     buckets,
   };
 
@@ -186,6 +221,24 @@ function normalizeQuotaPayload(
     // One family (GLM), split by allowance rather than by model family.
     partitioning: 'bucket',
   };
+}
+
+/**
+ * Verifies the bigmodel envelope: the monitor endpoints answer HTTP 200 even
+ * for auth failures, with the verdict in the body (`code`/`success`). Throws
+ * so the caller degrades to "no quota" instead of parsing an error as data.
+ */
+function assertQuotaSuccessPayload(payload: unknown): void {
+  const record = readObjectRecord(payload);
+  if (!record) {
+    throw new Error('Quota endpoint returned a non-object payload.');
+  }
+  const code = Number(record.code);
+  if (record.success === true && code === 200) {
+    return;
+  }
+  const message = readOptionalString(record.msg) ?? 'unknown provider error';
+  throw new Error(`Quota endpoint rejected the request (code ${Number.isFinite(code) ? code : 'n/a'}): ${message}`);
 }
 
 /**
@@ -202,29 +255,26 @@ export async function fetchZCodeQuota(
   return quotaCache.get(
     options,
     async () => {
-      const credentials = await deps.readCredentials();
-      if (!credentials.authenticated || !credentials.accessToken) {
+      const context = await deps.readQuotaContext();
+      if (!context) {
         return null;
       }
 
-      const targetUrl = credentials.providerFamily === 'zai' ? ZAI_QUOTA_URL : BIGMODEL_QUOTA_URL;
-
       try {
-        const [limitsResult, resetResult] = await Promise.allSettled([
-          readLimitsPayload(deps, credentials.providerFamily, credentials.accessToken),
-          readResetCreditsQuietly(deps, credentials.accessToken),
+        const [limitsResult, resetResult, mcpResult, startPlanResult] = await Promise.allSettled([
+          readLimitsPayload(deps, context),
+          readResetCreditsQuietly(deps, context),
+          readMcpUsageBucket(deps, context),
+          readStartPlanBalanceGroup(deps, context),
         ]);
 
         if (limitsResult.status === 'rejected') {
-          // Fail closed: network timeouts or errors degrade gracefully to null
+          // Fail closed: network timeouts, HTTP errors, or provider-side
+          // envelope rejections degrade gracefully to null
           return null;
         }
 
-        const normalized = normalizeQuotaPayload(
-          limitsResult.value,
-          credentials.providerFamily,
-          deps.now(),
-        );
+        const normalized = normalizeQuotaPayload(limitsResult.value, context.planFamily, deps.now());
         if (!normalized) {
           return null;
         }
@@ -232,6 +282,20 @@ export async function fetchZCodeQuota(
         // The reset-card inventory rides along when it can be read; a failing
         // card request must never take the quota display down with it.
         const resetCredits = resetResult.status === 'fulfilled' ? resetResult.value : undefined;
+        // The ZCode MCP call quota is an app-level allowance, not part of the
+        // coding plan subscription — it becomes its own group.
+        if (mcpResult.status === 'fulfilled' && mcpResult.value) {
+          normalized.groups.push({
+            name: 'ZCode MCP',
+            description: 'ZCode app MCP call allowance',
+            buckets: [mcpResult.value],
+          });
+        }
+        // The start plan balance becomes its own group — an exhausted trial
+        // allowance (remaining 0) is still worth showing.
+        if (startPlanResult.status === 'fulfilled' && startPlanResult.value) {
+          normalized.groups.push(startPlanResult.value);
+        }
         return resetCredits ? { ...normalized, resetCredits } : normalized;
       } catch {
         return null;
@@ -242,25 +306,166 @@ export async function fetchZCodeQuota(
 }
 
 /**
- * Reads the raw limits payload from the family-matched quota endpoint.
- * Rejects on transport errors and non-OK statuses so the caller can decide
- * between "no quota" and "quota unavailable".
+ * Reads the ZCode MCP call quota from the zcode.z.ai gateway. Auth is a dual
+ * header pair: the start-plan zcode JWT in `Authorization` beside the
+ * coding-plan credential in `X-Bigmodel-Authorization` (both as Bearer). The
+ * gateway envelope uses `code: 0` — unlike the bigmodel monitor endpoints'
+ * `code: 200` — and a missing/failing read only drops this bucket.
+ */
+async function readMcpUsageBucket(
+  deps: ZCodeQuotaDependencies,
+  context: ZCodeCodingPlanQuotaContext,
+): Promise<ProviderQuotaBucket | null> {
+  if (!context.zcodeJwtToken) {
+    return null;
+  }
+
+  const response = await deps.fetch(ZCODE_MCP_USAGE_URL, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${context.zcodeJwtToken}`,
+      'X-Bigmodel-Authorization': `Bearer ${context.apiKey}`,
+    },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`Mcp usage endpoint returned HTTP ${response.status}`);
+  }
+
+  const record = readObjectRecord(await response.json());
+  const code = Number(record?.code);
+  if (!record || code !== 0) {
+    const message = readOptionalString(record?.msg) ?? 'unknown gateway error';
+    throw new Error(`Mcp usage endpoint rejected the request (code ${Number.isFinite(code) ? code : 'n/a'}): ${message}`);
+  }
+
+  const data = readObjectRecord(record.data);
+  const usage = readObjectRecord(data?.total_usage);
+  const limit = Number(usage?.limit);
+  const remaining = Number(usage?.remaining);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return null;
+  }
+  const usedRaw = Number(usage?.used);
+  const used = Number.isFinite(usedRaw) ? usedRaw : Math.max(0, limit - remaining);
+  const resetTime = toSafeIsoDate(Number(data?.next_refresh_at) * 1000);
+
+  return {
+    id: 'zcode-mcp-usage',
+    name: 'ZCode MCP',
+    description: `${remaining} of ${limit} calls remaining`,
+    window: 'daily',
+    remainingFraction: Math.max(0, Math.min(1, remaining / limit)),
+    resetTime,
+  };
+}
+
+/** One `balances[]` entry of the zcode start plan billing payload. */
+type RawZCodePlanBalance = {
+  bucket_id?: unknown;
+  show_name?: unknown;
+  total_units?: unknown;
+  used_units?: unknown;
+  remaining_units?: unknown;
+  period?: unknown;
+  expires_at?: unknown;
+};
+
+/**
+ * Reads the start plan balance from the zcode gateway into its own quota
+ * group: the trial allowance can sit at zero and still be worth showing, so
+ * the group appears whenever the gateway answers, exhausted or not. Auth is
+ * the start-plan zcode JWT as Bearer; the gateway also requires the device
+ * UUID (`X-Device-Mid`) and an `app_version` query parameter.
+ */
+async function readStartPlanBalanceGroup(
+  deps: ZCodeQuotaDependencies,
+  context: ZCodeCodingPlanQuotaContext,
+): Promise<ProviderQuotaGroup | null> {
+  if (!context.zcodeJwtToken || !context.deviceMid) {
+    return null;
+  }
+
+  const url = `${ZCODE_PLAN_BALANCE_URL}?app_version=${encodeURIComponent(deps.readAppVersion())}`;
+  const response = await deps.fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${context.zcodeJwtToken}`,
+      'X-Device-Mid': context.deviceMid,
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`Start plan balance endpoint returned HTTP ${response.status}`);
+  }
+
+  const record = readObjectRecord(await response.json());
+  const code = Number(record?.code);
+  if (!record || code !== 0) {
+    const message = readOptionalString(record?.msg) ?? 'unknown gateway error';
+    throw new Error(`Start plan balance endpoint rejected the request (code ${Number.isFinite(code) ? code : 'n/a'}): ${message}`);
+  }
+
+  const data = readObjectRecord(record.data);
+  const balances = Array.isArray(data?.balances) ? data.balances : [];
+
+  const buckets = balances
+    .map((entry): ProviderQuotaBucket | null => {
+      const balance = readObjectRecord(entry) as RawZCodePlanBalance | null;
+      if (!balance) {
+        return null;
+      }
+      const total = Number(balance.total_units);
+      const remaining = Number(balance.remaining_units);
+      if (!Number.isFinite(total) || total <= 0) {
+        return null;
+      }
+      const name = readOptionalString(balance.show_name) ?? 'Start Plan Balance';
+      const cappedRemaining = Number.isFinite(remaining) ? Math.max(0, Math.min(remaining, total)) : 0;
+      const period = readOptionalString(balance.period);
+      return {
+        id: `zcode-start-plan-${readOptionalString(balance.bucket_id) ?? name}`,
+        name,
+        description: `${cappedRemaining} of ${total} tokens remaining`,
+        // one_time grants carry an expiry date, not a recurring reset window.
+        window: period === 'one_time' ? 'onetime' : 'total',
+        remainingFraction: Math.max(0, Math.min(1, cappedRemaining / total)),
+        resetTime: toSafeIsoDate(Number(balance.expires_at) * 1000),
+      };
+    })
+    .filter((bucket): bucket is ProviderQuotaBucket => bucket !== null);
+
+  if (buckets.length === 0) {
+    return null;
+  }
+
+  return {
+    name: 'ZCode Start Plan',
+    description: 'ZCode start plan balance',
+    buckets,
+  };
+}
+
+/**
+ * Reads the raw limits payload from the plan family's quota endpoint.
+ * Rejects on transport errors, non-OK statuses, and provider-side envelope
+ * rejections so the caller can decide between "no quota" and "quota unavailable".
  */
 async function readLimitsPayload(
   deps: ZCodeQuotaDependencies,
-  providerFamily: 'bigmodel' | 'zai',
-  accessToken: string,
+  context: ZCodeCodingPlanQuotaContext,
 ): Promise<unknown> {
-  const targetUrl = providerFamily === 'zai' ? ZAI_QUOTA_URL : BIGMODEL_QUOTA_URL;
-  const response = await deps.fetch(targetUrl, {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${accessToken}` },
+  const response = await deps.fetch(resolveQuotaUrl(context.planFamily), {    method: 'GET',
+    headers: buildQuotaAuthHeaders(context),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new Error(`Quota endpoint returned HTTP ${response.status}`);
   }
-  return response.json();
+  const payload = await response.json();
+  assertQuotaSuccessPayload(payload);
+  return payload;
 }
 
 /**
@@ -272,10 +477,10 @@ async function readLimitsPayload(
  */
 async function readResetCreditsQuietly(
   deps: ZCodeQuotaDependencies,
-  accessToken: string,
+  context: ZCodeCodingPlanQuotaContext,
 ): Promise<ProviderQuotaResetCredits | undefined> {
   try {
-    const credits = await fetchZCodeResetCreditList(deps, accessToken);
+    const credits = await fetchZCodeResetCreditList(deps, context);
     return credits.length > 0 ? { credits } : undefined;
   } catch {
     return undefined;
@@ -308,13 +513,13 @@ function normalizeZCodeTimestamp(value: string): string {
 
 async function fetchZCodeResetCreditList(
   deps: ZCodeQuotaDependencies,
-  accessToken: string,
+  context: ZCodeCodingPlanQuotaContext,
 ): Promise<ProviderQuotaResetCredit[]> {
   const response = await deps.fetch(
     `${BIGMODEL_RESET_LIST_URL}?targetType=${RESET_TARGET_TYPE}`,
     {
       method: 'GET',
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: buildQuotaAuthHeaders(context),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     },
   );
@@ -324,7 +529,12 @@ async function fetchZCodeResetCreditList(
     throw new Error(`Reset card endpoint returned HTTP ${response.status}`);
   }
 
-  const payload = readObjectRecord(await response.json());
+  const json = await response.json();
+  // The biz endpoints share the monitor envelope shape (HTTP 200 + body
+  // verdict); without this check an auth rejection parses as an empty card
+  // list and a spend attempt misreads "cannot read the cards" as "no cards".
+  assertQuotaSuccessPayload(json);
+  const payload = readObjectRecord(json);
   const data = readObjectRecord(payload?.data);
   const sections: Array<[string, ProviderQuotaResetCredit['resetType']]> = [
     ['fiveHourResets', '5h'],
@@ -377,14 +587,14 @@ export async function consumeZCodeQuotaReset(
 ): Promise<ProviderQuotaResetConsumeResult> {
   const deps = { ...DEFAULT_DEPENDENCIES, ...dependencyOverrides };
 
-  const credentials = await deps.readCredentials();
-  if (!credentials.authenticated || !credentials.accessToken) {
+  const context = await deps.readQuotaContext();
+  if (!context) {
     return { ok: false, code: 'notAuthenticated', message: 'ZCode is not authenticated.' };
   }
 
   let credits: ProviderQuotaResetCredit[];
   try {
-    credits = await fetchZCodeResetCreditList(deps, credentials.accessToken);
+    credits = await fetchZCodeResetCreditList(deps, context);
   } catch (error) {
     return {
       ok: false,
@@ -402,7 +612,7 @@ export async function consumeZCodeQuotaReset(
     const response = await deps.fetch(BIGMODEL_RESET_USE_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${credentials.accessToken}`,
+        ...buildQuotaAuthHeaders(context),
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({

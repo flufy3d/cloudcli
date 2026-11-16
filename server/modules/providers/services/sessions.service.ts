@@ -562,11 +562,11 @@ export const sessionsService = {
       });
     }
 
-    // A session that has never run has no conversation to copy, so there is
-    // nothing a fork of it could resume from. Providers whose transcript is not
-    // a file (OpenCode) only need the provider-native session id.
-    const needsTranscriptFile = fork.requiresTranscriptFile !== false;
-    if (!source.provider_session_id || (needsTranscriptFile && !source.jsonl_path)) {
+    // A session that has never run has no transcript to copy, so there is
+    // nothing a fork of it could resume from. An empty `jsonl_path` is fine:
+    // ZCode and OpenCode keep conversations in their own engine stores, and
+    // their fork facets never touch the file.
+    if (!source.provider_session_id) {
       throw new AppError('This session has not produced a transcript yet.', {
         code: 'FORK_SOURCE_NOT_READY',
         statusCode: 409,
@@ -578,7 +578,9 @@ export const sessionsService = {
 
     const forked = await fork.forkSession({
       providerSessionId: source.provider_session_id,
-      jsonlPath: source.jsonl_path ?? null,
+      // Engine-stored sessions (ZCode, OpenCode) carry no transcript path and
+      // their facets never touch one; file-backed providers validate the file.
+      jsonlPath: source.jsonl_path ?? '',
       projectPath: source.project_path ?? '',
       upToAnchorId: options.upToAnchorId,
       title: sessionName,

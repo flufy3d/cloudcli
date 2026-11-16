@@ -1,6 +1,6 @@
 # Provider 架构与接入指南
 
-> 基准：2.13.0 / 2026-10-24
+> 基准：2.22.0 / 2026-11-15
 > **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
 > 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
 > 引用一律给"文件路径 + 符号名"，不用行号。
@@ -225,7 +225,7 @@ Claude 的模型目录由 `claude-models.provider.ts` 向对话所用的同一�
 - zcode 附件通道：上传描述符在 runtime 内映射为 `sendText` 命令的 `attachments` 项（`{ref, fileName, mime, bytes}`，ref 是绝对路径，引擎按 `mime` 把它读成本地图片、PDF 或文件；相对路径丢弃，缺 MIME 或大小时按未知大小的普通文件发），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
 - zcode 打断与发送走 `v4/command`（ZCode App 自己用的命令通道），不用旧的 `session/send` / `session/stop`。引擎 0.17 会把后台任务完成通知排进会话自己的输入队列，上一轮一结束就用它自动开新一轮；旧接口只认 `session/send` 开的轮次，旧 stop 停不了这种轮次，旧 send 的提示词会被它吞掉。打断发 `stop`，回执 `accepted` 或 `noop` 才记为已打断；引擎同步停轮，本轮 `resultType: cancelled` 的完成事件会先于回执到达，停止已发出时它记为打断而不是完成（停止失败则撤销）；消息还在被引擎受理时点停止，先等受理回执再停（最多 10 秒），否则停到的是被抢占的轮次；消息发出前就点了停止，消息不再发出。发送发 `sendText`，带 `requestedDelivery: 'startNow'`（抢占引擎自己开的轮次，网关保证同一会话不会有两个 cloudcli 运行，所以被抢占的只会是这种轮次）和 `heldQueueDisposition: 'keepQueueAndSend'`（队列里的通知留着之后送达），回执不是 `accepted` 就报错。例外是 cloudcli 建的会话在首条消息成功发出之前（`sessionsAwaitingFirstPrompt`，按引擎会话记录）：引擎只在旧 `session/send` 收到首条输入时才把新会话写库，之前发 `sendText` 会因外键约束失败，所以这一条仍走旧接口并带 `inputId`（全新会话没有后台任务，没有会抢消息的引擎轮次）。命令 ID（旧接口则是 `inputId`）就是这一轮的 `inputId`：运行从 `turn.started` 载荷的 `inputId` 认出自己的 `turnId`（`turn.completed` 也带 `inputId`），带 `turnId` 但不属于本轮的 `complete` / `error` 不结束运行也不转发；还没认领且不带 `inputId` 的终态推迟到本批输出处理完再判，那时回执已到仍未认领就算本轮提前失败，否则算被抢占的轮次；不带 `turnId` 的事件按"发出提示词后的第一个终态"处理。打断之后引擎仍可能马上用队列里的通知开新一轮，这是引擎行为，桌面端相同，下一条用户消息会抢占它。
 - zcode 发送链路：每 turn 的模型选择随 `sendText` 下发（`modelSelection` + `modelExecution`，均 optional——本地 `cli/config.json` 配置不完整时降级省略，由引擎默认模型执行，不阻断发送）；引擎所需的 personal provider registry 由服务端从 `cli/config.json` 物化为 `~/.zcode/cli/cloudcli-provider-config.json` 并随 spawn env 注入，环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留）一律剥离，注入以 cloudcli 的解析为权威。引擎进程的 `ZCODE_APP_VERSION` 取自引擎所在 App 安装包 `Info.plist` 的 `CFBundleShortVersionString`，每次启动重读；引擎用它生成模型请求的 `User-Agent` 和 `X-ZCode-App-Version`，不传时会退回引擎自身版本号（如 `0.17.1`），体验套餐网关对这种请求返回 405（业务码 3012）。引擎不在 App 安装包内（如 `CLOUDCLI_ZCODE_ENGINE` 覆盖路径、非 macOS）时不注入。
-- zcode 账号套餐：个人模型目录按白名单提取 `GLM-5.3` 和 `GLM-5.3-Flash`，选项用裸模型 id、无分组头，与 claude/antigravity 的扁平菜单一致。有唯一且可解密的个人套餐 API Key 时，裸 id 与旧会话保存的 `bigmodel-coding-plan`、`builtin:bigmodel-coding-plan` 引用在发送时都解析到 ZCode 原生 `account:bigmodel-individual-coding-plan` 并使用个人套餐凭证；同名自定义 provider 保持自身路由；没有该凭证时保留本地 provider 路径。有可解密的 `zcodejwttoken` 时，选择器在末尾追加写死的体验套餐模型 `account:bigmodel-start-plan/GLM-5.3-Flash`，界面标签为 `GLM-5.3-Flash（体验）`；不读套餐账务接口（权益清单映射不成可用模型），体验模型即为固定单条。`buildZCodeSendModelParams` 和 `interaction/requestProviderRuntimeHeaders` 为各账号套餐使用对应凭证（体验套餐用 JWT，个人套餐用 API Key）；账号套餐缺少凭证时发送失败，不降级到引擎默认模型。回复底部的模型标签剥离 `account:`/`builtin:` 范围前缀，体验套餐的回答追加（体验）后缀以区分额度来源；会话回读把 start-plan 的 providerID 拼回完整模型引用，选择器才能按 value 高亮体验选项。引擎启动时账号类 provider 默认未授权；`ZCodeProtocolClient` 根据凭证同步可用套餐的 entitlement，并按 ZCode App 的原生形状为体验套餐附带 `builtinModelIds`（`GLM-5.3-Flash`、`GLM-5.3`）——引擎注册表从该字段取账号 provider 的模型清单，缺了它静态 builtin 表未列的模型（体验套餐的 `GLM-5.3`）会被引擎拒绝或静默回落默认模型。进程重启后重新同步。恢复会话时，本次选择与引擎保存的选择不一致就同步会话模型，供子代理继承。多份个人套餐 Key 无法确定账号时，不自动选择其中一份。
+- zcode 账号套餐：个人模型目录按白名单提取 `GLM-5.3` 和 `GLM-5.3-Flash`，选项用裸模型 id、无分组头，与 claude/antigravity 的扁平菜单一致。有当前账号匹配的个人项目登录材料或唯一且可解密的旧版个人套餐 API Key 时，裸 id 与旧会话保存的 `bigmodel-coding-plan`、`builtin:bigmodel-coding-plan` 引用在发送时都解析到 ZCode 原生 `account:bigmodel-individual-coding-plan` 并使用个人套餐凭证；同名自定义 provider 保持自身路由；没有账号登录材料时保留本地 provider 路径。新版登录材料存在但不完整或账号不匹配时拒绝发送，不回退本地旧 Key。有可解密的 `zcodejwttoken` 时，选择器在末尾追加写死的体验套餐模型 `account:bigmodel-start-plan/GLM-5.3-Flash`，界面标签为 `GLM-5.3-Flash（体验）`；不读套餐账务接口（权益清单映射不成可用模型），体验模型即为固定单条。`buildZCodeSendModelParams` 和 `interaction/requestProviderRuntimeHeaders` 为各账号套餐使用对应凭证：体验套餐用 JWT，旧版个人套餐用唯一 API Key（有旧 BigModel OAuth 时须匹配当前账号 ID；只有旧 OAuth 字段不能判定为新版，结合新版存储标记和 App 版本识别）；ZCode 3.18.2 的个人套餐由 runtime headers 桥接从当前 OAuth 账号匹配已保存的非团队 `project-key-location:v1` 项目，以业务登录凭证向固定 `https://bigmodel.cn` 的项目 `access_tokens` 接口换取短期模型令牌（`zcode-account-auth.ts`），不能将 OAuth 业务凭证直接当作模型 Key。发送参数只携带套餐选择，令牌在引擎请求时提供；只在内存按登录、项目和有效期缓存，提前刷新，并响应引擎拒绝的令牌指纹。换取前后核对账号，账号不符、项目缺失/不唯一、令牌禁用或接口拒绝均失败，不修改凭证文件、不自动创建项目或降级套餐；账号套餐缺少凭证时发送失败，不降级到引擎默认模型。回复底部的模型标签剥离 `account:`/`builtin:` 范围前缀，体验套餐的回答追加（体验）后缀以区分额度来源；会话回读把 start-plan 的 providerID 拼回完整模型引用，选择器才能按 value 高亮体验选项。引擎启动时账号类 provider 默认未授权；`ZCodeProtocolClient` 根据凭证同步可用套餐的 entitlement，并按 ZCode App 的原生形状为体验套餐附带 `builtinModelIds`（`GLM-5.3-Flash`、`GLM-5.3`）——引擎注册表从该字段取账号 provider 的模型清单，缺了它静态 builtin 表未列的模型（体验套餐的 `GLM-5.3`）会被引擎拒绝或静默回落默认模型。进程重启后重新同步。恢复会话时，本次选择与引擎保存的选择不一致就同步会话模型，供子代理继承。多份个人套餐 Key 无法确定账号时，不自动选择其中一份。
 - 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `injectInput` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession` / `backgroundWorkQueuesInput` / `canInterruptBackgroundWork`）。常驻引擎的会话生命周期切面（`getSessionActivity` / `hasSessionWork` / `closeSessionAdmission` / `releaseSession` / `openSessionAdmission`）由各 runtime 自行实现，网关只通过 `IProviderRuntime` 的可选成员调用。
 
 ## OpenCode 服务客户端（v2）
@@ -245,6 +245,7 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 - 历史、会话索引、模型目录、登录检测不变：仍读 `opencode.db`（双格式）与 CLI 探测（模型显示名与推理档位取自 `kv` 表缓存的 models.dev 目录：v2.2 起键名 `models-dev:v2:catalog`、档位在 `capabilities.reasoning.effort`，旧键 `models-dev:catalog` 的 `reasoning_options` 作回退）；v2 的 `compaction` 消息行（v2.0.32 把压缩写在会话旁而非 assistant 消息里）渲染成"压缩行 + 摘要行"（`isCompactSummary`）。子代理历史：父转录的 `subagent`/`task` 工具块按 `state.metadata.sessionID` 找到子会话行（`parent_id`），把子会话自身的消息翻成 `subagentTools` 时间线（assistant 正文/reasoning/工具，工具结果优先读 v2 的 `state.content`），agent 名取自子会话 `agent`、状态以子会话最近一次 settle 为准——`idle_outcome`/`time_idle` 只在会话行没有比 idle 标记更新的写入时可信（被再次唤醒、仍在中途的子会话还戴着上一轮的 idle 标记，直读会把工作中的子代理误报成已完成），后台启动的父块 `metadata.status` 永远是 running；子会话不进侧边栏索引（同步器照旧剪枝）。**卡名映射**：引擎的 `question` 在实时与历史两条路径都改写成共享提问卡的 `AskUserQuestion`（输入把 `multiple` 折成 `multiSelect`，答案取自 `state.metadata`），`subagent`/`task` 同理收成 `Agent` 卡。契约探针：`scripts/probe/opencode-subagent-probe.mjs`。
 - `opencode-context-usage.ts`：上下文占用读取器（bridge 的 `step.ended` 令牌经 `OpenCodeTokenBudgetTracker` 变成实时 `token_budget` 帧；`/token-usage`、历史页与回合结束帧共用同一读数），语义与 v1/v2 布局差异见上方用量表。
 - **消息编辑与 fork**（服务端原语，v2.1.4 探针 `scripts/probe/opencode-revert-fork-probe.mjs`）：历史里每条用户行带 `transcriptAnchorId = msg_…`；`readOpenCodeConversationOrder`（`opencode-data-root.ts`）给出只含 user/assistant 的消息序，跳过 v2 的 `model-switched`/`system`/`idle` 等簿记行——切点落在簿记行上会把一个回合劈开。编辑走 `rewindSession`：在保留点之后的第一条用户消息处 `revert/stage {files:true}` + `revert/commit`（删行并按引擎快照还原这些回合改过的文件，故 `editRevertsFiles: true`；快照只存在于 git 仓库内，非 git 目录只回退对话），provider 会话 id 不变，替换 prompt 是普通续写；未知保留点直接 404，绝不退化成"全部丢弃"。fork（`opencode-fork.provider.ts`）用 `POST /fork {before}`，该切点**不含** `before`，所以传锚点回合之后的第一条用户消息，得到含锚点整回合的副本（与 codex 一致）；副本无 `parent_id`，同步器不会当子会话剪掉。两者与 runtime 共用 `opencodeServiceSupervisor` 单例（`connectOpenCodeApiClient`），不会另起一个 `serve`。
+- **旁问（side question）**：`askSideQuestion` 在会话的只读 fork 上回答问题（`opencode-side-question.ts`）：先给 fork 下发 `shell`/`edit`/`write`/`patch` 的 deny 规则，再用一条独立的 `/api/event` 连接只订阅该 fork，答完即删除 fork，不在引擎里留下副本。失败一律以 error outcome 返回，从不抛出；从未运行过的会话直接给出错误说明。上游 #1673 的入口，运行时切面已接。
 - **相对旧实现的缺口（待移植）**：空交付自动重试、回合中途插话（`injectInput`）。子代理卡片与审批桥上溯父会话已补（历史见上，实时见 registry / bridge 两条）。配额卡片已移植（`opencode-quota.provider.ts`）；`/compact` 已随服务客户端恢复（见上方「`/compact` 的引擎实现」）。
 
 
@@ -270,6 +271,8 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 | opencode | `~/.local/share/opencode` | `opencode.db`（共享 SQLite，`jsonl_path` 存 null） |
 | zcode | `~/.zcode`（`zcode-data-root.ts`） | 引擎自有会话存储 |
 | antigravity | `~/.gemini/antigravity-cli`（`antigravity-data-root.ts`） | brain 文档在 `~/.gemini/antigravity/brain`（只读暴露给 file-tree） |
+
+**fork 的两种存储形态决定读法**（`fork` 切面在即能力在，缺省即无 fork 入口）。codex 与 opencode 的 fork 是真复制：新会话名下就有全部行，读法与普通会话无异；opencode 的切点参数 `before` 是排除语义，facet 负责换算成"锚点后一条消息"。zcode 的 fork 是引用：`session/fork` 的新会话在 `session` 表以 `parent_id` 链回父会话，自身只存 fork 之后的行和一条 fork 通知（截断边界记在通知的 `forkContext.targetMessageId`），引擎自己的 `session/messages` RPC 同样不解析链——所以 `fetchHistory` 必须沿 `parent_id` 递归拼接祖先行、按边界（含边界消息）截断再接上自己的行（`selectResolvedHistoryRows`）。fork 前会话须先 `session/resume` 激活；运行中的回合被引擎拒绝。两家历史读取都为真实 user 提示发射 `transcriptAnchorId`（= 该回合最后一条消息的引擎 id），fork 入口据此保住提示与其回答；antigravity 的 `/fork` 被引擎挡在交互模式内，无头不可用。旁问（`askSideQuestion`）建立在同一 fork 机制上：claude 用 SDK 只读 fork 流、codex 用一次性 off-disk fork，opencode 在 fork 副本上 deny 全部变更动作（denied 动作的工具直接从工具集消失）后提问，走私有 `/api/event` SSE 流收答，答完删除副本。
 
 ## 会话存储清理
 
@@ -311,7 +314,19 @@ opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的�
 “周配额（所有模型）”，与 Claude 官方 `/usage` 的 `Current week (all models)` / `Current week (Fable)` 对齐。
 
 **配额的数据源各家不同，但都收在 auth 切面背后**：codex 起一次 `app-server` 走
-`account/rateLimits/read`，zcode 直接打 BigModel / Z.AI 的 HTTP 端点，
+`account/rateLimits/read`，zcode 直接打 BigModel / Z.AI 的 HTTP 端点，鉴权优先取当前
+活跃 OAuth 会话的平台凭据（`zai_cn` 登录关联的 `oauth:linked_bigmodel` 令牌，或
+`oauth:bigmodel:access_token` / `oauth:zai:access_token`），无会话令牌时回退唯一一条
+编码套餐 `api-key`；凭据放入 `authorization` 头（无 Bearer 前缀），再按 `customerId`
+配对 `project-key-location` 凭据项附上可选的 `bigmodel-organization` /
+`bigmodel-project` 作用域头（带错作用域头会掏空返回，缺失就整头不发）；监控端点对鉴权失败回 HTTP 200 + body 非
+成功码，zcode 适配器先验信封再解析，任何一层拒绝一律降级为"无配额"。ZCode MCP 调用次数单独走
+zcode 网关 `zcode.z.ai/api/v1/mcp/usage`（信封 `code: 0`），鉴权是双头——`Authorization: Bearer
+<zcodejwttoken>` + `X-Bigmodel-Authorization: Bearer <编码套餐凭据>`；monitor 的 TIME_LIMIT 桶是
+工具调用次数（老套餐无周限额，不显示周行）。体验套餐余额单独成组走
+`zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=<桌面版号>`（信封 `code: 0`，
+鉴权 `Authorization: Bearer <zcodejwttoken>`，且网关**必须**带 `X-Device-Mid` 设备 UUID 头——
+来自 `onboarding-record.json`，缺了报 3001 parameter error），额度耗尽也照常成组显示。
 claude 直连 `/api/oauth/usage?cedar_ember=1`（本地 OAuth token + CLI User-Agent + 代理），
 一次取回窗口和 reset 卡；直连失败时退回 Agent SDK 的 control request，由它刷新 token
 并照常返回窗口。
@@ -322,6 +337,14 @@ opencode 打 Go 套餐的内部端点 `/zen/go/v1/usage`（官方文档未列，
 各家都要拉起进程或走网络，因此统一用 `createProviderQuotaCache`（TTL 两分钟）挡在前面，
 `?refresh=true` 才穿透。claude 那条路额外有一点要守住：喂给 SDK 的输入流一条消息都不产出，
 CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在汇报的额度。
+
+**zcode 凭据解密**：`~/.zcode/v2/credentials.json` 的值有 `enc:v1`（key 可由主机环境或
+`ZCODE_CREDENTIAL_SECRET` 推导）与 `enc:v2` 两代——`enc:v2:<来源>:<sha256指纹24位>:<载荷>`，
+随机 32 字节 key 存 macOS 钥匙串（服务名 `ZCode Credential Encryption`），指纹用于验钥。
+无 GUI 的服务端读不到钥匙串，改读凭据旁的 `credential-secret` 落钥文件：在 GUI 会话跑
+`scripts/zcode-stage-credential-key.mjs` 生成，桌面端重新登录后 key 可能轮换，需重跑。
+`oauth:linked_bigmodel` 与当前 `user_info` 的用户 id 不一致时拒绝使用；回退编码套餐
+`api-key` 时，多份账号并存也不自动挑选（读错账号比没有配额更糟）。
 
 **重置卡（banked reset）随配额载荷搭车**：`ProviderQuotaData.resetCredits` 由各配额适配器
 在读取时顺带解析（`POST /providers/quota/reset` 花卡）。调用方传的只是 `resetType`，

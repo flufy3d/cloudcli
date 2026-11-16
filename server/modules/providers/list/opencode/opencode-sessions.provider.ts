@@ -19,6 +19,7 @@ import type {
 } from '@/shared/types.js';
 import {
   AppError,
+  compactProviderPayload,
   createNormalizedMessage,
   generateMessageId,
   normalizeProjectPath,
@@ -223,6 +224,45 @@ const buildOpenCodeV2CompactionRows = (messageRow: {
   }
   return rows;
 };
+
+/**
+ * For every visible user prompt, the engine message that closes its turn —
+ * the prompt itself when nothing answered it yet, otherwise the last message
+ * before the next prompt. Fork entries anchor there, so both entry points
+ * (the prompt's own row and the turn-final assistant row) cut at the same
+ * place and keep the prompt together with the answer it got.
+ */
+function buildOpenCodeTurnAnchors(rows: Iterable<OpenCodeHistoryRow>): Map<string, string> {
+  const roles = new Map<string, 'user' | 'assistant'>();
+  const order: string[] = [];
+  for (const row of rows) {
+    if (roles.has(row.message_id)) {
+      continue;
+    }
+    const info = compactProviderPayload(readJsonRecord(row.message_data));
+    const role = readOptionalString(info?.role);
+    if (role === 'user' || role === 'assistant') {
+      roles.set(row.message_id, role);
+      order.push(row.message_id);
+    }
+  }
+
+  const anchors = new Map<string, string>();
+  for (let index = 0; index < order.length; index += 1) {
+    if (roles.get(order[index]) !== 'user') {
+      continue;
+    }
+    let turnEnd = index;
+    for (let next = index + 1; next < order.length; next += 1) {
+      if (roles.get(order[next]) === 'user') {
+        break;
+      }
+      turnEnd = next;
+    }
+    anchors.set(order[index], order[turnEnd]);
+  }
+  return anchors;
+}
 
 /**
  * Flattens v2 `session_message` rows into the (message, part) row shape the
@@ -723,8 +763,11 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       // v2 keeps the per-session token totals on the session row (read below
       // as `cumulative`); the v1 layout aggregates them from per-message rows.
       const rows = layout === 'session_message'
-        ? flattenOpenCodeV2HistoryRows(db, providerSessionId)
+        ? [...flattenOpenCodeV2HistoryRows(db, providerSessionId)]
         : this.readV1HistoryRows(db, providerSessionId);
+      const turnAnchors = layout === 'session_message'
+        ? buildOpenCodeTurnAnchors(rows)
+        : new Map<string, string>();
       // Current occupancy (newest message) plus the model's window, so a
       // reloaded transcript shows the same ratio the live frames pushed. The
       // session-lifetime numbers ride along as `cumulative`.
@@ -746,7 +789,13 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
         );
       }
 
-      const normalized = this.normalizeHistoryRows(rows, sessionId, childSessions, subagentActivityBySession);
+      const normalized = this.normalizeHistoryRows(
+        rows,
+        sessionId,
+        childSessions,
+        subagentActivityBySession,
+        turnAnchors,
+      );
       const normalizedOffset = Math.max(0, offset);
       const normalizedLimit = limit === null ? null : Math.max(0, limit);
       const total = normalized.length;
@@ -924,6 +973,7 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
     sessionId: string,
     childSessions: Map<string, OpenCodeChildSessionRow> = new Map(),
     subagentActivityBySession: Map<string, SubagentActivity[]> = new Map(),
+    turnAnchors: Map<string, string> = new Map(),
   ): NormalizedMessage[] {
     const normalized: NormalizedMessage[] = [];
     const emittedMessageErrors = new Set<string>();
@@ -1014,9 +1064,11 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
             // disclosure, and the row above it says what the compaction was.
             ...(partData.isCompactSummary === true ? { isCompactSummary: true } : {}),
             ...(compactAnnotation ? { compact: compactAnnotation } : {}),
-            // The provider message id is what "edit this message" and "fork
-            // from here" address; the revert and fork cuts are named by it.
-            ...(messageRole === 'user' ? { transcriptAnchorId: row.message_id } : {}),
+            // The turn's last engine message, so "fork from here" keeps the
+            // prompt and the answer it got.
+            ...(messageRole === 'user'
+              ? { transcriptAnchorId: turnAnchors.get(row.message_id) ?? row.message_id }
+              : {}),
           }));
         }
         continue;
@@ -1159,7 +1211,17 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
       if (index < 0) {
         return { found: false, resumeThroughId: null };
       }
-      return { found: true, resumeThroughId: index === 0 ? null : order[index - 1].id };
+      // The anchor is the turn's final message (the user row and its answer
+      // share it), so the edit cut belongs at the prompt that starts that
+      // turn: the message before it is what the replacement keeps.
+      let turnStart = index;
+      while (turnStart >= 0 && order[turnStart].role !== 'user') {
+        turnStart -= 1;
+      }
+      if (turnStart < 0) {
+        turnStart = index;
+      }
+      return { found: true, resumeThroughId: turnStart <= 0 ? null : order[turnStart - 1].id };
     } finally {
       db.close();
     }
