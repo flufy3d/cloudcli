@@ -200,7 +200,7 @@ claude 每个回合默认起一个 CLI 进程，回合结束即退出；18MB 级
 
 **会话生命周期切面**：`getSessionActivity`（引擎是在排队还是在本回合里）、`hasSessionWork`（回合在跑 / 引擎自发上报 / agent 还在跑 → 不许归档或删除）、`closeSessionAdmission` / `releaseSession` / `openSessionAdmission`（先关准入、再看状态、再释放常驻进程，中间不会插进新 run）。
 
-**后台任务与任务条**：`createBackgroundWorkTracker()` 记录 `task_started`（带 `tool_use_id`）到 `task_notification` / 终态 `task_updated`，供运行列表（`listBackgroundWork`）与单任务停止（`stopBackgroundTask` → SDK `stopTask`）使用；`extractBackgroundTasks` 从工具调用提取 composer 任务条所需的条目，runtime 以 `background_tasks` 帧广播（含 `chat_subscribed` 回放），每回合结束与新 run 接手时都会重发，所以清空不依赖某一条丢失的帧。spawn 时声明 `perTaskStopAffordance: true`，CLI 的 interrupt 因此只停回合、放过后台 agent/workflow；`abort` 只 `interrupt`，会话还有在跟任务时不关 stdin。
+**后台任务与任务条**：`createBackgroundWorkTracker()` 记录 `task_started`（带 `tool_use_id`）到 `task_notification` / 终态 `task_updated`，供运行列表（`listBackgroundWork`）与单任务停止（`stopBackgroundTask` → SDK `stopTask`）使用；没收到可配对 `task_started` 的后台 Bash/Agent/Workflow 由任务条卡片补出摘要，运行列表与任务条因此数目一致（等待中的 wakeup/cron 仍只报"有后台工作"、不列任务）；`extractBackgroundTasks` 从工具调用提取 composer 任务条所需的条目，runtime 以 `background_tasks` 帧广播（含 `chat_subscribed` 回放），每回合结束与新 run 接手时都会重发，所以清空不依赖某一条丢失的帧。spawn 时声明 `perTaskStopAffordance: true`，CLI 的 interrupt 因此只停回合、放过后台 agent/workflow；`abort` 只 `interrupt`，会话还有在跟任务时不关 stdin。
 
 **上下文窗口（本 fork 补充）**：transcript 只记录解析后的模型 id（`claude-opus-5`），读不出 `[1m]` 变体；SDK 只在 query 活着时知道真实窗口。runtime 因此在流头部与首批 assistant 回复各探测一次 `getContextUsage()`（最多两次，共享 in-flight 读），把结果经 `recordClaudeSessionContextWindow` 写进 `sessions.context_window`，并让该 run 之后发出的 `token_budget` 帧用这个窗口而不是启动参数（`createContextWindowCapture`，`services/claude-context-window.ts`）。历史页与 `/token-usage` 走同一个解析器（`resolveClaudeContextWindow`：记录值 → `CONTEXT_WINDOW` → 带 `[1m]` 的模型 id），所以实时百分比与刷新后一致。
 
