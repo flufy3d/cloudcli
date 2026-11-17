@@ -21,7 +21,11 @@ import {
 
 import { readZCodeIndividualPlanAuthContext, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
-import { resolveZCodeProviderApiType } from './zcode-provider-config.js';
+import {
+  readZCodeModelReasoningValues,
+  readZCodeTemplateModelDefaults,
+  resolveZCodeProviderApiType,
+} from './zcode-provider-config.js';
 import { tryResolveEnginePath } from './zcode-engine-path.js';
 import { protocolClient } from './zcode-protocol.client.js';
 
@@ -81,6 +85,201 @@ const REASONING_EFFORT_ORDER: Record<string, number> = {
   max: 40,
 };
 
+/** disabled/enabled-only option lists are engine thinking toggles, not effort pickers. */
+function isToggleOnlyReasoning(values: string[]): boolean {
+  return values.every((value) => value === 'disabled' || value === 'enabled');
+}
+
+function sortReasoningValues(values: string[]): string[] {
+  return [...values].sort((a, b) => {
+    const orderA = REASONING_EFFORT_ORDER[a] ?? 999;
+    const orderB = REASONING_EFFORT_ORDER[b] ?? 999;
+    if (orderA !== orderB) return orderA - orderB;
+    return a.localeCompare(b);
+  });
+}
+
+/**
+ * Level used when the composer carried none. The engine requires
+ * `options.reasoningLevel` for any model shipping a reasoning spec, so
+ * something must be picked: the top effort (highest sorted value, which
+ * lands on max → xhigh before exotic ids), and thinking-off for toggle-only
+ * specs. Null without a spec — nothing is invented.
+ */
+function pickNativeReasoningDefault(values: string[]): string | null {
+  const efforts = values.filter((value) => value !== 'disabled' && value !== 'enabled');
+  if (efforts.length > 0) return sortReasoningValues(efforts).at(-1) ?? null;
+  if (values.includes('disabled')) return 'disabled';
+  if (values.includes('enabled')) return 'enabled';
+  return null;
+}
+
+/** Menu effort from engine reasoning specs; toggle-only specs stay off the picker. */
+function buildNativeReasoningEffort(values: string[]): ProviderModelOption['effort'] | undefined {
+  if (values.length === 0 || isToggleOnlyReasoning(values)) return undefined;
+  const fallback = pickNativeReasoningDefault(values);
+  return {
+    ...(fallback ? { default: fallback } : {}),
+    values: sortReasoningValues(values).map((value) => ({
+      value,
+      description: EFFORT_DESCRIPTIONS[value] || `${value} reasoning level`,
+    })),
+  };
+}
+
+/**
+ * One personal provider parsed from ZCode's native `v2/provider_config.json`
+ * (what the ZCode App provider settings page writes). `modelIds` is the
+ * enabled catalog in display order; `apiKeyConfigured` marks the rule that
+ * carries api-key access. Consumers: `readZCodeModelConfig` (catalog merge),
+ * `resolveZCodeModelRef` (bare-id routing) and `buildNativePersonalSendParams`
+ * (send params) below — kept module-private.
+ *
+ * The engine loads this file (or a materialized copy that preserves its
+ * rules) as the personal provider registry at spawn, so cloudcli only has to
+ * list and route the ids; the credential never transits send params.
+ */
+type NativePersonalProviderRule = {
+  providerId: string;
+  providerName: string;
+  modelIds: string[];
+  apiKeyConfigured: boolean;
+};
+
+function readNativePersonalProviderRules(): NativePersonalProviderRule[] {
+  let body: Record<string, unknown> | null = null;
+  try {
+    const root = readObjectRecord(JSON.parse(fsSync.readFileSync(
+      path.join(getZCodeStorageDir(), 'v2', 'provider_config.json'),
+      'utf8',
+    )));
+    body = readObjectRecord(root?.config);
+  } catch {
+    // Missing or unreadable native config: no personal providers.
+    return [];
+  }
+
+  const providerRules = Array.isArray(readObjectRecord(body?.providerConfigRules)?.providerRules)
+    ? readObjectRecord(body?.providerConfigRules)?.providerRules as unknown[]
+    : [];
+  const modelRules = Array.isArray(readObjectRecord(body?.modelConfigRules)?.providerModelRules)
+    ? readObjectRecord(body?.modelConfigRules)?.providerModelRules as unknown[]
+    : [];
+  const manualRules = Array.isArray(readObjectRecord(body?.modelConfigRules)?.manualProviderModelRules)
+    ? readObjectRecord(body?.modelConfigRules)?.manualProviderModelRules as unknown[]
+    : [];
+
+  const collectStringList = (value: unknown): string[] => (
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : []
+  );
+
+  const templateDefaults = readZCodeTemplateModelDefaults();
+  const rules: NativePersonalProviderRule[] = [];
+  for (const entry of providerRules) {
+    const record = readObjectRecord(entry);
+    const providerId = readOptionalString(record?.providerId);
+    if (!providerId || record?.enabled === false) continue;
+    // Account/builtin rows are the plans' or ZCode's own registry, and the
+    // legacy `bigmodel-coding-plan` row keeps plan routing authority; none of
+    // them belong to the native personal-provider list.
+    if (providerId.startsWith('builtin:')
+      || providerId.startsWith('account:')
+      || providerId === 'bigmodel-coding-plan') continue;
+
+    const config = readObjectRecord(record?.config);
+    const templateId = readOptionalString(record?.templateId) || providerId;
+    const templateModels = templateDefaults?.get(templateId) ?? null;
+    const personalModelIds = collectStringList(config?.personalModelIds);
+
+    // Mirrors the App model page, which shows exactly this overlay: user
+    // deviation rules first, then user-added personal models (listed only
+    // when picked, so membership means enabled), then the engine template's
+    // shipped defaults. When the template defaults are entirely unavailable
+    // (no engine, no builtin rows) stay permissive rather than hiding the
+    // whole group.
+    const isModelEnabled = (modelId: string): boolean => {
+      for (const modelEntry of modelRules) {
+        const modelRecord = readObjectRecord(modelEntry);
+        if (readOptionalString(modelRecord?.providerId) === providerId
+          && readOptionalString(modelRecord?.modelId) === modelId) {
+          return readObjectRecord(modelRecord?.config)?.enabled !== false;
+        }
+      }
+      if (personalModelIds.includes(modelId)) return true;
+      if (templateModels) return templateModels.get(modelId) === true;
+      return true;
+    };
+
+    const modelIds: string[] = [];
+    const addModel = (modelId: string) => {
+      if (!modelIds.includes(modelId)) modelIds.push(modelId);
+    };
+    const pushModel = (modelId: string) => {
+      if (isModelEnabled(modelId)) addModel(modelId);
+    };
+    // modelOrder first (the App's display order), then ids it omits.
+    collectStringList(config?.modelOrder).forEach(pushModel);
+    personalModelIds.forEach(pushModel);
+    for (const manualEntry of manualRules) {
+      const manualRecord = readObjectRecord(manualEntry);
+      if (readOptionalString(manualRecord?.providerId) !== providerId) continue;
+      if (readObjectRecord(manualRecord?.config)?.enabled === false) continue;
+      const manualModelId = readOptionalString(manualRecord?.modelId);
+      // The manual row itself is the user's explicit enable signal; skip the
+      // template consult (manual models are not template catalog members).
+      if (manualModelId) addModel(manualModelId);
+    }
+    if (modelIds.length === 0) continue;
+
+    const access = readObjectRecord(config?.access);
+    rules.push({
+      providerId,
+      providerName: readOptionalString(record?.providerName) || providerId,
+      modelIds,
+      apiKeyConfigured: readOptionalString(access?.type) === 'api-key'
+        && Boolean(readOptionalString(access?.apiKey)),
+    });
+  }
+  return rules;
+}
+
+/**
+ * Send params for a selection whose authoritative config is the native
+ * personal provider file. Only the selection travels: the engine resolves
+ * the api key from the personal config handed to it at spawn, so the
+ * credential is never copied into send params. The engine hard-requires
+ * `options.reasoningLevel` for models that ship a reasoning spec, so when
+ * the composer carried none the top spec level is filled in. Returns null
+ * (engine default model, the existing degrade philosophy) when the
+ * provider/model is not in the native config or lacks api-key access.
+ *
+ * Consumer: `buildZCodeSendModelParams` below.
+ */
+function buildNativePersonalSendParams(
+  explicitSelection: { providerId: string; modelId: string; options?: { reasoningLevel: string } },
+): {
+  modelSelection: { providerId: string; modelId: string; options?: { reasoningLevel: string } };
+  modelExecution: { selectionScope: 'execution' };
+} | null {
+  const rule = readNativePersonalProviderRules().find((candidate) => (
+    candidate.providerId === explicitSelection.providerId
+    && candidate.modelIds.includes(explicitSelection.modelId)
+  ));
+  if (!rule || !rule.apiKeyConfigured) return null;
+  const modelSelection = { ...explicitSelection };
+  if (!modelSelection.options?.reasoningLevel) {
+    const values = readZCodeModelReasoningValues(explicitSelection.modelId) ?? [];
+    const fallback = values.length > 0 ? pickNativeReasoningDefault(values) : null;
+    if (fallback) modelSelection.options = { reasoningLevel: fallback };
+  }
+  return {
+    modelSelection,
+    modelExecution: { selectionScope: 'execution' },
+  };
+}
+
 /**
  * Appends the pinned trial-plan option when the account holds a trial JWT.
  * The trial model stays a single hard-coded entry: the plan's billing API
@@ -117,6 +316,10 @@ function appendStartPlanModelIfEligible(options: ProviderModelOption[]): Provide
  * Reads ZCode's user-facing provider config to extract model definitions.
  * 0.16.9 stores the active catalog in `cli/config.json`; the v2 path is
  * retained as a fallback for installations that have not rewritten it yet.
+ * Providers configured in the ZCode App (`v2/provider_config.json`) merge in
+ * after the cli table, grouped under their provider name; on a bare-key
+ * collision the cli entry wins, matching the send routing in
+ * `resolveZCodeModelRef`.
  */
 const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
   let baseDefinition: ProviderModelsDefinition = ZCODE_BUILTIN_MODELS;
@@ -135,10 +338,10 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
     }
 
     const providers = config ? readObjectRecord(config.provider) : null;
-    if (providers) {
     const modelOptions: ProviderModelOption[] = [];
     const seenModelKeys = new Set<string>();
 
+    if (providers) {
     for (const [providerId, providerConfig] of Object.entries(providers)) {
       const providerRecord = readObjectRecord(providerConfig);
       // Skip explicitly disabled providers
@@ -222,12 +425,32 @@ const readZCodeModelConfig = async (): Promise<ProviderModelsDefinition> => {
       }
     }
 
+    }
+
+    // Merge providers configured in the ZCode App settings page. Their model
+    // metadata carries no limits, so options stay plain entries grouped under
+    // the provider name.
+    for (const rule of readNativePersonalProviderRules()) {
+      for (const modelId of rule.modelIds) {
+        if (seenModelKeys.has(modelId)) continue;
+        seenModelKeys.add(modelId);
+        const reasoningValues = readZCodeModelReasoningValues(modelId);
+        const effort = reasoningValues ? buildNativeReasoningEffort(reasoningValues) : undefined;
+        modelOptions.push({
+          value: modelId,
+          label: modelId,
+          group: rule.providerName,
+          description: `ZCode ${modelId} model`,
+          ...(effort ? { effort } : {}),
+        });
+      }
+    }
+
     if (modelOptions.length > 0) {
       baseDefinition = {
         OPTIONS: modelOptions,
         DEFAULT: modelOptions[0]?.value ?? ZCODE_BUILTIN_MODELS.DEFAULT,
       };
-    }
     }
   } catch {
     // Config read failed; the builtin definition stays the base.
@@ -611,7 +834,9 @@ export function readZCodeSessionModelFromDb(providerSessionId: string): string |
  *
  * Handles:
  * - Full model refs formatted as `providerId/modelId` (e.g. `builtin:bigmodel-coding-plan/GLM-5.3`)
- * - Bare model keys (e.g. `GLM-5.3`), by looking up the active/enabled provider from config or defaulting
+ * - Bare model keys (e.g. `GLM-5.3`), by looking up the active/enabled provider from
+ *   `cli/config.json` first, then the ZCode App native `v2/provider_config.json` personal
+ *   providers, then defaulting
  * - Optional reasoning effort variant (e.g. `low`, `medium`, `high`, `max`)
  *
  * Consumer: `server/modules/providers/list/zcode/zcode-runtime.provider.ts`
@@ -737,6 +962,18 @@ export function resolveZCodeModelRef(
     // Personal provider config missing or unreadable; fall through.
   }
 
+  // Then the ZCode App's native personal providers. The cli lookup ran first
+  // so bare-key precedence matches the merged catalog.
+  for (const rule of readNativePersonalProviderRules()) {
+    if (rule.modelIds.includes(requestedModelId)) {
+      return {
+        providerId: rule.providerId,
+        modelId: requestedModelId,
+        ...(normalizedReasoningLevel ? { options: { reasoningLevel: normalizedReasoningLevel } } : {}),
+      };
+    }
+  }
+
   return {
     providerId: requestedProviderId ?? nativePersonalId ?? 'builtin:bigmodel-coding-plan',
     modelId: requestedModelId,
@@ -750,7 +987,10 @@ export function resolveZCodeModelRef(
  * The provider identity and request authentication are resolved from the same
  * `cli/config.json` record so they cannot drift apart. The runtime consumes
  * this result directly as `sendText` payload fields; credentials only travel to
- * the local engine subprocess over stdio.
+ * the local engine subprocess over stdio. Selections that belong to a ZCode App
+ * native personal provider (`v2/provider_config.json`) carry only the selection:
+ * the engine resolves their api key from the personal config handed to it at
+ * spawn, so the credential is not copied into send params.
  *
  * Returns null when the local config cannot produce a complete, executable
  * selection (missing provider/model record, unsupported API kind, no base
@@ -807,10 +1047,11 @@ export function buildZCodeSendModelParams(
     providerRecord = readObjectRecord(readObjectRecord(config?.provider)?.[explicitSelection.providerId]);
     modelRecord = readObjectRecord(readObjectRecord(providerRecord?.models)?.[explicitSelection.modelId]);
   } catch {
-    // Treated as "not configured" below; the send degrades to the engine default.
+    // Treated as "not configured" below; the send may still route through
+    // the native personal providers before degrading to the engine default.
   }
   if (!providerRecord || !modelRecord) {
-    return null;
+    return buildNativePersonalSendParams(explicitSelection);
   }
   const providerOptions = readObjectRecord(providerRecord.options);
   const baseUrl = readOptionalString(providerOptions?.baseURL)
@@ -820,8 +1061,13 @@ export function buildZCodeSendModelParams(
   }
 
   const configuredDefault = readOptionalString(readObjectRecord(modelRecord?.reasoning)?.defaultLevel);
+  // Same engine-spec fallback as the native path: a cli-config provider can
+  // select a model whose builtin reasoning spec the local config knows
+  // nothing about, and the engine rejects sends without a required level.
+  const specValues = readZCodeModelReasoningValues(explicitSelection.modelId) ?? [];
   const selectedReasoningLevel = explicitSelection.options?.reasoningLevel
-    ?? configuredDefault?.toLowerCase();
+    ?? configuredDefault?.toLowerCase()
+    ?? (specValues.length > 0 ? pickNativeReasoningDefault(specValues) : null);
   const modelSelection = {
     providerId: explicitSelection.providerId,
     modelId: explicitSelection.modelId,

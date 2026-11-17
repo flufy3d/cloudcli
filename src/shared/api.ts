@@ -1,4 +1,4 @@
-import type { ImageMediaRequest, PathExistenceRequest } from '@/shared/types';
+import type { SignedMediaRequest, PathExistenceRequest } from '@/shared/types';
 import {
   expireAuthSession,
   getStoredAuthToken,
@@ -441,8 +441,10 @@ export const api = {
     put(`/api/file-tree/projects/${projectId}/file`, { filePath, content }),
   // Lists project directories one level deep, up to 50 per call; '' is the
   // project root, other paths are relative to it or absolute inside it.
-  listDirectories: (projectId: string, paths: string[], options: ApiRequestOptions = {}) =>
-    post(`/api/file-tree/projects/${projectId}/directories`, { paths }, options),
+  // showHidden lifts the server's ignore filtering for this batch (VCS
+  // metadata directories stay hidden); the File Tree's toggle passes it.
+  listDirectories: (projectId: string, paths: string[], options: ApiRequestOptions = {}, showHidden = false) =>
+    post(`/api/file-tree/projects/${projectId}/directories`, { paths, showHidden }, options),
   // Searches the project's files by name and path on the server (best name
   // matches first); type 'any' also returns matching folders. Answers with a
   // `FileTreeSearchResponse`.
@@ -903,8 +905,8 @@ export const readExternalFileContent = (
   );
 
 /** 鉴权申请图片地址；返回 URL 后由浏览器直接加载图片字节。 */
-export const requestImageUrls = (images: ImageMediaRequest[], options: ApiRequestOptions = {}) =>
-  post('/api/media/image-urls', { images }, options);
+export const requestSignedUrls = (files: SignedMediaRequest[], options: ApiRequestOptions = {}) =>
+  post('/api/media/signed-urls', { files }, options);
 
 /** 鉴权批量探测本地路径是否可读；聊天渲染据此决定路径引用是否可点。 */
 export const requestPathsExist = (items: PathExistenceRequest[], options: ApiRequestOptions = {}) =>

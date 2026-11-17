@@ -266,6 +266,31 @@ test('listDirectories falls back to conventional directory names when the root h
   assert.deepEqual(listingNames(documentation), ['guide.md']);
 });
 
+test('listDirectories with showHidden reveals ignored entries but keeps VCS metadata hidden', async () => {
+  const fileSystem = createTreeFileSystem(fakeProjectRoot, {
+    '': ['.git/', 'node_modules/', 'dist/', '.env', 'README.md', '.gitignore'],
+    '.git': ['HEAD'],
+    node_modules: ['left-pad/'],
+    dist: ['bundle.js'],
+  }, { files: { '.gitignore': ['dist/', '.env'].join('\n') } });
+  const service = createFileTreeService(createDependencies(fileSystem, fakeProjectRoot));
+
+  const [root] = await service.listDirectories('project-1', [''], { showHidden: true });
+
+  assert.deepEqual(listingNames(root), ['dist', 'node_modules', '.env', '.gitignore', 'README.md']);
+});
+
+test('listDirectories with showHidden skips the fallback directory names too', async () => {
+  const fileSystem = createTreeFileSystem(fakeProjectRoot, {
+    '': ['node_modules/', 'dist/', 'docs/', 'guide.md'],
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, fakeProjectRoot));
+
+  const [root] = await service.listDirectories('project-1', [''], { showHidden: true });
+
+  assert.deepEqual(listingNames(root), ['dist', 'docs', 'node_modules', 'guide.md']);
+});
+
 test('listDirectories truncates one oversized directory without reading it all', async () => {
   let streamedEntries = 0;
   const fileSystem = createFakeFileSystem({
@@ -1178,15 +1203,15 @@ test('image inspection canonicalizes project files and rejects symlink escapes, 
     const dependencies = createDependencies(createFakeFileSystem({ realpath: fsPromises.realpath, stat: fsPromises.stat }), project, [outside]);
     dependencies.resolveMimeType = () => 'image/png';
     const service = createFileTreeService(dependencies);
-    assert.equal((await service.resolveImagePath({ path: 'inside.png', projectId: 'p', external: false })).path, await fsPromises.realpath(path.join(project, 'ok.png')));
+    assert.equal((await service.resolveMediaPath({ path: 'inside.png', projectId: 'p', external: false })).path, await fsPromises.realpath(path.join(project, 'ok.png')));
     for (const candidate of ['escape.png', '../outside/secret.png', '.']) {
-      await assert.rejects(service.resolveImagePath({ path: candidate, projectId: 'p', external: false }));
+      await assert.rejects(service.resolveMediaPath({ path: candidate, projectId: 'p', external: false }));
     }
-    assert.equal((await service.resolveImagePath({ path: path.join(outside, 'secret.png'), external: true })).path, await fsPromises.realpath(path.join(outside, 'secret.png')));
-    await assert.rejects(service.resolveImagePath({ path: 'secret.png', external: true }));
+    assert.equal((await service.resolveMediaPath({ path: path.join(outside, 'secret.png'), external: true })).path, await fsPromises.realpath(path.join(outside, 'secret.png')));
+    await assert.rejects(service.resolveMediaPath({ path: 'secret.png', external: true }));
     await fsPromises.unlink(path.join(project, 'inside.png'));
     await fsPromises.symlink(path.join(outside, 'secret.png'), path.join(project, 'inside.png'));
-    await assert.rejects(service.resolveImagePath({ path: 'inside.png', projectId: 'p', external: false }));
+    await assert.rejects(service.resolveMediaPath({ path: 'inside.png', projectId: 'p', external: false }));
   } finally { await fsPromises.rm(root, { recursive: true, force: true }); }
 });
 

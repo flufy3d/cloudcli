@@ -24,7 +24,7 @@
 
 服务端支持两种脱离用户直接点击的自主回合（Detached Chat Turn），两者在抢占策略上有着严格的架构边界：
 
-- **定时消息（Scheduled Messages）**：采用**显式抢断**策略（`interruptActiveRun: true`）。调度到期后直接抢占当前正在执行的交互回合，确保定时指令准时送达。composer 横幅提供两个动作：铅笔撤回先调取消接口，成功才把文本放回该会话的输入框（定时消息不带附件，只还原文本；取消失败横幅原样保留）；X 直接取消并丢弃正文。
+- **定时消息（Scheduled Messages）**：采用**显式抢断**策略（`interruptActiveRun: true`）。调度到期后直接抢占当前正在执行的交互回合，确保定时指令准时送达。composer 横幅提供两个动作：铅笔撤回先调取消接口，成功才把文本放回该会话的输入框（定时消息不带附件，只还原文本；取消失败横幅原样保留）；X 直接取消并丢弃正文。新建、取消、被调度器领取和发送失败都会向该会话广播 `scheduled_messages_changed` 帧（不含消息正文），页面收到后重读该会话的定时消息列表。
 - **排队消息（Queued Messages）**：采用**非抢断式空闲占用**策略，服务端是唯一发送方。页面经追加接口写入 `auth.db` 的 `session_drafts.queued_message`，服务端在事务中合并文字和附件，后提交的设置用于整条消息。主轮回复时等待；Claude 声明 `supportsInputAcceptance`，服务端可在后台任务继续运行时尝试原进程续轮。准备设置期间消息仍可编辑、追加或删除，提交前原子领取未变的快照；变化或不能安全续轮就继续等待。同一会话只有一次准备尝试。领取包装在原 JSON 列中保留已领取快照和后续追加，普通引擎起跑确认或支持输入确认的引擎由 SDK 消费输入后，只移除已领取消息；启动失败恢复原顺序。命令不能与其他消息合并，领取中的命令也不能追加普通消息。确认后广播 `queued_message_dispatched`，只带会话 id 和实际提交内容的 SHA-256 指纹，不广播正文；页面只回显指纹匹配的本地消息，其他内容由历史补齐，并重载服务端队列。进程重启恢复未确认领取，跨进程崩溃窗口不提供恰好一次投递保证。浏览器镜像只用于首屏恢复，旧 `queued_message_<sessionId>` key 不读不迁。
 - **异步任务接续（Task Continuation）**：采用**非抢断式空闲占用**策略（`interruptActiveRun: false`）。后台长耗时命令执行完成并原子落库后，派发器（`task-continuation-dispatcher.service.ts`）在领取事件时检查 `chatRunRegistry.isProcessing(sessionId)`。若用户正在输入或当前有正在进行的运行，派发器**主动释放租约并退回 pending**，等待下一次会话空闲轮询；仅当会话完全空闲时才启动唤醒回合，并将任务结果（`toolOutput`）送入引擎，转录落盘为 `status_note` 消息行。集中开关默认关闭；关闭后不领取新投递，但继续保存任务结果并核对已经发送的回合。 Codex 驻留开启时还要检查引擎的完整活动状态，不能只看网关前台运行。管理模块在独占借用处再次判断；确定尚未提交的忙状态经运行时和网关返回 `busy`，派发器把事件从 sending 退回 pending，不转成人工核对。接续使用管理模块创建的一次性进程恢复原生线程，工具结果回合结束后关闭；普通聊天继续跨轮驻留。
 
@@ -97,6 +97,10 @@ flowchart TD
 
 批准和提问卡片的 `context.subagent`（`toolUseId`、`description`）由 provider 在边界填入，横幅在卡片上方显示“来自子 agent：<description>”。一轮成功结束（`complete`）时，带 `context.subagent` 的卡片保留（派它的后台 agent 可能还在跑，要撤回由服务端发 `permission_cancelled`），其余卡片随这一轮清掉；失败或中止的结束清掉全部。没有前台回复在跑时到达的批准卡片只把会话记成后台工作（`onSessionProcessing(id, { awaitingApproval: true })`），不会让它变成前台“处理中”。各引擎怎样把自家的派 agent 形态翻成 `Agent` 行、怎样保证结算，见 [providers.md](./providers.md)「子 agent 卡片」。
 
+### 旁问（Side Questions）
+
+不进主时间线的独立提问，由能力位 `supportsSideQuestions` 门控显隐。入口：发送菜单（含 `/btw` 斜杠命令）与消息行上的旁问按钮；旁问的问题与回答包含在对话导出中。服务端 `side-questions.service` 把旁问建在会话 fork 机制上（各引擎实现见 providers.md「fork 的两种存储形态决定读法」：claude 原生 stdin 优先、fork 副本回落；codex 一次性 off-disk fork；opencode deny-all 副本）。问题与回答以 `side_question` 事件帧（`running` / `done` / `error` 三态）送达（opencode 走私有 `/api/event` SSE 流），渲染在转录旁的旁车列：不进主时间线、不算引擎自发回合、不改变会话忙碌状态。
+
 ## 断线恢复
 
 - `seq` 由 run registry 按 session 维护单调水位：跨 run 续数、不随缓冲驱逐失效，服务端单方定义，客户端只透传（取 max 对账）。重连后发 `chat.subscribe`（带 `lastSeq`）→ 活跃 run 从缓冲精确补发；ack 带权威 `lastSeq` 与 `stale` 标志——`stale: true` 表示 `lastSeq` 已落在缓冲窗之前（5000 条上限 / 5 分钟保留），客户端补一次 REST 刷新。完成态 run 不 replay，走 REST。**已应用游标跨页面刷新持久化**：`SessionTimelineStore` 只把实际经过 `applyServerEvent` 的帧写进 `sessionStorage`（每 25 个序号或 `pagehide` 落盘，最多 50 个会话，按标签页隔离），ack 的权威水位不写入；刷新后 `chat.subscribe` 带恢复的 `lastSeq` 与 `streamEpoch`，同一网关代次只补发刷新期间错过的事件，代次变化则退回完整重放 + REST 对账。游标状态按标签页在 `globalThis` 上共享单例：HMR 或测试的重复模块实例共享同一份 map，旧实例的 `pagehide` 监听不会把代次重置后的新游标覆盖回旧代次。否则长回合（一个 run 跑上小时、缓冲覆盖整段对话）刷新时会把整个 run 从第一条重放一遍。
@@ -121,6 +125,7 @@ flowchart TD
   - 卡片描述任务本身，等待状态还包括任务完成后的汇报回复。任务完成或唤醒到期时卡片立即消失，后续回复结束后才解除等待。未提供等待字段的引擎按卡片列表判断。
 - **输入防打断与智能排队**：
   - `useChatComposerState` 监听 `hasActiveBackgroundTasks`：在后台任务执行期间（即使主轮次已发出 `complete`），是否把新消息转入队列由能力矩阵 `inputWhileBusy` 决定：`backgroundWorkQueuesInput` = 有后台任务且为 `queue`；`turnQueuesInput` = 回合进行中且不是 `always`；两者之或即 `queuesInput`，composer 的排队判断、排队卡与发送按钮形态都只看它。claude、opencode（`background`）后台任务期间直接发送、任务条照常显示但不排队：claude 写进同一驻留进程，opencode 投进服务 inbox；codex/zcode/antigravity/cursor（`queue`）后台任务期间排队，避免新 run 取代在跑的后台子进程；`always` 目前无引擎使用。注意 `useChatSessionState` 的 `isProcessing`（即 composer 的 `isLoading`）只表示"正在产出回复"，只剩后台任务的 `background` 活动条目不算——否则 `background` 档永远被回合排队吞掉；`hasActiveBackgroundTasks` 同时认这种条目，保证 `queue` 档照旧排队。
+  - **后台发送确认对话框**：`queuesInput` 为真、主轮已结束、只剩后台任务且还没有排队草稿时（即 `inputWhileBusy: 'queue'` 的引擎），点发送先弹 `BackgroundSendDialog`：取消=原样退回文本与附件，不发送；排队=走排队路径；仍要发送=带 `forceInterrupt: true` 直发，新开回合并停掉后台任务。claude、opencode 后台阶段直接发送，不弹窗。
   - **排队消息由服务端保管与发送**：`queuesInput` 为真时提交走 `user.appendQueuedMessage`，写进 `session_drafts.queued_message`（同会话再次排队 = 文字与附件在事务里原子合并，并记录内容指纹）；`scheduled-messages` 调度器每 2s 轮询，会话没有活动 run 也没有后台工作时认领，用 `runDetachedChatTurn` 发出，成功后广播 `queued_message_dispatched`（只带会话 id 与指纹，不广播正文）。页面侧 `useQueuedMessageSync` 清掉本页的排队卡并在正查看该会话时回显本条消息；其他打开的页面通过 `subscribeToChatDrafts` 跟随服务端，因此多设备不会互相覆盖，也不会重复发送；刷新或断网重连后队列仍在。排队卡支持等待期编辑、追加与删除，权限设置对整条消息生效；「立即发送」(`forceSendQueuedDraft`) 仍可显式跳过等待（claude 不提供，因为新 run 会顶替驻留进程）。
   - **插话（steer）与侧边提问**：`supportsSteering` 为真且回复仍在流式输出时，composer 在排队发送键旁提供 Steer，走 `chat.steer` 把消息送进正在跑的回合（斜杠命令永远排队）；服务端回 `chat_steer_accepted` 或 `STEER_UNAVAILABLE` 协议错误，实时流里回显的 user 行表示模型已读到，`useChatRealtimeHandlers` 把这三种结果交给 composer 的 `pendingSteers` 收卡。`supportsSideQuestions` 为真时可发 `chat.side_question`（`/btw`），答案以 `side_question` 帧进 `sideQuestionStore`，按提问位置拼进显示，从不进入会话转录与 timeline store。
   - `/compact` 与技能一样是发给引擎的消息文本（菜单项来自 `useProjectSlashCommands`，`type: 'engine'`），走 `chat.send` 与普通 run；没有单独的压缩帧。回合进行中发出时和其它斜杠命令一样进服务端队列（`session-drafts.db.ts` 的 `isSlashCommand` 不与其它排队消息合并），会话空闲后由调度器发出，不依赖页面在线。压缩刚结束时 claude 用边界自报的 `postTokens` 立即换上新占用；报不出新占用的引擎（见 [providers.md](./providers.md) 的 `compacted` 约定）前端收到后清空占用百分比（`ContextUsageBar`），`TokenUsageSummary` 改用 `summaryBytes` 显示压缩摘要的大小，等下一个回合的刷新再显示真实 K 数与百分比。
@@ -267,7 +272,7 @@ MCP 客户端连接断开不关闭会话。运行记录与查询游标由 execut
 
 ## 聊天图片加载
 
-聊天附件和本地 Markdown 图片通过共享的 `useSignedImage` 申请短期图片 URL，由浏览器直接读取图片字节。引用解析保留所属项目；聊天绝对路径允许外部白名单读取被拒后回退到项目边界；旧附件允许全局资产缺失后回退到原项目文件。回退在后端完成，签名绑定实际解析结果。
+聊天附件和本地 Markdown 图片通过共享的 `useSignedMedia` 申请短期签名 URL，由浏览器直接读取图片字节。引用解析保留所属项目；聊天绝对路径允许外部白名单读取被拒后回退到项目边界；旧附件允许全局资产缺失后回退到原项目文件。回退在后端完成，签名绑定实际解析结果。
 
 图片接近视口才申请签名，相邻申请合并，同图复用有效票据，已有有效票据时挂载首帧直接出图；Markdown 图片在内存里记住原始尺寸，行被虚拟列表卸载再挂载时先占住原来的高度，机制见 [frontend.md](./frontend.md#图片直连与缓存)；同秒续签也产生不同地址。图片解码或传输失败最多自动续签一次，仍失败则显示错误并允许手动重试。放大和保存图片会按需续签。签名 URL 不进入消息持久化；上传前本地预览和导出嵌入图片保留原有数据形式。
 

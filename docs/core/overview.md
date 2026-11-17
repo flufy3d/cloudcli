@@ -51,7 +51,7 @@ server/
     database/              better-sqlite3 连接、schema、migrations、repositories（21 张表）
     assets/                聊天上传资产（~/.cloudcli/assets）的上传与读取
     agent/                 无头 Agent API（API key / 平台模式鉴权）
-    notifications/         Web Push（VAPID）+ 桌面通知 WS
+        notifications/         Web Push（VAPID）+ 桌面通知 WS + 出站 Webhook（用户配置 URL + 签名密钥，密钥仅创建时展示；只发 run 生命周期事件，接收方按事件 id 去重）
     plugins/               插件注册表、插件子进程、WS 代理
     scheduled-messages/    定时消息与排队消息（调度器 → 无附着 chat turn）
     scheduled-jobs/        定时任务（cron 循环或 run_at 仅一次 + 运行历史；reuse/new 两种会话模式，reuse 可设 rotate_after_days 到龄换新会话并归档旧会话；永不打断在跑回合）
@@ -88,7 +88,7 @@ docs/
 | 异步任务目录与产物 | `~/.cloudcli/tasks/<taskId>` | 后台命令日志 `output.log` 与原子结果 `result.json`，支持宿主断电/崩溃重启后自动扫描补录入库 |
 | 聊天上传资产 | `~/.cloudcli/assets` | 存储清理开启时，`inline-*`、`zcode-*` 按时间清理（读历史时重新生成），上传文件只在选中“同时删除对话”且无人引用时清理。`server/modules/assets`；聊天发送只信任该目录**直接子文件**（`chat-websocket.service.ts` 过滤） |
 | 插件本体与启用状态 | `~/.cloudcli/plugins` + `~/.cloudcli/plugins.json` | `server/modules/plugins`（注册表扫描 + 子进程管理）；首次访问时从旧 `~/.claude-code-ui` 一次性自动迁移（`migrateLegacyPluginPaths`） |
-| 各引擎会话原件 | `~/.claude` / `~/.codex` / `~/.cursor` / `~/.local/share/opencode` / `~/.zcode` / `~/.gemini/antigravity*` | 云 CLI 不复制、不改写；同步器只读解析后把元数据 upsert 进 SQLite（`sessions` 表含 `jsonl_path`）。`sessions` 还记会话的运行时事实：`model`、`effort`、`context_window`（引擎自报的真实上下文窗口，转录里推不出来；未跑过的会话为 NULL）、`name_locked`（用户在应用里改过名，引擎标题不得覆盖）、`worktree_path` / `worktree_branch`（引擎把会话绑到项目某个 git worktree 时的位置；主检出会话为 NULL）、`isPinned`（侧边栏置顶：项目会话与跨项目动态都按置顶优先、组内再按活跃时间排序，服务端分页同样置顶优先） |
+| 各引擎会话原件 | `~/.claude` / `~/.codex` / `~/.cursor` / `~/.local/share/opencode` / `~/.zcode` / `~/.gemini/antigravity*` | 云 CLI 不复制、不改写；同步器只读解析后把元数据 upsert 进 SQLite（`sessions` 表含 `jsonl_path`）。`sessions` 还记会话的运行时事实：`model`、`effort`、`context_window`（引擎自报的真实上下文窗口，转录里推不出来；未跑过的会话为 NULL）、`name_locked`（用户在应用里改过名，引擎标题不得覆盖）、`worktree_path` / `worktree_branch`（引擎把会话绑到项目某个 git worktree 时的位置；主检出会话为 NULL）、`isPinned`（侧边栏置顶：项目会话与跨项目动态都按置顶优先、组内再按活跃时间排序，服务端分页同样置顶优先）；fork 出的会话带祖先链上下文（`getForkAncestors` 递归 CTE 沿 `forked_from_session_id` 同项目同 provider 上溯，止于归档、缺失、跨项目或跨 provider 的祖先，UNION 去重防环）；项目会话接口与 WS 摘要携带该上下文，侧栏把 fork 会话缩进挂到祖先树下，祖先不占分页位；祖先被删除、改名或行 upsert 时上下文实时保活 |
 | 运行结束记录 | 服务进程内存（有界，约百条） | `server/modules/diagnostics`：每个 run 为什么结束（见 [chat.md](./chat.md)）。刻意不入库——它服务于"刚刚出了什么事"，重启即弃；`GET /api/diagnostics/runs` 读出，前端诊断报告把它和浏览器侧证据合成一份文件 |
 | 前端构建产物 | `dist/`（vite build） | Express 静态托管 + SPA fallback |
 | 服务端构建产物 | `dist-server/` | `tsc + tsc-alias` 先产出 `dist-server.next`，`scripts/promote-dist-server.mjs` 原子晋升（保留 `dist-server.old`；`preserver` 钩子启动前自愈） |
@@ -132,8 +132,8 @@ npm run typecheck    # 前后端双 tsconfig --noEmit
 | 新增 WS 消息类型 | [chat.md](./chat.md) 的扩展检查单 |
 | 新增前端大块 UI | [frontend.md](./frontend.md) + `.agents/skills/frontend-module-standards` |
 
-## 图片签名直连
+## 签名媒体直连
 
-`media` 模块把图片授权与字节传输分开。申请入口沿用 API key、登录和平台用户规则，批量校验资源并返回短期 URL；图片读取入口只接受专用签名票据，挂在通用 API key 中间件之前。图片票据使用从安装密钥按专用用途派生的密钥，绑定用户、用途及规范化资源，不能作为登录令牌；有效期不超过登录令牌剩余期。签发按固定窗口确定性计算（`iat` 取窗口起点、无随机 `jti`），同一资源在同一窗口内两次签发得到相同 URL，浏览器 HTTP 缓存以完整 URL 为键，URL 稳定才能命中缓存。具体协议类型以 `shared/protocol/imageMedia.ts` 为准。
+`media` 模块把媒体授权与字节传输分开。申请入口沿用 API key、登录和平台用户规则，批量校验资源并返回短期 URL；签名读取入口只接受专用签名票据，挂在通用 API key 中间件之前。媒体票据使用从安装密钥按专用用途派生的密钥，绑定用户、用途及规范化资源，不能作为登录令牌；有效期不超过登录令牌剩余期。签发按固定窗口确定性计算（`iat` 取窗口起点、无随机 `jti`），同一资源在同一窗口内两次签发得到相同 URL，浏览器 HTTP 缓存以完整 URL 为键，URL 稳定才能命中缓存。具体协议类型以 `shared/protocol/signedMedia.ts` 为准。
 
-签发和读取都经文件服务校验项目、外部白名单和 realpath；图片读取还校验用户存在、图片类型及打开文件的身份。`304` 前也完成授权检查。字节响应允许与票据窗口等长的私有 `max-age` 缓存，到期后浏览器用 ETag 再验证，因此被编辑的文件最迟一个窗口内刷新，且不刷新登录令牌；SVG 以 sandbox CSP 和 `nosniff` 限制主动内容。持有者在有效期内可访问对应图片，退出登录不主动撤销已签发票据，已传输字节不能收回。路径与文件仍保存在现有位置，不迁移数据。
+签发和读取都经文件服务校验项目、外部白名单和 realpath；签名读取还校验用户存在、媒体类型（图片白名单 + 音频前缀）及打开文件的身份。`304` 前也完成授权检查。字节响应允许与票据窗口等长的私有 `max-age` 缓存，到期后浏览器用 ETag 再验证，因此被编辑的文件最迟一个窗口内刷新，且不刷新登录令牌；SVG 以 sandbox CSP 和 `nosniff` 限制主动内容。持有者在有效期内可访问对应文件，退出登录不主动撤销已签发票据，已传输字节不能收回。路径与文件仍保存在现有位置，不迁移数据。
