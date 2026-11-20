@@ -145,7 +145,7 @@ ZCode 的 `SendMessage` 能把已结束的 agent 复活到后台。引擎把这�
 
 **可选成员就是能力开关**，这是整个框架的核心设计。
 
-**模型目录特例（opencode）**：`list/opencode/opencode-models.provider.ts` 以 `opencode models` CLI 的账号级清单为准（后台服务在时约百毫秒返回；首次调用需冷启动该服务，故超时放宽到 15s），id 为 `<providerID>/<modelID>`，再叠加 OpenCode 自己缓存于数据库 `kv` 的 models.dev 条目补全推理档位与说明；CLI 缺失/失败/空答案时回退 `OPENCODE_PREDEFINED_MODELS` 预置表并按本机已连接 provider 过滤，且打上 `FALLBACK: true`（`ProviderModelsDefinition` 通用字段，`providerModelsService` 合并时透传），告诉前端这只是替身目录、需稍后重拉。目录经 `createStaleWhileRefreshValue` 缓存：第一个调用等 CLI，过期值立即返回并在后台刷新（CLI 结果 60s 新鲜期，`FALLBACK` 目录 10s，失败按 10s 退避），所以每回合读目录不再被 `opencode models` 拖住。会话模型值同样以目录的 `<providerID>/<modelID>` 为准，`providerModelsService` 负责把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原。此前的「读 `~/.cache/opencode/models.json` 实时目录」叠加层随本轮 client-mode 迁移一并移除（见「OpenCode 服务客户端」）；antigravity 与 codex 的目录读取同用这套缓存。
+**模型目录特例（opencode）**：`list/opencode/opencode-models.provider.ts` 以 `opencode models` CLI 的账号级清单为准（后台服务在时约百毫秒返回；首次调用需冷启动该服务，故超时放宽到 15s），id 为 `<providerID>/<modelID>`，再叠加 OpenCode 自己缓存于数据库 `kv` 的 models.dev 条目补全推理档位与说明；CLI 缺失/失败/空答案时回退 `OPENCODE_PREDEFINED_MODELS` 预置表并按本机已连接 provider 过滤，且打上 `FALLBACK: true`（`ProviderModelsDefinition` 通用字段，`providerModelsService` 合并时透传），告诉前端这只是替身目录、需稍后重拉。目录经 `createStaleWhileRefreshValue` 缓存：第一个调用等 CLI，过期值立即返回并在后台刷新（CLI 结果 60s 新鲜期，`FALLBACK` 目录 10s，失败按 10s 退避），所以每回合读目录不再被 `opencode models` 拖住。会话模型值同样以目录的 `<providerID>/<modelID>` 为准，`providerModelsService` 负责把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原；会话行还没有 effort 时，读引擎 `session.model` 里的 `variant` 作为 reasoning effort 回填（与 ZCode 的做法一致），否则 Agent API 或 CLI 直接创建的会话会被前端回落到浏览器默认档位。此前的「读 `~/.cache/opencode/models.json` 实时目录」叠加层随本轮 client-mode 迁移一并移除（见「OpenCode 服务客户端」）；antigravity 与 codex 的目录读取同用这套缓存。
 
 **模型目录特例（zcode）**：新版本 ZCode 把用户自建 provider/模型从 `~/.zcode/v2/config.json` 迁到了 `~/.zcode/v2/provider_config.json` + 引擎自带目录（`zcode-provider-config.ts` 定位 runtime 刷新副本或安装目录 `resources/config/provider/zcode-builtin.json`），因此 `getSupportedModels()` 以引擎为准：调一次 `session/create` 取响应里的 `settings.model.available`（即引擎已合并用户 provider 后的完整目录，用完即 `session/close`），失败才回退磁盘解析。会话模型值同样是 `<providerID>/<modelID>`，并把每个模型的 `reasoning.defaultLevel` 记进 `zcode-models.provider.ts` 的 `engineReasoningDefaults`；`setModel` 的 schema 是严格校验，reasoning 档位必须放 `model.options.reasoningLevel`（旧的 `model.variant` 会被拒），缺省取上面记下的 defaultLevel，否则引擎报 “Reasoning level is required”。
 
@@ -560,7 +560,7 @@ Claude、Codex 的全历史缓存按归一化结果的序列化大小、字符�
 执行能力从 provider 注册表发现已安装且声明 `supportsTaskExecution` 的引擎及模型，不在 nexus-kit 维护第二份引擎列表。
 当前只有 ZCode 声明可靠终止契约，已完成真实派发、交付、返工续跑和取消验证。其他引擎继续使用原直连执行器。
 聊天 complete 不自动等于引擎停止：RPC 失败或超时补出的界面终态不能作为自动任务的停止凭据。
-现有 `/api/agent` 保留原协议与鉴权，与执行 MCP 共用 provider 调度层。
+现有 `/api/agent` 保留原协议与鉴权，与执行 MCP 共用 provider 调度层；它在起跑前把本次 `model`/`effort` 写进会话行（新会话缺省 effort 记为 `default`），续跑未显式给 `effort` 时沿用会话已记录值，避免下一轮把引擎档位重置。
 
 服务默认关闭。服务进程须显式配置：
 

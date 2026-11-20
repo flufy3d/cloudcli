@@ -1141,7 +1141,7 @@ export class ZCodeProviderModels implements IProviderModels {
         if (session && !session.effort && modelInfo.variant) {
           sessionsDb.setSessionEffort(sessionId, modelInfo.variant);
         }
-        return { model: modelInfo.modelId };
+        return { model: modelInfo.modelId, effort: modelInfo.variant ?? null };
       }
     }
 
