@@ -49,6 +49,8 @@ type MessageComponentProps = {
   selectedProject?: Project | null;
   provider: Provider | string;
   onEditMessage?: (message: ChatMessage) => void;
+  /** Why the edit control is disabled right now; shown as its tooltip. */
+  editDisabledReason?: string;
   onForkFromMessage?: (message: ChatMessage) => void;
   /** True while a fork of this session is being created; disables the action. */
   isForking?: boolean;
@@ -77,7 +79,7 @@ function SideQuestionDismissButton({ label, onDismiss }: { label: string; onDism
   );
 }
 
-const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurnFinalAssistant = true, createDiff, onFileOpen, showRawParameters, showThinking, isThinkingStreaming, selectedProject, provider, onEditMessage, onForkFromMessage, isForking = false }: MessageComponentProps) => {
+const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurnFinalAssistant = true, createDiff, onFileOpen, showRawParameters, showThinking, isThinkingStreaming, selectedProject, provider, onEditMessage, editDisabledReason, onForkFromMessage, isForking = false }: MessageComponentProps) => {
   const { t } = useTranslation('chat');
   // Folds (thinking, compaction summary) render as native <details> here so
   // they stay expandable in the statically rendered exported document.
@@ -210,13 +212,16 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
                   </Markdown>
                 </div>
                 <div className="mt-1 flex items-center justify-end gap-1 text-xs text-muted-foreground">
-                  {onEditMessage && message.transcriptAnchorId && (
+                  {(onEditMessage || editDisabledReason) && message.transcriptAnchorId && (
                     <button
                       type="button"
-                      onClick={() => onEditMessage(message)}
-                      title={t('message.editAndResend', { defaultValue: 'Edit and resend' })}
-                      aria-label={t('message.editAndResend', { defaultValue: 'Edit and resend' })}
-                      className="rounded p-1 opacity-70 transition-opacity hover:bg-muted hover:opacity-100 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                      onClick={onEditMessage ? () => onEditMessage(message) : undefined}
+                      disabled={!onEditMessage}
+                      title={editDisabledReason ?? t('message.editAndResend', { defaultValue: 'Edit and resend' })}
+                      aria-label={editDisabledReason ?? t('message.editAndResend', { defaultValue: 'Edit and resend' })}
+                      className={`rounded p-1 transition-opacity hover:bg-muted hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 ${
+                        editDisabledReason ? 'opacity-40' : 'opacity-70 sm:opacity-0 sm:group-hover:opacity-100'
+                      }`}
                     >
                       <PencilIcon className="h-3.5 w-3.5" />
                     </button>
