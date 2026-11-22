@@ -79,6 +79,8 @@ type ChatSessionChannel = {
  */
 type ChatRun = {
   appSessionId: string;
+  /** Stable id for this round, so a client can address its event cursor. */
+  runId: string;
   provider: LLMProvider;
   providerSessionId: string | null;
   status: ChatRunStatus;
@@ -149,6 +151,14 @@ function releaseBufferedEvents(channel: ChatSessionChannel): void {
 const runs = new Map<string, ChatRun>();
 
 /**
+ * The same runs keyed by `runId`, for callers that address one round rather
+ * than the session's current slot. A completed run stays here for the same
+ * retention window as its replay buffer; after that, the event endpoint is
+ * gone and the caller falls back to the persisted result/history.
+ */
+const runsById = new Map<string, ChatRun>();
+
+/**
  * The event channels of the sessions that have been talked to, keyed by app
  * session id.
  *
@@ -205,6 +215,7 @@ let retainCompletedRun: (appSessionId: string) => boolean = () => false;
  */
 function evictRunLater(run: ChatRun): void {
   const timer = setTimeout(() => {
+    runsById.delete(run.runId);
     if (runs.get(run.appSessionId) !== run || run.status !== 'completed') {
       return;
     }
@@ -507,6 +518,7 @@ export const chatRunRegistry = {
 
     const run: ChatRun = {
       appSessionId: input.appSessionId,
+      runId: randomUUID(),
       provider: input.provider,
       providerSessionId: input.providerSessionId,
       status: 'running',
@@ -544,11 +556,17 @@ export const chatRunRegistry = {
     });
 
     runs.set(input.appSessionId, run);
+    runsById.set(run.runId, run);
     return run;
   },
 
   getRun(appSessionId: string): ChatRun | undefined {
     return runs.get(appSessionId);
+  },
+
+  /** Looks up one round by the id `startRun` returned; used by the Agent API event cursor. */
+  getRunById(runId: string): ChatRun | undefined {
+    return runsById.get(runId);
   },
 
   isProcessing(appSessionId: string): boolean {
@@ -557,6 +575,7 @@ export const chatRunRegistry = {
 
   listRunningRuns(): Array<{
     sessionId: string;
+    runId: string;
     provider: LLMProvider;
     startedAt: number;
     lastSeq: number;
@@ -565,6 +584,7 @@ export const chatRunRegistry = {
       .filter((run) => run.status === 'running')
       .map((run) => ({
         sessionId: run.appSessionId,
+        runId: run.runId,
         provider: run.provider,
         startedAt: run.startedAt,
         lastSeq: run.channel.lastSeq,
@@ -801,6 +821,7 @@ export const chatRunRegistry = {
    */
   clearAll(): void {
     runs.clear();
+    runsById.clear();
     sessionChannels.clear();
     totalBufferedBytes = 0;
     sessionWatermarks.clear();
