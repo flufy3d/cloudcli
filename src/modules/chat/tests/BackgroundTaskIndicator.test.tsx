@@ -51,8 +51,8 @@ describe('BackgroundTaskIndicator', () => {
     expect(screen.getByText(/Task/)).toBeTruthy();
   });
 
-  it('stops every task from the header and one task from its row', () => {
-    const onStopTasks = vi.fn();
+  it('triggers onAbort from the header when the engine can stop the work', () => {
+    const onAbort = vi.fn();
     const tasks: ActiveBackgroundTask[] = [
       {
         id: 'task-1',
@@ -63,17 +63,14 @@ describe('BackgroundTaskIndicator', () => {
       },
     ];
 
-    render(<BackgroundTaskIndicator tasks={tasks} onStopTasks={onStopTasks} />);
+    render(<BackgroundTaskIndicator tasks={tasks} onAbort={onAbort} />);
 
     screen.getByTitle('中止后台任务').click();
-    expect(onStopTasks).toHaveBeenLastCalledWith();
-
-    screen.getByTitle('停止此任务').click();
-    expect(onStopTasks).toHaveBeenLastCalledWith('task-1');
+    expect(onAbort).toHaveBeenCalledTimes(1);
   });
 
   it('offers no stop for a task the engine cannot stop', () => {
-    const onStopTasks = vi.fn();
+    const onAbort = vi.fn();
     const tasks: ActiveBackgroundTask[] = [
       {
         id: 'toolu_shell_1',
@@ -83,17 +80,16 @@ describe('BackgroundTaskIndicator', () => {
       },
     ];
 
-    render(<BackgroundTaskIndicator tasks={tasks} onStopTasks={onStopTasks} />);
+    render(<BackgroundTaskIndicator tasks={tasks} onAbort={onAbort} />);
 
     expect(screen.queryByTitle('中止后台任务')).toBeNull();
-    expect(screen.queryByTitle('停止此任务')).toBeNull();
   });
 
-  it('reveals the task whose label is clicked, and stopping it does not reveal', () => {
-    // The label region is the jump to the transcript card; the stop button
-    // beside it must not trigger that jump.
+  it('reveals the task whose label is clicked without aborting', () => {
+    // The label region is the jump to the transcript card; the header abort is
+    // a separate control and must not fire when the row is clicked.
     const onRevealTask = vi.fn();
-    const onStopTasks = vi.fn();
+    const onAbort = vi.fn();
     const task: ActiveBackgroundTask = {
       id: 'toolu_spawn_1',
       taskId: 'task-1',
@@ -103,16 +99,16 @@ describe('BackgroundTaskIndicator', () => {
     };
 
     render(
-      <BackgroundTaskIndicator tasks={[task]} onRevealTask={onRevealTask} onStopTasks={onStopTasks} />,
+      <BackgroundTaskIndicator tasks={[task]} onRevealTask={onRevealTask} onAbort={onAbort} />,
     );
 
     screen.getByTitle('定位到对应卡片').click();
     expect(onRevealTask).toHaveBeenCalledTimes(1);
     expect(onRevealTask).toHaveBeenCalledWith(task);
-    expect(onStopTasks).not.toHaveBeenCalled();
+    expect(onAbort).not.toHaveBeenCalled();
 
-    screen.getByTitle('停止此任务').click();
-    expect(onStopTasks).toHaveBeenCalledWith('toolu_spawn_1');
+    screen.getByTitle('中止后台任务').click();
+    expect(onAbort).toHaveBeenCalledTimes(1);
     expect(onRevealTask).toHaveBeenCalledTimes(1);
   });
 

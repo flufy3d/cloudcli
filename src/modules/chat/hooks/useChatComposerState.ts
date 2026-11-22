@@ -1902,18 +1902,34 @@ export function useChatComposerState({
     setIsTextareaExpanded(false);
   }, [resetCommandMenuState, updateInput]);
 
+  // The task strip targets background work even while a foreground turn is
+  // responding. Leave cards and queued drafts intact until the server settles it.
+  const handleAbortBackgroundTasks = useCallback(() => {
+    const targetSessionId = selectedSession?.id || currentSessionId || null;
+    if (!targetSessionId) {
+      console.warn('Background stop requested but no session ID is available.');
+      return;
+    }
+    for (const taskId of new Set(backgroundTasks.flatMap((task) => task.taskId ? [task.taskId] : []))) {
+      sendMessage({ type: 'chat.stop-task', sessionId: targetSessionId, taskId });
+    }
+  }, [backgroundTasks, currentSessionId, selectedSession?.id, sendMessage]);
+
   const handleAbortSession = useCallback(() => {
+    if (!canAbortSession) {
+      return;
+    }
+
     const targetSessionId = selectedSession?.id || currentSessionId || null;
     if (!targetSessionId) {
       console.warn('Abort requested but no session ID is available.');
       return;
     }
 
-    // Stop aborts the turn only, as Esc does in Claude Code; background tasks
-    // are stopped from the task strip. Once the turn has ended there is no run
-    // to abort, but a finished task can still wake the model with a turn of
-    // its own, which `chat.abort` interrupts as well.
-    if (!canAbortSession && !processingSessions?.get(targetSessionId)?.background) {
+    const activity = processingSessions?.get(targetSessionId);
+    if (backgroundTasks.length > 0 && backgroundTasks.every((task) => task.taskId)
+      && !(activity && !activity.background)) {
+      handleAbortBackgroundTasks();
       return;
     }
 
@@ -1923,30 +1939,7 @@ export function useChatComposerState({
       type: 'chat.abort',
       sessionId: targetSessionId,
     });
-  }, [canAbortSession, currentSessionId, processingSessions, selectedSession?.id, sendMessage]);
-
-  /**
-   * Stops background tasks by id: the one launched by `toolUseId`, or every
-   * stoppable task the session still has running when it is omitted.
-   *
-   * Only an entry carrying `taskId` has a stop handle the engine accepts —
-   * a child agent's session or a command's shell job.
-   */
-  const handleStopBackgroundTasks = useCallback((toolUseId?: string) => {
-    const targetSessionId = selectedSession?.id || currentSessionId || null;
-    if (!targetSessionId) {
-      return;
-    }
-    for (const task of backgroundTasks) {
-      if (!task.taskId) {
-        continue;
-      }
-      if (toolUseId && task.id !== toolUseId) {
-        continue;
-      }
-      sendMessage({ type: 'chat.stop-task', sessionId: targetSessionId, taskId: task.taskId });
-    }
-  }, [backgroundTasks, currentSessionId, selectedSession?.id, sendMessage]);
+  }, [backgroundTasks, canAbortSession, currentSessionId, handleAbortBackgroundTasks, processingSessions, selectedSession?.id, sendMessage]);
 
   const handleGrantToolPermission = useCallback(
     (suggestion: { entry: string; toolName: string }) => {
@@ -2078,7 +2071,7 @@ export function useChatComposerState({
     syncInputOverlayScroll,
     handleClearInput,
     handleAbortSession,
-    handleStopBackgroundTasks,
+    handleAbortBackgroundTasks,
     handlePermissionDecision,
     handleGrantToolPermission,
     handleInputFocusChange,

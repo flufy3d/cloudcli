@@ -226,7 +226,7 @@ function ChatInterface({
     syncInputOverlayScroll,
     handleClearInput,
     handleAbortSession,
-    handleStopBackgroundTasks,
+    handleAbortBackgroundTasks,
     handlePermissionDecision,
     handleGrantToolPermission,
     handleInputFocusChange,
@@ -673,7 +673,7 @@ function ChatInterface({
           isTextareaExpanded={isTextareaExpanded}
           sendByCtrlEnter={sendByCtrlEnter}
           backgroundTasks={namedBackgroundTasks}
-          onStopBackgroundTasks={handleStopBackgroundTasks}
+          onAbortBackgroundTasks={handleAbortBackgroundTasks}
           onRevealBackgroundTask={handleRevealBackgroundTask}
           hasActiveBackgroundTasks={hasActiveBackgroundTasks}
           backgroundWorkQueuesInput={backgroundWorkQueuesInput}

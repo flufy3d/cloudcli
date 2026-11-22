@@ -5,8 +5,8 @@ import type { ActiveBackgroundTask } from '@/shared/types';
 
 type BackgroundTaskIndicatorProps = {
   tasks: ActiveBackgroundTask[];
-  /** Stops the task launched by `toolUseId`, or every stoppable task when omitted. */
-  onStopTasks?: (toolUseId?: string) => void;
+  /** Stops every background task the engine can stop (the strip's abort). */
+  onAbort?: () => void;
   /** Reveals the task's card in the transcript; omitted rows stay inert. */
   onRevealTask?: (task: ActiveBackgroundTask) => void;
   /** A message sent now waits for the tasks; false for an engine that takes it mid-background-work. */
@@ -23,7 +23,7 @@ function formatElapsed(elapsedSeconds: number): string {
 }
 
 /** Used by ChatComposer to display running background tasks. */
-export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTask, queuesInput = true }: BackgroundTaskIndicatorProps) {
+export default function BackgroundTaskIndicator({ tasks, onAbort, onRevealTask, queuesInput = true }: BackgroundTaskIndicatorProps) {
   const { t } = useTranslation('chat');
   const [, setTick] = useState(0);
 
@@ -80,10 +80,10 @@ export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTa
                 })}
             </span>
           </span>
-          {onStopTasks && tasks.some((task) => task.taskId) && (
+          {onAbort && tasks.some((task) => task.taskId) && (
             <button
               type="button"
-              onClick={() => onStopTasks()}
+              onClick={() => onAbort()}
               aria-label={t('composer.backgroundTasks.abort', { defaultValue: '中止后台任务' })}
               title={t('composer.backgroundTasks.abort', { defaultValue: '中止后台任务' })}
               className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-destructive hover:bg-destructive/10 transition-colors"
@@ -138,17 +138,6 @@ export default function BackgroundTaskIndicator({ tasks, onStopTasks, onRevealTa
               <span className="shrink-0 tabular-nums text-muted-foreground/70">
                 {formatElapsed(elapsedSeconds)}
               </span>
-              {onStopTasks && task.taskId && (
-                <button
-                  type="button"
-                  onClick={() => onStopTasks(task.id)}
-                  aria-label={t('composer.backgroundTasks.stopOne', { defaultValue: '停止此任务' })}
-                  title={t('composer.backgroundTasks.stopOne', { defaultValue: '停止此任务' })}
-                  className="shrink-0 rounded p-0.5 text-muted-foreground/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
-                >
-                  <Square className="h-2.5 w-2.5 fill-current" />
-                </button>
-              )}
             </div>
           );
         })}

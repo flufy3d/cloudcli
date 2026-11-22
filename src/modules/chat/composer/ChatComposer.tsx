@@ -169,7 +169,7 @@ type ChatComposerProps = {
   sendByCtrlEnter?: boolean;
   backgroundTasks?: ActiveBackgroundTask[];
   /** Stops the task launched by `toolUseId`, or all of them when omitted. */
-  onStopBackgroundTasks?: (toolUseId?: string) => void;
+  onAbortBackgroundTasks: () => void;
   /** Reveals a running task's card in the transcript. */
   onRevealBackgroundTask?: (task: ActiveBackgroundTask) => void;
   hasActiveBackgroundTasks?: boolean;
@@ -281,7 +281,7 @@ function ChatComposer({
   isTextareaExpanded,
   sendByCtrlEnter = false,
   backgroundTasks = [],
-  onStopBackgroundTasks,
+  onAbortBackgroundTasks,
   onRevealBackgroundTask,
   hasActiveBackgroundTasks = false,
   backgroundWorkQueuesInput = false,
@@ -458,7 +458,7 @@ function ChatComposer({
       {hasActiveBackgroundTasks && backgroundTasks.length > 0 && (
         <BackgroundTaskIndicator
           tasks={backgroundTasks}
-          onStopTasks={onStopBackgroundTasks}
+          onAbort={backgroundTasks.every((task) => task.taskId) ? onAbortBackgroundTasks : undefined}
           onRevealTask={onRevealBackgroundTask}
           queuesInput={backgroundWorkQueuesInput}
         />
