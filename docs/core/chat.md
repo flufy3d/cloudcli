@@ -15,7 +15,8 @@
 | 会话先创建（REST） | `POST /api/providers/sessions` → `sessionsService.createAppSession` → `sessionsDb`；app session id 是服务端生成的 `randomUUID`，URL/帧/store 全用它 |
 | `chat.send` 入口 | `server/modules/websocket/services/chat-websocket.service.ts` 的 `handleChatSend`：`resolveSendTarget`（会话行以 DB 为准，不信任客户端）→ 会话已有 run 时先试 `injectIntoRunningTurn`（runtime `injectInput`，见下）→ `dispatchRun`（附件过滤只放行 `~/.cloudcli/assets` 直接子文件、记录 model/effort） |
 | 运行登记 | `chat-run-registry.service.ts`：`startRun` / `replayEvents` / `completeRunIfCurrent`；**run 属于服务端不属于 socket**——断线存活、多端同看、无观察者也能跑；每个 run 有稳定 `runId`，Agent API 的 `GET /api/agent/runs/:runId/events?after=seq` 用会话 `seq` 水位续读；完成后事件缓冲保留约 5 分钟供补发，过期后只有持久化历史/结果可用 |
-| 定时任务入口 | `scheduled-jobs` 模块的调度器到点调 `runDetachedChatTurn`（与一次性定时消息同一条无附着通道）：`reuse` 任务跑在绑定会话、`new` 任务先 `createAppSession` 再跑；`reuse` 设了 `rotateAfterDays` 时，绑定会话满龄（按会话 `created_at`）的那次先新建会话、改绑任务、归档旧会话再跑；新会话沿用旧会话的 `model`/`effort`，否则会静默回落到引擎当前的默认模型；`new` 任务（以及没有模型选择的复用会话）在起跑前按“任务最近一次运行的会话 → 同项目同 provider 的最近会话 → provider 目录默认”解析并写入 `model`/`effort`，`options.model` 可显式覆盖——侧边栏只留一个活会话，历史载入成本不随时间无限增长（压缩不缩短 transcript），在跑中的会话不轮换；会话忙时记 `skipped`，**永不打断**在跑回合（一次性消息的 interrupt 语义只属于用户手选的时刻）。任务分 cron 循环与 `runAt` 仅一次两种：仅一次的认领事务里直接置 `enabled=0`，跑完读作已完成，composer 卡片随该会话 run 结束时的重新拉取而消失。agent 侧同一能力经受管 MCP `cloudcli-scheduled-tasks` 暴露（`cron` / `runAt` 二选一），默认绑定调用它的会话；整个功能由 Settings 的全局开关驱动，关闭后任务不触发、Tab 与 composer 任务入口隐藏 |
+| 定时任务入口 | `scheduled-jobs` 模块的调度器到点调 `runDetachedChatTurn`（与一次性定时消息同一条无附着通道）：`reuse` 任务跑在绑定会话、`new` 任务先 `createAppSession` 再跑；`reuse` 设了 `rotateAfterDays` 时，绑定会话满龄（按会话 `created_at`）的那次先新建会话、改绑任务、归档旧会话再跑；新会话沿用旧会话的 `model`/`effort`，否则会静默回落到引擎当前的默认模型；`new` 任务（以及没有模型选择的复用会话）在起跑前按“任务最近一次运行的会话 → 同项目同 provider 的最近会话 → provider 目录默认”解析并写入 `model`/`effort`，`options.model` 可显式覆盖，目录默认解析失败只记 warn 不拦截起跑（该次按引擎默认模型跑）——侧边栏只留一个活会话，历史载入成本不随时间无限增长（压缩不缩短 transcript），在跑中的会话不轮换；会话忙时记 `skipped`，**永不打断**在跑回合（一次性消息的 interrupt 语义只属于用户手选的时刻）。任务分 cron 循环与 `runAt` 仅一次两种：仅一次的认领事务里直接置 `enabled=0`，跑完读作已完成，composer 卡片随该会话 run 结束时的重新拉取而消失。agent 侧同一能力经受管 MCP `cloudcli-scheduled-tasks` 暴露（`cron` / `runAt` 二选一），默认绑定调用它的会话；整个功能由 Settings 的全局开关驱动，关闭后任务不触发、Tab 与 composer 任务入口隐藏 |
+
 | 统一分发 | `server/modules/providers/services/provider-runtime.service.ts` → `IProviderRuntime.run(command, options, writer, context)` |
 | 出站写入 | `chat-session-writer.service.ts`（`ChatSessionWriter`）：**先过线上契约闸门**（`server/shared/normalized-message-contract.ts`：信封坏了整条丢、协议未声明的字段剥掉并点名记录，见 [providers.md](./providers.md)），再吞掉 `session_created`、把 provider 原生 id 重映射为 app session id、给每事件打**单调 `seq`**、扇出给所有 watching socket |
 | 终态 | 每次运行**恰好一个 `complete`**（成功/失败/中止都是）；`error` 是信息性行，不终止 run |
@@ -115,6 +116,11 @@ flowchart TD
 - 引擎侧：claude 走 SDK 的 `canUseTool` 回调；zcode 走引擎权限桥 + 四档权限模式映射（`chat.send` 的 `options.permissionMode` → 引擎 set_mode）；codex 走 app-server 的反向 JSON-RPC 请求（`item/{commandExecution,fileChange,permissions}/requestApproval`），该请求在被应答前整个 turn 都是阻塞的，因此**必须**应答——run 结束时仍挂着的一律发 `permission_cancelled` 并按拒绝收尾。能力有无由矩阵的 `supportsPermissionRequests` 表达。
 - 批准记忆（`rememberEntry`）各引擎语义不同：claude 往 `allowedTools` 追加一条规则，codex 改答 `acceptForSession`（由引擎自己记住本会话）。
 - **谁来复核由引擎配置决定，适配器不覆盖**：codex 的 `approvals_reviewer`（`user` / `auto_review` / `guardian_subagent`）决定请求是否在到达客户端前就被自动裁决；在 `thread/start` 里写死这个值等于悄悄推翻用户自己的设置。
+
+权限卡片的推送通知由网关统一发（`ChatSessionWriter.send` 看到 `permission_request` 就调用通知服务），各引擎适配器不再各自发一份；没有前台回复在跑时到达的卡片（后台 agent 在一轮结束后发出的请求）不会把会话记成“处理中”，只记成后台工作。
+
+回合结束的推送正文也由 writer 统一供料：run writer 构造时清掉该会话的通知回复预览，之后每条 `text`+`assistant` 帧都刷新它（五家引擎的出站消息都过这一处，runtime 零改动）；回合终止通知（completed/aborted）把预览作为推送正文。失败的最终错误文本由通知编排层落 `session_turn_failures` 表（见 [overview.md](./overview.md)），历史读取方据此让重载后的时间线与推送一致。
+
 
 ## 后台任务与输入排队
 
@@ -239,6 +245,12 @@ flowchart LR
 - 工具卡片按 toolId upsert，服务端把引擎的流式参数增量累积成稳定快照再发。
 - `transcript/Markdown.tsx` 的链接分三类：工作区文件路径在编辑器里打开；指向服务器本机端口（而页面自身不在那台机器上）的链接改走本机服务代理，机制与安全边界见 [overview.md](./overview.md#认证与安全边界)；其余按普通外链新标签打开。
 - 虚拟化与滚动的硬约束见 [frontend.md](./frontend.md) 的性能守则；端到端闸门是 `scripts/perf/chat-scroll-up-stability.mjs`，它断言屏幕上的行走了多远，而不是 `scrollTop` 变了多少。
+
+## 输入框的 token 计数
+
+输入框按钮只显示**上下文占用**：`status/token_budget` 帧（或历史页带回的 `tokenUsage`）里的 `used` 与 `total`，即最近一次请求的 prompt 加输出。`/cost` 详情另外读 `cumulativeUsage`（会话累计），两处口径不能互换，契约在 [providers.md](./providers.md#token-用量口径)。
+
+按钮值只在「切换会话」「一轮结束」「页面回到前台」时刷新：手机休眠或标签页后台化期间收不到 `token_budget`，回到前台由 `useChatSessionState` 的 `visibilitychange` 监听补拉一次；WebSocket 重连走既有的历史尾页刷新，历史页同样带回上下文快照。`/cost` 的返回只覆盖上下文三项，不会把累计量写进按钮。
 
 ## 扩展检查单
 

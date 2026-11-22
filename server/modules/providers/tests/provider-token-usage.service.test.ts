@@ -253,6 +253,9 @@ test('the Claude summarizer reads the newest assistant turn, not the whole conve
     cacheReadTokens: 4000,
     cacheCreationTokens: 100,
     cacheTokens: 4100,
+    // The total is every turn added up — that is what the session's spend was,
+    // and it is deliberately larger than the newest turn's context reading.
+    cumulative: { used: 5238, inputTokens: 5108, outputTokens: 130 },
     breakdown: { input: 4103, output: 80 },
   });
 });
@@ -320,6 +323,9 @@ test('the Claude summarizer reports the post-compaction occupancy when the bound
     total: 1_000_000,
     inputTokens: 14_247,
     outputTokens: 0,
+    // The pre-compaction turn is still real spend, even though its numbers no
+    // longer describe the context.
+    cumulative: { used: 388_067, inputTokens: 387_126, outputTokens: 941 },
     breakdown: { input: 14_247, output: 0 },
   });
 });

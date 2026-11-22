@@ -22,6 +22,7 @@
     "saved": "Gespeichert!",
     "exitFullscreen": "Vollbild beenden",
     "fullscreen": "Vollbild",
+    "cancel": "Abbrechen",
     "close": "Schließen",
     "previewMarkdown": "Markdown-Vorschau",
     "editMarkdown": "Markdown bearbeiten"
@@ -34,6 +35,10 @@
   "binaryFile": {
     "title": "Binärdatei",
     "message": "Die Datei \"{{fileName}}\" kann im Texteditor nicht angezeigt werden, da es sich um eine Binärdatei handelt."
+  },
+  "filePreview": {
+    "prevPage": "Vorherige Seite",
+    "nextPage": "Nächste Seite"
   },
   "unsavedChanges": {
     "confirmClose": "Du hast ungespeicherte Änderungen. Diese Datei schließen und die Änderungen verwerfen?",

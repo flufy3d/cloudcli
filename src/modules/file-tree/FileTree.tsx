@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Check, X, Loader2, Folder, Upload } from 'lucide-react';
 
 import { cn } from '@/shared/utils';
+import { LARGE_FILE_OPEN_BYTES } from '@/shared/constants';
 import { ICON_SIZE_CLASS, getFileIconData } from '@/modules/file-tree/utils/fileIcons';
 import { useFileTreeOperations } from '@/modules/file-tree/hooks/useFileTreeOperations';
 import { useFileTreeSearch } from '@/modules/file-tree/hooks/useFileTreeSearch';
@@ -19,6 +20,7 @@ import FileTreeHeader from '@/modules/file-tree/FileTreeHeader';
 import FileTreeLoadingState from '@/modules/file-tree/FileTreeLoadingState';
 import FileTreeUploadProgress from '@/modules/file-tree/FileTreeUploadProgress';
 import ImageViewer from '@/modules/file-tree/ImageViewer';
+import LargeFileOpenDialog from '@/modules/file-tree/LargeFileOpenDialog';
 
 
 type FileTreeProps = {
@@ -34,6 +36,11 @@ export default function FileTree({ selectedProject, onFileOpen, revealDirectory 
   const { t } = useTranslation();
   const [selectedImage, setSelectedImage] = useState<FileTreeImageSelection | null>(null);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  // The oversized file waiting on the open confirmation. Loading a file above
+  // the threshold would read the whole document into the editor and stall the
+  // pane, so the click parks the node here and the dialog decides: keep
+  // opening, or download it directly instead.
+  const [largeFileCandidate, setLargeFileCandidate] = useState<FileTreeNode | null>(null);
   const newItemInputRef = useRef<HTMLInputElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
 
@@ -194,10 +201,39 @@ export default function FileTree({ selectedProject, onFileOpen, revealDirectory 
         return;
       }
 
+      // Entries above the open threshold ask first: the dialog offers a direct
+      // download so opening a huge document stays a deliberate choice.
+      if ((item.size ?? 0) > LARGE_FILE_OPEN_BYTES) {
+        setLargeFileCandidate(item);
+        return;
+      }
+
       onFileOpen?.(item.path);
     },
     [onFileOpen, selectedProject, toggleDirectory, search.isSearchActive, setSearchQuery, revealAndScroll],
   );
+
+  // Opens the parked large file after the user confirmed; closing the dialog
+  // clears the candidate on every path.
+  const openLargeCandidate = useCallback(() => {
+    if (!largeFileCandidate) return;
+    const { path } = largeFileCandidate;
+    setLargeFileCandidate(null);
+    onFileOpen?.(path);
+  }, [largeFileCandidate, onFileOpen]);
+
+  // Destructured so the dialog's download callback can depend on the stable
+  // memoized handler instead of the per-render operations object.
+  const { handleDownload } = operations;
+
+  // Downloads the parked large file through the same streaming download the
+  // tree's context menu uses, then closes the dialog.
+  const downloadLargeCandidate = useCallback(() => {
+    if (!largeFileCandidate) return;
+    const item = largeFileCandidate;
+    setLargeFileCandidate(null);
+    void handleDownload(item);
+  }, [largeFileCandidate, handleDownload]);
 
   const formatRelativeTimeLabel = useCallback(
     (date?: string) => formatRelativeTime(date, t),
@@ -375,7 +411,7 @@ export default function FileTree({ selectedProject, onFileOpen, revealDirectory 
                 disabled={operationLoading}
                 className="rounded-md px-3 py-1.5 text-sm transition-colors hover:bg-accent"
               >
-                {t('common.cancel', 'Cancel')}
+                {t('buttons.cancel', 'Cancel')}
               </button>
               <button
                 onClick={operations.handleConfirmDelete}
@@ -388,6 +424,18 @@ export default function FileTree({ selectedProject, onFileOpen, revealDirectory 
             </div>
           </div>
         </div>
+      )}
+
+      {/* Large-file Open Confirmation */}
+      {largeFileCandidate && (
+        <LargeFileOpenDialog
+          name={largeFileCandidate.name}
+          size={largeFileCandidate.size}
+          downloading={operationLoading}
+          onOpen={openLargeCandidate}
+          onDownload={downloadLargeCandidate}
+          onCancel={() => setLargeFileCandidate(null)}
+        />
       )}
 
       {/* Toast Notification */}

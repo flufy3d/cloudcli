@@ -23,7 +23,7 @@ import {
 } from '@/shared/utils.js';
 
 import { readZCodeTokenUsedCount } from './zcode-live-event-normalizer.js';
-import { resolveZCodeModelContextWindow } from './zcode-models.provider.js';
+import { DEFAULT_ZCODE_CONTEXT_WINDOW, resolveZCodeModelContextWindow } from './zcode-models.provider.js';
 
 /** One persisted step's numbers, normalized across the two stored shapes. */
 type ZCodeStepTotals = {
@@ -71,9 +71,16 @@ function readZCodeStepTotals(value: unknown): ZCodeStepTotals | null {
   const generationTokens = isStreamingShape
     ? readUsageNumber(tokens.outputTokens) + readUsageNumber(tokens.reasoningTokens)
     : readUsageNumber(tokens.output) + readUsageNumber(tokens.reasoning);
+  // The persisted shape folds the cache READ into `input` (a row reporting
+  // `input: 169340` next to `cache.read: 169088` describes one prompt, not
+  // two), but the cache WRITE is not part of it — the engine's own `total`
+  // is `input + output + reasoning + cache.write`.
+  const cacheWriteTokens = isStreamingShape
+    ? readUsageNumber(tokens.cacheWriteTokens)
+    : readUsageNumber(readObjectRecord(tokens.cache)?.write);
   const additiveFallback = isStreamingShape
     ? readZCodeTokenUsedCount(tokens) ?? 0
-    : inputTokens + generationTokens;
+    : inputTokens + generationTokens + cacheWriteTokens;
   const used = readUsageNumber(tokens.total) || additiveFallback;
 
   if (used <= 0 && inputTokens <= 0 && generationTokens <= 0) {
@@ -269,9 +276,12 @@ export function readZCodeContextUsage(
     return undefined;
   }
 
-  const contextWindow = latest.modelKey
+  // The engine config may not know the model (first run, hand-edited store);
+  // the composer still needs a denominator, so fall back to the documented
+  // default rather than rendering a windowless reading.
+  const contextWindow = (latest.modelKey
     ? resolveZCodeModelContextWindow(latest.modelKey)
-    : undefined;
+    : undefined) ?? DEFAULT_ZCODE_CONTEXT_WINDOW;
 
   const cumulativePayload = cumulativeTotals
     ? { cumulative: { ...cumulativeTotals } }
@@ -284,7 +294,7 @@ export function readZCodeContextUsage(
 
     return {
       used: 0,
-      ...(contextWindow ? { total: contextWindow } : {}),
+      total: contextWindow,
       inputTokens: 0,
       outputTokens: 0,
       breakdown: { input: 0, output: 0 },
@@ -296,7 +306,7 @@ export function readZCodeContextUsage(
 
   return {
     used: latest.totals.used,
-    ...(contextWindow ? { total: contextWindow } : {}),
+    total: contextWindow,
     inputTokens: latest.totals.inputTokens,
     outputTokens: latest.totals.outputTokens,
     breakdown: { input: latest.totals.inputTokens, output: latest.totals.outputTokens },

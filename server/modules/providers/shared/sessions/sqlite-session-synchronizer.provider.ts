@@ -26,6 +26,7 @@ import { normalizeProviderTimestamp, normalizeSessionName, readOptionalString } 
 
 import { admitsWorkspacePath } from './workspace-admission.js';
 import { applySessionWorktreePlacement } from './session-worktree-placement.js';
+import { canonicalizeSessionProjectPath } from './session-project-path-canonicalization.js';
 import { resolveSessionTitle, type DerivedSessionTitle } from './session-title-resolution.js';
 
 /**
@@ -107,6 +108,15 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
   protected abstract getDatabasePath(): string;
 
   /**
+   * Secondary databases scanned in addition to the primary one, sharing the
+   * row schema and id space. Antigravity keeps the managed ACP directory's
+   * summaries there; empty by default (single-database providers).
+   */
+  protected getSecondaryDatabasePaths(): string[] {
+    return [];
+  }
+
+  /**
    * Selects the session rows to process. Adapters may pre-filter `sinceMillis`
    * in SQL; the base class re-applies the same strict `newer-than` filter per
    * row via `getRowTimestampsMs`, so an adapter that ignores `sinceMillis`
@@ -170,11 +180,30 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
     sinceMillis: number | null,
     limit: number | null,
   ): Promise<{ processedCount: number; firstSessionId: string | null }> {
-    const dbPath = this.getDatabasePath();
-    if (!fsSync.existsSync(dbPath)) {
-      return { processedCount: 0, firstSessionId: null };
+    const dbPaths = [this.getDatabasePath(), ...this.getSecondaryDatabasePaths()];
+    let processedCount = 0;
+    let firstSessionId: string | null = null;
+    for (const dbPath of dbPaths) {
+      if (!fsSync.existsSync(dbPath)) {
+        continue;
+      }
+      const result = await this.queryUpdatedSessionsIn(dbPath, sinceMillis, limit);
+      processedCount += result.processedCount;
+      firstSessionId ??= result.firstSessionId;
     }
+    return { processedCount, firstSessionId };
+  }
 
+  /**
+   * Runs one scan against a single database: opens a short read-only
+   * connection, selects and filters rows, upserts each, and advances the
+   * high-water mark. Never throws.
+   */
+  private async queryUpdatedSessionsIn(
+    dbPath: string,
+    sinceMillis: number | null,
+    limit: number | null,
+  ): Promise<{ processedCount: number; firstSessionId: string | null }> {
     let db: Database.Database | null = null;
     try {
       db = new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -222,10 +251,16 @@ export abstract class SqliteSessionSynchronizer<Row extends SqliteSynchronizerRo
       return null;
     }
 
-    const projectPath = this.getProjectPath(row);
-    if (!projectPath) {
+    const reportedProjectPath = this.getProjectPath(row);
+    if (!reportedProjectPath) {
       return null;
     }
+
+    // An engine that canonicalizes its session directory records a filesystem
+    // equivalent of the project the user opened; canonicalize before
+    // admission so the session files under the registered project instead of
+    // splitting a twin into the sidebar.
+    const projectPath = canonicalizeSessionProjectPath(reportedProjectPath);
 
     if (!admitsWorkspacePath(projectPath)) {
       return null;

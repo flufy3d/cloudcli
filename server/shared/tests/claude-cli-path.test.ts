@@ -67,7 +67,10 @@ test('resolveClaudeCodeExecutablePath returns undefined on Windows when the defa
     throw new Error('not found');
   }) as unknown as ResolveClaudeCodeExecutablePathDependencies['execFileSync'];
 
-  const resolved = resolveClaudeCodeExecutablePath(undefined, {
+  // `''`, not `undefined`: a default parameter still falls back to
+  // CLAUDE_CLI_PATH, and a machine that sets it would make this case read the
+  // real install instead of the injected PATH lookup.
+  const resolved = resolveClaudeCodeExecutablePath('', {
     platform: 'win32',
     execFileSync,
   });
@@ -83,7 +86,10 @@ test('resolveClaudeCodeExecutablePath returns undefined when every wrapper on PA
     (() => `${wrapperDir}\\claude\r\n${wrapperDir}\\claude.cmd\r\n`) as unknown as ResolveClaudeCodeExecutablePathDependencies['execFileSync'];
   const readFileSync = (() => 'exec node "$basedir/node_modules/@anthropic-ai/claude-code/cli.js" "$@"') as unknown as ResolveClaudeCodeExecutablePathDependencies['readFileSync'];
 
-  const resolved = resolveClaudeCodeExecutablePath(undefined, {
+  // `''`, not `undefined`: a default parameter still falls back to
+  // CLAUDE_CLI_PATH, and a machine that sets it would make this case read the
+  // real install instead of the injected PATH lookup.
+  const resolved = resolveClaudeCodeExecutablePath('', {
     platform: 'win32',
     execFileSync,
     existsSync: () => false,
@@ -101,7 +107,10 @@ test('resolveClaudeCodeExecutablePath still resolves the native exe when both in
     (() => `${staleDir}\\claude\r\n${nativeDir}\\claude\r\n`) as unknown as ResolveClaudeCodeExecutablePathDependencies['execFileSync'];
   const readFileSync = (() => 'exec node "$basedir/node_modules/@anthropic-ai/claude-code/cli.js" "$@"') as unknown as ResolveClaudeCodeExecutablePathDependencies['readFileSync'];
 
-  const resolved = resolveClaudeCodeExecutablePath(undefined, {
+  // `''`, not `undefined`: a default parameter still falls back to
+  // CLAUDE_CLI_PATH, and a machine that sets it would make this case read the
+  // real install instead of the injected PATH lookup.
+  const resolved = resolveClaudeCodeExecutablePath('', {
     platform: 'win32',
     execFileSync,
     existsSync: (candidate) => candidate === nativePath,
@@ -112,7 +121,10 @@ test('resolveClaudeCodeExecutablePath still resolves the native exe when both in
 });
 
 test('resolveClaudeCodeExecutablePath leaves non-Windows platforms on the bare command', () => {
-  const resolved = resolveClaudeCodeExecutablePath(undefined, { platform: 'linux' });
+  // `''`, not `undefined`: a default parameter still falls back to
+  // CLAUDE_CLI_PATH, and a machine that sets it would make this case read the
+  // real install instead of the injected PATH lookup.
+  const resolved = resolveClaudeCodeExecutablePath('', { platform: 'linux' });
 
   assert.equal(resolved, 'claude');
 });

@@ -22,6 +22,7 @@
     "saved": "Enregistré !",
     "exitFullscreen": "Quitter le plein écran",
     "fullscreen": "Plein écran",
+    "cancel": "Annuler",
     "close": "Fermer",
     "previewMarkdown": "Aperçu markdown",
     "editMarkdown": "Modifier le markdown"
@@ -34,6 +35,10 @@
   "binaryFile": {
     "title": "Fichier binaire",
     "message": "Le fichier \"{{fileName}}\" ne peut pas être affiché dans l'éditeur de texte car c'est un fichier binaire."
+  },
+  "filePreview": {
+    "prevPage": "Page précédente",
+    "nextPage": "Page suivante"
   },
   "unsavedChanges": {
     "confirmClose": "Vous avez des modifications non enregistrées. Fermer ce fichier et les abandonner ?",

@@ -7,6 +7,7 @@ import { getCodexHome } from '@/shared/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import { codexBackgroundWork } from '@/modules/providers/list/codex/codex-background-work.js';
+import { releaseCodexResidentSession } from '@/modules/providers/list/codex/codex-session-manager.js';
 import {
   buildCodexSubagentAgentRow,
   codexThreadItemToRows,
@@ -21,6 +22,7 @@ import {
 import { parseFilesInputTag, toImageAttachments } from '@/shared/image-attachments.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import { prepareTranscriptMessages } from '@/shared/message-unification.js';
+import { buildCodexUsageSnapshot, readCodexRolloutTokenUsage } from '@/modules/providers/services/codex-usage.js';
 import type {
   AnyRecord,
   FetchHistoryOptions,
@@ -41,7 +43,6 @@ import {
   createNormalizedMessage,
   generateMessageId,
   readObjectRecord,
-  readUsageNumber,
   removePathIfExists,
   sliceTailPage,
   MAX_TRANSMITTED_SUBAGENT_ACTIVITIES,
@@ -1174,78 +1175,7 @@ async function findCodexSessionFile(
 }
 
 /**
- * Builds one Codex token-usage answer from a rollout `token_count.info` block.
- *
- * `last_token_usage` is the turn that just ran — the prompt the model actually
- * carried, i.e. what the context window holds. `total_token_usage` is the
- * session's cumulative spend; reporting it as `used` made the context
- * percentage climb with every turn, so it is preserved separately as
- * `cumulative` for the cost breakdown.
- */
-function buildCodexTokenUsage(info: AnyRecord): ProviderTokenUsageResult {
-  const last = readObjectRecord(info.last_token_usage);
-  const cumulative = readObjectRecord(info.total_token_usage);
 
-  const lastInputTokens = readUsageNumber(last?.input_tokens);
-  const lastOutputTokens = readUsageNumber(last?.output_tokens);
-  const cumulativeInputTokens = readUsageNumber(cumulative?.input_tokens);
-  const cumulativeOutputTokens = readUsageNumber(cumulative?.output_tokens);
-  const used = readUsageNumber(last?.total_tokens)
-    || lastInputTokens + lastOutputTokens
-    || readUsageNumber(cumulative?.total_tokens)
-    || cumulativeInputTokens + cumulativeOutputTokens;
-
-  return {
-    used,
-    total: readUsageNumber(info.model_context_window) || 200_000,
-    inputTokens: lastInputTokens || cumulativeInputTokens,
-    outputTokens: lastOutputTokens || cumulativeOutputTokens,
-    breakdown: {
-      input: lastInputTokens || cumulativeInputTokens,
-      output: lastOutputTokens || cumulativeOutputTokens,
-    },
-    ...(cumulative
-      ? {
-          cumulative: {
-            used: readUsageNumber(cumulative.total_tokens) || cumulativeInputTokens + cumulativeOutputTokens,
-            inputTokens: cumulativeInputTokens,
-            outputTokens: cumulativeOutputTokens,
-          },
-        }
-      : {}),
-  };
-}
-
-/**
- * Reads the latest `token_count` snapshot from a Codex rollout JSONL.
- *
- * Codex appends cumulative totals over time, so the scan walks from the end
- * and stops at the first readable token_count entry.
- */
-async function readCodexTokenUsage(filename: string): Promise<ProviderTokenUsageResult> {
-  let latest: ProviderTokenUsageResult | null = null;
-
-  for await (const entry of readJsonlRecords(filename)) {
-    const tokenInfo = entry.type === 'event_msg' && entry.payload?.type === 'token_count'
-      ? entry.payload.info
-      : null;
-    if (!tokenInfo) {
-      continue;
-    }
-
-    latest = buildCodexTokenUsage(tokenInfo);
-  }
-
-  return latest ?? {
-    used: 0,
-    total: 200_000,
-    inputTokens: 0,
-    outputTokens: 0,
-    breakdown: { input: 0, output: 0 },
-  };
-}
-
-/**
  * Reads one Codex rollout file and produces the compact per-message records
  * `normalizeHistoryEntry` turns into `NormalizedMessage`s.
  *
@@ -1265,7 +1195,17 @@ async function readCodexTokenUsage(filename: string): Promise<ProviderTokenUsage
  * reports.
  */
 async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryResult> {
-  const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
+  // The indexed `jsonl_path` wins while it still exists; when the row lost it
+  // but kept the provider id — a detach that was never re-announced, or a
+  // mapping recorded without a path — the rollout is located on disk the same
+  // way `getTokenUsage` finds it. Without either, the conversation is empty.
+  const session = sessionsDb.getSessionById(sessionId);
+  const indexedFilePath = session?.jsonl_path && fsSync.existsSync(session.jsonl_path)
+    ? session.jsonl_path
+    : null;
+  const sessionFilePath = indexedFilePath ?? (session?.provider_session_id
+    ? await findCodexSessionFile(path.join(getCodexHome(), 'sessions'), session.provider_session_id)
+    : null);
 
   if (!sessionFilePath) {
     console.warn(`Codex session file not found for session ${sessionId}`);
@@ -1273,7 +1213,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
   }
 
   const messages: AnyRecord[] = [];
-  let tokenUsage: AnyRecord | null = null;
+  let tokenUsage: ProviderTokenUsageResult | null = null;
 
   const turns = createCodexTurnTracker();
   /** Turns whose prompt already carries the anchor, so only the first does. */
@@ -1368,7 +1308,14 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
 
     if (payload.type === 'token_count' && payload.info) {
       const info = payload.info as AnyRecord;
-      tokenUsage = buildCodexTokenUsage(info);
+      // Same mapping the live notification goes through: the composer shows
+      // the last turn's occupancy, the `/cost` detail shows the cumulative
+      // block this snapshot also carries.
+      tokenUsage = buildCodexUsageSnapshot({
+        last: info.last_token_usage,
+        total: info.total_token_usage,
+        contextWindow: info.model_context_window,
+      }) ?? tokenUsage;
       continue;
     }
 
@@ -1626,6 +1573,16 @@ export class CodexSessionsProvider implements IProviderSessions {
         statusCode: 409,
       });
     }
+
+    // The resident process of the previous round still holds the thread this
+    // session is leaving. If it survives, the next round acquires it and
+    // resumes the retired thread — the engine then appends the edited turn to
+    // the very transcript the indexer refuses to re-attach, and the row's
+    // just-cleared mapping is never corrected, so the conversation reads as
+    // empty forever. Closing it makes the next round open the thread the row
+    // now points at. Idle at rewind time: the rewind runs inside an admitted
+    // run, before that run's own process exists.
+    releaseCodexResidentSession(sessionId, { dispose: true });
 
     // Nothing of the conversation survives an edit to its first prompt, and
     // there is no such thing as a fork of no turns, so the session is simply
@@ -1962,7 +1919,7 @@ export class CodexSessionsProvider implements IProviderSessions {
       });
     }
 
-    return readCodexTokenUsage(sessionFilePath);
+    return readCodexRolloutTokenUsage(sessionFilePath);
   }
 
   /**

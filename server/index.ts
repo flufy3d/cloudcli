@@ -23,6 +23,7 @@ import {
     closeCodexResidentSessions,
     createBackgroundTasksStatusMessage,
     setCodexHostTaskSource,
+    closeAntigravityAcpSessions,
     shutdownZCodeRuntime,
 } from '@/modules/providers/index.js';
 import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/index.js';
@@ -599,6 +600,12 @@ async function startServer() {
                 await shutdownZCodeRuntime();
             } catch (err) {
                 console.error('[ZCode] Error during protocol client shutdown:', getErrorMessage(err));
+            }
+            try {
+                // Wait for ACP children so process.exit cannot skip their SIGKILL fallback.
+                await closeAntigravityAcpSessions();
+            } catch (err) {
+                console.error('[Antigravity] Error closing ACP sessions during shutdown:', getErrorMessage(err));
             }
             try {
                 // The Codex processes that stay alive between rounds must not

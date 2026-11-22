@@ -41,6 +41,12 @@ import { resolveAttachmentAssetFile } from '@/modules/assets/index.js';
 import { zcodeBackgroundWork } from './zcode-background-work.js';
 import { readZCodeContextUsage } from './zcode-context-usage.js';
 import { getZCodeAgentSidecarDir, getZCodeDatabasePath, getZCodeStorageDir } from './zcode-data-root.js';
+import {
+  DEFAULT_ZCODE_CONTEXT_WINDOW,
+  readZCodeModelContextLimit,
+  readZCodeSessionModelInfoFromDb,
+  resolveZCodeModelContextWindow,
+} from './zcode-models.provider.js';
 import { ZCodeProtocolClient } from './zcode-protocol.client.js';
 import {
   buildZCodeTextRowKey,
@@ -54,61 +60,6 @@ import {
 } from './zcode-live-event-normalizer.js';
 
 const PROVIDER = 'zcode';
-
-type ZCodeTokenTotals = {
-  input: number;
-  output: number;
-  reasoning: number;
-  cache: number;
-};
-
-/**
- * Reads token usage from either the streaming shape
- * (`{inputTokens, outputTokens, reasoningTokens, cacheReadTokens, cacheWriteTokens}`)
- * or the SQLite `message.data.tokens` shape
- * (`{input, output, reasoning, cache: {read, write}}`).
- * Returns null when no positive count is present in either shape.
- */
-function readTokenTotals(value: unknown): ZCodeTokenTotals | null {
-  const record = readObjectRecord(value);
-  if (!record) {
-    return null;
-  }
-
-  const cacheRecord = readObjectRecord(record.cache);
-  const totals: ZCodeTokenTotals = {
-    input: Number(record.inputTokens ?? record.input ?? 0),
-    output: Number(record.outputTokens ?? record.output ?? 0),
-    reasoning: Number(record.reasoningTokens ?? record.reasoning ?? 0),
-    cache: cacheRecord
-      ? Number(cacheRecord.read ?? 0) + Number(cacheRecord.write ?? 0)
-      : Number(record.cacheReadTokens ?? 0) + Number(record.cacheWriteTokens ?? 0),
-  };
-
-  const used = totals.input + totals.output + totals.reasoning + totals.cache;
-  return used > 0 ? totals : null;
-}
-
-/**
- * Builds the shared token usage summary from ZCode token totals.
- * Shape matches the `token_budget` summaries other providers report
- * (`used` plus input/output breakdown).
- */
-function buildTokenUsage(totals: ZCodeTokenTotals | null): ProviderTokenUsageResult | undefined {
-  if (!totals) {
-    return undefined;
-  }
-
-  return {
-    used: totals.input + totals.output + totals.reasoning + totals.cache,
-    inputTokens: totals.input,
-    outputTokens: totals.output,
-    breakdown: {
-      input: totals.input,
-      output: totals.output,
-    },
-  };
-}
 
 /**
  * Open a read-only connection to ZCode's SQLite database.
@@ -445,32 +396,17 @@ function buildZCodeTurnAnchors(rows: ZCodeHistoryRow[]): Map<string, string> {
 }
 
 /**
- * Aggregate token usage from all messages in a session.
+ * Resolves the context window of the model a ZCode session last ran with:
+ * the session's `modelID` mapped through the engine config's model limits.
+ * Opens its own short-lived read-only connection (the model reader owns that
+ * path); null when either side is unknown — callers fall back to the default.
  */
-function aggregateZCodeSessionTokenUsage(
-  db: Database.Database,
-  sessionId: string,
-): ProviderTokenUsageResult | undefined {
-  const rows = db.prepare('SELECT data FROM message WHERE session_id = ?').iterate(sessionId) as Iterable<{ data: string }>;
-
-  const totals: ZCodeTokenTotals = { input: 0, output: 0, reasoning: 0, cache: 0 };
-  let hasAnyUsage = false;
-
-  for (const row of rows) {
-    const info = readJsonRecord(row.data);
-    const messageTotals = readTokenTotals(info?.tokens);
-    if (!messageTotals) {
-      continue;
-    }
-
-    hasAnyUsage = true;
-    totals.input += messageTotals.input;
-    totals.output += messageTotals.output;
-    totals.reasoning += messageTotals.reasoning;
-    totals.cache += messageTotals.cache;
+function readSessionContextWindow(nativeSessionId: string): number | null {
+  const modelId = readZCodeSessionModelInfoFromDb(nativeSessionId)?.modelId;
+  if (!modelId) {
+    return null;
   }
-
-  return hasAnyUsage ? buildTokenUsage(totals) : undefined;
+  return resolveZCodeModelContextWindow(modelId) ?? readZCodeModelContextLimit(modelId);
 }
 
 /**
@@ -1175,6 +1111,7 @@ export class ZCodeSessionsProvider implements IProviderSessions {
 
       return {
         used: 0,
+        total: readSessionContextWindow(input.nativeSessionId) ?? DEFAULT_ZCODE_CONTEXT_WINDOW,
         inputTokens: 0,
         outputTokens: 0,
         breakdown: { input: 0, output: 0 },

@@ -27,6 +27,22 @@ export function getAntigravityDataRoot(): string {
 }
 
 /**
+ * The retired managed directory: ACP sessions created before the runtime
+ * switched to the user's own data directory wrote their conversations and
+ * summaries here. Kept on the read paths (history, brain roots, token
+ * usage) so that history stays readable; new sessions never write here.
+ */
+export const ACP_APP_DATA_DIR_NAME = 'cloudcli-acp';
+
+/**
+ * ACP settings, transcript lookups, and token snapshots share the same root.
+ * Used by the Antigravity runtime, session manager, and brain path helpers.
+ */
+export function getAntigravityAcpDataRoot(): string {
+  return path.join(os.homedir(), '.gemini', ACP_APP_DATA_DIR_NAME);
+}
+
+/**
  * Resolves the conversation summaries SQLite database that agy maintains for
  * session indexing. Consumed by the session synchronizer (reads rows) and by
  * the sessions watcher (matches the file name it listens for).
@@ -57,7 +73,7 @@ export function getAntigravityOauthTokenPath(): string {
 
 /**
  * Returns the brain directory roots whose contents the File Tree module may
- * read on the user's behalf: the current data root's `brain` directory plus
+ * read on the user's behalf: the print and ACP roots' `brain` directories plus
  * the pre-1.1 legacy `~/.gemini/antigravity/brain` tree kept for old
  * installations. Consumed by the File Tree composition root, which injects
  * them as the read-only allowlist for external plan documents that Antigravity
@@ -66,13 +82,14 @@ export function getAntigravityOauthTokenPath(): string {
 export function getAntigravityBrainRoots(): string[] {
   return [
     path.join(getAntigravityDataRoot(), 'brain'),
+    path.join(getAntigravityAcpDataRoot(), 'brain'),
     path.join(os.homedir(), '.gemini', 'antigravity', 'brain'),
   ];
 }
 
 /**
  * Returns transcript.jsonl candidates for one session, newest layout first:
- * the current data root's brain directory, then the pre-1.1 legacy
+ * the print and ACP brain directories, then the pre-1.1 legacy
  * `~/.gemini/antigravity` tree kept for old installations. Consumed by the
  * sessions provider's history loader. `safeSessionId` must already be
  * sanitized with `sanitizeLeafDirectoryName`.
@@ -80,6 +97,8 @@ export function getAntigravityBrainRoots(): string[] {
 export function getAntigravityTranscriptCandidates(safeSessionId: string): string[] {
   return [
     path.join(getAntigravityDataRoot(), 'brain', safeSessionId, '.system_generated', 'logs', 'transcript.jsonl'),
+    // The ACP runtime's sessions live under the managed data directory.
+    path.join(getAntigravityAcpDataRoot(), 'brain', safeSessionId, '.system_generated', 'logs', 'transcript.jsonl'),
     path.join(os.homedir(), '.gemini', 'antigravity', 'brain', safeSessionId, '.system_generated', 'logs', 'transcript.jsonl'),
   ];
 }

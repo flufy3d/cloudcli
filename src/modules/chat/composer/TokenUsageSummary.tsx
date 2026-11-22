@@ -3,31 +3,11 @@ import { ActivityIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { formatByteSize, readContextUsage } from '@/modules/chat/utils/contextUsage';
+import { formatTokenCount } from '@/modules/chat/composer/tokenUsage';
 
 type TokenUsageSummaryProps = {
   usage: Record<string, unknown> | null;
   onClick?: () => void;
-};
-
-const formatTokenCount = (value: number) => {
-  if (!Number.isFinite(value) || value <= 0) {
-    return '0';
-  }
-
-  // Thresholds sit where rounding would carry into the next unit, so 9,960 reads "10K", not "10.0K".
-  if (value >= 999_500) {
-    return `${(value / 1_000_000).toFixed(value >= 9_950_000 ? 0 : 1)}M`;
-  }
-
-  if (value >= 9_950) {
-    return `${Math.round(value / 1_000)}K`;
-  }
-
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1)}K`;
-  }
-
-  return value.toLocaleString();
 };
 
 /**
@@ -43,7 +23,7 @@ const formatTokenCount = (value: number) => {
  */
 function TokenUsageSummary({ usage, onClick }: TokenUsageSummaryProps) {
   const { t } = useTranslation();
-  const { used, percent, summaryBytes } = readContextUsage(usage);
+  const { used, total, percent, summaryBytes } = readContextUsage(usage);
 
   // The engine has no occupancy to report right after a compaction, but the
   // summary that replaced the conversation does have a size — show that rather
@@ -56,16 +36,25 @@ function TokenUsageSummary({ usage, onClick }: TokenUsageSummaryProps) {
     return null;
   }
 
+  // The button measures the context window's current occupancy, not the
+  // session's spend; the tooltip names the window it is measured against so
+  // the number cannot be read as a total.
+  const title = compacted
+    ? t('chat:misc.compactedSummarySize', { size: formatByteSize(summaryBytes) })
+    : total > 0
+      ? t('chat:misc.contextTokensUsed', {
+        used: formatTokenCount(used),
+        total: formatTokenCount(total),
+        defaultValue: 'Current context: {{used}} / {{total}} tokens',
+      })
+      : t('chat:misc.tokensUsed', { count: used });
+
   return (
     <button
       type="button"
       onClick={onClick}
       className="inline-flex h-8 items-center gap-1 rounded-lg border border-border/70 bg-background/70 px-1.5 text-xs text-muted-foreground shadow-sm transition-colors hover:border-primary/25 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:gap-2 sm:px-2.5"
-      title={compacted
-        ? t('chat:misc.compactedSummarySize', { size: formatByteSize(summaryBytes) })
-        : percent === null
-          ? t('chat:misc.tokensUsed', { count: used })
-          : t('chat:misc.contextUsedPercent', { percent })}
+      title={title}
       aria-label={t('chat:misc.showTokenUsage')}
     >
       <span className="hidden h-5 w-5 place-items-center rounded-md bg-primary/10 text-primary sm:grid">

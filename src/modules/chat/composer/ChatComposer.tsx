@@ -49,6 +49,8 @@ import BackgroundSendDialog from '@/modules/chat/composer/BackgroundSendDialog';
 import type { ActiveBackgroundTask } from '@/shared/types';
 import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
 import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
+import ComposerOverflowMenu from '@/modules/chat/composer/ComposerOverflowMenu';
+import TokenUsageBadge from '@/modules/chat/composer/TokenUsageBadge';
 
 type MentionableFile = {
   name: string;
@@ -197,6 +199,9 @@ type ChatComposerProps = {
 // A stable empty default, so a composer with no steered messages (every
 // caller but the chat tab) does not get a new array each render.
 const NO_PENDING_STEERS: PendingSteer[] = [];
+
+/** The schedule trigger keeps its desktop slot; phones reach the same form from the ＋ panel. */
+const SHOW_SCHEDULE_TRIGGER = true;
 
 function ChatComposer({
   pendingPermissionRequests,
@@ -585,6 +590,24 @@ function ChatComposer({
 
         <PromptInputFooter>
           <PromptInputTools className="min-w-0">
+            {/* Mobile-only ＋ panel: the low-frequency tools (usage, commands,
+                schedule, clear) collect behind it so the main row stays lean. */}
+            <div className="sm:hidden">
+              <ComposerOverflowMenu
+                tokenBudget={tokenBudget}
+                onShowTokenUsage={onShowTokenUsage}
+                slashCommandsCount={slashCommandsCount}
+                onToggleCommandMenu={onToggleCommandMenu}
+                canSchedule={Boolean(input.trim())}
+                hasInput={hasInput}
+                onClearInput={onClearInput}
+                onScheduleMessage={onScheduleMessage}
+                onScheduleTask={onScheduleTask}
+                supportsNativeScheduling={supportsNativeScheduling}
+                recurringEnabled={scheduledJobsEnabled}
+              />
+            </div>
+
             <PromptInputButton
               tooltip={{ content: t('input.attachFiles') }}
               onClick={openAttachmentPicker}
@@ -597,14 +620,19 @@ function ChatComposer({
               <VoiceInputButton state={voiceState} onToggle={voiceToggle} errorMsg={voiceError} />
             )}
 
-            {/* Phones get the bare token count (no icon/percentage) so this row
-                stays inside ~320px; ContextUsageBar shows the window fill. */}
-            <TokenUsageSummary usage={tokenBudget} onClick={onShowTokenUsage} />
+            {/* Usage: the full chip is a desktop fixture; on phones the badge
+                only speaks up once the window closes in on full. */}
+            <div className="hidden sm:block">
+              <TokenUsageSummary usage={tokenBudget} onClick={onShowTokenUsage} />
+            </div>
+            <div className="sm:hidden">
+              <TokenUsageBadge usage={tokenBudget} onClick={onShowTokenUsage} />
+            </div>
 
             <PromptInputButton
               tooltip={{ content: t('input.showAllCommands') }}
               onClick={onToggleCommandMenu}
-              className="relative"
+              className="relative hidden sm:inline-flex"
             >
               <SquareSlashIcon />
               {slashCommandsCount > 0 && (
@@ -646,13 +674,19 @@ function ChatComposer({
               </span>
             </Tooltip>
 
-            <ScheduleMessagePopover
-              disabled={!input.trim()}
-              onSchedule={onScheduleMessage}
-              onScheduleTask={onScheduleTask}
-              supportsNativeScheduling={supportsNativeScheduling}
-              recurringEnabled={scheduledJobsEnabled}
-            />
+            {/* Scheduled send keeps its desktop trigger; phones reach the same
+                form through the ＋ panel above. */}
+            {SHOW_SCHEDULE_TRIGGER && (
+              <div className="hidden sm:flex">
+                <ScheduleMessagePopover
+                  disabled={!input.trim()}
+                  onSchedule={onScheduleMessage}
+                  onScheduleTask={onScheduleTask}
+                  supportsNativeScheduling={supportsNativeScheduling}
+                  recurringEnabled={scheduledJobsEnabled}
+                />
+              </div>
+            )}
 
             <ComposerModelMenu
               effort={effort}

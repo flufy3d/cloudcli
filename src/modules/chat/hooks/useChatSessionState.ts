@@ -234,7 +234,23 @@ export function useChatSessionState({
     setHasMoreMessages(slot.hasMore);
     setTotalMessages(slot.total);
     if (slot.tokenUsage && typeof slot.tokenUsage === 'object') {
-      setTokenBudget(toTokenBudget(slot.tokenUsage));
+      const incoming = toTokenBudget(slot.tokenUsage);
+      setTokenBudget((previous) => {
+        if (!incoming) {
+          return null;
+        }
+        const incomingWindow = Number(incoming.total ?? 0);
+        const previousWindow = Number(previous?.total ?? 0);
+        // A just-compacted reading carries no window but its summary size IS
+        // the honest answer, so it must replace whatever was there.
+        const compactedReading = Number(incoming.summaryBytes ?? 0) > 0;
+        // A window-less blob (an older frame, or a provider that only reports
+        // tokens) must not wipe a reading that carried the window.
+        if (incomingWindow > 0 || compactedReading || previousWindow <= 0) {
+          return incoming;
+        }
+        return previous;
+      });
     }
   }, []);
 
@@ -772,6 +788,26 @@ export function useChatSessionState({
       return;
     }
     void refreshTokenUsage(activeSessionId);
+  }, [activeSessionId, refreshTokenUsage]);
+
+  /**
+   * A phone that slept, or a tab the user backgrounded, stops receiving live
+   * `token_budget` frames while the session keeps working. Merging the
+   * persisted reading back on return keeps the counter from showing whatever
+   * snapshot the page last saw (an hour-old, 46K-against-475K reading in one
+   * reported case) while the detail modal already reports the current one.
+   */
+  useEffect(() => {
+    if (!activeSessionId) {
+      return;
+    }
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshTokenUsage(activeSessionId);
+      }
+    };
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => document.removeEventListener('visibilitychange', refreshWhenVisible);
   }, [activeSessionId, refreshTokenUsage]);
 
   // Refresh token usage automatically when a turn finishes processing within the same session

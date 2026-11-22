@@ -15,6 +15,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 import { parseFilesInputTag, parseImagesInputTag } from '@/shared/image-attachments.js';
+import { hasConnection, sessionTurnFailuresDb } from '@/modules/database/index.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import type {
   AnyRecord,
@@ -171,42 +172,131 @@ function planAntigravityErrorRows(entries: AnyRecord[]): { skip: Set<number>; em
 }
 
 /**
+ * Rewrites the trailing collapsed error row with the failure the live run
+ * actually reported, when one is stored for this app session.
+ *
+ * agy never writes a turn's final error into its transcript — only the
+ * per-attempt `API error (attempt N)` rows the collapse above reassembles.
+ * The notification orchestrator persists the real final message, so a
+ * reloaded timeline can say what the push the user already received said.
+ * Guards keep the overlay conservative: only the last message overall is a
+ * candidate (a later successful turn owns the tail), and a stored failure
+ * older than that row's transcript timestamp is not this turn's failure.
+ * Skipped entirely without an open DB (tests and pre-init paths): the raw
+ * collapsed row is then exactly what history always showed.
+ */
+function overlayStoredTurnFailure(appSessionId: string, messages: NormalizedMessage[]): void {
+  if (!hasConnection() || messages.length === 0) {
+    return;
+  }
+
+  const failure = sessionTurnFailuresDb.getTurnFailure(appSessionId);
+  if (!failure) {
+    return;
+  }
+
+  const last = messages[messages.length - 1];
+  if (last.kind !== 'error') {
+    return;
+  }
+
+  const rowTime = Date.parse(last.timestamp);
+  const failureTime = Date.parse(failure.failedAt);
+  if (!Number.isFinite(rowTime) || !Number.isFinite(failureTime) || failureTime < rowTime) {
+    return;
+  }
+
+  // Keep the retry count the collapse computed: the stored text already
+  // wraps the raw error, so the suffix is the only lost detail.
+  const attempts = /\(failed after (\d+) attempts\)$/.exec(String(last.content ?? ''));
+  last.content = attempts
+    ? `${failure.errorText} (failed after ${attempts[1]} attempts)`
+    : failure.errorText;
+}
+
+/**
  * Reads a usage snapshot from one Antigravity transcript.jsonl.
  *
  * Transcripts carry the usage either on a `result` event or on bare
- * total/input/output lines. When no explicit usage was recorded the transcript
- * is re-scanned and characters are estimated at ~3 chars/token so long
- * conversations still show a ballpark figure instead of zeros.
+ * total/input/output lines. A `result` block is the run's cumulative bill,
+ * while every other usage block is the prompt of the step that wrote it — that
+ * last step is what the context window currently holds. When no explicit usage
+ * was recorded the transcript is re-scanned and characters are estimated at
+ * ~3 chars/token so long conversations still show a ballpark figure instead of
+ * zeros.
  */
 async function readAntigravityTokenUsage(filename: string): Promise<ProviderTokenUsageResult> {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let totalTokens = 0;
+  let contextInputTokens = 0;
+  let contextOutputTokens = 0;
+  let contextTotal = 0;
+  let cumulativeInputTokens = 0;
+  let cumulativeOutputTokens = 0;
+  let cumulativeTotal = 0;
   let estimatedInputChars = 0;
   let estimatedOutputChars = 0;
+
   for await (const entry of readJsonlRecords(filename)) {
     const contentLength = typeof entry.content === 'string' ? entry.content.length : 0;
     const thinkingLength = typeof entry.thinking === 'string' ? entry.thinking.length : 0;
     if (entry.source === 'MODEL' || entry.type === 'PLANNER_RESPONSE') estimatedOutputChars += contentLength + thinkingLength;
     else estimatedInputChars += contentLength;
+
+    const isResult = entry.event === 'result' || Boolean(readObjectRecord(entry.result)?.usage);
     const usage = entry.usage ?? entry.result?.usage
       ?? (entry.event === 'result' ? entry.result?.usage : null) ?? entry.payload?.usage ?? null;
     if (usage) {
-      inputTokens = readUsageNumber(usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens);
-      outputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens);
-      totalTokens = readUsageNumber(usage.total_tokens ?? usage.totalTokens) || inputTokens + outputTokens;
+      const inputTokens = readUsageNumber(usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens);
+      const outputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens);
+      const totalTokens = readUsageNumber(usage.total_tokens ?? usage.totalTokens) || inputTokens + outputTokens;
+      if (isResult) {
+        cumulativeInputTokens = inputTokens;
+        cumulativeOutputTokens = outputTokens;
+        cumulativeTotal = totalTokens;
+      } else {
+        contextInputTokens = inputTokens;
+        contextOutputTokens = outputTokens;
+        contextTotal = totalTokens;
+        // Steps are per-request prompts; adding them is this engine's own
+        // convention for the run's bill when no `result` block was written.
+        cumulativeInputTokens += inputTokens;
+        cumulativeOutputTokens += outputTokens;
+        cumulativeTotal += totalTokens;
+      }
     } else if (typeof entry.total_tokens === 'number' || typeof entry.tokens === 'number') {
-      totalTokens = readUsageNumber(entry.total_tokens ?? entry.tokens);
-      inputTokens = readUsageNumber(entry.input_tokens ?? entry.prompt_tokens);
-      outputTokens = readUsageNumber(entry.output_tokens ?? entry.completion_tokens);
+      contextTotal = readUsageNumber(entry.total_tokens ?? entry.tokens);
+      contextInputTokens = readUsageNumber(entry.input_tokens ?? entry.prompt_tokens);
+      contextOutputTokens = readUsageNumber(entry.output_tokens ?? entry.completion_tokens);
     }
   }
-  if (totalTokens === 0 && inputTokens === 0 && outputTokens === 0) {
-    inputTokens = Math.ceil(estimatedInputChars / 3);
-    outputTokens = Math.ceil(estimatedOutputChars / 3);
-    totalTokens = inputTokens + outputTokens;
+
+  if (contextTotal === 0 && contextInputTokens === 0 && contextOutputTokens === 0) {
+    if (cumulativeTotal > 0 || cumulativeInputTokens > 0 || cumulativeOutputTokens > 0) {
+      // A transcript that recorded only the run's `result` block has no
+      // per-step reading left; the run total is the best context answer.
+      contextTotal = cumulativeTotal || cumulativeInputTokens + cumulativeOutputTokens;
+      contextInputTokens = cumulativeInputTokens;
+      contextOutputTokens = cumulativeOutputTokens;
+    } else {
+      contextInputTokens = Math.ceil(estimatedInputChars / 3);
+      contextOutputTokens = Math.ceil(estimatedOutputChars / 3);
+      contextTotal = contextInputTokens + contextOutputTokens;
+      cumulativeInputTokens = contextInputTokens;
+      cumulativeOutputTokens = contextOutputTokens;
+      cumulativeTotal = contextTotal;
+    }
   }
-  return { used: totalTokens || inputTokens + outputTokens, inputTokens, outputTokens, breakdown: { input: inputTokens, output: outputTokens } };
+
+  return {
+    used: contextTotal || contextInputTokens + contextOutputTokens,
+    inputTokens: contextInputTokens,
+    outputTokens: contextOutputTokens,
+    cumulative: {
+      used: cumulativeTotal || cumulativeInputTokens + cumulativeOutputTokens,
+      inputTokens: cumulativeInputTokens,
+      outputTokens: cumulativeOutputTokens,
+    },
+    breakdown: { input: contextInputTokens, output: contextOutputTokens },
+  };
 }
 
 function cleanToolArgValue(val: unknown): unknown {
@@ -973,6 +1063,8 @@ export class AntigravitySessionsProvider implements IProviderSessions {
       }
 
       await this.settleSpawnCalls(sessionId, providerSessionId, spawnCalls, canonicalRows.map((row) => readOptionalString(row.entry.content) ?? ''));
+
+      overlayStoredTurnFailure(sessionId, normalizedMessages);
 
       const total = normalizedMessages.length;
       const { page, hasMore } = sliceTailPage(normalizedMessages, limit, offset);

@@ -178,6 +178,8 @@
     },
     "clickToChangeMode": "Click to change permission mode (or press Tab in input)",
     "showAllCommands": "Show all commands",
+    "moreTools": "More options",
+    "contextUsage": "Context usage",
     "clearInput": "Clear input",
     "scrollToBottom": "Scroll to bottom",
     "queue": {
@@ -402,6 +404,10 @@
   "cost": {
     "readingUsage": "Reading session usage…",
     "totalTokensUsed": "Total tokens used",
+    "cumulativeTokens": "Total tokens (session)",
+    "cumulativeInputTokens": "Input tokens (session)",
+    "cumulativeOutputTokens": "Output tokens (session)",
+    "contextTokens": "Current context",
     "inputTokens": "Input tokens",
     "outputTokens": "Output tokens",
     "contextWindow": "Context window",
@@ -469,7 +475,6 @@
     "resetCardWeeklyAlso5h": "Resetting the weekly allowance also refills the 5-hour pool, without spending a 5-hour card.",
     "contextUsage": "Context usage",
     "usedPercent": "{{percent}}% used",
-    "cumulativeTokens": "Cumulative tokens",
     "compactedSummary": "Compaction summary",
     "monthlyWindow": "Monthly Quota"
   },
@@ -499,6 +504,7 @@
     "cancelEditing": "Cancel editing",
     "userDeniedTool": "User denied tool use",
     "showTokenUsage": "Show token usage",
+    "contextTokensUsed": "Current context: {{used}} / {{total}} tokens",
     "fallbackCommands": {
       "models": "Browse available models for the active provider.",
       "cost": "Review token usage for the active session.",

@@ -41,7 +41,7 @@ composer 的定时卡片同样不走 Context，也不是实时状态：`useSched
 - 本地选择持久化为 `<provider>-model` / `<provider>-effort`（`useChatProviderState` 直接读写 localStorage，设备本地，不经 preference store）。
 - 引擎外观：`src/shared/providerDisplay.ts`（显示名）、`src/shared/ui/LLMProviderLogo.tsx`（Logo）。
 - 新增引擎的前端步骤见 [providers.md](./providers.md) 第六步——composer 不写 provider 分支，一切按能力矩阵渲染（slash 菜单同理：`/compact` 仅在 `supportsCompaction` 为真时出现，它和技能一样作为消息文本发出；编辑横幅的「文件会不会一并还原」也按 `editRevertsFiles` 切换文案，见 [providers.md](./providers.md) 的编辑段）。
-- **上下文占用展示**：`tokenBudget`（WS `token_budget` 指令 / 历史页 `tokenUsage`）喂 composer 的两个控件与 `/cost` 弹窗，二者读同一份 `readContextUsage`（`src/modules/chat/utils/contextUsage.ts`；引擎自报 `percentage` 优先，否则 `used/total`）：顶沿细进度条 `ContextUsageBar`（`<60%` 绿 / `60–84%` 黄 / `≥85%` 红）表示窗口占用，工具行里的 `TokenUsageSummary` 显示当前 K 数——手机上只留 K 数（隐藏图标与 `xx%`）以免工具行（附件/语音/命令 + 定时/模型/权限/发送）在 ~320px 溢出、和定时图标重叠，`sm` 以上再加图标和百分比。两者点击都开 `/cost`。没有窗口时细条不画；徽章在整份读数缺失时才不画（快照全 0，或刚压缩且没有摘要大小），因为只显示 K 数、百分比是 `sm` 以上的附加项。刚压缩时引擎还没有 token 数，徽章改用 `summaryBytes`（压缩摘要的 UTF-8 字节数）显示 "9.4KB"，占用条不画。字段语义与来源见 [providers.md](./providers.md)，前端不按引擎分支；`cumulative` 只在 `/cost` 里单列。
+- **上下文占用展示**：`tokenBudget`（WS `token_budget` 指令 / 历史页 `tokenUsage`）喂 composer 的两个控件与 `/cost` 弹窗，二者读同一份 `readContextUsage`（`src/modules/chat/utils/contextUsage.ts`；引擎自报 `percentage` 优先，否则 `used/total`）：顶沿细进度条 `ContextUsageBar`（`<60%` 绿 / `60–84%` 黄 / `≥85%` 红）表示窗口占用；工具行里的桌面徽章 `TokenUsageSummary` 显示当前 K 数与百分比，手机换成 `TokenUsageBadge`——平时只显示 K 数，窗口用量逼近上限（`≥85%` 警告、`≥95%` 危险）才变色提醒，定时入口也让给 `ComposerOverflowMenu` 的 ＋ 面板，避免工具行在 ~320px 溢出。所有控件点击都开 `/cost`。没有窗口时细条不画；徽章在整份读数缺失时才不画（快照全 0，或刚压缩且没有摘要大小），因为只显示 K 数、百分比是 `sm` 以上的附加项。刚压缩时引擎还没有 token 数，徽章改用 `summaryBytes`（压缩摘要的 UTF-8 字节数）显示 "9.4KB"，占用条不画。字段语义与来源见 [providers.md](./providers.md)，前端不按引擎分支；`cumulativeUsage`（会话累计）只在 `/cost` 详情里单列。
 
 ### 会话标签只有一个字段
 
@@ -157,7 +157,7 @@ MCP 服务器表单按 `useProviderMcpCapabilities()` 渲染。首屏与请求�
 ## PWA 与版本
 
 - `public/manifest.json` + `public/sw.js`（当前由 `src/main.tsx` 与 `index.html` 注册）；HTML 始终走网络，hash 静态资源走 cache-first，API 与 WebSocket 永不经 SW；因此刷新可拿到新版本，已缓存资源可复用。设置 → 关于的版本提示用 `__APP_VERSION__`（vite define）与含 git describe 的 `__BUILD_INFO__` 判断长驻窗口是否过期。
-- iOS 状态栏：`apple-mobile-web-app-status-bar-style` 固定为 `default`，运行时不改。iOS 27 会给已安装的 PWA 顶部叠一层系统模糊，CSS 和 meta 都关不掉；只有状态栏不透明、且页面顶部有固定定位元素时，系统才改用该元素的背景色铺满状态栏并撤掉模糊。`black-translucent` 下这条路径不生效。因此 `index.html` 的 `body` 首个子元素是 `.ios-pwa-status-strip`：只在 iOS standalone 显示，11px 高，取 `--background`，用 `background-clip: text` 不实际绘制。这是未公开的系统行为，升级 iOS 时要回看。已安装的图标要删掉重新添加才会用上新的状态栏样式。
+- iOS 状态栏：`apple-mobile-web-app-status-bar-style` 固定为 `default`。独立窗口中的 `.ios-pwa-status-strip` 是页面顶部一条 11px 高的固定色带，供 WebKit 取样以减轻系统模糊。色带取 `--background`，背景裁剪到空文本，不会遮住页面或拦截点击。页面初次加载、从缓存恢复或回到前台时，`src/shared/iosPwaStatusBar.ts` 让色带离开顶边一帧再回去，给 WebKit 重新取样的机会。顶部安全区仍由 `env(safe-area-inset-top)` 决定。取样和模糊由系统控制，需在已安装的 iOS PWA 上验证冷启动和后台恢复。
 - 冷启动会话恢复：`src/shared/sessionProtection*` / `useSessionProtection`——仅 standalone 模式记忆并预验证回跳；恢复 effect 必须声明在记录 effect 之前（顺序敏感）。
 - Web Push 复用 SW：`src/modules/settings/hooks/useWebPush.ts`，服务端 VAPID 在 `server/modules/notifications/`。
 

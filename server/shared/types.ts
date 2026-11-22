@@ -171,13 +171,32 @@ export type AntigravityQuotaData = QuotaDataShape;
 // ---------------------------
 //----------------- PROVIDER SESSION TOKEN USAGE TYPES ------------
 /**
+ * Whole-session token spend for one provider session.
+ *
+ * Every engine counts the same way: `inputTokens` includes cache hits and
+ * `used` is their sum with `outputTokens`. Shape shared by the provider
+ * adapters, the live `token_budget` status frames and the `/cost` command.
+ */
+export type ProviderCumulativeTokenUsage = {
+  used: number;
+  inputTokens: number;
+  outputTokens: number;
+};
+
+/**
  * Latest token-usage snapshot for one provider session, as served by
  * `GET /providers/sessions/:sessionId/token-usage`.
  *
  * Each provider sessions facet produces this shape from its own native
- * storage. `unsupported: true` marks providers that cannot report usage at
- * all (callers surface `message` instead of the counters); `total` carries
- * the context window when the provider knows it.
+ * storage. `used`, `inputTokens`, `outputTokens` and `breakdown` describe the
+ * context window's current occupancy — the prompt plus output of the newest
+ * request, which is what the composer's counter shows. `cumulative` is the
+ * session's whole spend and is what the `/cost` detail reports as the total;
+ * summing per-turn context readings would count the same cached prefix once
+ * per turn, so the two numbers must never be confused. `total` carries the
+ * context window when the provider knows it, and `unsupported: true` marks
+ * providers that cannot report usage at all (callers surface `message`
+ * instead of the counters).
  */
 export type ProviderTokenUsageResult = {
   used: number;
@@ -187,20 +206,10 @@ export type ProviderTokenUsageResult = {
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
   cacheTokens?: number;
+  cumulative?: ProviderCumulativeTokenUsage;
   breakdown: {
     input: number;
     output: number;
-  };
-  /**
-   * Session-lifetime token totals. `used` above reports the CURRENT context
-   * occupancy for providers whose engines can tell the two apart (codex,
-   * opencode); this field preserves the cumulative spend those endpoints used
-   * to report, for the `/cost` breakdown.
-   */
-  cumulative?: {
-    used: number;
-    inputTokens: number;
-    outputTokens: number;
   };
   /**
    * Context-window usage percent as reported by the engine itself (Claude's
@@ -257,7 +266,13 @@ export type ProviderSessionUsageInput = {
 export type ProviderSessionWatchTarget = {
   /** Directory holding this provider's session artifacts. */
   rootPath: string;
-  /** Returns true when a file event under `rootPath` should trigger a sync. */
+  /**
+   * Additional directories holding the same artifacts under another data
+   * root (antigravity's managed ACP directory), watched with the same file
+   * filter; empty by default.
+   */
+  extraRootPaths?: string[];
+  /** Returns true when a file event under any root should trigger a sync. */
   isTargetFile(filePath: string): boolean;
 };
 
@@ -499,13 +514,21 @@ export type ProviderPermissionDecision = {
   rememberEntry?: unknown;
 };
 
+//----------------- ANTIGRAVITY ACP ------------
+
+/** A method notification sent by agy over ACP stdio. The payload is narrowed by each consumer. */
+export type AcpNotification = { method: string; params: unknown };
+
 /**
- * Interactive-approval facet of a provider runtime: the cards the chat shows
- * and the decisions that answer them.
- *
- * Consumers: the chat websocket through the provider runtime service, which
- * fans every call out across the registered providers.
+ * Decision delivered by the ACP card bridge to a suspended Antigravity turn.
+ * Expiry denies the pending action. Abort settles the cancelled turn without a follow-up prompt.
  */
+export type AcpCardOutcome = ProviderPermissionDecision & {
+  aborted?: boolean;
+  expired?: boolean;
+};
+
+// ---------------------------
 export type ProviderRuntimePermissionGateway = {
   resolve(requestId: string, decision: ProviderPermissionDecision): void;
   listPending(sessionId: string): unknown[];
@@ -1065,6 +1088,8 @@ export type WorktreeDescriptor = {
   isCurrent: boolean;
   isLocked: boolean;
   isDetached: boolean;
+  /** Git has registered this worktree but its directory is gone (`prunable`); it cannot be inspected, opened or merged. */
+  isPrunable: boolean;
   changedFileCount: number;
   ahead: number;
   behind: number;
@@ -1559,6 +1584,14 @@ export type FileTreeServices = {
   }>;
   createWorkspaceFolder(folderPath: string): Promise<{ success: true; path: string }>;
   readTextFile(projectId: string, filePath: string): Promise<{ content: string; path: string }>;
+  /**
+   * Reports one readable file's size without reading its contents. Resolution
+   * follows the same rules as `readTextFile` — project-relative paths inside
+   * the project root, absolute paths inside the read-only roots — so anything
+   * this admits could also be opened. Exists so chat file links can show the
+   * large-file confirmation before the editor loads the whole document.
+   */
+  statFile(projectId: string, filePath: string): Promise<{ size: number }>;
   /**
    * Reads a text file outside any project root. The path must resolve inside
    * one of the injected `externalReadOnlyRoots`, or within a linked worktree of

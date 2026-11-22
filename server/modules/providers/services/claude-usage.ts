@@ -1,5 +1,10 @@
 import type { AnyRecord, ProviderTokenUsageResult } from '@/shared/types.js';
-import { readObjectRecord, readUsageNumber } from '@/shared/utils.js';
+import {
+  readJsonlIncrementally,
+  readObjectRecord,
+  readUsageNumber,
+  type JsonlIncrementalState,
+} from '@/shared/utils.js';
 
 /**
  * Context windows the Claude SDK reported per provider session id.
@@ -48,127 +53,109 @@ export function getReportedClaudeContextWindow(
   return providerSessionId ? reportedClaudeContextWindows.get(providerSessionId) : undefined;
 }
 
-/**
- * Latest context-window usage from a Claude transcript's already-parsed rows.
- *
- * Consumers: the Claude sessions provider, for both the usage it hands back on
- * every history page (the way the Codex and OpenCode readers do — without
- * that, a Claude session's counter only moved when the session was reselected,
- * and the store's "this provider reports no usage" path overwrote it with
- * zero) and the `/token-usage` endpoint. One reader for both is deliberate:
- * they used to be separate scans that disagreed about the same session.
- *
- * Reads the newest assistant turn only: `input_tokens + cache_read +
- * cache_creation` is that one request's whole prompt, i.e. what the context
- * window currently holds. Summing turns would count the same cached prefix
- * once per turn.
- *
- * A compaction boundary newer than every assistant turn replaces that reading
- * with its own `postTokens`: the assistant rows before it describe the context
- * the compaction just discarded, while `postTokens` is exactly what the next
- * request will carry. Newer SDKs report it, so a just-compacted session keeps a
- * real percentage instead of showing the pre-compaction one (or nothing).
- */
-export function summarizeClaudeTokenUsage(
-  entries: AnyRecord[],
-  contextWindowSources: ClaudeContextWindowSources = {},
-): ProviderTokenUsageResult {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadTokens = 0;
-  let cacheCreationTokens = 0;
-  let observedModel: string | null = null;
+/** Running totals over one Claude transcript: newest context plus whole spend. */
+type ClaudeUsageAccumulator = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  cumulativeInputTokens: number;
+  cumulativeOutputTokens: number;
   /** Set once the newest compaction boundary is passed: older turns are history. */
-  let compacted = false;
-  let postCompactionTokens: number | null = null;
+  compacted: boolean;
+  /** `postTokens` recorded by the newest compaction boundary, when the CLI wrote one. */
+  postCompactionTokens: number | null;
+  /** Model named by the newest main-thread assistant row, for window resolution. */
+  observedModel: string | null;
+};
 
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    // A subagent's turns report the subagent's context window, not this
-    // conversation's; reading one makes the counter drop to the subagent's
-    // number and bounce back on the next main-thread turn.
-    if (entry?.isSidechain === true) {
-      continue;
-    }
+/** Cursors of the transcripts already read; one small object per session. */
+const claudeTranscriptCursors = new Map<string, JsonlIncrementalState<ClaudeUsageAccumulator>>();
 
-    if (entry?.type === 'system' && entry?.subtype === 'compact_boundary') {
-      compacted = true;
-      postCompactionTokens ??= readCompactionPostTokens(entry);
-      continue;
-    }
+/** Bounds a long-lived server's memory; the least recently read entry leaves. */
+const MAX_CLAUDE_TRANSCRIPT_CURSORS = 200;
 
-    const usage = entry?.type === 'assistant' ? entry.message?.usage : null;
-    if (!usage) {
-      continue;
-    }
-
-    const directInputTokens = readUsageNumber(usage.input_tokens ?? usage.inputTokens);
-    const rowCacheReadTokens = readUsageNumber(
-      usage.cache_read_input_tokens ?? usage.cacheReadInputTokens ?? usage.cacheReadTokens,
-    );
-    const rowCacheCreationTokens = readUsageNumber(
-      usage.cache_creation_input_tokens
-        ?? usage.cacheCreationInputTokens
-        ?? usage.cacheCreationTokens,
-    );
-    const rowInputTokens = directInputTokens + rowCacheReadTokens + rowCacheCreationTokens;
-    const rowOutputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens);
-
-    // `<synthetic>` rows — interrupts, API errors, "No response requested" —
-    // are written with an all-zero usage block rather than none at all. They
-    // never carried a prompt, so treating one as the newest turn zeroed a
-    // counter that a live event had just set correctly.
-    if (rowInputTokens === 0 && rowOutputTokens === 0) {
-      continue;
-    }
-
-    const model = entry.message?.model;
-    observedModel = typeof model === 'string' ? model : null;
-    // An assistant turn older than the boundary still names the model that
-    // served the conversation, which is what the window is resolved from. Its
-    // numbers, however, belong to the context that was just replaced.
-    if (compacted) {
-      break;
-    }
-    cacheReadTokens = rowCacheReadTokens;
-    cacheCreationTokens = rowCacheCreationTokens;
-    inputTokens = rowInputTokens;
-    outputTokens = rowOutputTokens;
-    break;
-  }
-
-  const total = resolveClaudeContextWindow(contextWindowSources, observedModel);
-
-  if (compacted) {
-    if (postCompactionTokens !== null) {
-      return {
-        used: postCompactionTokens,
-        total,
-        inputTokens: postCompactionTokens,
-        outputTokens: 0,
-        breakdown: { input: postCompactionTokens, output: 0 },
-      };
-    }
-    return {
-      used: 0,
-      total,
-      inputTokens: 0,
-      outputTokens: 0,
-      breakdown: { input: 0, output: 0 },
-      compacted: true,
-    };
-  }
-
+function createClaudeUsageAccumulator(): ClaudeUsageAccumulator {
   return {
-    used: inputTokens + outputTokens,
-    total,
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    cacheCreationTokens,
-    cacheTokens: cacheReadTokens + cacheCreationTokens,
-    breakdown: { input: inputTokens, output: outputTokens },
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    cumulativeInputTokens: 0,
+    cumulativeOutputTokens: 0,
+    compacted: false,
+    postCompactionTokens: null,
+    observedModel: null,
   };
+}
+
+/**
+ * Folds one transcript entry into the running totals.
+ *
+ * Shared by the pure summarizer (which is handed already-parsed rows) and the
+ * incremental file reader, so both apply exactly the same rules.
+ */
+function applyClaudeUsageEntry(accumulator: ClaudeUsageAccumulator, entry: AnyRecord): void {
+  // A compaction boundary marks every assistant row before it as history. The
+  // boundary itself may carry `postTokens`: the size of the summary the next
+  // request will carry, i.e. the only honest occupancy reading right after a
+  // compaction. A newer boundary without one clears the previous reading
+  // rather than letting a superseded number stand in for it.
+  if (entry?.type === 'system' && entry?.subtype === 'compact_boundary') {
+    accumulator.compacted = true;
+    accumulator.postCompactionTokens = readCompactionPostTokens(entry);
+    return;
+  }
+
+  const usage = entry?.type === 'assistant' ? entry.message?.usage : null;
+  if (!usage) {
+    return;
+  }
+
+  const directInputTokens = readUsageNumber(usage.input_tokens ?? usage.inputTokens);
+  const rowCacheReadTokens = readUsageNumber(
+    usage.cache_read_input_tokens ?? usage.cacheReadInputTokens ?? usage.cacheReadTokens,
+  );
+  const rowCacheCreationTokens = readUsageNumber(
+    usage.cache_creation_input_tokens
+      ?? usage.cacheCreationInputTokens
+      ?? usage.cacheCreationTokens,
+  );
+  const rowInputTokens = directInputTokens + rowCacheReadTokens + rowCacheCreationTokens;
+  const rowOutputTokens = readUsageNumber(usage.output_tokens ?? usage.outputTokens);
+
+  // `<synthetic>` rows — interrupts, API errors, "No response requested" —
+  // are written with an all-zero usage block rather than none at all. They
+  // never carried a prompt, so counting one zeroed a counter that a live
+  // event had just set correctly.
+  if (rowInputTokens === 0 && rowOutputTokens === 0) {
+    return;
+  }
+
+  accumulator.cumulativeInputTokens += rowInputTokens;
+  accumulator.cumulativeOutputTokens += rowOutputTokens;
+
+  // A subagent's turns report the subagent's context window, not this
+  // conversation's; reading one makes the counter drop to the subagent's
+  // number and bounce back on the next main-thread turn. They still count as
+  // spend above, and the newest main-thread row wins here.
+  if (entry?.isSidechain === true) {
+    return;
+  }
+
+  const model = entry.message?.model;
+  if (typeof model === 'string' && model.length > 0) {
+    accumulator.observedModel = model;
+  }
+
+  accumulator.cacheReadTokens = rowCacheReadTokens;
+  accumulator.cacheCreationTokens = rowCacheCreationTokens;
+  accumulator.inputTokens = rowInputTokens;
+  accumulator.outputTokens = rowOutputTokens;
+  // An assistant turn ran after the boundary, so its own reading is the
+  // current context again.
+  accumulator.compacted = false;
+  accumulator.postCompactionTokens = null;
 }
 
 /**
@@ -183,6 +170,127 @@ function readCompactionPostTokens(entry: AnyRecord): number | null {
   const metadata = readObjectRecord(entry.compact_metadata ?? entry.compactMetadata);
   const postTokens = readUsageNumber(metadata?.post_tokens ?? metadata?.postTokens);
   return postTokens > 0 ? postTokens : null;
+}
+
+function buildClaudeUsageResult(
+  accumulator: ClaudeUsageAccumulator,
+  sources: ClaudeContextWindowSources,
+): ProviderTokenUsageResult {
+  const total = resolveClaudeContextWindow(sources, accumulator.observedModel);
+  const cacheTokens = accumulator.cacheReadTokens + accumulator.cacheCreationTokens;
+  const cumulative = {
+    used: accumulator.cumulativeInputTokens + accumulator.cumulativeOutputTokens,
+    inputTokens: accumulator.cumulativeInputTokens,
+    outputTokens: accumulator.cumulativeOutputTokens,
+  };
+
+  if (accumulator.compacted) {
+    if (accumulator.postCompactionTokens !== null) {
+      return {
+        used: accumulator.postCompactionTokens,
+        total,
+        inputTokens: accumulator.postCompactionTokens,
+        outputTokens: 0,
+        cumulative,
+        breakdown: { input: accumulator.postCompactionTokens, output: 0 },
+      };
+    }
+    return {
+      used: 0,
+      total,
+      inputTokens: 0,
+      outputTokens: 0,
+      cumulative,
+      breakdown: { input: 0, output: 0 },
+      compacted: true,
+    };
+  }
+
+  return {
+    used: accumulator.inputTokens + accumulator.outputTokens,
+    total,
+    inputTokens: accumulator.inputTokens,
+    outputTokens: accumulator.outputTokens,
+    cacheReadTokens: accumulator.cacheReadTokens,
+    cacheCreationTokens: accumulator.cacheCreationTokens,
+    cacheTokens,
+    cumulative,
+    breakdown: { input: accumulator.inputTokens, output: accumulator.outputTokens },
+  };
+}
+
+/**
+ * Latest context-window usage plus the session's cumulative spend from a
+ * Claude transcript's already-parsed rows.
+ *
+ * Exported because the session-messages reader hands the same usage back on
+ * every history page, the way the Codex and OpenCode readers do. Without that,
+ * a Claude session's counter only moved when the session was reselected, and
+ * the store's "this provider reports no usage" path overwrote it with zero.
+ *
+ * `used` reads the newest main-thread assistant turn only:
+ * `input_tokens + cache_read + cache_creation` is that one request's whole
+ * prompt, i.e. what the context window currently holds. Summing turns would
+ * count the same cached prefix once per turn, so the cumulative block sums
+ * every assistant row instead — subagent turns included, since their tokens
+ * were really spent on this session.
+ *
+ * A compaction boundary newer than every assistant turn replaces that reading
+ * with its own `postTokens`: the assistant rows before it describe the context
+ * the compaction just discarded, while `postTokens` is exactly what the next
+ * request will carry. Newer SDKs report it, so a just-compacted session keeps a
+ * real percentage instead of showing the pre-compaction one (or nothing).
+ */
+export function summarizeClaudeTokenUsage(
+  entries: AnyRecord[],
+  sources: ClaudeContextWindowSources = {},
+): ProviderTokenUsageResult {
+  const accumulator = createClaudeUsageAccumulator();
+  for (const entry of entries) {
+    applyClaudeUsageEntry(accumulator, entry);
+  }
+  return buildClaudeUsageResult(accumulator, sources);
+}
+
+/**
+ * Same reading, computed from the transcript file itself and parsing only the
+ * bytes appended since the previous call.
+ *
+ * A Claude transcript reaches hundreds of megabytes while each turn adds a few
+ * kilobytes, so replaying the whole file on every usage refresh spends
+ * hundreds of milliseconds of parse and GC for nothing. The accumulator keeps
+ * the running totals, which is all a refresh needs, and the reader streams the
+ * file, so a cold read of a huge transcript never holds it in memory.
+ *
+ * Consumers: the Claude sessions provider's token-usage endpoint.
+ */
+export async function readClaudeTranscriptTokenUsage(
+  filename: string,
+  sources: ClaudeContextWindowSources = {},
+): Promise<ProviderTokenUsageResult> {
+  const next = await readJsonlIncrementally(
+    filename,
+    claudeTranscriptCursors.get(filename),
+    createClaudeUsageAccumulator,
+    applyClaudeUsageEntry,
+  );
+
+  if (next) {
+    // Re-insert so the most recently read transcripts are the last evicted.
+    claudeTranscriptCursors.delete(filename);
+    claudeTranscriptCursors.set(filename, next);
+    if (claudeTranscriptCursors.size > MAX_CLAUDE_TRANSCRIPT_CURSORS) {
+      const oldest = claudeTranscriptCursors.keys().next().value;
+      if (oldest !== undefined) {
+        claudeTranscriptCursors.delete(oldest);
+      }
+    }
+  }
+
+  return buildClaudeUsageResult(
+    next?.accumulator ?? createClaudeUsageAccumulator(),
+    sources,
+  );
 }
 
 /**

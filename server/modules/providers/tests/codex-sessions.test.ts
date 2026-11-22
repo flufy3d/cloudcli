@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -319,7 +319,50 @@ test('Codex history reads 0.153-era prompts from item_completed UserMessage rows
   }
 });
 
-test('getTokenUsage reads the latest token_count snapshot from the indexed rollout', async () => {
+test('Codex history locates the rollout by the provider id when the row has no indexed path', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-history-fallback-'));
+  const workspacePath = await createWorkspaceFixture();
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const providerSessionId = 'codex-fallback-1';
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(
+      path.join(sessionsDir, `rollout-${providerSessionId}.jsonl`),
+      [
+        JSON.stringify({ type: 'session_meta', payload: { id: providerSessionId, cwd: workspacePath } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+        JSON.stringify({ type: 'turn_context', payload: { turn_id: 'turn-1' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'item-u1', content: [{ type: 'text', text: 'prompt from the orphaned rollout' }] } },
+        }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      // The mapping a lost path leaves behind: the provider id survived, the
+      // indexed path did not. The reader must find the rollout the same way
+      // getTokenUsage does, or the conversation reads as empty forever.
+      sessionsDb.createAppSession('app-fallback-1', 'codex', workspacePath);
+      sessionsDb.assignProviderSessionId('app-fallback-1', providerSessionId);
+      assert.equal(sessionsDb.getSessionById('app-fallback-1')?.jsonl_path ?? null, null);
+
+      const history = await new CodexSessionsProvider().fetchHistory('app-fallback-1');
+      const userRows = history.messages.filter((message) => message.kind === 'text' && message.role === 'user');
+      assert.equal(userRows.length, 1);
+      assert.equal(userRows[0]?.content, 'prompt from the orphaned rollout');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('getTokenUsage reports the last turn as context and the rollout totals as the session spend', async () => {
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'codex-token-usage-'));
   const sessionFilePath = path.join(tempDirectory, 'rollout-provider-session.jsonl');
 
@@ -330,8 +373,8 @@ test('getTokenUsage reads the latest token_count snapshot from the indexed rollo
         payload: {
           type: 'token_count',
           info: {
-            last_token_usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
             total_token_usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+            last_token_usage: { input_tokens: 30, output_tokens: 6, total_tokens: 36 },
             model_context_window: 100_000,
           },
         },
@@ -341,8 +384,8 @@ test('getTokenUsage reads the latest token_count snapshot from the indexed rollo
         payload: {
           type: 'token_count',
           info: {
-            last_token_usage: { input_tokens: 36, output_tokens: 6, total_tokens: 42 },
-            total_token_usage: { input_tokens: 40, output_tokens: 9, total_tokens: 49 },
+            total_token_usage: { input_tokens: 140, output_tokens: 9, total_tokens: 149 },
+            last_token_usage: { input_tokens: 70, output_tokens: 11, total_tokens: 81 },
             model_context_window: 250_000,
           },
         },
@@ -350,6 +393,40 @@ test('getTokenUsage reads the latest token_count snapshot from the indexed rollo
     ].join('\n'));
 
     const provider = new CodexSessionsProvider();
+    const first = await provider.getTokenUsage({
+      appSessionId: 'app-session',
+      nativeSessionId: 'provider-session',
+      jsonlPath: sessionFilePath,
+      projectPath: null,
+    });
+    assert.deepEqual(
+      first,
+      {
+        // The newest turn's prompt is the context reading (what the composer
+        // shows); the cumulative block is the session's whole spend.
+        used: 81,
+        total: 250_000,
+        inputTokens: 70,
+        outputTokens: 11,
+        breakdown: { input: 70, output: 11 },
+        cumulative: { used: 149, inputTokens: 140, outputTokens: 9 },
+      },
+    );
+
+    // The reader keeps a cursor per rollout: the next turn appends a snapshot
+    // and the refresh must pick it up from the tail alone.
+    await appendFile(sessionFilePath, `${JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 240, output_tokens: 12, total_tokens: 252 },
+          last_token_usage: { input_tokens: 110, output_tokens: 3, total_tokens: 113 },
+          model_context_window: 250_000,
+        },
+      },
+    })}\n`);
+
     assert.deepEqual(
       await provider.getTokenUsage({
         appSessionId: 'app-session',
@@ -358,14 +435,12 @@ test('getTokenUsage reads the latest token_count snapshot from the indexed rollo
         projectPath: null,
       }),
       {
-        // `used` is the latest turn's prompt (what the context window holds);
-        // the session's cumulative spend stays available next to it.
-        used: 42,
+        used: 113,
         total: 250_000,
-        inputTokens: 36,
-        outputTokens: 6,
-        breakdown: { input: 36, output: 6 },
-        cumulative: { used: 49, inputTokens: 40, outputTokens: 9 },
+        inputTokens: 110,
+        outputTokens: 3,
+        breakdown: { input: 110, output: 3 },
+        cumulative: { used: 252, inputTokens: 240, outputTokens: 12 },
       },
     );
   } finally {

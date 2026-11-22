@@ -431,8 +431,12 @@ export const api = {
   },
 
   // Workspace file tree
-  readFile: (projectId: string, filePath: string) =>
-    get(`/api/file-tree/projects/${projectId}/file${query({ filePath })}`),
+  readFile: (projectId: string, filePath: string, options: ApiRequestOptions = {}) =>
+    get(`/api/file-tree/projects/${projectId}/file${query({ filePath })}`, options),
+  // Size-only probe feeding the large-file open confirmation; the answer never
+  // carries contents, so chat file links can ask before the editor loads.
+  fileStat: (projectId: string, filePath: string, options: ApiRequestOptions = {}) =>
+    get(`/api/file-tree/projects/${projectId}/stat${query({ filePath })}`, options),
   // Raw bytes for a workspace file. The endpoint requires the auth header, so
   // media call sites fetch a blob through here instead of using a bare `src`.
   readFileBlob: (projectId: string, filePath: string, options: ApiRequestOptions = {}) =>
@@ -888,9 +892,10 @@ export function synthesizeVoice(text: string, signal: AbortSignal): Promise<Resp
 }
 
 /** Fork: fetches one external (outside-project) file's content for the code editor document. */
-export const readExternalFile = (filePath: string, projectId?: string): Promise<Response> =>
+export const readExternalFile = (filePath: string, projectId?: string, options: ApiRequestOptions = {}): Promise<Response> =>
   authenticatedFetch(
     `/api/file-tree/external-file?path=${encodeURIComponent(filePath)}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}`,
+    options,
   );
 
 /** Fork: streams one external (allowlisted) file's bytes — chat markdown resolves local-path images through this. */

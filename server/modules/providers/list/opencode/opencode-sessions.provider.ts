@@ -46,6 +46,10 @@ import { connectOpenCodeApiClient } from './opencode-service.js';
 import { formatOpenCodeToolBlock } from './opencode-tool-output.js';
 import { toClientToolName } from './opencode-subagent.js';
 import { isOpenCodeQuestionTool, toQuestionCardInput } from './opencode-question.js';
+import {
+  DEFAULT_OPENCODE_CONTEXT_WINDOW,
+  readOpenCodeModelContextLimit,
+} from './opencode-models.provider.js';
 
 const PROVIDER = 'opencode';
 
@@ -595,6 +599,38 @@ type OpenCodeSessionsDependencies = {
   /** The client the edit rewind talks to; defaults to the production server. */
   connectClient?: () => Promise<Pick<OpenCodeApiClient, 'revertSession'>>;
 };
+
+/**
+ * Reads the context window the session's model declares in the models.dev
+ * catalog (the session row carries `{providerID, id}`), for callers outside
+ * this provider — the runtime's token budget frame uses it as the usage
+ * denominator. Returns null when the row, the catalog or the model is
+ * missing or silent.
+ */
+export async function readOpenCodeSessionContextWindow(nativeSessionId: string): Promise<number | null> {
+  try {
+    const databasePath = getOpenCodeDatabasePath();
+    if (!fsSync.existsSync(databasePath)) {
+      return null;
+    }
+    const database = new Database(databasePath, { readonly: true, fileMustExist: true });
+    try {
+      const table = resolveOpenCodeSessionTableName(database);
+      if (!table) return null;
+      const row = database.prepare(`SELECT model FROM ${table} WHERE id = ?`)
+        .get(nativeSessionId) as { model?: string } | undefined;
+      const model = readJsonRecord(row?.model) ?? {};
+      const providerID = String(model.providerID ?? '');
+      const id = String(model.id ?? '');
+      if (!providerID || !id) return null;
+      return readOpenCodeModelContextLimit({ providerID, id });
+    } finally {
+      database.close();
+    }
+  } catch {
+    return null;
+  }
+}
 
 export class OpenCodeSessionsProvider implements IProviderSessions {
   private readonly connectClient: () => Promise<Pick<OpenCodeApiClient, 'revertSession'>>;

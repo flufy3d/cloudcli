@@ -57,7 +57,6 @@ import {
 import { getProviderDisplayName, PROVIDER_DISPLAY_NAMES } from '@/shared/providerDisplay';
 
 import ModelLibraryPanel from '@/modules/chat/modals/ModelLibraryPanel';
-import { formatByteSize } from '@/modules/chat/utils/contextUsage';
 
 type CommandResultModalProps = {
   payload: CommandModalPayload | null;
@@ -1035,12 +1034,7 @@ function ResetCreditsCard({
 
 function CostContent({ data, pending }: { data: CostCommandData; pending: boolean }) {
   const { t } = useTranslation('chat');
-  // A just-compacted session reports no occupancy: the numbers that exist
-  // describe the context the user just discarded, so they are suppressed in
-  // favor of an explicit "updates after the next turn" note.
-  const compacted = data.compacted === true;
-  const summaryBytes = Number(data.summaryBytes ?? 0) || 0;
-  const used = compacted ? 0 : Number(data.tokenUsage?.used ?? 0);
+  const used = Number(data.tokenUsage?.used ?? 0);
   const total = Number(data.tokenUsage?.total ?? 0);
   const model = data.model || 'Unknown';
   const provider = getProviderLabel(data.provider, data.provider || 'Unknown');
@@ -1121,60 +1115,40 @@ function CostContent({ data, pending }: { data: CostCommandData; pending: boolea
     };
   }, [fetchQuota, supportsQuota, data.quota, quotaProvider]);
 
-  const hasBreakdown =
-    typeof data.tokenBreakdown?.input === 'number' ||
-    typeof data.tokenBreakdown?.output === 'number';
-  // The engine's own percentage (Claude) wins; otherwise derive it from the
-  // reported occupancy and window (codex, antigravity, opencode).
-  const contextPercent = typeof data.percentage === 'number' && data.percentage > 0
-    ? Math.min(100, Math.round(data.percentage))
-    : total > 0 && used > 0
-      ? Math.min(100, Math.round((used / total) * 100))
-      : null;
+  // Same four rows for every engine, in the same order: the session's
+  // cumulative spend (the honest answer to "how many tokens did this
+  // conversation cost"), its input/output halves, and the context window. A
+  // provider that cannot report a number shows "—" instead of dropping the
+  // row, so switching engines never changes the layout. `used` is the context
+  // window's current occupancy and belongs to the composer's counter, not to
+  // the total.
+  const cumulative = data.cumulativeUsage;
+  const formatOptional = (value: number | undefined) => (
+    typeof value === 'number' && value > 0 ? formatNumber(value) : '—'
+  );
   const usageRows = [
-    ...(compacted
-      ? summaryBytes > 0
-        ? [{
-            label: t('cost.compactedSummary', { defaultValue: 'Compaction summary' }),
-            value: formatByteSize(summaryBytes),
-            icon: Gauge,
-          }]
-        : []
-      : [{ label: t('cost.totalTokensUsed', { defaultValue: 'Total tokens used' }), value: formatNumber(used), icon: Activity }]),
-    ...(hasBreakdown
-      ? [
-          {
-            label: t('cost.inputTokens', { defaultValue: 'Input tokens' }),
-            value: formatNumber(Number(data.tokenBreakdown?.input ?? 0)),
-            icon: TerminalSquare,
-          },
-          {
-            label: t('cost.outputTokens', { defaultValue: 'Output tokens' }),
-            value: formatNumber(Number(data.tokenBreakdown?.output ?? 0)),
-            icon: Coins,
-          },
-        ]
-      : []),
-    // Only when it is consistent with what was actually used. Claude reports
-    // the window its model has once a turn completes, but until then (and for
-    // providers that report none) it is the CONTEXT_WINDOW setting, which cannot
-    // know whether a session runs a 200K or a 1M variant of the same model —
-    // and a row reading "used 404,009 / window 160,000" is worse than no row.
-    ...(total > used
-      ? [{ label: t('cost.contextWindow', { defaultValue: 'Context window' }), value: formatNumber(total), icon: Gauge }]
-      : []),
-    ...(data.cumulative
-      ? [{
-          label: t('cost.cumulativeTokens', { defaultValue: 'Cumulative tokens' }),
-          value: formatNumber(Number(data.cumulative.used ?? 0)),
-          icon: Layers,
-        }]
-      : []),
+    {
+      label: t('cost.cumulativeTokens', { defaultValue: 'Total tokens (session)' }),
+      value: formatOptional(cumulative?.used),
+      icon: Activity,
+    },
+    {
+      label: t('cost.cumulativeInputTokens', { defaultValue: 'Input tokens (session)' }),
+      value: formatOptional(cumulative?.inputTokens),
+      icon: TerminalSquare,
+    },
+    {
+      label: t('cost.cumulativeOutputTokens', { defaultValue: 'Output tokens (session)' }),
+      value: formatOptional(cumulative?.outputTokens),
+      icon: Coins,
+    },
+    { label: t('cost.contextTokens', { defaultValue: 'Current context' }), value: formatOptional(used), icon: Gauge },
+    { label: t('cost.contextWindow', { defaultValue: 'Context window' }), value: formatOptional(total), icon: Gauge },
   ];
 
   // Opened on click before `/cost` answered, and the composer had no usage of
   // its own: say it is reading rather than show a total of 0.
-  const isReadingUsage = pending && used <= 0 && !hasBreakdown;
+  const isReadingUsage = pending && used <= 0 && !data.cumulativeUsage;
 
   const quotaGroups = sortQuotaGroupsForModel(
     quotaData?.groups ?? [],
@@ -1211,26 +1185,6 @@ function CostContent({ data, pending }: { data: CostCommandData; pending: boolea
           );
         })}
 
-        {contextPercent !== null && (
-          <div className="border-b border-border/60 px-4 py-3 last:border-b-0">
-            <div className="mb-2 flex items-center justify-between gap-4">
-              <span className="text-sm font-medium text-foreground">
-                {t('cost.contextUsage', { defaultValue: 'Context usage' })}
-              </span>
-              <span className="shrink-0 font-mono text-sm font-semibold text-foreground">
-                {t('cost.usedPercent', { percent: contextPercent, defaultValue: '已用 {{percent}}%' })}
-              </span>
-            </div>
-            <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-              <div
-                className={`h-full rounded-full transition-all duration-500 ${
-                  contextPercent >= 90 ? 'bg-red-500' : contextPercent >= 70 ? 'bg-amber-500' : 'bg-primary'
-                }`}
-                style={{ width: `${contextPercent}%` }}
-              />
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Provider Quota & Rate Limits Section (5-hour & Weekly) */}

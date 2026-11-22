@@ -22,7 +22,7 @@ flowchart LR
   S -->|stdio JSONRPC| E2["codex app-server"]
   S -->|CLI| E3["cursor / opencode"]
   S -->|协议客户端| E4["zcode 引擎"]
-  S -->|CLI print| E5["agy (Antigravity)"]
+  S -->|CLI print / ACP| E5["agy (Antigravity)"]
   S -->|本轮 stdio MCP| M["Codex task bridge"]
   M -->|经已挂载的 REST API| S
   S -->|独立 app-server command/exec| W["脱离宿主的任务 worker"]
@@ -31,7 +31,8 @@ flowchart LR
 要点：
 
 - **服务端是引擎的宿主**，不是代理。引擎子进程/SDK 由服务端拉起，会话原件落盘在各引擎自己的数据目录，服务端只做索引、归一化与转发。
-- 入口 `server/index.ts`：组装 Express、挂全部 REST 路由、挂 WS（`server/modules/websocket`）、托管 `dist/`、SPA fallback、启动异步任务恢复与派发、优雅停机。异步任务 worker 是脱离宿主生命周期的子进程。
+- 入口 `server/index.ts`：组装 Express、挂全部 REST 路由、挂 WS（`server/modules/websocket`）、托管 `dist/`、SPA fallback、启动异步任务恢复与派发、优雅停机。异步任务 worker 是脱离宿主生命周期的子进程。优雅停机同时关掉常驻引擎进程（Codex 驻留会话、Claude 空闲常驻与为后台工作留着的进程、ZCode 协议客户端、Antigravity 的 ACP 子进程），不让引擎活过宿主。
+- 装配层把网关的事件发布入口交给 provider 运行时：常驻引擎在回合结束后自发汇报回合时，事件经 `chatRunRegistry` 的会话通道发出，运行时自己不发包、不编号。装配层也把任务桥接的登记入口与凭证的签发、作废交给运行时，并单独挂载桥接入口 `/api/tasks/mcp/invoke`（在通用 API Key 中间件之前，自行鉴权）。宿主任务的任务条也在这里接线：`setCodexHostTaskSource` 把任务模块的卡片列表和停止交给 Codex 运行时，`setTaskActivityListener` 在任务开始或结束时经会话通道重发整张任务条（机制见 providers.md「Codex 异步任务结果续开」）。
 - 端口：`SERVER_PORT` 默认 **3001**，`HOST` 默认 `0.0.0.0`；开发模式 Vite 跑 5173 并把 API 代理到 3001（`vite.config.js`）。
 - HTTP 连接配置：`server/http-timeouts.ts` 在监听前配置 origin 的连接空闲时间；默认覆盖常见代理的默认空闲池时间，但自定义代理仍需保证其空闲池先于 origin 过期。`HTTP_KEEP_ALIVE_TIMEOUT_MS` 可覆盖默认值，单位为毫秒，必须是 Node 定时器范围内的正整数；非法配置使启动失败。请求头接收超时保持大于连接空闲超时。默认值与校验范围以实现为准，PM2 实例的覆盖值写在 `~/.pm2/ecosystem.config.cjs`。
 - 启动标记：`~/.cloudcli/local-server.json`（host/port/pid/appRoot），用于 CLI 与健康检查定位实例。
@@ -90,6 +91,7 @@ docs/
 | 插件本体与启用状态 | `~/.cloudcli/plugins` + `~/.cloudcli/plugins.json` | `server/modules/plugins`（注册表扫描 + 子进程管理）；首次访问时从旧 `~/.claude-code-ui` 一次性自动迁移（`migrateLegacyPluginPaths`） |
 | 各引擎会话原件 | `~/.claude` / `~/.codex` / `~/.cursor` / `~/.local/share/opencode` / `~/.zcode` / `~/.gemini/antigravity*` | 云 CLI 不复制、不改写；同步器只读解析后把元数据 upsert 进 SQLite（`sessions` 表含 `jsonl_path`）。`sessions` 还记会话的运行时事实：`model`、`effort`、`context_window`（引擎自报的真实上下文窗口，转录里推不出来；未跑过的会话为 NULL）、`name_locked`（用户在应用里改过名，引擎标题不得覆盖）、`worktree_path` / `worktree_branch`（引擎把会话绑到项目某个 git worktree 时的位置；主检出会话为 NULL）、`isPinned`（侧边栏置顶：项目会话与跨项目动态都按置顶优先、组内再按活跃时间排序，服务端分页同样置顶优先）；fork 出的会话带祖先链上下文（`getForkAncestors` 递归 CTE 沿 `forked_from_session_id` 同项目同 provider 上溯，止于归档、缺失、跨项目或跨 provider 的祖先，UNION 去重防环）；项目会话接口与 WS 摘要携带该上下文，侧栏把 fork 会话缩进挂到祖先树下，祖先不占分页位；祖先被删除、改名或行 upsert 时上下文实时保活 |
 | 运行结束记录 | 服务进程内存（有界，约百条） | `server/modules/diagnostics`：每个 run 为什么结束（见 [chat.md](./chat.md)）。刻意不入库——它服务于"刚刚出了什么事"，重启即弃；`GET /api/diagnostics/runs` 读出，前端诊断报告把它和浏览器侧证据合成一份文件 |
+| 回合失败最终错误（每会话一行） | `session_turn_failures` 表 | 通知编排层 `notifyRunFailed` 落库（引擎转录普遍只留逐次重试行、不留最终错误）；agy 历史读取用它把重载后时间线末尾的折叠错误行改写为用户在推送里看到的最终错误（`antigravity-sessions.provider.ts` 的 `overlayStoredTurnFailure`，仅末行为错误且记录更新时生效）；会话删除不级联清理，孤儿行无害 |
 | 前端构建产物 | `dist/`（vite build） | Express 静态托管 + SPA fallback |
 | 服务端构建产物 | `dist-server/` | `tsc + tsc-alias` 先产出 `dist-server.next`，`scripts/promote-dist-server.mjs` 原子晋升（保留 `dist-server.old`；`preserver` 钩子启动前自愈） |
 

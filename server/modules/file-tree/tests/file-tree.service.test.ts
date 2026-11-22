@@ -1016,6 +1016,30 @@ test('listDirectories on a real filesystem refuses a symlink out of the project 
   }
 });
 
+test('browseWorkspace suggests symlinked directories and skips broken links and file links', async () => {
+  const workspaceRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-ws-'));
+  const outside = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-outside-'));
+
+  try {
+    await fsPromises.mkdir(path.join(outside, 'linked-project'));
+    await fsPromises.writeFile(path.join(outside, 'note.txt'), '', 'utf8');
+    // The shape an external volume mounted into the workspace root takes:
+    // real project folders reached through links inside the browsed root.
+    await fsPromises.symlink(path.join(outside, 'linked-project'), path.join(workspaceRoot, 'linked-project'));
+    await fsPromises.symlink(path.join(outside, 'missing-target'), path.join(workspaceRoot, 'broken-link'));
+    await fsPromises.symlink(path.join(outside, 'note.txt'), path.join(workspaceRoot, 'file-link'));
+    await fsPromises.mkdir(path.join(workspaceRoot, 'plain-dir'));
+    const service = createRealFileSystemService(path.resolve('file-tree-test-project'), workspaceRoot);
+
+    const browsed = await service.browseWorkspace(workspaceRoot);
+
+    assert.deepEqual(browsed.suggestions.map((entry) => entry.name), ['linked-project', 'plain-dir']);
+  } finally {
+    await fsPromises.rm(workspaceRoot, { recursive: true, force: true });
+    await fsPromises.rm(outside, { recursive: true, force: true });
+  }
+});
+
 test('the temp directory can be browsed and read, but never written to', async () => {
   const temporaryDirectory = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-tmp-'));
   const projectRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-project-'));
@@ -1093,7 +1117,16 @@ test('the temp directory can be browsed and read, but never written to', async (
 // every root and this case's premise collapses. Skip there; it still runs for
 // checkouts outside the temp directories.
 const tempRootsReal = await Promise.all(['/tmp', os.tmpdir()].map((root) => fsPromises.realpath(root).catch(() => null)));
-const repoUnderReadOnlyRoot = tempRootsReal.some((root) => root !== null && (testDirectory.startsWith(root + '/')));
+const repoUnderReadOnlyRoot = tempRootsReal.some((root) => {
+  if (root === null) {
+    return false;
+  }
+  // `path.relative` is the platform-correct containment test; a `root + '/'`
+  // prefix misses every Windows path, which left these cases running on a
+  // checkout under the temp directory and failing on a collapsed premise.
+  const relative = path.relative(root, testDirectory);
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+});
 test('reading through a symlink out of the temp directory is still refused', { skip: repoUnderReadOnlyRoot }, async () => {
   const temporaryDirectory = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-tmp-'));
   const projectRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-project-'));
@@ -1254,4 +1287,94 @@ test('checkPathsExist applies read boundaries without reading contents', async (
       'absolute-missing-outside-project': 404,
     });
   } finally { await fsPromises.rm(root, { recursive: true, force: true }); }
+});
+
+test('statFile reports a project file size without reading contents', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const statPaths: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    stat: async (filePath) => {
+      statPaths.push(filePath);
+      return createStats(false, 0o100644);
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  const result = await service.statFile('project-1', 'builds/report.html');
+
+  assert.equal(result.size, 24);
+  assert.deepEqual(statPaths, [path.join(projectRoot, 'builds/report.html')]);
+});
+
+test('statFile resolves absolute paths through the same read-only roots as reads', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const externalPath = path.resolve('/tmp/agent-run/report.html');
+  const fileSystem = createFakeFileSystem({
+    stat: async (filePath) => {
+      assert.equal(filePath, externalPath);
+      return { ...createStats(false, 0o100644), size: 21_300_000 };
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot, [], {
+    workspace: {
+      rootPath: projectRoot,
+      readOnlyRoot: null,
+      validatePath: async (candidatePath) => ({ valid: true, resolvedPath: candidatePath }),
+      resolveReadOnlyRootPath: async (candidatePath) => (candidatePath === externalPath ? candidatePath : null),
+    },
+  }));
+
+  const result = await service.statFile('project-1', externalPath);
+
+  assert.equal(result.size, 21_300_000);
+});
+
+test('statFile rejects traversal before invoking the filesystem adapter', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const statPaths: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    stat: async (filePath) => {
+      statPaths.push(filePath);
+      return createStats(false, 0o100644);
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  await assert.rejects(
+    service.statFile('project-1', '../secret.txt'),
+    (error: unknown) => error instanceof AppError
+      && error.code === 'PATH_OUTSIDE_PROJECT'
+      && error.statusCode === 403,
+  );
+  assert.deepEqual(statPaths, []);
+});
+
+test('statFile reports a missing file as a 404', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const fileSystem = createFakeFileSystem({
+    stat: async () => {
+      const error = new Error('ENOENT: no such file or directory, stat');
+      (error as NodeJS.ErrnoException).code = 'ENOENT';
+      throw error;
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  await assert.rejects(
+    service.statFile('project-1', 'gone.html'),
+    (error: unknown) => error instanceof AppError && error.statusCode === 404,
+  );
+});
+
+test('statFile reports a directory as a client error', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const fileSystem = createFakeFileSystem({
+    stat: async () => createStats(true, 0o040755),
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  await assert.rejects(
+    service.statFile('project-1', 'builds'),
+    (error: unknown) => error instanceof AppError && error.statusCode === 400,
+  );
 });

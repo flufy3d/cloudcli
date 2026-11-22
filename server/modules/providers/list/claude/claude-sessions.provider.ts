@@ -45,7 +45,12 @@ import {
 import { sessionsDb } from '@/modules/database/index.js';
 import { readClaudeSessionWindowSources } from '@/modules/providers/services/claude-context-window.js';
 import { getClaudeSDKSessionStartTime } from '@/modules/providers/list/claude/claude-runtime.provider.js';
-import { summarizeClaudeTokenUsage, getReportedClaudeContextWindow } from '@/modules/providers/services/claude-usage.js';
+import {
+  getReportedClaudeContextWindow,
+  readClaudeTranscriptTokenUsage,
+  summarizeClaudeTokenUsage,
+  type ClaudeContextWindowSources,
+} from '@/modules/providers/services/claude-usage.js';
 import { liftMemoryCitations } from '@/modules/providers/shared/memory-citations.js';
 import { isClaudeConversationRecord } from '@/shared/index.js';
 
@@ -1052,36 +1057,21 @@ function readTaskUsage(value: unknown): TaskUsage | undefined {
 }
 
 /**
- * Streams the rows `summarizeClaudeTokenUsage` needs from a Claude transcript.
+ * Reads the latest usage snapshot from a Claude JSONL file.
  *
- * Consumers: `getTokenUsage`, which serves the `/token-usage` endpoint. Reading
- * the whole file into one string made a 133 MB transcript peak at ~450 MB RSS
- * per call; when that overlapped the session watcher's scan, PM2's memory limit
- * killed the server mid-turn. Only assistant usage/model and compaction
- * boundaries affect the summary, so project those fields while reading.
+ * The file is append-only and reaches hundreds of megabytes, so the shared
+ * reader parses only the bytes added since the previous call; the rules for
+ * which row is the context reading (newest main-thread assistant turn) and
+ * which rows count as spend live in `claude-usage.ts` and are shared with the
+ * history reader.
+ *
+ * Consumers: this provider's token-usage endpoint.
  */
-async function readClaudeUsageEntries(jsonlPath: string): Promise<AnyRecord[]> {
-  const entries: AnyRecord[] = [];
-  for await (const entry of readJsonlRecords(jsonlPath)) {
-    if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-      entries.push(entry);
-      continue;
-    }
-    if (entry.type !== 'assistant') {
-      continue;
-    }
-    const message = readObjectRecord(entry.message);
-    const usage = message?.usage;
-    if (!usage) {
-      continue;
-    }
-    entries.push({
-      type: 'assistant',
-      isSidechain: entry.isSidechain,
-      message: { usage, model: message?.model },
-    });
-  }
-  return entries;
+async function readClaudeTokenUsage(
+  filename: string,
+  sources: ClaudeContextWindowSources,
+): Promise<ProviderTokenUsageResult> {
+  return readClaudeTranscriptTokenUsage(filename, sources);
 }
 
 /**
@@ -1986,10 +1976,9 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       });
     }
 
-    const entries = await readClaudeUsageEntries(sessionFilePath);
     // Same summarizer the history page uses, so the endpoint and the page can
     // never report a different occupancy or a different window for one session.
-    return summarizeClaudeTokenUsage(entries, {
+    return readClaudeTokenUsage(sessionFilePath, {
       ...readClaudeSessionWindowSources(input.appSessionId),
       reported: getReportedClaudeContextWindow(input.nativeSessionId),
       configured: process.env.CONTEXT_WINDOW,

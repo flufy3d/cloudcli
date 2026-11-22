@@ -6,8 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after, before } from 'node:test';
 
-import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
+import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { createOpenCodeRuntime } from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
+import { connectedClients } from '@/modules/websocket/index.js';
 import type {
   AnyRecord,
   NormalizedMessage,
@@ -212,10 +213,22 @@ const withRuntime = async (
   }
 };
 
-/** Polls until `predicate` holds; adopted-run settlement is fire-and-forget. */
-const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
+/**
+ * Polls until `predicate` holds; adopted-run settlement is fire-and-forget.
+ *
+ * Accepts both shapes the suite uses: a boolean predicate, and an assertion
+ * callback that signals failure by throwing.
+ */
+const waitFor = async (predicate: () => unknown, timeoutMs = 2_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  for (;;) {
+    try {
+      if (predicate() !== false) {
+        return;
+      }
+    } catch {
+      // An assertion that has not settled yet; retry until the deadline.
+    }
     if (Date.now() > deadline) {
       throw new Error('condition was not met before the timeout');
     }
@@ -752,5 +765,74 @@ test('/compact with instructions fails the run without touching the session', as
     );
     assert.ok(!service.requests.some((request) => request.path.endsWith('/compact') || request.path.endsWith('/prompt')));
     assert.ok(frames.some((frame) => frame.kind === 'error' && /without instructions/.test(String(frame.content))));
+  });
+});
+
+test('the name the engine generated reaches the app row and is announced as a name-only update', async () => {
+  const sent: unknown[] = [];
+  const connection = {
+    readyState: 1,
+    send: (payload: string) => { sent.push(JSON.parse(payload)); },
+  };
+  connectedClients.add(connection as never);
+  try {
+    await withRuntime(async ({ service, runtime }) => {
+      // The row the chat run leaves behind: the app's own session, mapped to
+      // the engine's session id, still carrying the first message as its name.
+      sessionsDb.createAppSession('app-1', 'opencode', '/tmp/project-a', 'The first message');
+      sessionsDb.assignProviderSessionId('app-1', 'ses_new');
+
+      // A chat has to have run for the runtime to be listening to the
+      // engine's event feed, which is where the name arrives.
+      const { writer } = makeWriter();
+      const running = runtime.run('hello', { sessionId: 'app-1', projectPath: '/tmp/project-a' }, writer, makeContext('ses_new'));
+      await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+      service.emit(session('session.execution.succeeded', {}));
+      await running;
+
+      service.emit({
+        id: 'evt_renamed',
+        created: 1_700_000_009_000,
+        type: 'session.renamed',
+        data: { sessionID: 'ses_new', title: 'The name the engine chose' },
+      });
+
+      await waitFor(() => {
+        assert.equal(sessionsDb.getSessionById('app-1')?.custom_name, 'The name the engine chose');
+      });
+
+      const upserts = sent.filter((payload): payload is { kind: string; metadataOnly?: boolean; session: { summary: string } } =>
+        (payload as { kind?: string }).kind === 'session_upserted');
+      assert.equal(upserts.length, 1);
+      assert.equal(upserts[0].metadataOnly, true);
+      assert.equal(upserts[0].session.summary, 'The name the engine chose');
+    });
+  } finally {
+    connectedClients.delete(connection as never);
+  }
+});
+
+test('a name the user chose is not replaced by the engine', async () => {
+  await withRuntime(async ({ service, runtime }) => {
+    sessionsDb.createAppSession('app-locked', 'opencode', '/tmp/project-a', 'The name I chose');
+    sessionsDb.assignProviderSessionId('app-locked', 'ses_new');
+    sessionsDb.updateSessionCustomName('app-locked', 'The name I chose', { lockName: true });
+
+    const { writer } = makeWriter();
+    const running = runtime.run('hello', { sessionId: 'app-locked', projectPath: '/tmp/project-a' }, writer, makeContext('ses_new'));
+    await service.waitForRequest((request) => request.path.endsWith('/prompt'));
+    service.emit(session('session.execution.succeeded', {}));
+    await running;
+
+    service.emit({
+      id: 'evt_renamed',
+      created: 1_700_000_009_000,
+      type: 'session.renamed',
+      data: { sessionID: 'ses_new', title: 'The name the engine chose' },
+    });
+
+    await waitFor(() => {
+      assert.equal(sessionsDb.getSessionById('app-locked')?.custom_name, 'The name I chose');
+    });
   });
 });

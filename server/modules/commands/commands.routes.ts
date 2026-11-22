@@ -37,6 +37,25 @@ function substituteCommandArguments(template: string, argumentsText: string, arg
   });
 }
 
+/**
+ * The session-wide spend block a live frame or a provider snapshot carries.
+ *
+ * Providers report it under `cumulative` (the normalized shape); older live
+ * payloads also spelled the two halves `cumulativeInputTokens` /
+ * `cumulativeOutputTokens`. Returns null when neither side reported anything,
+ * so the detail view can say "not reported" instead of showing zero.
+ */
+function readCumulativeBlock(tokenUsage) {
+  const block = tokenUsage?.cumulative;
+  const inputTokens = Number(block?.inputTokens ?? tokenUsage?.cumulativeInputTokens ?? 0) || 0;
+  const outputTokens = Number(block?.outputTokens ?? tokenUsage?.cumulativeOutputTokens ?? 0) || 0;
+  const used = Number(block?.used ?? 0) || inputTokens + outputTokens;
+  if (used <= 0 && inputTokens <= 0 && outputTokens <= 0) {
+    return null;
+  }
+  return { used, inputTokens, outputTokens };
+}
+
 /** Creates Commands routes around explicit filesystem, model-catalog, and runtime adapters. */
 export function createCommandsRouter(dependencies: CommandsRouterDependencies): express.Router {
 const fs = dependencies.fileSystem;
@@ -283,11 +302,6 @@ Custom commands can be created in:
 
   "/cost": async (args, context) => {
     let tokenUsage = context?.tokenUsage || {};
-    // A just-compacted session has no occupancy to report yet (the engine only
-    // learns it on the next turn); forwarding the flag plus the summary's size
-    // lets callers show that instead of a misleading "0".
-    let compacted = tokenUsage.compacted === true;
-    let summaryBytes = Number(tokenUsage.summaryBytes ?? 0) || 0;
     const provider = readModelProvider(context?.provider);
     const model = await resolveCommandModel(providerModelsService, provider, context);
     const hasContextUsage = Boolean(
@@ -319,32 +333,34 @@ Custom commands can be created in:
         ?? 0,
       ),
     );
+    // The detail's total is the session's cumulative spend, which only the
+    // provider's persisted snapshot (or a live frame that carried it) can
+    // answer. Missing it is the one case worth a transcript read even when the
+    // composer's context numbers already look complete.
+    const hasCumulativeUsage = Number(readCumulativeBlock(tokenUsage)?.used ?? 0) > 0;
 
     if (
-      (!hasContextUsage || !hasContextBreakdown)
+      (!hasContextUsage || !hasContextBreakdown || !hasCumulativeUsage)
       && context?.sessionId
       && providerTokenUsageService
     ) {
       try {
         const persisted = await providerTokenUsageService.getSessionTokenUsage(context.sessionId);
-        if (persisted?.compacted === true) {
-          compacted = true;
-        }
-        if (!summaryBytes) {
-          summaryBytes = Number(persisted?.summaryBytes ?? 0) || 0;
-        }
         if (persisted && (persisted.used > 0 || persisted.inputTokens > 0 || persisted.outputTokens > 0)) {
-          // Live telemetry can have a newer total/context window while omitting
-          // input/output. Keep those live values and fill only the missing
-          // breakdown from the provider's persisted session snapshot.
-          tokenUsage = hasContextUsage && !hasContextBreakdown
-            ? {
-                ...tokenUsage,
-                inputTokens: persisted.inputTokens,
-                outputTokens: persisted.outputTokens,
-                breakdown: persisted.breakdown,
-              }
-            : persisted;
+          // Live telemetry can be newer than the persisted snapshot in some
+          // fields and silent in others. Start from whichever side knows the
+          // context reading, then fill only the gaps: the context breakdown,
+          // or the cumulative block the rollout/transcript reader supplies.
+          const merged: AnyRecord = hasContextUsage ? { ...tokenUsage } : { ...persisted };
+          if (!hasContextBreakdown) {
+            merged.inputTokens = persisted.inputTokens;
+            merged.outputTokens = persisted.outputTokens;
+            merged.breakdown = persisted.breakdown;
+          }
+          if (!hasCumulativeUsage && persisted.cumulative) {
+            merged.cumulative = persisted.cumulative;
+          }
+          tokenUsage = merged;
         }
       } catch {
         // Fall back to context tokenUsage
@@ -403,19 +419,7 @@ Custom commands can be created in:
     const computedUsed = inputTokens + outputTokens;
     const hasTokenBreakdown = computedUsed > 0;
     const used = Math.max(reportedUsed, computedUsed);
-
-    // Providers that report the current context occupancy (codex, opencode)
-    // also ship the session's cumulative spend and the engine's own context
-    // percentage; forward both so the modal can render them.
-    const cumulativeSource = tokenUsage.cumulative;
-    const cumulative = cumulativeSource && typeof cumulativeSource === "object"
-      ? {
-          used: Number(cumulativeSource.used ?? 0) || 0,
-          inputTokens: Number(cumulativeSource.inputTokens ?? 0) || 0,
-          outputTokens: Number(cumulativeSource.outputTokens ?? 0) || 0,
-        }
-      : undefined;
-    const percentage = Number(tokenUsage.percentage ?? 0) || 0;
+    const cumulativeUsage = readCumulativeBlock(tokenUsage);
 
     return {
       type: "builtin",
@@ -433,10 +437,10 @@ Custom commands can be created in:
               },
             }
           : {}),
-        ...(percentage > 0 ? { percentage } : {}),
-        ...(cumulative ? { cumulative } : {}),
-        ...(compacted ? { compacted: true } : {}),
-        ...(summaryBytes > 0 ? { summaryBytes } : {}),
+        // The detail's "total tokens" row reads this, never `used`: `used` is
+        // the context window's current occupancy and would shrink after a
+        // compaction or read as one turn's prompt.
+        ...(cumulativeUsage ? { cumulativeUsage } : {}),
         provider,
         model,
       },

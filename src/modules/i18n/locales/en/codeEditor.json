@@ -22,6 +22,7 @@
     "saved": "Saved!",
     "exitFullscreen": "Exit fullscreen",
     "fullscreen": "Fullscreen",
+    "cancel": "Cancel",
     "close": "Close",
     "previewMarkdown": "Preview markdown",
     "editMarkdown": "Edit markdown"
@@ -43,7 +44,9 @@
     "openInNewTab": "Open in new tab",
     "zoomIn": "Zoom in",
     "zoomOut": "Zoom out",
-    "resetZoom": "Reset zoom"
+    "resetZoom": "Reset zoom",
+    "prevPage": "Previous page",
+    "nextPage": "Next page"
   },
   "readOnly": {
     "badge": "Read-only"

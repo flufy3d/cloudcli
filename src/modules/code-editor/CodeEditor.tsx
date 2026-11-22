@@ -246,6 +246,9 @@ export default function CodeEditor({
         isDarkMode={isDarkMode}
         isSidebar={isSidebar}
         loadingText={t('loading', { fileName: file.name })}
+        // A loading buffer has no edits to lose, so this closes straight away.
+        onCancel={requestClose}
+        cancelLabel={t('actions.cancel', 'Cancel')}
       />
     );
   }
@@ -272,6 +275,8 @@ export default function CodeEditor({
           zoomIn: t('filePreview.zoomIn', 'Zoom in'),
           zoomOut: t('filePreview.zoomOut', 'Zoom out'),
           resetZoom: t('filePreview.resetZoom', 'Reset zoom'),
+          prevPage: t('filePreview.prevPage', 'Previous page'),
+          nextPage: t('filePreview.nextPage', 'Next page'),
         }}
       />
     );

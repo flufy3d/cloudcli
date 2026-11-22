@@ -498,14 +498,10 @@ test('OpenCode sessions provider reads sqlite history and token usage', { concur
       used: 35,
       inputTokens: 15,
       outputTokens: 20,
+      cumulative: { used: 42, inputTokens: 13, outputTokens: 20 },
       breakdown: {
         input: 15,
         output: 20,
-      },
-      cumulative: {
-        used: 42,
-        inputTokens: 13,
-        outputTokens: 20,
       },
     });
 
