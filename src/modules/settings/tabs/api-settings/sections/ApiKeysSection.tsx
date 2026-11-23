@@ -1,4 +1,5 @@
-import { ExternalLink, Key, Plus, Trash2 } from 'lucide-react';
+import { useState } from 'react';
+import { Check, Copy, ExternalLink, Eye, EyeOff, Key, Plus, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { Button, Input } from '@/shared/ui';
@@ -14,6 +15,8 @@ type ApiKeysSectionProps = {
   onCancelCreateApiKey: () => void;
   onToggleApiKey: (keyId: string, isActive: boolean) => void;
   onDeleteApiKey: (keyId: string) => void;
+  onCopyApiKey?: (text: string, id: string) => void;
+  copiedKey?: string | null;
 };
 
 /** Rendered by CredentialsSettingsTab to list, create and revoke CloudCLI API keys. */
@@ -27,8 +30,16 @@ export default function ApiKeysSection({
   onCancelCreateApiKey,
   onToggleApiKey,
   onDeleteApiKey,
+  onCopyApiKey,
+  copiedKey,
 }: ApiKeysSectionProps) {
   const { t } = useTranslation('settings');
+  const [revealedKeys, setRevealedKeys] = useState<Record<string, boolean>>({});
+
+  const toggleReveal = (id: string | number) => {
+    const keyId = String(id);
+    setRevealedKeys((prev) => ({ ...prev, [keyId]: !prev[keyId] }));
+  };
 
   return (
     <div>
@@ -77,32 +88,65 @@ export default function ApiKeysSection({
         {apiKeys.length === 0 ? (
           <p className="text-sm italic text-muted-foreground">{t('apiKeys.empty')}</p>
         ) : (
-          apiKeys.map((key) => (
-            <div key={key.id} className="flex items-center justify-between rounded-lg border p-3">
-              <div className="flex-1">
-                <div className="font-medium">{key.key_name}</div>
-                <code className="text-xs text-muted-foreground">{key.api_key}</code>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  {t('apiKeys.list.created')} {new Date(key.created_at).toLocaleDateString()}
-                  {key.last_used
-                    ? ` - ${t('apiKeys.list.lastUsed')} ${new Date(key.last_used).toLocaleDateString()}`
-                    : ''}
+          apiKeys.map((key) => {
+            const isRevealed = Boolean(revealedKeys[String(key.id)]);
+            const displayKey = isRevealed
+              ? key.api_key
+              : `${key.api_key.substring(0, 10)}...`;
+
+            return (
+              <div key={key.id} className="flex items-center justify-between rounded-lg border p-3">
+                <div className="flex-1">
+                  <div className="font-medium">{key.key_name}</div>
+                  <div className="mt-1 flex items-center gap-2">
+                    <code className="text-xs text-muted-foreground">{displayKey}</code>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 w-6 p-0"
+                      onClick={() => toggleReveal(key.id)}
+                      title={isRevealed ? '隐藏' : '查看完整密钥'}
+                    >
+                      {isRevealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </Button>
+                    {onCopyApiKey && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 w-6 p-0"
+                        onClick={() => onCopyApiKey(key.api_key, String(key.id))}
+                        title="复制密钥"
+                      >
+                        {copiedKey === String(key.id) ? (
+                          <Check className="h-3.5 w-3.5 text-green-500" />
+                        ) : (
+                          <Copy className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+                    )}
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {t('apiKeys.list.created')} {new Date(key.created_at).toLocaleDateString()}
+                    {key.last_used
+                      ? ` - ${t('apiKeys.list.lastUsed')} ${new Date(key.last_used).toLocaleDateString()}`
+                      : ''}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant={key.is_active ? 'outline' : 'secondary'}
+                    onClick={() => onToggleApiKey(key.id, key.is_active)}
+                  >
+                    {key.is_active ? t('apiKeys.status.active') : t('apiKeys.status.inactive')}
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => onDeleteApiKey(key.id)}>
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant={key.is_active ? 'outline' : 'secondary'}
-                  onClick={() => onToggleApiKey(key.id, key.is_active)}
-                >
-                  {key.is_active ? t('apiKeys.status.active') : t('apiKeys.status.inactive')}
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => onDeleteApiKey(key.id)}>
-                  <Trash2 className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
     </div>

@@ -68,6 +68,8 @@ export default function CredentialsSettingsTab() {
         onCancelCreateApiKey={cancelNewApiKeyForm}
         onToggleApiKey={toggleApiKey}
         onDeleteApiKey={deleteApiKey}
+        onCopyApiKey={copyToClipboard}
+        copiedKey={copiedKey}
       />
 
       <GithubCredentialsSection

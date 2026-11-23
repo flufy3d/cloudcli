@@ -35,6 +35,7 @@ import { createErrorResponse } from './error-response.js';
 import { createGitModule } from './modules/git/index.js';
 import {
     authenticateToken,
+    authenticateTokenOrApiKey,
     authenticateWebSocket,
     authRoutes,
     validateApiKey,
@@ -316,8 +317,8 @@ app.use('/api/browser-use-mcp', browserUseMcpRoutes);
 // Browser API Routes (protected)
 app.use('/api/browser-use', authenticateToken, browserUseRoutes);
 
-// Unified provider MCP routes (protected)
-app.use('/api/providers', authenticateToken, providerRoutes);
+// Unified provider MCP routes (supports Web JWT and API Key for model catalogs)
+app.use('/api/providers', authenticateTokenOrApiKey, providerRoutes);
 app.use('/api/scheduled-messages', authenticateToken, scheduledMessagesRoutes);
 app.use('/api/scheduled-jobs', authenticateToken, scheduledJobsRoutes);
 

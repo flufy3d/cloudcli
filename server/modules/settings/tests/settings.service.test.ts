@@ -21,14 +21,14 @@ function dependencies(overrides: Partial<Dependencies> = {}): Dependencies {
   };
 }
 
-test('listApiKeys redacts secret values through the service boundary', () => {
+test('listApiKeys returns api keys through the service boundary', () => {
   const service = createSettingsService(dependencies({
     apiKeys: {
-      list: () => [{ id: 1, api_key: '1234567890-secret' }],
+      list: () => [{ id: 1, api_key: 'ck_1234567890secret' }],
       create: () => ({}), remove: () => false, toggle: () => false,
     },
   }));
-  assert.equal(service.listApiKeys(1).apiKeys[0]?.api_key, '1234567890...');
+  assert.equal(service.listApiKeys(1).apiKeys[0]?.api_key, 'ck_1234567890secret');
 });
 
 test('subscribeToPush persists the subscription and enables Web Push', () => {

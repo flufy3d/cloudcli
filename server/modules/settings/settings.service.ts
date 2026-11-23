@@ -55,10 +55,7 @@ function assertFound(found: boolean, resourceName: string, code: string): void {
 export function createSettingsService(dependencies: SettingsDependencies) {
   return {
     listApiKeys(userId: number) {
-      const apiKeys = dependencies.apiKeys.list(userId).map((key) => ({
-        ...key,
-        api_key: `${key.api_key.substring(0, 10)}...`,
-      }));
+      const apiKeys = dependencies.apiKeys.list(userId);
       return { apiKeys };
     },
     createApiKey(userId: number, keyNameInput: unknown) {
