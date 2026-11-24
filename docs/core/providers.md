@@ -1,0 +1,614 @@
+# Provider 架构与接入指南
+
+> 基准：2.22.0 / 2026-11-15
+> **核心文档**：改动 `server/modules/providers/**` 或 `server/shared/{types,interfaces}.ts` 时**必须同步更新本文**。
+> 普通 bug 修复不动架构的不需要更新（提交时走 `--no-verify`，见 `AGENTS.md`）。
+> 引用一律给"文件路径 + 符号名"，不用行号。
+
+相关文档：[overview.md](./overview.md)（全景）· [chat.md](./chat.md)（运行时事件怎么流向前端）
+
+## 现状：六家引擎
+
+`claude | codex | cursor | opencode | zcode | antigravity`，联合类型定义在 `shared/protocol/chatEvents.ts` 的 `LLMProvider`（前后端共用同一份，见下文「线上契约」）。注册表 `server/modules/providers/provider.registry.ts` 用 `Record<LLMProvider, IProvider>` 硬编码六家实例——漏一家直接编译报错。
+
+每家一个目录：`server/modules/providers/list/<name>/`，由 `<name>.provider.ts` 组装各切面。claude / cursor 的 runtime 是遗留 `.js` 适配器；opencode、codex、zcode / antigravity 是 TS（含协议客户端、运行生命周期等更多切面文件）。
+
+## Codex 异步任务结果续开（Task Continuation）
+
+Codex app-server（0.159.2+）在协议层面支持脱离父回合的工具结果续开。当长耗时后台任务在宿主完成且原聊天处于空闲时，`codex-runtime.provider.ts` 在新连接上执行 `thread/resume`，并在 `turn/start` 中直接传入：
+```json
+{
+  "threadId": "<thread_id>",
+  "input": [],
+  "toolOutput": {
+    "name": "cloudcli_task_result",
+    "output": "<JSON 任务完成报告>"
+  }
+}
+```
+引擎以工具结果为契机唤醒新回合汇报。`codex-thread-items.ts` 只把名称为 `cloudcli_task_result` 的孤立 `FunctionCallOutput` / `functionCallOutput` 归一化为纯说明性质的 `status_note`，不生成缺失前置调用的残缺工具卡，也不伪造用户提问。其他工具的输出不会被误认成异步任务通知。其他引擎（Claude 等）保持其原生的输入流保持机制，第一版异步任务外部接续由 Codex 首发支持。
+
+**常驻会话（resident app-server）**：`codex-resident-*.ts` 把一个 app-server 子进程留在会话上跨回合复用，而不是每回合重新 `thread/start`/`thread/resume`。回合之间进程进入 idle 常驻，`run()` 的下一回合直接在同一个 `threadId` 上 `turn/start`；引擎自发的回合（后台 agent 结束后的汇报）经 `getSessionActivity` / `hasSessionWork` 暴露给网关，由 `adoptExternalRun` 认领成一个正常 run。进程交接（`codex-resident-session`）负责把原生 thread 在进程间传递，`turn/start` 的队列状态（`queued` / `reporting`）经 `chatEvents` 的队列帧到达页面，composer 用 `backgroundWorkQueuesInput` 决定"立即发"还是"排队"。同一份常驻设施也供会话标题使用：回合成功后开一个隔离的 ephemeral thread 生成标题，失败不影响主会话。
+
+**宿主任务的任务条卡片与停止**：`cloudcli_task_run` 的命令跑在宿主起的独立 worker 里，引擎不知道它，所以卡片由宿主出。任务模块的 `task-host-cards.service.ts` 列出卡片：状态为 `running`、没有记录异常、且 worker 心跳新鲜的任务，才画一张 `Bash` 卡。心跳是任务目录里的 `worker.alive`：worker 在启动命令前写好、运行中每 5 秒刷新一次修改时间，超过 60 秒没刷新就当 worker 已死；卡片 id 和停止句柄都是任务 id。装配层通过 `setCodexHostTaskSource` 把列表和停止交给 Codex 运行时：运行时的任务条列表是引擎 agent 在前、宿主任务在后，所有任务条帧（包括进程回收时结算 agent 的那一帧）都由同一个函数组装、带全量，agent 的帧不会抹掉宿主卡；`stopBackgroundTask` 转给宿主。任务开始、结束、worker 异常退出或从磁盘补录结果时，任务模块通知装配层，由它在会话通道上重发整张任务条。
+
+宿主任务不算引擎后台工作，不进 `listBackgroundWork`：续接派发、排队消息和定时消息都不等它，任务 A 的汇报不会被还在跑的任务 B 挡住。只剩宿主任务时，Codex 运行时回答 `queuesInput: false`（可直接发消息）和 `canInterrupt: false`（没有引擎运行可取消，只按卡片逐个停）；还有 agent 或引擎自发汇报时沿用引擎原规则。
+
+停止走任务目录，不走信号：宿主只对显示着卡片的任务受理，在任务目录里建空文件 `stop`；worker 每 500 毫秒查一次，看到后对自己连接上的命令发 `command/exec/terminate`（实测会连同子进程一起结束，`command/exec` 随即以 137 返回）。terminate 失败（比如命令还没在 app-server 登记）时每 500 毫秒重试，20 次仍失败就关闭这条连接，app-server 退出时带走命令。被停下的命令记为 `cancelled`；结果进入任务记录前（实时回调和磁盘恢复两条路径），任务目录里有宿主写的 `stop` 请求的 `cancelled` 结果会先取消续接通知，卡片随结果收掉、不续开汇报轮。别处报来的 `cancelled`（没有 `stop` 请求）照常汇报。worker 按退出码判定：停止后命令以非 0 结束记 `cancelled`（停止前已经自行失败的命令也会这样记），以 0 结束记 `completed` 并照常汇报（包括捕获终止信号后以 0 退出的命令）。terminate 重试用尽、只能关连接时，结果同样记 `cancelled`，但写明停止未确认、命令可能还在运行（关连接只结束 app-server，不保证它起的命令一起退出）。宿主在线时 worker 退出会立刻收卡；宿主离线期间 worker 死掉，重启后最多再显示 60 秒旧卡，这期间点中止会被受理但没人执行。用文件和心跳，是为了宿主重启后照样能停、能判断 worker 死活，不依赖 pid，也就不会被复用了 pid 的别的进程骗过。升级前起的任务没有心跳，不显示卡片。
+
+## Claude SDK 环境
+
+运行时向 SDK 透传宿主环境，默认设置 `CLAUDE_CODE_ARTIFACT=1`，宿主显式值优先。后台等待上限继续由运行时设置；Artifact 工具沿用现有工具权限和引擎配置，环境默认值不替代工具可用性的实际核验。
+
+## Claude 转录记录边界
+
+Claude JSONL 同时保存真实对话和模型请求诊断快照。例如，`api-request-blob` 的 `message.role` 可以是 `user`，正文也可以完整复制原提问。快照不代表用户又发送了一次消息。
+
+`server/shared/utils.ts` 的 `isClaudeConversationRecord` 只认顶层 `type` 与 `message.role` 相符的 `user`、`assistant` 记录。主历史、普通消息归一化、工具结果配对、后台通知、子代理活动和搜索共用这个判定。诊断快照不能生成消息身份、消耗压缩摘要标记，也不能改写工具结果或子代理状态。判定不要求 UUID，合法实时事件仍由各自明确的类型分支处理。
+
+`ClaudeSessionsProvider` 的历史读取器另行保留 `last-prompt`、`progress`、`system`、`attachment` 和 `queue-operation`，分别供恢复分支、压缩边界和后台通知使用。整个转录不能只筛成普通对话。用户真实发送两次相同正文时，两条记录都保留；输入边界不按正文去重。
+
+## Claude 后台任务生命周期
+
+`list/claude/claude-background-work.ts` 是后台执行记录和输入框任务卡片的共同归属者。调用刚发出时先记录待确认任务，`task_started` 将引擎任务 id 关联到工具调用 id；CLI 自己转入后台的主线程调用（超过超时的前台 `Bash`）调用里没有后台标记，在 `task_started` 时按任务信息补出卡片，否则订阅确认和任务条帧会报"有等待、无卡片"，页面把后台阶段画成回复进行中；完成通知、终态更新和工具失败都收掉同一条记录，并立即广播当前列表。子代理内部启动的任务保留停止句柄，但不进入父会话的卡片列表。`TaskCreate` 只写待办项，不属于后台执行。
+
+卡片身份使用启动工具调用的 id，独立停止使用引擎任务 id。停止句柄既可以由任务启动事件提供，也可以由工具的结构化返回提供；收到句柄时替换并广播卡片快照，实时流和订阅确认使用同一投影。没有停止句柄的等待项只能通过会话取消结束驻留进程，不能把工具调用 id 传给引擎的停止任务接口。
+
+`ScheduleWakeup` 按工具返回的 `scheduledFor` 等待：成功重排替换旧唤醒，失败保留旧唤醒，停止或循环到期取消待唤醒记录。计时器只移除到期的等待卡片，不关闭 Claude 输入流；唤醒后的回复仍需运行。`CronCreate` 按返回的任务 id 关联，成功 `CronDelete` 只移除对应任务。定时任务和没有返回 `scheduledFor` 的唤醒不会发出完成事件，它们在发起回合之后的下一个回合结束时一并收掉，循环定时任务也不会一直占着会话。
+
+主轮结束时，尚未完成的执行任务、子代理内部任务和待唤醒任务共同决定是否保持输入流打开。后台任务切面的 `isPending` 还包含卡片清理后的汇报回复阶段，供消息排队和重连使用。只有主线程自己发起的任务正常结束才进入汇报回复阶段；子代理内部任务、引擎自启任务和被停止的任务都不会触发回复，也不会让会话进入等待。没有实现 `isPending` 的引擎（如 Codex）不会在订阅确认里报告后台等待，因为它们不广播能解除等待的状态帧。任务完成后的回复轮结束，进程转入空闲常驻（见下文）；后台工作一直不汇报时，进程最多驻留到连续 24 小时没有任何消息（默认值，`CLOUDCLI_CLAUDE_BG_WAIT_CEILING_MS` 可调，0 表示不限），每条消息和每次续轮都会清零计时；取消标记绑定具体引擎实例，等待中止返回后只移除仍由该实例持有的会话。旧运行被新运行接替后，其迟到事件和退出清理都不得修改新运行的任务状态，新运行负责广播当前列表。
+
+取消分两种，判断依据是取消时本轮回复是否已经结束。回复还在进行、且本轮起的后台工作没跑完时，`abortClaudeSDKSession` 只调用 `interrupt()`，不关输入流、不移除会话，和 CLI 里按 Esc 一样只打断这一轮。实测（agent SDK 驱动 claude CLI）：`interrupt()` 后 CLI 立即发出 `subtype: error_during_execution` 的 `result`；此前后台启动的 Bash 继续运行，结束时照常发 `task_notification`，CLI 再自己跑一轮汇报；后台 agent 则由 CLI 当场停掉并发 `task_notification stopped`，卡片随之收掉。CloudCLI 这边额外杀掉后台工作的只有关闭输入流，所以只打断回合时不关。运行循环收到这条被打断的 `result` 时清掉取消标记、视为本轮已结束，之后进入普通的驻留流程。回复已结束、只剩后台工作或汇报回复时取消，仍然中断并关闭输入流，结束全部后台工作。
+
+后台工作挂着进程时，会话的下一轮不起新进程，而是写进同一个输入流（`continueOnHeldProcess` → 驻留运行的 `continueTurn`）。实测：同一个 CLI 进程能接着收消息，每条成为一轮，各有自己的 `init` 和 `result`；后台 Bash 活过这些轮次；回合中写入的消息会并进当前这一轮。拥有进程的那次 `queryClaudeSDK` 继续跑消息循环，把按轮次计的状态（writer、`turnCompleteSent`、空闲重发判定、会话名）换绑到新一轮，新一轮的 `result` 到达时只给它发 `complete`，续轮那次调用的 promise 随之兑现；进程结束时兑现所有还在等的续轮。CLI 正在自己跑汇报轮时到达的一轮，等那一轮的 `result` 之后再写入，不并进汇报轮。模型、权限模式、效果档位变了，先调 `setModel` / `setPermissionMode` / `applyFlagSettings({ effortLevel })` 再写入；三者都实测下一轮即生效（档位是在 API 前放日志代理看请求体的 `output_config.effort` 核实的，中途下发能盖过启动参数 `--effort`；换到不分档位的 haiku 后 CLI 自己不再发档位）。进出 plan 模式只切权限模式，`canUseTool` 读的 `allowedTools` 随之增减 plan 模式放行的工具。切换超过 10 秒或被拒时，仍有后台执行或汇报回复就返回 `PROVIDER_INPUT_DEFERRED`，保留原进程和排队消息；没有后台工作才允许新开进程。仍要起新进程的情况：启动时定死的选项（`heldProcessCompatibilityKey`：工作目录、用户的工具许可、MCP、ultracode 设置等）变了；编辑重发、从头重来；离开进程启动时所在的 plan 模式（启动参数已放行那批工具，中途收不回）；打开跳过权限（实测 CLI 拒绝把未带 `--dangerously-skip-permissions` 启动的进程切到 `bypassPermissions`）；进程带 `--effort` 启动而这一轮回到默认档位（`effortLevel: null` 只会回落到启动参数）。这些情况遇到尚未完成的后台工作时同样等待，不能为了发消息自动停止后台任务；后台执行和汇报回复结束后才允许按接替逻辑新开进程。用户停掉回复后、被打断的一轮还没出 `result` 时发来的一轮，也等那条 `result` 之后写入；一轮已交给驻留进程但还没写入时用户点停止，只撤回这一轮，进程、汇报轮和后台工作都不动。驻留进程的 `result.modelUsage` 是整个进程累计的数，令牌预算只在没有逐条助手用量时才读它。Claude 的任务条帧和订阅确认带 `backgroundWorkQueuesInput: true`，页面先保留排队卡。运行时通过 `supportsInputAcceptance` 声明可安全尝试续轮：设置切换结束后调用可信的 `onBeforeInputAccepted` 原子领取仍未修改的排队消息；消息被修改或删除时放弃旧快照，不提交输入。SDK 从输入流消费完本轮消息后调用 `onInputAccepted`，网关才广播已发送。这个确认表示 SDK 已消费输入，不保证远端模型已经开始回复。
+
+**空闲常驻**：没有后台工作的一轮结束后，进程同样留下来接下一轮，走上面同一条续轮通道。例子：用户在一个 18MB 的会话里连发三条，第一轮新开进程续接整份记录；第二、三轮直接写进这个进程，不再新开进程、不再续接（实测经 runtime 走真实 CLI，第二、三轮到首条回复 3.4 秒和 2.5 秒，关掉常驻时是 44.9 秒和 57.1 秒，接口本身波动很大，量级可信、秒数不准）。`result` 时没有后台工作、没有待写入的下一轮，运行时进入空闲常驻：输入流不关，起空闲计时，登记进空闲进程表，并让拥有进程的那次 `queryClaudeSDK` 立即返回——调用方无事可等，`touchSession` 也不会拖到进程退出才执行。空闲常驻不发后台任务条、不算会话在忙；`getClaudeSDKSessionStartTime` 此时返回 null，历史读取把没汇报的后台 agent 读作已停止（空闲即没有后台工作，不可能还有 agent 在跑）；进程离开空闲接下一轮时，起始时间改为这一刻，之前各轮发起的 agent 照旧读作已停止。空闲进程自己退出（被杀、内存不足）不算任何一轮失败：只记日志，不给上一轮发错误、不推送运行失败。离开空闲常驻的路有五条：下一轮写入（或 CLI 自己起一轮，以 `system/init` 为准）；空闲计时到期；空闲进程数超过上限，最久没用的被关；下一轮不能续用，新进程按接替逻辑结束它；会话归档、删除或宿主关机。空闲时长与上限默认 10 分钟、4 个，由 `CLOUDCLI_CLAUDE_RESIDENT_IDLE_MS`、`CLOUDCLI_CLAUDE_RESIDENT_MAX` 覆盖，前者设为 0 即回到每轮退出；一个常驻进程连同它拉起的 MCP 子进程约 700MB；只有带 `residentBetweenTurns` 的调用方（聊天网关）会常驻，一次性调用方照旧每轮退出；只有空闲进程计入上限，为后台工作留着的进程不计入、不被淘汰。空闲重发（`pendingIdleResend`）的那一轮不常驻，进程照旧退出后在新进程上重发。
+
+常驻拉长了进程寿命，续用判断多了两条。第一条是配置：续用前比较 `readClaudeConfigFingerprint` 读到的修改时间（用户级与项目级的 settings、CLAUDE.md、`.mcp.json`、已装插件清单，工作目录往上每一级的 CLAUDE.md 与 CLAUDE.local.md，skills / commands / agents / rules 目录往下一层，含每个技能的 `SKILL.md`），任何一个变了，下一轮新开进程——实测空闲期间写入的 CLAUDE.md 常驻进程看不到，新进程能看到。只约束空闲常驻的进程：为后台工作留着的进程不看指纹，不会因为改了 CLAUDE.md 杀掉后台工作。更深一层的文件和 `@path` 引入的文件看不出来，要等空闲到期。第二条是别的进程接着聊了同一会话：进入空闲时记下记录文件（`context.resolveTranscriptPath`，即会话行的 `jsonl_path`）的字节长度，续用前读之后新增的行，出现本进程没在流上报过 uuid 的 `user` / `assistant` 行，或出现 `continued-in`（终端把会话转去了后台任务），就放弃续用、关掉旧进程、新开进程续接。依据：实测空闲进程不往记录里写任何东西；终端 `claude -p --resume` 把整轮追加在同一个文件末尾，`entrypoint` 同样是 `sdk-ts`，不能按写入方区分；本进程写的助手行 uuid 都在流上出现过，自己的提示词行在回合开始时就已写入、早于记下的长度。实测脚本是 `scripts/probe/claude-resident.probe.mjs`（引擎行为）与 `scripts/probe/claude-resident-runtime.probe.ts`（经 runtime 的耗时对比）。
+
+生命周期切面与 Codex 一致：`hasSessionWork` 在回复进行中、有后台工作或汇报回复、有已交接未写入的一轮时为真，空闲常驻为假；`closeSessionAdmission` 之后 `queryClaudeSDK` 直接回错误和 `complete`，不起进程；`releaseSession` 关掉会话的进程；宿主关机时 `closeClaudeResidentSessions` 关掉全部 Claude 进程。
+
+```mermaid
+flowchart LR
+  A[工具调用] --> B[记录待确认任务]
+  B --> C[关联引擎任务或唤醒时间]
+  C --> D[完成、失败、中止或唤醒到期]
+  D --> E[移除对应记录并广播卡片列表]
+  E --> F[后续回复轮结束]
+  F --> G{仍有待执行任务？}
+  G -->|有| H[保持输入流]
+  G -->|没有| I[释放输入流]
+```
+
+## 子 agent 卡片：六家引擎的共同约定
+
+一条 `tool_use` 只有工具名等于 `Agent` 时才是子 agent 卡片，前端只认这一个名字（常量 `SUBAGENT_TOOL_NAME`，定义在 `shared/protocol/subagent.ts`，前后端 import 同一份）。`Task` 只指任务清单类工具（`TaskCreate`、`TaskUpdate`、`manage_task`）。各家引擎派 agent 的原生形态不同，适配器在边界把它翻成两样东西，前端零引擎分支：
+
+1. 一条工具名为 `Agent` 的 `tool_use` 行。历史读取和实时流用同一个构造函数生成，所以刷新后重建出的就是直播画过的那张卡。
+2. 状态：历史行上挂 `subagent`（`SubagentInfo`），实时流用 `task_status` 事件按 `toolUseId` 折回这张卡。
+
+每张卡必须有结算的那一刻。引擎给得出结束信号就用它；给不出，适配器在能确定"不会再有消息"的时刻（轮次结束、进程退出、会话丢失）把它结算成 `stopped`，前端显示为 "no result"。
+
+| 引擎 | 原生形态 | 适配层做什么 | 结算点 |
+| --- | --- | --- | --- |
+| Claude | `Agent` 工具；老记录里叫 `Task` | 历史与实时共用 `canonicalClaudeSubagentToolName`，把老名字 `Task` 翻成 `Agent`；`claude-background-work.ts` 认两个名字；历史按调用结果里的 `agentId` 挂 `subagent` 和子时间线 | 同步 agent 用调用结果；后台 agent 用 SDK 的任务通知；进程没了、或进程空闲常驻时读作 `stopped` |
+| ZCode | `Agent` 工具，名字原样透传 | 引擎在父会话上发 `subagent_spawned` / `subagent_stopped`，翻成 `task_status`；历史读 agent 旁车 `cli/agents/<父会话>/<agentId>/metadata.json`，`Agent` 行按自己结果里的 `agentId:` 一行（引擎重建历史用的同一条正则）认领旁车，结果里没有时才按旁车的 `parentToolUseId` 回落，因为引擎复活 agent 会把这个字段改写成 SendMessage 的调用 id；再按旁车里的 `childSessionId` 读子会话的消息行（与父会话同一个归一化器）作子时间线，条数上限 `MAX_TRANSMITTED_SUBAGENT_ACTIVITIES`，`activityCount` 报总数 | `subagent_stopped`（`completed` / `failed` / `stopped`）；引擎进程死掉（`SESSION_LOST_METHOD`）时对登记簿里每个 agent 补发 `stopped`；旁车里仍写 `running` 的，只有登记簿里还有该 agent 才算运行中，否则读作 `stopped` |
+| Codex | `SubAgentActivity` 或 `CollabAgentToolCall` 派发回执 | 活动记录生成 `Agent` 行；派发回执按接收者线程关联原卡片；同一 agent 的开始与结束靠线程 id 配对 | agent 自己线程的 `turn/completed` 按回合状态结算（`completed` / `failed` 带错误原因 / `interrupted` 读作 `stopped`），父线程的 `completed` / `interrupted` 活动也结算；被父线程再次叫醒的 agent 由它线程的 `turn/started` 回到原卡片继续 `running`；短连接的 app-server 随每一轮结束被杀，轮次结束时仍登记的 agent 一律结算为 `stopped`；历史与实时同口径：`completed` 活动在案就读作 `completed`（它的 FINAL_ANSWER 可能缺失或是读不出的加密消息），否则 `interrupted` 活动和 `turn_aborted` 都读作 `stopped`，父线程没有结束记录的 agent 只有登记簿里还有它才算 `running`，否则按它自己 rollout 末轮的结局读（`task_complete` 带 `error` 为 `failed`、不带为 `completed`，`turn_aborted` 为 `stopped`），末轮没有结局读作 `stopped` |
+| OpenCode | `subagent` 工具，输入 `{agent, description, prompt, sessionID?}`，结果 metadata 带子会话 id | 实时翻译器和历史读取共用 `opencode-subagent.ts`：名字翻成 `Agent`，`agent` 翻成 `subagent_type`；历史有子会话 id 时读子会话的 `session_message` 作子时间线 | 前台调用看工具自身的状态（`completed` / `error`）；运行结束时翻译器对没等到结果的调用补 `stopped`；历史里停在 `pending` / `running` 的调用，只有所属会话还没进入 idle 才算运行中，否则读作 `stopped`。`background: true` 的调用立即以 `completed` 返回、metadata 仍是 `running`，这只表示已启动：结果看引擎在 agent 结束时写进父会话的合成通知（`completed` / `cancelled`→`stopped` / 其余→`failed`），还没有通知时运行时登记簿里有它就是 `running`，否则是 `stopped`（见下文 OpenCode 的后台工作） |
+| Antigravity | `invoke_subagent`，一次调用派 N 个 agent | 一次调用拆成 N 条 `Agent` 行，`toolId` 为 `<调用 id>:<conversation_id>`，每个 agent 一张卡，卡头的描述取提示词首行（不是角色名，否则会显示 "角色 / 角色"）；实时取 `step_type: "subagent"` 的 DONE 步骤，历史取规划条目里的角色与提示词、再从下一步的回执文本取 `conversationId`；子时间线读 agent 自己的 transcript | agy 在所有 agent 汇报完之后才给出 `result`。实时在 `result` 到达时、历史在读取时，用同一个判定 `judgeAntigravityAgent`：父会话里有该 agent 的汇报（`sender=<conversationId>`）即 `completed`；否则读 agent 自己的 transcript 的最后一条有效行：`ERROR_MESSAGE` 为 `failed`，不再请求工具的规划回复为 `completed`，其余（工具未返回、没有 transcript）为 `stopped`。进程退出或中止时一律 `stopped`。回执步骤还没写入时，历史采用运行时登记簿里同一次调用的 conversationId 和 `running` 状态，刷新前后是同一批卡 |
+| Cursor | 本机没有 Cursor 转录，不能确认有派 agent 的工具 | 未接入；若转录里出现派 agent 的工具，按上面的方式翻成 `Agent` 行 | — |
+
+`agent` part 在 OpenCode 里是用户在提示框里 @ 某个 agent 的标记（提示文本已含这段 @ 文字），不是派发，所以不画成卡片。
+
+Codex、ZCode、Antigravity、OpenCode 共用 `shared/background-work/background-work-registry.ts`（`BackgroundWorkRegistry`）：按应用会话 id 登记仍在跑的后台工作（agent；OpenCode 还有放到后台的命令）。运行时切面的 `listBackgroundWork()`（返回 `SessionBackgroundWork[]`）直接读它，供运行中会话轮询给活动指示和侧栏使用；历史读取用 `has` 区分"进程还活着的 agent"和"进程已死、永远等不到结束记录的 agent"。输入框上方的后台任务条也从它来：各家的 `backgroundTasks.list` 都返回 `listStripTasks(会话)`，供订阅确认恢复；登记簿每次增减后，运行时用 `createBackgroundTasksStatusMessage` 广播完整列表（清空时发空列表，否则任务条不会消失）。`taskType` 为 `local_bash` 的登记项在任务条上叫 `Bash`（命令），其余叫 `Agent`。只有调用方给 `listStripTasks` 传了停止句柄的登记项才带 `taskId`，任务条只给带 `taskId` 的项逐个中止：Codex、ZCode、Antigravity 没有单独停一个 agent 的接口，不传；OpenCode 的 agent 能单独停（中断它的子会话），传子会话 id，命令不能停，不带。`clearSession` 返回被清掉的登记项，调用方据此给每张卡补发结算。每家各有一个模块级实例（`codex-background-work.ts`、`zcode-background-work.ts`、`antigravity-subagent.ts`、`opencode-background-work.ts`），因为同一进程里只有它们自己的引擎子进程能产生这些工作，登记簿里没有的工作不可能还在跑。`shared/background-work/task-status.ts` 的 `createTaskStatusMessage` 是 `task_status` 事件的唯一构造函数，`TaskUsage` 的三个字段都可缺省：引擎没上报的数字留空，不填 0。
+
+**Codex 短连接**的进程模型决定了它的结算点（短连接的任务条只在轮次进行中出现，`settleOutstandingAgents` 清空登记簿时同时广播空列表，发在 `complete` 之前）：`queryCodex` 在轮次结束时 `connection.close()` 会杀掉 app-server，它派出的 agent 随之消失，完成事件永远到不了。所以 agent 只在轮次进行中被登记：活动记录在 `started` 时发卡、发 `task_status started`、按线程 id 登记；派发调用在完成回执确认接收者后发卡并登记，多接收者各用独立卡片；`completed` / `interrupted` 通过线程 id 找回登记项，发 `task_status`（完成 / 停止）并注销；找不到登记项（服务重启期间开始的 agent）就不发，因为没有卡片可收。短连接结束时对还登记着的 agent 逐个补发 `stopped` 并清空，且发在终态 `complete` 之前，页面不会看到轮次已结束而卡片还在转。`interacted` 是 agent 之间的往来，不画。
+
+**ZCode** 的引擎进程比一轮对话活得久，后台 agent 在 `complete` 之后还在跑。一轮结束时运行时摘掉自己的监听器，若该会话还有登记在册的 agent，就留下一个只认 subagent 生命周期事件的窄监听器（`subagentWatchers`），后台 agent 迟到的 stop 由它转发并注销登记。窄监听器和运行中监听器走同一个出口 `context.normalizeMessage`，载荷里不带 `parentToolCallId` 的事件丢弃，因为没有卡片可落。下一轮开始时，`run()` 在第一个 await 之前就撤掉窄监听器、挂上本轮监听器，所以订阅、设模式、解析模型这三次异步等待期间到达的事件只进本轮的 writer；本轮在发出提示词之前不接受 `complete` / `error`，因为那时到达的终态只可能属于上一轮；发出之后也只认自己那一轮的终态，规则见下文「zcode 发送链路」。被新一轮取代的旧监听器在旧轮次的 100ms 轮询发现自己被取代之前，除引擎死亡通知外一律不转发。引擎死亡时，运行中监听器和窄监听器都调用 `settleAgentsOfLostEngine`，先对登记簿里每个 agent 发 `stopped` 再清空。一轮结束后 `abort` 已经找不到运行可停（停止命令针对的是运行，协议里没有单停 agent 的请求），所以窄监听器接手时会重发一次任务条并带 `canInterrupt: false`，`backgroundTasks.canInterrupt` 在订阅确认里给出同样的答案，页面不显示一个只会报 `ABORT_FAILED` 的停止按钮。引擎的失败 stop 不带 token 和工具调用总数，这两个字段在 `task_status.usage` 里直接缺省。
+
+ZCode 的 `SendMessage` 能把已结束的 agent 复活到后台。引擎把这次运行的生命周期事件、镜像工具事件和批准请求都挂在 SendMessage 的调用 id 上，而它自己的界面复用原来那张 agent 卡。CloudCLI 照此处理：`SendMessage` 行保持普通工具行；归一化器收到带 `resumed: true` 的 `subagent_spawned` 时，按 agentId 查引擎库里结果写着这个 agentId 的 `Agent` 调用（复活常在很多轮之后，中间可能重启过，所以查库不靠内存），记下“SendMessage 调用 → `Agent` 调用”，之后该会话里指向这个 SendMessage 的生命周期事件和镜像工具行都改写到原 `Agent` 调用，直到这次运行的 stop。这条映射不随回合结束清空。复活的 `started` 带 `resumed: true` 发给前端，前端据此让卡片重新运行（见 chat.md「子 agent 卡片只认 `Agent`」）。查不到 `Agent` 调用时不改写。
+
+**OpenCode** 的服务进程比一轮对话活得久，`subagent` 和 `shell` 都能带 `background: true` 调用，工作在回合结束后接着跑。以一次后台评审为例（v2.0.31 实测）：模型调用 `subagent`（`background: true`），引擎为它建子会话，调用立即返回 `tool.success`，metadata 是 `{ sessionID: 子会话, status: "running" }`；翻译器认出这是后台启动（`opencode-background-work.ts` 的 `readBackgroundLaunch`：metadata 仍是 `running`，agent 带子会话 id、命令带 `shellID`），不把卡片结算成完成，而是发 `task_status started`（状态 `running`），工具结果带 `toolUseResult.isAsync`；登记表按子会话 id 登记这项工作并广播任务条。父会话随后进入 idle，这一轮照常发 `complete`，但会话还在 `listBackgroundWork()` 里，侧栏和活动药丸显示后台工作，`hasSessionWork` 挡住归档和删除。子会话接着干活，它的行仍带 `parentToolUseId` 折进那张卡。agent 结束时，引擎往父会话的收件箱放一条合成通知（`session.inbox.enqueued`，`item.type: "synthetic"`，`payload.metadata` 为 `{ source: "subagent", childID, state }`；命令为 `{ source: "shell", shellID, state }`），同一条通知也作为 `synthetic` 消息写进 `session_message`。翻译器把它读成结算，登记表发 `task_status`（`completed` / `cancelled`→`stopped` / 其余→`failed`）、注销登记、重发任务条。紧接着引擎为汇报自己起一轮（`session.execution.started`），这时没有 cloudcli 发起的运行，登记表把它记作引擎回合：`getSessionActivity` 报 `reporting: true`，会话以空任务列表出现在 `listBackgroundWork()` 里，汇报的行照常发出，直到这一轮的终态。工作在父回合结束前就完成时，通知并进正在跑的那一轮，不另起一轮。
+
+为此 `opencode-run-registry.ts` 按会话而不是按运行管理：会话在运行进行中、后台工作未完、引擎回合未完这三种情况下存活，三者都没了才遗忘（连同子会话归属表）。运行在跑时帧发给运行的 writer；运行结束后会话改用会话通道（`context.publishSessionEvent`，见 chat.md 的会话通道），交互桥随之改挂到会话通道上，后台 agent 的批准卡片在运行结束时不撤回、改绑到会话通道，回复仍发给子会话。用户在汇报回合中发消息时，引擎把消息并进正在跑的那一轮，新运行接管这个会话，在这一轮的终态结束。没有运行时，`abort` 中断汇报回合和每个后台 agent 的子会话；`stopBackgroundTask` 中断一个 agent 的子会话（引擎随后发 `cancelled` 通知并起一轮汇报）。放到后台的命令没有停止接口：`DELETE /api/shell/:id` 实测返回 204 但管的是另一套 shell，后台命令照跑。因此只剩命令时 `backgroundTasks.canInterrupt` 为 false，运行中会话条目的 `canInterrupt` 取这个值。服务进程退出时，每项后台工作都结算为 `stopped`。事件流断线期间错过的通知，在重连时从 `opencode.db` 的 `synthetic` 消息里补读（`readOpenCodeSyntheticNoticeMetadata`）；断线期间结束的引擎回合按会话快照的 `time.idle` 对账。新消息不打断后台工作，所以 `backgroundTasks.queuesInput` 为 false，实时任务条帧也带 `backgroundWorkQueuesInput: false`（`createBackgroundTasksStatusMessage` 的第四个参数）：订阅确认和实时帧必须说同一句话，否则没刷新过的页面会把新消息排队到汇报结束。汇报回合的条目带自己的 `startedAt`（回合开始时刻），页面的计时不从早已结束的那一轮算起。这一轮结束、会话里什么都不剩时，运行时发 `notifyBackgroundWorkCompleted`（与 Claude 同一事件 `run.background_completed`），父回合结束时那条 `run.stopped` 照常发。OpenCode 不实现 `isPending`：汇报回合的结束没有能清掉页面等待状态的帧，活动以运行中会话轮询为准。
+
+### 子 agent 的请求和过程归谁
+
+子 agent 发出的批准卡片、提问和每一步过程，必须送到派它的那个根会话上。五家引擎的情况不同，下面是逐家核实的结论。
+
+- **OpenCode**：引擎为每个子 agent 新建一个子会话，它的事件和 `permission.asked` 都带子会话 id。`opencode-run-registry.ts` 从 `session.created.parentID` 和父会话上 `session.tool.progress` 的 `metadata.sessionID` 建立"子会话 → 根会话"的归属表。每个子会话记着派它的调用（`spawnCallId`，同一子会话被后一次调用再派时跟随最新的调用）；它的行属于哪张卡，是在分发时顺着祖先链走到根会话下最上面那个子会话、取它的派发调用得出的，孙会话因此总是落到用户看得见的那张外层卡，即使孙会话比它的祖先更早被登记。卡片还不明时的帧先存着（每个子会话上限 500 条，超出时记一条警告日志）。批准和提问卡片按根会话显示，回复仍发给子会话（`opencode-interaction-bridge.ts` 通过 `resolveChild` 找到根会话），卡片的 `context.subagent` 带上这张 `Agent` 卡（`toolUseId` 和派发调用的 `description`）。子会话的事件由它自己的翻译器翻成行，带上 `parentToolUseId`（派它的那次 `Agent` 调用）发给根会话当前的 writer（运行在跑时是运行的 writer，否则是会话通道）；派发调用还没被报告出来之前的行先存着，调用报告出来后补发；流式增量不发，只发定稿行。子会话的结束事件不结算父会话这一轮。根运行结束时，前台子会话里没等到结果的嵌套 agent 调用补发 `stopped`，后台 agent 的子会话还在干活，不补；归属表随会话一起遗忘。
+- **Claude**：子 agent 与主线程共用同一个 `canUseTool` 回调（SDK 的回调参数带 `toolUseID` 和 `agentID`），请求自然到达页面，请求 id 就是回复键。回调只给出发起调用的 id，不给卡片：`claude-subagent-origin.ts` 的追踪器在流上记下每个工具调用的 `parent_tool_use_id`（嵌套 agent 解析到最外层那张卡）和各 `Agent` 调用的任务行，请求据此带上 `context.subagent`；等待中的卡片（重连回放用）保存同一份上下文。请求和流是两条路，实测流领先请求约 1ms，但顺序没有保证，所以请求先到时 `whenObserved` 最多等 1.5 秒让流把这次调用交代出来，再取来源。一轮的进程结束时，`cancelRunApprovals` 撤回这一轮还没回答的卡片（交互类工具如 `AskUserQuestion` 不设超时，子 agent 的请求也活得比派它的那一轮久），不依赖 SDK 是否在进程退出时中止信号。直播里子 agent 的行带 `parent_tool_use_id`，进入下面的"过程折进卡片"机制。MCP elicitation（MCP 服务器在调用中途向用户要输入，form/URL 两型）也走同一审批通道：交互式 run 才设置 `onElicitation`，请求翻成 `permission_request` 帧（工具名 `MCP_ELICITATION_TOOL_NAME`），到达每个已连接标签页、刷新不丢并触发通知；无超时，服务器自带超时、中止走信号。无人值守 run（agent API 默认 `unattended`）不设回调，SDK 立即 decline 而不是等一个等不到的答案；agent API 调用方传 `unattended: false` 改为 attended 接表单。
+- **Codex**：子 agent 跑在同一个 app-server 连接的另一条线程上。审批是连接级的服务端请求（`onRequest`），不看线程 id，所以子 agent 的批准能到页面。子线程的 `item/completed` 通知此前被丢弃，现在按线程 id 在登记簿里找到那张卡，用与历史相同的行渲染器（跳过 agent 自己的提示词和生命周期条目）发出，带 `parentToolUseId`；不是本次运行派出的线程忽略。
+
+  agent 是否在跑，以它自己线程的回合为准，不以父线程的活动记录为准。引擎只在父线程等待 agent 时写 `subAgentActivity completed`；父回合先失败（例如撞上额度上限）就没人写，agent 会一直显示在跑。实测本机全部子 agent 记录：同一 agent 一轮结束后又被父线程叫醒跑下一轮很常见，额度失败后再被叫醒也出现过，所以一轮结束只表示 agent 空闲，不表示它没了。运行时因此在子线程 `turn/completed` 时注销登记、按回合状态结算卡片，并记住这张卡；同一线程再出 `turn/started` 时按原卡片重新登记。父线程的 `started` 活动常常晚于 agent 自己这一轮的结束：驻留会话要等确认父线程事件属于哪一轮才处理它们，子线程事件则立即处理。所以运行时记住每个 agent 末轮的结局，下一轮开始时清掉；`started` 活动登记时若末轮已有结局，立即结算。父线程在 agent 新一轮开始前就记下叫醒时，卡片先结算一次，到 agent 那一轮开始再转回 `running`。停止或关进程结算掉的 agent 同样记住卡片，新进程叫醒它时回到原卡片。审批请求的 `threadId` 是子线程时，卡片的 `context.subagent` 取自同一条登记项。`collab_spawn` 的 `completed` 只表示派发调用完成；回执以异步结果表示，接收者线程继续登记，直到自己的回合结束。
+- **ZCode**：引擎的 `createSubagentInteractionBroker` 会把子 agent 的权限请求改写到父会话 id，并带上 `origin`（`kind: "subagent"`、`agentId`、`agentType`、`description`、`parentToolCallId`、`childSessionId`），所以只要父会话有一轮在跑，请求就按父会话找到对应运行；卡片的 `context.subagent` 取自 `origin.parentToolCallId`、`origin.agentId` 和 `origin.description`。父会话这一轮结束后后台 agent 仍可能请求批准，此时没有运行可找，请求曾被当场拒绝。现在 `ZCodeRunLifecycle.adoptIdleTarget` 让窄监听器把自己的 writer 登记为该会话的临时目标，批准和提问卡片发给它，回复和撤回卡片走同一条路。agent 停止时，它名下尚未回答的卡片会被撤回（先于临时目标的释放；按 `agentId` 匹配，因为复活的 agent 的请求挂在 SendMessage 调用上，而它的 stop 已改写到 `Agent` 调用），引擎那边挂着的请求按拒绝应答；引擎死亡时撤回该会话所有子 agent 的卡片。主线程的提问卡同理：引擎的 `AskUserQuestion` 自带超时，超时后引擎自行结算调用（时间线显示 Skipped）且不再重发询问、也不通知服务端，运行时收到同一 `toolCallId` 的 `tool_result` 即撤掉还挂着的卡并广播 `permission_cancelled`；TTL 到期的清理也走同一条广播。直播过程不需要订阅子会话：真实引擎把 agent 的工具调用镜像在父会话的流里（`tool.updated`，载荷带 `source: "subagent"`、`parentToolCallId`、`agentId`、`childSessionId`、`childToolCallId`），归一化器给这些 `tool_use` 行加上 `parentToolUseId`；agent 的文字不在父会话流里，刷新后由历史（子会话）补上。
+- **Antigravity**：默认以常驻 `agy acp` 会话运行（`docs/design/agyACP运行时.md`；`CLOUDCLI_ANTIGRAVITY_ACP=0` 回退 print 模式），与终端共用用户自有数据目录 `~/.gemini/antigravity-cli`（终端可续聊 ACP 会话）；spawn 前钉 settings 的 `toolPermission: request-review`（`always-proceed` 会吞掉全部权限请求，其余取值含缺省不干预），`session/request_permission` 与挂起的 `ask_question`（引擎以 pending 工具卡+回合结束挂起，下一条 prompt 即答案）都桥上 pending 卡通道，经 `permissions.resolve` 应答；会话跨进程恢复前确认数据根里有原生会话文件，再走 `session/load`。恢复失败时本轮结束并保留原会话映射。旧 print 会话用 print 续聊。启动权限改变后，先等原进程退出再恢复会话。后台命令仍在运行时保留进程并拒绝这次切换。控制请求和卡片各自超时，回合取消走 `session/cancel`，启动中或取消无响应时结束引擎进程。agy 在无 run 持有时仍会推帧（后台 `IsDaemon` 命令的完成通知），会话级路由把帧翻译后经 `publishSessionEvent` 发到会话频道。print 路径的子 agent 行为如下；ACP 路径的 `invoke_subagent` 帧不带 conversationId，卡片、登记簿与 transcript tail 从父 transcript 的 spawn 回执（与历史同源）轮询绑定。子 agent 的过程不在 `agy` 的流里，只写在它自己的 transcript（brain 目录，按 conversationId）；agent 登记期间，`antigravity-agent-tail.ts` 用 `fs.watch` 加定时轮询重读该 transcript（与历史同一个读取器，行和 id 一致），把新增或变化的步骤（工具调用、文字、思考）带上 `parentToolUseId` 发出。轮次结果到达、进程退出或出错时，先等每个 agent 最后一次读取发完，再发结算帧和 `complete`，所以最后的步骤不会落在结算之后；`conversationId` 不合法的 agent 只警告一次、不再轮询。实时流里 `invoke_subagent` 的原始 `tool_use` / `tool_result` 不再发出（agent 卡片已代表这次调用），与历史一致。
+
+**过程折进卡片（前端）**：前端把 `parentToolUseId` 指向某张 `Agent` 卡的行，不再当作主线程的行，而是折成这张卡的时间线（`normalizedToChatMessages`）。历史行自带 `subagentTools` 时以它为准，否则用直播送来的行。这样历史和直播是同一种形状，Claude 也走这条路（此前直播的子 agent 行会混在主线程里，刷新后才收进卡片）。嵌套的 agent 和它名下的行都折进最外层那张卡；父卡尚未到达的行先不进主线程。五家引擎里，Claude、OpenCode、Codex、ZCode、Antigravity 都按这个机制送直播行，各家的来源见上面各条。
+
+**批准卡片的通知**：任何引擎的 `permission_request` 帧都经过 `ChatSessionWriter.send`，推送通知（`permission.required`）在这里统一发出，用应用会话 id 和 `requestId` 去重；引擎适配器自己不再各发一份。
+
+## IProvider 七切面
+
+契约在 `server/shared/interfaces.ts`，基类在 `server/modules/providers/shared/base/abstract.provider.ts`：
+
+| 切面 | 职责 | 关键成员 / 消费服务 |
+| --- | --- | --- |
+| `runtime` | 拉起/中止引擎执行 | `run(command, options, writer, context)`、`abort(sessionId)`；可选 `permissions`（权限批准网关）、`backgroundTasks`（后台活跃任务列表）→ `providerRuntimeService` |
+| `models` | 模型目录 | `getSupportedModels()`（引擎目录或预置目录）、`getCurrentActiveModel()`（只读兜底）→ `providerModelsService` |
+| `auth` | 安装/登录状态 | `getStatus()`（"未安装/未登录"是数据不是异常）；可选 `getQuota()`（配额）→ `providerAuthService` |
+| `mcp` | 引擎原生 MCP 配置读写 | `McpProvider` 基类（scope/transport 校验）→ `providerMcpService` |
+| `skills` | 技能发现/写入 | `SkillsProvider` 基类（SKILL.md 扫描）→ `providerSkillsService` |
+| `sessions` | 事件归一化 + 历史 | `normalizeMessage`、`fetchHistory`；可选 `getTokenUsage` / `resolveEditAnchor`（编辑锚点）/ `rewindSession`（codex 分支式回退、opencode 原地 revert）/ `cleanupSession` → `sessionsService` |
+| `sessionSynchronizer` | 落盘索引 | `getSessionWatchTarget()`（声明 watch 根）、`synchronize()`、`synchronizeFile()` → `sessionSynchronizerService` + `sessions-watcher.service.ts` |
+| `fork?`（可选） | 会话分支复制 | `forkSession()`；**缺省即"该引擎无 fork 能力"** |
+
+**可选成员就是能力开关**，这是整个框架的核心设计。
+
+**模型目录特例（opencode）**：`list/opencode/opencode-models.provider.ts` 以 `opencode models` CLI 的账号级清单为准（后台服务在时约百毫秒返回；首次调用需冷启动该服务，故超时放宽到 15s），id 为 `<providerID>/<modelID>`，再叠加 OpenCode 自己缓存于数据库 `kv` 的 models.dev 条目补全推理档位与说明；CLI 缺失/失败/空答案时回退 `OPENCODE_PREDEFINED_MODELS` 预置表并按本机已连接 provider 过滤，且打上 `FALLBACK: true`（`ProviderModelsDefinition` 通用字段，`providerModelsService` 合并时透传），告诉前端这只是替身目录、需稍后重拉。目录经 `createStaleWhileRefreshValue` 缓存：第一个调用等 CLI，过期值立即返回并在后台刷新（CLI 结果 60s 新鲜期，`FALLBACK` 目录 10s，失败按 10s 退避），所以每回合读目录不再被 `opencode models` 拖住。会话模型值同样以目录的 `<providerID>/<modelID>` 为准，`providerModelsService` 负责把会话行上丢失前缀的裸 model id 按目录后缀唯一匹配还原；会话行还没有 effort 时，读引擎 `session.model` 里的 `variant` 作为 reasoning effort 回填（与 ZCode 的做法一致），否则 Agent API 或 CLI 直接创建的会话会被前端回落到浏览器默认档位。此前的「读 `~/.cache/opencode/models.json` 实时目录」叠加层随本轮 client-mode 迁移一并移除（见「OpenCode 服务客户端」）；antigravity 与 codex 的目录读取同用这套缓存。
+
+**模型目录特例（zcode）**：新版本 ZCode 把用户自建 provider/模型从 `~/.zcode/v2/config.json` 迁到了 `~/.zcode/v2/provider_config.json` + 引擎自带目录（`zcode-provider-config.ts` 定位 runtime 刷新副本或安装目录 `resources/config/provider/zcode-builtin.json`），因此 `getSupportedModels()` 以引擎为准：调一次 `session/create` 取响应里的 `settings.model.available`（即引擎已合并用户 provider 后的完整目录，用完即 `session/close`），失败才回退磁盘解析。会话模型值同样是 `<providerID>/<modelID>`，并把每个模型的 `reasoning.defaultLevel` 记进 `zcode-models.provider.ts` 的 `engineReasoningDefaults`；`setModel` 的 schema 是严格校验，reasoning 档位必须放 `model.options.reasoningLevel`（旧的 `model.variant` 会被拒），缺省取上面记下的 defaultLevel，否则引擎报 “Reasoning level is required”。
+
+## 能力矩阵：推导而非手写
+
+`server/modules/providers/services/provider-capabilities.service.ts`：
+
+- `deriveCapabilities` 从注册表里的切面**推导**能力——`runtime.permissions` 存在 ⇒ `supportsPermissionRequests`；`sessions.resolveEditAnchor` 存在 ⇒ `supportsMessageEditing`；`fork` 存在 ⇒ `supportsSessionForking`；`sessions.getTokenUsage` 存在 ⇒ `supportsTokenUsage`；`runtime.steer` 存在 ⇒ `supportsSteering`（目前仅 claude：消息写进驻留进程的输入流，模型在下一个工具调用边界读到）；`runtime.askSideQuestion` 存在 ⇒ `supportsSideQuestions`（claude 用原生进程的只读 fork、codex 用 ephemeral 只读 fork 线程作答，不写入会话转录）。`supportsCompaction` 是目录里的静态能力。
+- 静态部分（权限模式列表、图片/文件/中止/effort、编辑是否回滚文件 `editRevertsFiles`、引擎是否自带会话内调度 `supportsNativeScheduling`、会话忙时新消息能走多远 `inputWhileBusy`）来自 `provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG`。
+- **`inputWhileBusy: 'queue' | 'background' | 'always'`**（类型 `ProviderInputWhileBusy`）：会话忙时新消息能否直达引擎而不杀掉在跑的工作。`background`（claude、opencode）——回合进行中 composer 排队，只剩后台工作时可直接发送：claude 把排到的回合写进同一驻留进程，opencode 把消息投进服务端会话 inbox，后台 shell/agent 都继续跑；`queue`（codex、zcode、antigravity、cursor）——只剩后台工作时也排队，避免新 run 取代在跑工作；`always` 目前无引擎使用。`always` 必须配 runtime 可选切面 `injectInput`，`provider-capabilities.test.ts` 钉住两者同在同缺；claude 改用常驻后不再实现 `injectInput`，网关取不到切面就退回"开一个正常 run"。
+- `provider-capabilities.test.ts` 把推导结果钉在显式基线上：切面增删会以"评审过的测试差异"呈现，而不是静默改能力。
+- **`supportsNativeScheduling` 只是提示位，不参与启停**：CloudCLI 的循环定时任务（`scheduled-jobs`）对所有引擎可用；该位为 true（目前仅 claude 的 CronCreate/ScheduleWakeup）时，任务表单与 composer 重复入口提示"引擎自身也有会话内定时、冲突回合会被跳过"，行为不变。
+- **前端零 provider 分支**：composer/设置页完全按 `GET /api/providers/capabilities` 渲染。首屏与请求失败时的回退镜像在 `src/shared/providerCatalogFallback.ts`（`PROVIDER_FALLBACK_CATALOG`），由跨树 parity 测试（`server/modules/providers/tests/provider-catalog-parity.test.ts`）钉住与后端目录一致；**其 key 顺序就是全应用的引擎规范顺序**。
+- **账号配额（`auth.getQuota`）现状**：antigravity（`agy` CLI）、codex（app-server JSON-RPC）、zcode（BigModel / Z.AI HTTP）、opencode（OpenCode Go 官方 `GET /zen/go/v1/usage`，`list/opencode/opencode-quota.provider.ts`；凭证顺序：v2 `opencode.db` 的 `opencode-go` API key → 同库 `opencode` 控制台 OAuth（需 orgID）→ v1 `auth.json` 的 key；key 不带 org 头。Zen 按量账号无公开端点，返回 null 即不渲染卡片）。前端按 `supportsQuota` 能力位渲染配额卡片，不再维护同名名单。
+
+## 上下文占用与按需压缩
+
+`ProviderTokenUsageResult`（`server/shared/types.ts`）的语义是"**当前上下文占用**"而不是"会话累计花费"：`used` 是这一刻窗口里承载的量，`total` 是窗口大小；需要累计的引擎（codex/opencode）把会话累计放在 `cumulative`，claude 自报的百分比放在 `percentage`。前端 composer 徽章显示 `used`（有 `total` 时追加 `xx%`），`/cost` 弹窗画占用条并单列累计行。
+
+引擎只在回合结束时才报用量的引擎（zcode），runtime 会在**回合进行中**补发 `token_budget`：监听器每次收到一个 step 收尾的信号（zcode 是 `tool_result`）就去引擎库读一次最新占用，距上次发送不足 1.5s 或读数没变则不发；帧的 payload 与 `/token-usage` 端点同形，长工具轮的徽章因此不必等到 `complete` 才动。opencode 的回合中预算来自 `session.step.ended` 事件自带的该 step `tokens`（同一 1.5s/去重节流；窗口在回合开始时按所选模型解析一次），回合结束再用与 `/token-usage` 相同的 `opencode.db` 读取器补一帧权威读数（含窗口），保证实时与重开一致。
+
+| 引擎 | `used` 来源 | `total` 来源 | 备注 |
+| --- | --- | --- | --- |
+| claude | 最新一条主线程 assistant 的 `input + cache_read + cache_creation + output`；更晚的压缩边界（`compact_boundary`）改写为它的 `postTokens`；每回合结束再用 SDK `Query.getContextUsage({detail:'summary'})` 覆盖（带 `percentage`） | **会话维度持久化的 SDK 真值**（见下）＞`CONTEXT_WINDOW` ＞ 模型启发式（先看会话行的 `model`（用户选的变体，带 `[1m]`），再看转录里的模型 id；命中 `[1m]` 定 1M，否则 200k），单一 resolver `resolveClaudeContextWindow`（`services/claude-usage.ts`） | SDK 会执行输入流里的 `/compact`，无需额外协议；压缩边界的 `postTokens` 是压缩后下一次请求的真实占用，历史页与回合中帧共用它（见下） |
+| codex | rollout `token_count.info.last_token_usage`（live 用 `turn.completed.usage`） | `model_context_window` | 旧的 `total_token_usage` 只作 `cumulative` |
+| opencode | 最新一条 assistant 消息自己的 `tokens`（prompt = input + cache read/write，输出 = output + reasoning；v1/v2 双布局同读） | OpenCode 数据库 `kv` 的 models.dev 目录（`models-dev:v2:catalog` 优先，`models-dev:catalog` 其次）里的 `limit.context`；目录缺该型号时回退 `~/.cache/opencode/models.json`（`resolveOpenCodeContextWindow`；DB 目录按 kv 行 `time_updated`+长度记忆化，文件按 mtime+size） | 会话行 `tokens_*` 五列（`GET /api/session/:id` 同值）只是会话累计花费，单列为 `cumulative`；压缩摘要跳过（v2.0.32 写成 `compaction` 消息行，旧版是 `summary: true` 的 assistant 行）→ `compacted` + 摘要字节数；数据库早于 token 列时不支持（`unsupported: true`） |
+| antigravity | live usageRecord 的 total | 1M（硬编码） | 同值持久化到 brain `token_usage.json` |
+| zcode | 最新 step 的 `tokens.total`；旧行没有该字段时取 `input + output + reasoning`（持久化 prompt 已含 cache read，不能再加） | 引擎目录的 `contextWindow`（`resolveZCodeModelContextWindow`；用户自加 provider 只有引擎目录里有），缺失时回退 `v2/config.json` 的 `limit.context` | 全转录求和只作 `cumulative`（`list/zcode/zcode-context-usage.ts`）；压缩摘要行（`summary` 对象）跳过 → `compacted` + `summaryBytes` |
+| cursor | 无 `getTokenUsage` 切面 | — | `supportsTokenUsage: false` |
+
+opencode 的窗口先读数据库目录，是因为账号级目录里的免费型号（如 `opencode-go/beam-free`）可能不在 `~/.cache/opencode/models.json`：后者由旧版 CLI 写、可长期不更新，只按文件解析会让这类会话只有 token 数、没有百分比。API 调用不传 `model` 时默认取目录首项，最容易命中这种型号；UI 选同一型号时同样受此影响。
+
+**claude 的上下文窗口为什么必须持久化**：转录里每条 assistant 记的是*解析后*的模型 id（`claude-opus-5`），永远不会出现 `claude-opus-5[1m]` 这种窗口变体标记，所以任何"读转录猜窗口"的启发式都分不出 1M 会话和 200k 会话。真值只有 SDK 在 query 存活期间知道（`getContextUsage()` 的 `rawMaxTokens`，其 `maxTokens` 与之同值，`percentage` 就是 `round(used/total*100)`）。因此 runtime 一读到该值就写进 `sessions.context_window`（`services/claude-context-window.ts`，键是 app session id，找不到行就静默跳过，下一回合再写）。探测点有两个：流的开头（已恢复会话此刻上下文已经装配好，不必等首个 token）和首条 assistant 回复（全新会话最早有东西可测的时刻），每轮最多两次 control request（`createContextWindowCapture` 负责计次与去重），回合结束时再读一次，顺手把 badge 刷成 SDK 的精确读数。不只在回合结束写，是因为跑到一半就断的 run 根本没有 `result`——用户中断、CLI 崩溃、服务端在回合中间重启都算——那一行会永远留白，而 `model` 是 `default` 的会话没有 `[1m]` 标签可回退，此后一直显示 200k。三条发布 token budget 的路径——`/token-usage`、每一页历史、回合中的每个 assistant 帧——都先读它再落到 `CONTEXT_WINDOW` 和启发式。这条优先级里 SDK 真值排在 `CONTEXT_WINDOW` **之前**，否则实时帧（从不读 env）和重开会话后的读数又会互相矛盾。历史页不额外带 `percentage`：它等价于前端已有的 `used/total`，存下来只会在转录继续前进后变成陈旧值。还没在本应用跑过的会话退而看 `sessions.model`：那是用户在模型选择器里选的变体（`opus[1m]`），比转录里被解析掉的 id 多一个 `[1m]` 标签，所以配置成 1M 的会话重开即显 1M、不必先跑一轮。
+
+历史页走 `sessionHistoryCache`，而缓存项的有效性原本只看转录文件的 path+mtime+size——因为结果曾经完全由文件推导。窗口持久化打破了这个前提（`tokenUsage.total` 多依赖了一个 DB 列，而该列是回合进行中和回合结束时异步写的），所以 `session.context_window` 也进了缓存判据：否则回合后的首次历史读取可能赶在写入之前，把一个回退默认值的 `total` 凝固在缓存里，往后每次翻页都把 badge 打回旧窗口，和实时帧来回跳。
+
+`/token-usage` 与历史页共用 `summarizeClaudeTokenUsage` 这一个读取器（同样跳过 sidechain 与全零的 `<synthetic>` 行），两者只在取行范围上不同：历史页按 `sessionId` 过滤转录行，端点读整份文件。
+
+**会话压缩（`/compact`）是静态能力 `supportsCompaction`**：前端只在为真时往斜杠菜单里加 `/compact`，它和技能一样作为消息文本经普通 run 发给引擎，没有单独的压缩帧或 runtime 切面。各家怎么压缩的差异收在 `run()` 里：
+claude、zcode、antigravity 的引擎自己从提示词里认出 `/compact`，原样透传（claude 的 SDK 按 local slash command 执行；zcode 引擎的 `session/compact` 内部也是 `submitPrompt("/compact")`，文本带 inputId，轮次归属判断天然成立）。
+codex 和 opencode 的引擎只认专门的调用，`run()` 用 `readCompactCommand`（`server/shared/utils.ts`）认出命令后改调 `thread/compact/start`（codex，常驻会话走 `codex-session-manager` 的压缩通道）和 `POST /api/session/:id/compact`（opencode，v2.0.32：只把一条合成 `compaction` 消息排进会话队列，摘要经 `session.compaction.*` 流出、再以常规 `session.execution.*` 终态结束，runtime 不拿 POST 的响应当结果）。这两家不接受附加说明，`/compact <说明>` 直接报错。cursor 不支持。
+**opencode 的压缩失败算本轮失败**（fork 保留的一行）：`run()` 以 `purpose: 'compact'` 登记压缩轮，`session.compaction.failed` 带上原因后，registry 只把它结算成这个 run 的失败；普通回合里引擎自己触发的自动压缩失败不打断该回合。v2 的 `compaction` 消息行由历史读取器渲染成"压缩行 + 摘要行"（`isCompactSummary`，前端折叠展示），context-usage 读取器同样按这行（或旧版写进 assistant 消息的 `summary: true` 标记）给出 `compacted` + `summaryBytes`。探针：`scripts/probe/opencode-compact-probe.mjs`（`--fail` 复现失败形态）。
+antigravity：目录值为真，`/compact` 文本透传给 agy；fork 早期实测 agy print 模式把它当普通 prompt，上游称 `-p` 模式先回一轮再生成压缩检查点，两者可能是 agy 版本差异，尚未复核。
+
+压缩**刚结束的那一刻，各引擎能给出的读数不同**。claude 的 `system/compact_boundary` 自带 `compactMetadata.postTokens`（摘要在内、下一次请求真正携带的上下文），历史读取器（`summarizeClaudeTokenUsage`）和实时流（`extractCompactionTokenBudget`）都直接把它换成新占用，所以百分比会在压缩完成时立刻下降；边界之外没有 assistant 行时，`result.usage` 只是摘要请求的账单（仍是压缩前上下文），实时路径会用它作有效读数的判定条件把它挡掉。zcode/opencode 没有这个数字（zcode 把摘要写成带 `summary` 对象的 user 行，读数直接跳过；opencode 要等下一回合），所以 `ProviderTokenUsageResult` 用 `compacted: true` + `used: 0` 表达"已重置、token 数未知"（前端 `readTokenBudgetFromUsage` 与实时 `token_budget` 帧都判这个标记，不会继续挂着旧数字）。zcode 的摘要大小经 `zcode-context-usage.ts` 作为 `summaryBytes` 随 `compacted` 一起给出，前端用它显示"压缩摘要 · 9.4KB"直到下一个回合拿到真实占用；`/cost` 经 `commands.routes.ts` 透传同样的标记与字节数，把误导性的 0 行换成摘要大小行。claude 的边界若来自不写 `postTokens` 的旧 CLI，也退回 `compacted: true`。
+
+## Claude 会话进程：常驻与复用（`claude-runtime.provider.ts`）
+
+claude 每个回合默认起一个 CLI 进程，回合结束即退出；18MB 级别的会话每回合重新 resume 要几十秒。运行期因此让进程**常驻**：`run()` 从网关收到 `residentBetweenTurns: true`（`chat-websocket.service.ts` 的 `buildRuntimeOptions` 统一附加）时，一个回合正常结束且没有未完成的工作后，进程进入 idle 常驻——默认 10 分钟、最多 4 个，最旧的先关，两者都可用环境变量覆盖。启动时读取的配置（`CLAUDE.md`、settings、下一层 skills、commands、agents、rules、MCP、plugins）变了，或 transcript 显示另一个进程续过这段会话，下一回合就换新进程：绝不用旧配置悄悄跑。空转进程不算会话工作，归档/删除/关机时一并关闭；它自己死掉不会失败任何回合。
+
+**后台工作：进程保活，回合续在同一个 stdin 上。** SDK 的输入流一旦结束就关 stdin，CLI 按 print wind-down 杀掉所有后台 shell/agent（`Bash(run_in_background)`、子代理、Cron 等）。所以起了后台工作的进程要一直持有：静默上限默认 24 小时（`CLOUDCLI_CLAUDE_BG_WAIT_CEILING_MS` 可调，0 表示不限），任何消息和每一次续回合都会重置。cloudcli 释放 stdin 后，CLI 侧只再等 10 分钟（固定的 `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`）就停掉残余后台工作，两个上限不再叠加。下一个用户回合直接写进这条 stdin，同一个进程里开新回合，后台任务不受影响；启动期固定的东西（目录、工具权限、MCP、ultracode）、编辑消息、离开启动期的 plan 模式、打开 bypass、以及从 `--effort` 启动回到默认 effort 仍然换新进程。回合交接时模型、权限模式、effort 在 10 秒超时内切换；CLI 正跑在某个回合里时，新回合等那个回合的 `result`；尚未写入的交接回合可以被 stop 单独撤回。**不能安全续在驻留进程上的回合**（换了 cwd、编辑消息、引擎不支持的配置切换）遇到仍有后台工作时直接拒收：run 抛 `PROVIDER_INPUT_DEFERRED`（409），网关把消息放回队列等后台工作结束再重试，绝不为新 run 杀掉在跑的后台任务。
+
+**会话生命周期切面**：`getSessionActivity`（引擎是在排队还是在本回合里）、`hasSessionWork`（回合在跑 / 引擎自发上报 / agent 还在跑 → 不许归档或删除）、`closeSessionAdmission` / `releaseSession` / `openSessionAdmission`（先关准入、再看状态、再释放常驻进程，中间不会插进新 run）。
+
+**后台任务与任务条**：`createBackgroundWorkTracker()` 记录 `task_started`（带 `tool_use_id`）到 `task_notification` / 终态 `task_updated`，供运行列表（`listBackgroundWork`）与单任务停止（`stopBackgroundTask` → SDK `stopTask`）使用；没收到可配对 `task_started` 的后台 Bash/Agent/Workflow 由任务条卡片补出摘要，运行列表与任务条因此数目一致（等待中的 wakeup/cron 仍只报"有后台工作"、不列任务）；`extractBackgroundTasks` 从工具调用提取 composer 任务条所需的条目，runtime 以 `background_tasks` 帧广播（含 `chat_subscribed` 回放），每回合结束与新 run 接手时都会重发，所以清空不依赖某一条丢失的帧。spawn 时声明 `perTaskStopAffordance: true`，CLI 的 interrupt 因此只停回合、放过后台 agent/workflow；`abort` 只 `interrupt`，会话还有在跟任务时不关 stdin。
+
+**上下文窗口（本 fork 补充）**：transcript 只记录解析后的模型 id（`claude-opus-5`），读不出 `[1m]` 变体；SDK 只在 query 活着时知道真实窗口。runtime 因此在流头部与首批 assistant 回复各探测一次 `getContextUsage()`（最多两次，共享 in-flight 读），把结果经 `recordClaudeSessionContextWindow` 写进 `sessions.context_window`，并让该 run 之后发出的 `token_budget` 帧用这个窗口而不是启动参数（`createContextWindowCapture`，`services/claude-context-window.ts`）。历史页与 `/token-usage` 走同一个解析器（`resolveClaudeContextWindow`：记录值 → `CONTEXT_WINDOW` → 带 `[1m]` 的模型 id），所以实时百分比与刷新后一致。
+
+**编辑第一条 prompt = 换一个引擎会话（重指向）**：`chat.edit-send` 替换首条用户消息时带 `resumeFromScratch`，`mapCliOptionsToSDK` 因此不传 `resume`，SDK 开启**新的 provider session** 并写新的 `<projectDir>/<newId>.jsonl`。runtime 在流里发现 `session_id` 与行上的旧 id 不同，就用 `writer.setSessionId(newId, { transcriptPath })` 把「这是替换，不是首次映射」交给网关；`ChatRunRegistry.recordProviderSessionId` 据此调 `repointSessionToProviderSession(..., { supersedePrevious: true })`，在同一事务里把 app 行的 `provider_session_id` 与 `jsonl_path` 一起换到新转录、删掉 watcher 抢先建的同 id 行，并把旧 id 记进 `superseded_provider_sessions`（Claude 同步器据此跳过旧转录，整库重扫也不会把它带回来）。**这里不能用 `assignProviderSessionId`**：它故意保留旧 `jsonl_path`，历史会继续读旧文件。Codex 的 `rewindSession` 分支同理，只是它自己记录 superseded。
+
+## 共享基础设施（写新引擎前先看）
+
+
+都在 `server/modules/providers/shared/`：
+
+- `engine-path/cli-engine-path.ts`：引擎二进制定位工厂——env 覆盖 → PATH → 平台安装路径，带 TTL 正/负缓存。配套 `installation/cli-installation-probe.ts` 探测原语。zcode / antigravity 有各自薄封装（`list/zcode/zcode-engine-path.ts` 等）。
+- `sessions/sqlite-session-synchronizer.provider.ts`：`SqliteSessionSynchronizer<Row>` 模板方法基类——watch 过滤、高水位增量、只读短连接、pending-app-session 绑定。zcode / antigravity / opencode 共用；claude / codex 解析 JSONL，cursor 读 store.db，各自实现。
+- `sessions/workspace-admission.ts`：会话入库前的工作区准入闸门，见下节。
+- `sessions/session-worktree-placement.ts`：会话目录的工作树认亲改判，见下节。
+- `sessions/session-project-path-canonicalization.ts`：引擎记录的目录与注册项目为同一目录的两种写法（软链还原）时，会话归并到已注册项目的存储写法，见下节。
+- `mcp/mcp.provider.ts`、`skills/skills.provider.ts`：MCP 与技能的校验/扫描基类；受管技能写入目标由各引擎覆盖 `getGlobalSkillSource()` 决定（claude → `~/.claude/skills`；codex / cursor / zcode / antigravity → `~/.agents/skills`；opencode → `~/.config/opencode/skills`），不覆盖即拒绝写入。
+
+Codex 的模型目录由 `codex-models.provider.ts` 通过 `codex-app-server.client.ts` 的连接读取（`model/list` 全分页、过滤隐藏模型、按 id 去重；查询用对话运行时同一份内置 `@openai/codex`）。成功目录缓存五分钟、并发共用一次加载；失败保留最近成功目录、十秒后允许重试；首次加载失败/空目录/格式异常会报错，前端走模型加载失败的重试入口。自定义模型由 `provider-models.service.ts` 合并：同 ID 记录只显示一项（保留用户名称并继承引擎推理强度），删除仅存在于自定义记录中的型号才切回默认型号。
+
+Claude 的模型目录由 `claude-models.provider.ts` 向对话所用的同一个 Claude Code 二进制（`resolveClaudeCodeExecutablePath`）查询：调 SDK 的 `query().supportedModels()`，传入一个永不产出消息的输入流，初始化握手应答后立即关闭进程。因为没有开始任何一轮，CLI 不写会话 JSONL。查询加载用户、项目、本地三级设置，否则 CLI 返回全部历史型号而不是 `/model` 选择器里的那几项；同时带 `disableAllHooks` 和 `strictMcpConfig`，因为实测不带时用户的 SessionStart hook 会执行、所有已配置和插件自带的 MCP 服务会被拉起。CLI 2.1.303 会在选择器条目后追加钉死版本号的型号（如 `claude-opus-4-8`），这类条目的 `value` 与 `resolvedModel` 相同；适配器把它们滤掉，只留别名或带后缀的条目（`opus`，以及 CLI 曾返回过的 `claude-fable-5-1[1m]`）。钉死版本号可以加成自定义模型，但自定义条目不带强度档位，选了它不会下发 `--effort`。代价：Bedrock/Vertex 这类只暴露具体 ID 的部署，若 CLI 返回的全是钉死条目则全部保留，只有一部分是钉死条目时这部分会被滤掉。名称、说明、推理强度都用 CLI 返回的值，重复 `value` 只保留第一项；强度含 `xhigh` 的型号额外提供 `ultracode`。目录缓存五分钟，单次查询 20 秒超时；过期后先返回旧目录、在后台刷新，所以每次发送做的强度校验不会等 CLI 冷启动。刷新失败保留旧目录；首次加载失败报错，前端走重试入口，不补静态列表（静态列表缺少用户存过的型号时，页面会把本地保存的选择重置成默认）。两种失败之后 30 秒内都不再起 CLI 进程。`CLAUDE_PREDEFINED_MODELS`（默认、Opus、Fable、Sonnet、Haiku，与 CLI 选择器一致，不含 1M 变体）只在运行时拿不到目录时用于强度校验。老会话和浏览器里存的 `opus[1m]`、`sonnet[1m]` 按基础条目对待：实测 2.1.303 的 `opus`、`sonnet`、`default` 本身就是 1M 上下文（`modelUsage.contextWindow` 为 1000000），所以前端 `findCatalogModelOption` 把保存的选择改写成 `opus` / `sonnet`、菜单勾选对应条目，运行时 `resolveClaudeEffort` 按基础条目校验强度（`ultracode` 也保留）；会话里记录的型号本身不改，CLI 照常接受 `opus[1m]`。完全不在目录里的型号（`opusplan`）放行 CLI 认得的五档强度，实测 CLI 对没有档位的型号传 `--effort` 照常运行。
+
+- 引擎专属协议设施（在各自目录内）：zcode 的协议客户端三件套 `zcode-protocol.client.ts`（单例 facade）= `zcode-codec.ts`（编解码）+ `zcode-engine-supervisor.ts`（子进程守护/崩溃熔断）+ `zcode-request-router.ts`（请求关联）；codex 的 `codex-app-server.client.ts`（JSON-RPC，**codex 的唯一对话传输**：`thread/start` / `thread/resume` / `turn/start` / `turn/interrupt` / `thread/fork`，这些请求产生的 item 通知流，以及反向的审批请求）。Codex 运行时开启 `features.defer_mailbox_preemption = true` 延缓 mailbox 抢占，避免子代理并发消息打断父会话推理；并在 `onNotification` 强制过滤非主会话 `threadId`，防止子代理事件流串线。
+- zcode 工具结果：实时事件的 `tool.updated`（旧名 `tool_call_scheduled`）在 `kind=result` 时直接携带 `result.content` 与 `result.success`，`kind=error` 携带 `error`。`ZCodeLiveEventNormalizer` 将它们与 `model_streaming` 的 `tool_result/tool_error` 共用一条转换路径，按原生 `toolCallId` 把输出或错误送回已有工具卡；空字符串是有效的成功输出。实时显示不依赖历史拉取或 SQLite 落库时序。没有内容的异常结果事件记录警告；失败事件即使没有错误正文也发送失败标记，只有索引的成功事件不生成结果正文。独立 `tool_result` 同时携带顶层和嵌套的错误标记，供前端配对与历史卡片使用；历史结果仍由持久化工具记录的 `state.output/state.error` 恢复。历史读取跑与 Claude/Codex 同一条 `prepareTranscriptMessages` 统一层：引擎把用户对 `AskUserQuestion` 的选择只写在结果的确认句里（`User has answered your questions: "问题"="回答".`），统一层按问题文本把回答折进调用的 `input.answers`，提问卡才能显示用户的选择；引擎写"用户未回答"的结果句子不含确认措辞，折出空表，卡片照常显示 Skipped。直播回合内卡片读不到折入的答案时，前端 ToolRenderer 渲染提问卡按同一形状兜底折叠（机制见 [chat.md](./chat.md)），回合内即显示用户的选择。
+- zcode 附件通道：上传描述符在 runtime 内映射为 `sendText` 命令的 `attachments` 项（`{ref, fileName, mime, bytes}`，ref 是绝对路径，引擎按 `mime` 把它读成本地图片、PDF 或文件；相对路径丢弃，缺 MIME 或大小时按未知大小的普通文件发），不走其余五家的 `<files_input>`/`<images_input>` 文本标签。
+- zcode 打断与发送走 `v4/command`（ZCode App 自己用的命令通道），不用旧的 `session/send` / `session/stop`。引擎 0.17 会把后台任务完成通知排进会话自己的输入队列，上一轮一结束就用它自动开新一轮；旧接口只认 `session/send` 开的轮次，旧 stop 停不了这种轮次，旧 send 的提示词会被它吞掉。打断发 `stop`，回执 `accepted` 或 `noop` 才记为已打断；引擎同步停轮，本轮 `resultType: cancelled` 的完成事件会先于回执到达，停止已发出时它记为打断而不是完成（停止失败则撤销）；消息还在被引擎受理时点停止，先等受理回执再停（最多 10 秒），否则停到的是被抢占的轮次；消息发出前就点了停止，消息不再发出。发送发 `sendText`，带 `requestedDelivery: 'startNow'`（抢占引擎自己开的轮次，网关保证同一会话不会有两个 cloudcli 运行，所以被抢占的只会是这种轮次）和 `heldQueueDisposition: 'keepQueueAndSend'`（队列里的通知留着之后送达），回执不是 `accepted` 就报错。例外是 cloudcli 建的会话在首条消息成功发出之前（`sessionsAwaitingFirstPrompt`，按引擎会话记录）：引擎只在旧 `session/send` 收到首条输入时才把新会话写库，之前发 `sendText` 会因外键约束失败，所以这一条仍走旧接口并带 `inputId`（全新会话没有后台任务，没有会抢消息的引擎轮次）。命令 ID（旧接口则是 `inputId`）就是这一轮的 `inputId`：运行从 `turn.started` 载荷的 `inputId` 认出自己的 `turnId`（`turn.completed` 也带 `inputId`），带 `turnId` 但不属于本轮的 `complete` / `error` 不结束运行也不转发；还没认领且不带 `inputId` 的终态推迟到本批输出处理完再判，那时回执已到仍未认领就算本轮提前失败，否则算被抢占的轮次；不带 `turnId` 的事件按"发出提示词后的第一个终态"处理。打断之后引擎仍可能马上用队列里的通知开新一轮，这是引擎行为，桌面端相同，下一条用户消息会抢占它。
+- zcode 发送链路：每 turn 的模型选择随 `sendText` 下发（`modelSelection` + `modelExecution`，均 optional——本地 `cli/config.json` 与 App native provider 配置都组不成完整选择时降级省略，由引擎默认模型执行，不阻断发送）；引擎所需的 personal provider registry 由服务端从 `cli/config.json` 物化为 `~/.zcode/cli/cloudcli-provider-config.json` 并随 spawn env 注入，环境继承的 `ZCODE_*_PROVIDER_CONFIG_FILE`（ZCode App 会话残留）一律剥离，注入以 cloudcli 的解析为权威。引擎进程的 `ZCODE_APP_VERSION` 取自引擎所在 App 安装包 `Info.plist` 的 `CFBundleShortVersionString`，每次启动重读；引擎用它生成模型请求的 `User-Agent` 和 `X-ZCode-App-Version`，不传时会退回引擎自身版本号（如 `0.17.1`），体验套餐网关对这种请求返回 405（业务码 3012）。引擎不在 App 安装包内（如 `CLOUDCLI_ZCODE_ENGINE` 覆盖路径、非 macOS）时不注入。
+- zcode 模型目录双来源：除 `cli/config.json` 的 `provider.*` 表外，还合并 ZCode App 设置页配置的 personal provider（`v2/provider_config.json`：模型顺序取 `modelOrder`∪`personalModelIds`∪手动条目；每模型启用 = 用户 `providerModelRules` 覆盖 → 引擎 builtin 配置 `templateModelRules` 的模板默认值（`readZCodeTemplateModelDefaults`，按文件 mtime+size 缓存），模板默认值不可得时宽松启用——菜单与 App 模型页一致，只列启用的子集；禁用 provider 与 `builtin:`/`account:`/`bigmodel-coding-plan` 保留行不列）。native 选项以 `providerName` 分组；推理档位也来自 builtin 配置（`modelRules[].modelMatch` 正则匹配 modelId、后匹配覆盖前匹配，`.*` 兜底排最前）的 `optionSpecs.reasoningLevel.values`：档位型进菜单（默认取最高档，实测 qwen3.8 为 low/medium/xhigh、App 的"极高"即 xhigh），纯 disabled/enabled 开关不进菜单；引擎对登记了 reasoningSpec 的模型强制要求 `options.reasoningLevel`（缺了报 `Reasoning level is required for <provider>/<model>`），所以发送缺省补档——用户选过则照选。裸模型 key 重名时 cli 条目优先，`resolveZCodeModelRef` 按同一顺序路由。native provider 发送只带 `modelSelection` + execution 范围标记，api-key 凭据留在交给引擎的 personal 配置文件里自取、不进发送参数；无 api-key 凭据的 native 条目降级为引擎默认。目录在 server 进程内只读一次且无失效入口，配置变更须重启服务端生效。
+- zcode 账号套餐：个人模型目录按白名单提取 `GLM-5.3` 和 `GLM-5.3-Flash`，选项用裸模型 id、无分组头，与 claude/antigravity 的扁平菜单一致。有当前账号匹配的个人项目登录材料或唯一且可解密的旧版个人套餐 API Key 时，裸 id 与旧会话保存的 `bigmodel-coding-plan`、`builtin:bigmodel-coding-plan` 引用在发送时都解析到 ZCode 原生 `account:bigmodel-individual-coding-plan` 并使用个人套餐凭证；同名自定义 provider 保持自身路由；没有账号登录材料时保留本地 provider 路径。新版登录材料存在但不完整或账号不匹配时拒绝发送，不回退本地旧 Key。有可解密的 `zcodejwttoken` 时，选择器在末尾追加写死的体验套餐模型 `account:bigmodel-start-plan/GLM-5.3-Flash`，界面标签为 `GLM-5.3-Flash（体验）`；不读套餐账务接口（权益清单映射不成可用模型），体验模型即为固定单条。`buildZCodeSendModelParams` 和 `interaction/requestProviderRuntimeHeaders` 为各账号套餐使用对应凭证：体验套餐用 JWT，旧版个人套餐用唯一 API Key（有旧 BigModel OAuth 时须匹配当前账号 ID；只有旧 OAuth 字段不能判定为新版，结合新版存储标记和 App 版本识别）；ZCode 3.18.2 的个人套餐由 runtime headers 桥接从当前 OAuth 账号匹配已保存的非团队 `project-key-location:v1` 项目，以业务登录凭证向固定 `https://bigmodel.cn` 的项目 `access_tokens` 接口换取短期模型令牌（`zcode-account-auth.ts`），不能将 OAuth 业务凭证直接当作模型 Key。发送参数只携带套餐选择，令牌在引擎请求时提供；只在内存按登录、项目和有效期缓存，提前刷新，并响应引擎拒绝的令牌指纹。换取前后核对账号，账号不符、项目缺失/不唯一、令牌禁用或接口拒绝均失败，不修改凭证文件、不自动创建项目或降级套餐；账号套餐缺少凭证时发送失败，不降级到引擎默认模型。回复底部的模型标签剥离 `account:`/`builtin:` 范围前缀，体验套餐的回答追加（体验）后缀以区分额度来源；会话回读把 start-plan 的 providerID 拼回完整模型引用，选择器才能按 value 高亮体验选项。引擎启动时账号类 provider 默认未授权；`ZCodeProtocolClient` 根据凭证同步可用套餐的 entitlement，并按 ZCode App 的原生形状为体验套餐附带 `builtinModelIds`（`GLM-5.3-Flash`、`GLM-5.3`）——引擎注册表从该字段取账号 provider 的模型清单，缺了它静态 builtin 表未列的模型（体验套餐的 `GLM-5.3`）会被引擎拒绝或静默回落默认模型。进程重启后重新同步。恢复会话时，本次选择与引擎保存的选择不一致就同步会话模型，供子代理继承。多份个人套餐 Key 无法确定账号时，不自动选择其中一份。
+- 运行期统一分发：`services/provider-runtime.service.ts`（`providerRuntimeService`：`run` / `abort` / `injectInput` / `getRunner` / `resolveToolApproval` / `getPendingApprovalsForSession` / `backgroundWorkQueuesInput` / `canInterruptBackgroundWork`）。常驻引擎的会话生命周期切面（`getSessionActivity` / `hasSessionWork` / `closeSessionAdmission` / `releaseSession` / `openSessionAdmission`）由各 runtime 自行实现，网关只通过 `IProviderRuntime` 的可选成员调用。
+
+## OpenCode 服务客户端（v2）
+
+opencode 的对话不走一次性子进程，而是连一个 cloudcli 自养的常驻服务（官方 `run --standalone` 同款配方，针对 v2.0.31 实测钉契约）。各构件在 `list/opencode/` 下：
+
+- `opencode-service.ts`：监管器，懒启动 `opencode serve --stdio --port 0`，随机密码经 `OPENCODE_PASSWORD` 传入、Basic 认证（账号固定 `opencode`）；就绪行是 stdout 上的 `{"url":…}`；**stdin 就是所有权租约**——cloudcli 退出服务随之退场，崩溃退避重启。v1 引擎在聊天时报错（历史读取的双格式兼容不受影响）。
+- `opencode-api.client.ts`：会话创建（`location.directory` 锚定项目目录）、模型/角色/权限规则切换、prompt、压缩请求（`POST /api/session/:id/compact`，v2.0.32）、interrupt、权限与表单答复，以及两个挂起列表读取（`GET /api/session/:id/form`、`/permission`，供丢事件后的兜底重读）。模型引用是对象 `{providerID, id, variant}`（variant 即推理力度，`provider/model#effort` 解析）。
+- `opencode-event-stream.ts`：一条全局 `GET /api/event` SSE，按 `data.sessionID` 分发；每次（重）连都重新解析端点，跟随重启换端口的服务；断线退避重连并广播重连事件。服务端的契约是 **volatile**（消费太慢会被踢、断流期间事件丢失），所以每次断流都按失败段记一条告警（干净断开也算，过去是静默重连），重连后 runtime 既对账 run 终态、也重读挂起询问。
+- `opencode-event-translator.ts`：会话事件 → 时间线帧（text.delta→stream_delta、reasoning.delta→同 id thinking、tool.*→tool_use/tool_result、execution.*→运行终态）。assistant 正文帧另带 `providerRowKey`（`opencode-part:${消息id}_text_${序号}`，序号取事件自带的正文段序号；与历史行同一推导，见身份表），否则流式气泡没有可被持久化行认领的身份。事件词表钉在测试夹具里，未知事件类型忽略，防版本漂移。
+- `opencode-interaction-bridge.ts`：`permission.asked` → 权限卡（Allow/记住/拒绝 → `once`/`always`/`reject`）；`form.created`（question 表单）→ `AskUserQuestion` 卡（服务的 `multiselect` 翻译成面板的 `multiSelect`；答复按问题文本映射回 `q0/q1` 字段键，多选按 `", "` 拆分——选项文案含该序列是已知边界）。跳过/拒绝=取消表单并附留言，模型继续而非整步作废。**Web 搜索门自动应答**：`form.created`（`metadata.kind: "websearch.provider"`，会话首次搜索前的 provider 选择门）不渲染成卡片，由 bridge 直接回 `allow`，引擎据此写入"随机可用 provider"默认值，后续搜索不再询问；这道门只是选 provider，真正的搜索许可仍由同一次调用的 `permission.asked` 卡把关，不答则引擎 1 分钟后取消表单、工具以 `Web search cancelled` 失败（旧版本的现象）。字段形状对不上（没有 `allow` 选项、缺 `choice`）时只告警并保持忽略，不盲答；已答过的表单 id 有界记忆，兜底重读不会重复答复。**兜底重读**：`adoptPending(sessionId, {forms, permissions})` 把服务仍持有、而 bridge 没有卡片的询问补发成同样的卡片——事件流断流期间丢掉的 `permission.asked`/`form.created` 只存在于服务内存，没有它模型会一直等一张看不到的卡；按 requestId 幂等，由 runtime 在事件流重连后（每个活跃 run）与 `chat.subscribe`（处理中的会话）调用。**卡片上溯**：事件来自子代理会话时经 `opencode-subagent-index.ts` 归到父会话的卡片流与 `pendingPermissions` 回放（同一条 run 的 writer），答复仍发往子会话 id（`POST /api/session/<child>/permission|form/...`），卡片的 `sessionId` 是父 app 会话。
+- `opencode-session-settings.ts`：权限模式映射——`plan`→只读 plan 角色+全部变更类 ask 规则；`acceptEdits`→仅 shell ask；`bypassPermissions`→无规则（引擎默认全放行）；`default`→全部变更类 ask。**引擎默认角色本身全放行，权限卡完全靠这些 ask 规则出现**；已应用的切换按会话缓存，避免每次发消息重复下发（切 plan 会附带一条系统提醒）。
+- `opencode-run-registry.ts`：活跃运行登记、事件分发、首结算生效；断线重连后按 `GET /api/session/:id` 的 `outcome`/`time.idle` 对账，补上错过的终态，避免会话卡在"处理中"。`OpenCodeTokenBudgetTracker` 消费 `session.step.ended` 的 per-step `tokens` 发回合中 `token_budget` 帧（1.5s 节流 + 值去重）；tracker 挂在各自的 run 上（`run.budgetTracker`），并发会话不共享窗口与节流状态；该接口的 `tokens` 是会话累计花费，不能当窗口占用用，权威占用读数走 `opencode.db` 的 `opencode-context-usage.ts`。登记时声明 run 的 `purpose`（`chat` / `compact`）：`session.compaction.failed` 只结算主动压缩的那个 run，普通回合里的自动压缩失败不影响该回合。**子会话事件的归属**：`opencode-subagent-index.ts` 从 `session.created`（子会话自带 `parentID`/`agent`/`title`，title 即启动时的 `description`）和父会话工具块的 `metadata.sessionID` 两条信号把子会话链回父 run 与启动调用；registry 据此把子会话帧盖 `parentToolUseId` 后写进父 run 的 writer（启动调用未定位前先入队，不裸奔到顶层），子会话自己的 step 占用与终态不结算父 run，只有属性是父 run 的 `tool_use` 行在时间线里聚成子代理卡。**后台子会话的存活提示**：registry 同时记录每个 app 会话仍在跑的子会话，发 `status(background_tasks)` 帧（`backgroundWorkPending` + `backgroundTasks`）让 composer 的紫色"后台工作"药丸在父回合 `complete` 后继续显示，子会话终态再发空列表清掉；runtime 暴露 `backgroundTasks.list/isPending`、`listBackgroundWork` 与 `stopBackgroundTask`，因此 `chat_subscribed` 回放、`/sessions/running` 轮询和完成 run 的保留判断都能看到这份清单；任务条条目的 `id` 取启动调用（`toolUseId`，未定位前退回子会话 id），与转录卡片的锚点、`chat.stop-task` 按 toolUseId 的匹配是同一身份，所以条纹一行同时能定位卡片和单独停止该任务。父回合结束后 writer 与 bridge 会一直保留到最后一个子会话结束：30 分钟到点先向子会话行复核（`GET /api/session/:id` 的 `outcome`/`time.idle`，判据同断线对账的 `idleAt >= startedAt`）——已 settle 的按该 outcome 发一条 `task_status` 让卡片立即收尾并清掉跟踪，仍在跑的续期保留（所以后台子代理里迟到的 `permission.asked`/`form.created` 仍能弹出并答复），读不到行或服务不在的按原兜底丢弃；每次清掉跟踪（包括 opencode 服务退出时的 `settleAll`）都会广播 `background_tasks` 空列表，免得页面挂着过期的"运行中"；事件流断线重连的对账也会复核后台子会话（判据同上，读不到行的留给定时复核）。总持有上限 6 小时兜住"会话行永远停在跑到一半"（引擎已死）的情况。同一套 30 分钟复核与 6 小时上限也覆盖后台命令：判据是 `GET /api/shell/:id`（按启动目录作用域），404 或已结束按状态结算，仍报 running 就续期。**后台命令的停止**：`DELETE /api/shell/:id`（同样带目录作用域），404 视为已结束；成功即本地结算并发 `task_status stopped`，不依赖引擎的终止通知。
+- **OpenCode 后台命令**：`shell` 调用带 `background: true` 时立即返回，metadata 仍是 `running` 并带 `shellID`；翻译器据此发 `task_status started`，registry 按 shell id 登记并广播任务条，卡片保持运行。命令结束时引擎在父会话投递 `session.inbox.enqueued`（`item.type: "synthetic"`，`payload.metadata: { source: "shell", shellID, state }`），registry 结算该条、更新卡片并清空任务条。停止走 `DELETE /api/shell/:id`，任务条条目带 `taskId`（shell id），与子代理一样可单独停；`backgroundTasks.canInterrupt` 仍只在有后台 agent 时为 true（那是打断回合的语义，不是逐条停止）。与子会话不同，命令不持有父 run：父回合照常 `complete`，引擎随后自发的汇报回合由 adopter 认领；`backgroundTasks.queuesInput` 为 false，后台命令在跑时新消息直接进入服务 inbox。
+- **引擎自发续跑的收养**：后台子代理完成时，引擎会给已空闲的会话投一条合成消息并**自行续跑**——cloudcli 侧没有任何客户端提示词、也没有 run 登记，这段执行的帧、权限/提问卡与终态原本全部丢失（`question` 卡连实时都到不了 UI，刷新也无可回放；表单答复只能由拥有它的服务实例回答）。现在事件流上出现「只可能发生在执行中」的事件（`ADOPTABLE_EVENT_TYPES`：`session.execution.started`、`session.*.delta/called/success/failed`、`form.created`、`permission.asked`、`session.inbox.delivered` 等）且该会话没有活跃 run 时，runtime 经组合根注入的 adopter（`server/index.ts` 调 `chatRunRegistry.adoptExternalRun`，与 `setRetentionGuard` 同一接线方式）开一个 `connection: null` 的网关 run（与定时消息同一条无附着通道）：帧照常翻译转发、bridge 挂载后交互卡进入既有卡片与 `pendingPermissions` 回放、`session.execution.*` 终态照常发 `complete`（seq/5 分钟保留/RunOutcome 全链路不变），`chat.subscribe` 记下的空闲订阅者会被挂上该 run 的 writer（开着的页面无需刷新即可看到续跑与卡片）。会话映射解不出的引擎侧会话（子代理、CLI 直开）不被收养；`session.inbox.enqueued` 等执行之外也会出现的事件故意不做触发，避免给空闲会话挂上永远等不到终态的幽灵 run。表单本身是服务实例内存态（`GET /api/session/:id/form` 可列出、按 `q0…` 字段键答复；契约探针 `scripts/probe/opencode-form-probe.mjs`），实例更换后引擎把悬空工具自动置为 interrupted，会话照常继续。这份内存态也是漏事件的唯一补救：断流期间丢掉的 ask 由 bridge 的兜底重读补发（见上文 bridge 一条）。
+- 附件：data-URI 文件块随 prompt 下发（模型真正看到内容），同时保留 `<images_input>`/`<files_input>` 路径标签供历史回读还原。
+- 历史、会话索引、模型目录、登录检测不变：仍读 `opencode.db`（双格式）与 CLI 探测（模型显示名与推理档位取自 `kv` 表缓存的 models.dev 目录：v2.2 起键名 `models-dev:v2:catalog`、档位在 `capabilities.reasoning.effort`，旧键 `models-dev:catalog` 的 `reasoning_options` 作回退）；v2 的 `compaction` 消息行（v2.0.32 把压缩写在会话旁而非 assistant 消息里）渲染成"压缩行 + 摘要行"（`isCompactSummary`）。子代理历史：父转录的 `subagent`/`task` 工具块按 `state.metadata.sessionID` 找到子会话行（`parent_id`），把子会话自身的消息翻成 `subagentTools` 时间线（assistant 正文/reasoning/工具，工具结果优先读 v2 的 `state.content`），agent 名取自子会话 `agent`、状态以子会话最近一次 settle 为准——`idle_outcome`/`time_idle` 只在会话行没有比 idle 标记更新的写入时可信（被再次唤醒、仍在中途的子会话还戴着上一轮的 idle 标记，直读会把工作中的子代理误报成已完成），后台启动的父块 `metadata.status` 永远是 running；子会话不进侧边栏索引（同步器照旧剪枝）。**卡名映射**：引擎的 `question` 在实时与历史两条路径都改写成共享提问卡的 `AskUserQuestion`（输入把 `multiple` 折成 `multiSelect`，答案取自 `state.metadata`），`subagent`/`task` 同理收成 `Agent` 卡。契约探针：`scripts/probe/opencode-subagent-probe.mjs`。
+- `opencode-context-usage.ts`：上下文占用读取器（bridge 的 `step.ended` 令牌经 `OpenCodeTokenBudgetTracker` 变成实时 `token_budget` 帧；`/token-usage`、历史页与回合结束帧共用同一读数），语义与 v1/v2 布局差异见上方用量表。
+- **消息编辑与 fork**（服务端原语，v2.1.4 探针 `scripts/probe/opencode-revert-fork-probe.mjs`）：历史里每条用户行带 `transcriptAnchorId = msg_…`；`readOpenCodeConversationOrder`（`opencode-data-root.ts`）给出只含 user/assistant 的消息序，跳过 v2 的 `model-switched`/`system`/`idle` 等簿记行——切点落在簿记行上会把一个回合劈开。编辑走 `rewindSession`：在保留点之后的第一条用户消息处 `revert/stage {files:true}` + `revert/commit`（删行并按引擎快照还原这些回合改过的文件，故 `editRevertsFiles: true`；快照只存在于 git 仓库内，非 git 目录只回退对话），provider 会话 id 不变，替换 prompt 是普通续写；未知保留点直接 404，绝不退化成"全部丢弃"。fork（`opencode-fork.provider.ts`）用 `POST /fork {before}`，该切点**不含** `before`，所以传锚点回合之后的第一条用户消息，得到含锚点整回合的副本（与 codex 一致）；副本无 `parent_id`，同步器不会当子会话剪掉。两者与 runtime 共用 `opencodeServiceSupervisor` 单例（`connectOpenCodeApiClient`），不会另起一个 `serve`。
+- **旁问（side question）**：`askSideQuestion` 在会话的只读 fork 上回答问题（`opencode-side-question.ts`）：先给 fork 下发 `shell`/`edit`/`write`/`patch` 的 deny 规则，再用一条独立的 `/api/event` 连接只订阅该 fork，答完即删除 fork，不在引擎里留下副本。失败一律以 error outcome 返回，从不抛出；从未运行过的会话直接给出错误说明。上游 #1673 的入口，运行时切面已接。
+- **引擎标题**：`session.renamed` 事件经 `opencode-engine-renames.ts` 写回 app 会话行并广播 `session_upserted`；用户手动改过的名字是终态，引擎后续改名不覆盖。每轮的引擎事件时间戳同时记录在重命名状态里，用于判断引擎行和 app 行谁更新。
+- **相对旧实现的缺口（待移植）**：空交付自动重试、回合中途插话（`injectInput`）。子代理卡片与审批桥上溯父会话已补（历史见上，实时见 registry / bridge 两条）。配额卡片已移植（`opencode-quota.provider.ts`）；`/compact` 已随服务客户端恢复（见上方「`/compact` 的引擎实现」）。
+
+
+## 会话索引准入：哪些工作区能变成项目
+
+引擎各自记录会话的工作目录，同步器据此建项目行。判定统一走 `shared/sessions/workspace-admission.ts` 的 `admitsWorkspacePath`——六家引擎的同步器（SQLite 骨架一处 + claude / codex / cursor 各一处）都必须调用它，**新引擎接入时这是第 2 步的一部分**。三条拒绝规则：
+
+1. **包管理器与运行时内部**：路径含 `node_modules` 或 pnpm 的 `.pnpm` 段（`server/shared/utils.ts` 的 `isInfrastructureWorkspacePath`）。
+2. **已消失且从未登记过的目录**：引擎在事后被系统回收的目录里跑过一次，就会长期把该目录记为工作区，这类行每次重扫都会复活成同一批空项目。
+3. **系统临时目录之内（含根本身）**：`$TMPDIR`、`/tmp` 这类是运行期暂存区，引擎驱动的沙箱跑批（任务评审、测试夹具）会把工作目录记在这里，收进侧边栏只会是噪音（`server/shared/utils.ts` 的 `isSystemTemporaryWorkspacePath`；macOS 上每个根同时按 `/var/folders/...` 与 `/private/var/folders/...` 两种写法比对，因为引擎记录的是符号链接还原后的写法）。被挡的只是 CloudCLI 自己的项目行，会话本体与引擎侧记录不受影响；聊天里打开临时目录下的文件走 `file:` 链接白名单，与本项目准入无关。
+
+"已登记过"这一半对第 2 条同样不能省：外置盘或网络卷没挂载时目录暂时不存在，但项目行已在，会话照常更新。准入失败只阻止**新建**项目，永不删除既有数据；已经入库的临时目录项目行由项目列表的同一判断过滤隐藏（`projects-with-sessions-fetch.service.ts`），数据保留在库中。
+
+引擎解析不出工作区时同步器返回 `null` 跳过该行，不拿服务端自己的 cwd 顶替——那只会把会话记到服务恰好启动的目录名下。
+
+## 会话工作树认亲：改绑进工作树的会话挂回主仓项目
+
+项目以目录路径为键，git 仓库归属对它不可见。引擎会把进行中的会话改绑到自己建的工作树（opencode v2 的工作树功能：引擎中途把会话记录里的目录改写为工作树路径；zcode 走同一通道，引擎侧尚无此功能），纯目录键控的索引随之把会话记成一个以工作树目录命名的新项目——对用户表现为会话"跳槽"成了独立项目。
+
+`shared/sessions/session-worktree-placement.ts` 的 `applySessionWorktreePlacement` 在六个同步器入库前统一改判（与 `admitsWorkspacePath` 同一套约定，新引擎接入同样必接）：目录是某个**已注册且在役**项目主仓的关联工作树时，会话挂回主仓项目，工作树路径与分支记入 `sessions.worktree_path`/`worktree_branch`，工作区头部副标题以「项目 · 分支」标注。两条例外保持现状：工作树目录已有正式命名的项目行（工作树面板「打开为项目」写入「仓 · 分支」格式）时会话留在该独立项目；主仓未注册或已归档时不动。git 归属查询在 worktrees 模块（`resolveWorktreeHome`，`git worktree list --porcelain`，按目录 30 秒正负缓存；软链路径与 git 还原路径不一致时不认亲，安全降级为现状）。解析器经 `server/index.ts` 组装根注入 placement——placement 静态引 worktrees barrel 会经 projects→providers 的既有依赖闭合模块初始化环。
+
+会话搬离后空掉的项目行由落库层收尾：`sessions.db.ts` 的孤儿归档只处理「自定义名等于目录名（即自动注册的默认名）且零活跃会话」的行，正式命名的项目永不自动归档，归档可逆。
+
+## 会话目录等价归并：同一目录的另一种写法不裂新项目
+
+项目以路径字符串为键，而引擎可能把同一目录记成另一种写法：claude CLI ≥ 2.1.327 启动时解析软链，把用户经 `/Users/azrael/workspaces/X` 打开的项目录成物理路径 `/Volumes/.../X`，纯字符串键控随之出现同名双项目（实证 2026-11-18 DuskBastion：41+2 会话 vs 2 会话），且之后每个项目都会随新版 CLI 裂一份。
+
+`shared/sessions/session-project-path-canonicalization.ts` 的 `canonicalizeSessionProjectPath` 在六个同步器解析出会话目录后、准入判断前统一改判（与前两条同一套约定，新引擎接入同样必接）：目录的 realpath 等于某个**非归档**注册项目的 realpath 时，会话按该项目的存储写法入库；等价者不止一个（双胞胎状态）时会话数多的胜出，重扫因此向重的一侧排空，清空后的影子行走既有孤儿归档。归并只做**精确等价**（realpath 相同），不做前缀包含——子目录会话与工作树会话各归各的策略管，这里不改变任何合法的"不同目录各建项目"行为。全新目录、解析不出 realpath 的路径、无等价注册项目：一律按引擎上报写法原样入库，项目形成行为与从前一致。realpath 失败与常规路径（realpath 等于自身且无歧义时也要查注册表——项目可能注册在任一写法下）都走注册表扫描，项目表很小，单次代价是一个 SELECT 加每行一次 realpath。
+
+## 会话标题：跟随引擎命名与改名锁
+
+会话名存在 `sessions.custom_name`，API 与推送一律以 `summary` 下发。各家引擎自己会给会话起智能标题（claude 的 `ai-title`/`custom-title`、codex 索引里的 `thread_name`、zcode / opencode / antigravity 共享库的 `title` 列），同步器每次扫描都能读到它；但读到的不一定落库，裁决统一走 `shared/sessions/session-title-resolution.ts`：上锁的行永远用用户的名；未锁的行跟随引擎生成的标题（即使覆盖掉之前同步来的名）；内容派生名（claude 的 `last-prompt`、opencode 的首条消息兜底、cursor 的首条消息）只在「无名 / 占位名」时补位，绝不追着跑——否则标题会随每轮对话漂移。
+
+用户在应用内改名（侧边栏铅笔、标题双击，经 `renameSessionById`）时该行置 `name_locked=1`：落库层 upsert 从此不再动这个名，任何同步器都覆盖不了。fork 时用户手填的标题同样上锁，自动拼的「(fork)」名不上。应用新建会话的初始名取首条消息的第一句（无句读则取首行，40 字封顶；中文不分词，旧的「前 4 个词」规则对中文等于整条消息），这个名不上锁，引擎标题生成后即被替换。升级时已存在的行一律不锁——旧版没记「是否用户改过」、无法区分，其中升级前手动改过的名会在引擎下次换标题时被覆盖，此后在应用内改的名才受锁保护。三处引擎侧细节：codex 每次给会话改名都向 `session_index.jsonl` 追加一条新记录，读取必须取「每个 id 的最后一条」；zcode 的标题列初始存的是用户原话（`title_source='first_input'`），只有 `generated` 与引擎侧改名 `custom` 才算引擎命名，老库没有该列时一律按内容派生处理；其生成标题会更新 `time_title_updated`，行时间戳要并入该列，否则增量游标会漏掉「只改了标题、消息活动没动」的行（并入后仅改标题也会把会话顶上最近列表，属预期）。cursor 是唯一没有引擎标题的一家，维持首条消息派生命名的现状。
+
+claude 的 `ai-title` 由引擎在 SDK 模式下自己生成，但每个进程只试一次：只看本进程收到的第一条消息，斜杠命令跳过；进程是续接（`resume`）起来的、读进的记录里已有对话，就直接不试。CloudCLI 每轮基本都是续接新进程，所以首条消息是 `/archify ...` 这类命令、或首轮那一次生成失败的会话，以后永远拿不到标题，侧边栏只能停在 `last-prompt`。`claude-runtime.provider.ts` 因此在每轮的 `system/init` 上调 SDK 的 `generateSessionTitle(本轮提示词, { persist: true })`：引擎已有标题（`custom-title` 或 `ai-title`）就原样返回、不调模型；否则生成并写进 transcript，由同步器按上面的规则落库。引擎拒绝拿斜杠命令起名，所以本轮是 `/archify 生成一下 core 的整体架构图` 这种带参数的命令时，只把参数部分交给引擎；不带参数的命令（`/compact`）不请求。判断是不是命令照引擎自己的规则：去掉开头空白后以 `/` 开头，且后面的名字出现在本进程 `system/init` 的 `slash_commands` 清单里；`/tmp 里面的日志`、绝对路径这类不在清单里的原样交给引擎。进程没报清单时一律原样交，由引擎判断。首轮新会话里引擎自己的那次生成和这次调用共用同一个请求，不会生成两次。同一进程同时只挂一个请求，拿到标题后不再请求；进程在标题回来前退出会把请求断掉，下一轮再试。代价：续接时引擎拿本轮这一句起名，如果这一句只是「继续」这类短话，标题就会很空泛，且之后不再改。
+
+opencode 的自动命名由引擎自己做，CloudCLI 只负责不挡路。引擎只在会话还带默认占位名时才生成标题，所以建会话时**不能传标题**（`opencode-runtime.provider.ts` 省略 `title`）——传了就把占位占满，标题永远停在首句。引擎起好名后从事件流发 `session.renamed`（事件时间就是它写进 `session_v2.time_updated` 的值）；runtime 收到后把名字写进 `sessions.custom_name`（`name_locked=1` 的行不写，用户的名字是终局），并以「仅元数据」推送下发，让前端只改名字。写名字不动行的活跃时间：改名不是用户在对话里做的事，不该把会话挪到按活跃排序的列表前面。引擎自己那次写库随后会被扫描看到，所以 runtime 把已应用的状态记在 `opencode-engine-renames.ts`（引擎会话 id 对引擎时间戳），扫描据此跳过这行，不把同一次改名再当内容变化播一遍——否则客户端会重读消息、给后台会话打待看标记。只有「应用没落后」时才记：引擎把每个会话级事件都记进行时间戳，应用若还有没同步的事件，扫描就仍有东西要播（那一次改名跟着一起播，消息不会漏），所以 runtime 同时记住引擎最近一次会话事件的时间，和应用上次同步的时间相比。引擎还没起名时 `session_v2.title` 是 NULL，扫描退回首条用户消息作占位；引擎的兜底名 `New session - <建会话时间>` 精确命中时同样按占位处理，只认这一个格式，同前缀的真实标题照常算引擎命名。
+
+## 引擎自有数据根
+
+| 引擎 | 数据根 | 会话产物 |
+| --- | --- | --- |
+| claude | `~/.claude` | `projects/**/*.jsonl`；`projects/` 作为聊天引用文件的只读根暴露给 file-tree，凭据与设置所在的上层目录不暴露 |
+| codex | `~/.codex` | `sessions/**/*.jsonl` |
+| cursor | `~/.cursor` | `projects/**/*.jsonl` + `store.db` |
+| opencode | `~/.local/share/opencode` | `opencode.db`（共享 SQLite，`jsonl_path` 存 null） |
+| zcode | `~/.zcode`（`zcode-data-root.ts`） | 引擎自有会话存储 |
+| antigravity | `~/.gemini/antigravity-cli`（`antigravity-data-root.ts`） | `~/.gemini/cloudcli-acp` 为已停用的托管目录（2026-11-22 前的 ACP 会话，只读保留）；其与旧版 `~/.gemini/antigravity/brain` 的 brain 目录均供文件树只读访问 |
+
+**fork 的两种存储形态决定读法**（`fork` 切面在即能力在，缺省即无 fork 入口）。codex 与 opencode 的 fork 是真复制：新会话名下就有全部行，读法与普通会话无异；opencode 的切点参数 `before` 是排除语义，facet 负责换算成"锚点后一条消息"。zcode 的 fork 是引用：`session/fork` 的新会话在 `session` 表以 `parent_id` 链回父会话，自身只存 fork 之后的行和一条 fork 通知（截断边界记在通知的 `forkContext.targetMessageId`），引擎自己的 `session/messages` RPC 同样不解析链——所以 `fetchHistory` 必须沿 `parent_id` 递归拼接祖先行、按边界（含边界消息）截断再接上自己的行（`selectResolvedHistoryRows`）。fork 前会话须先 `session/resume` 激活；运行中的回合被引擎拒绝。两家历史读取都为真实 user 提示发射 `transcriptAnchorId`（= 该回合最后一条消息的引擎 id），fork 入口据此保住提示与其回答；antigravity 的 `/fork` 被引擎挡在交互模式内，无头不可用。旁问（`askSideQuestion`）建立在同一 fork 机制上：claude 优先把旁问写进驻留进程的原生 stdin（不落盘、不打断在跑回合），引擎不接时回落 SDK 只读 fork 副本；codex 用一次性 off-disk fork，opencode 在 fork 副本上 deny 全部变更动作（denied 动作的工具直接从工具集消失）后提问，走私有 `/api/event` SSE 流收答，答完删除副本。
+
+## 会话存储清理
+
+`sessions-storage-cleanup.service.ts` 定期清理已归档、未置顶、长期不活动的会话，默认关闭。有运行中任务、排队消息或定时消息的会话不进候选，`updated_at` 无法解析的也不进。手动清理在后台执行：`POST .../run` 校验后立即返回 202，界面轮询 `GET .../settings` 的 `running` 直到结束，避免长任务撞上反向代理超时。引擎通过 `sessions` 切面的四个可选方法接入：
+
+- `cleanupSessionArtifacts`：删除能重建的数据。历史和继续对话必须不受影响。目前只有 ZCode 实现，范围是 `image-cache` 和 `exec`。ZCode 的 `artifacts` 不能动：引擎恢复历史时要读，rewind 快照和附件也存在同样的文件名下。
+- `purgeSessions`：由引擎负责永久删除，只有回报 `deleted` 的会话才删除应用行。ZCode 用 `v4/storage/sessionData/purge`，它处理子会话树，跳过运行中和被其他会话引用产物的会话。它的引用检查会同步扫描 `part` 表，所以一轮只调用一次，一批最多 200 个。没有实现的引擎走现有的强制删除路径。
+- `measureSessionStorage`：预览时统计永久删除能释放的空间。
+- `listStorageRoots`：引擎保存会话数据的路径。上传文件只有在所有引擎的路径和 `auth.db` 里都没出现时才删除，所以新增引擎必须实现，缺了会跳过上传清理。
+
+## 新增一个引擎：六步清单
+
+1. **类型**：`shared/protocol/chatEvents.ts` 扩展 `LLMProvider` 联合类型（全仓类型联动会指出所有必改点）。**只需改这一处**——前后端都从这里 re-export。
+2. **目录**：新建 `server/modules/providers/list/<name>/`，尽量复用基类（`AbstractProvider` / `McpProvider` / `SkillsProvider` / `SqliteSessionSynchronizer` / `cli-engine-path`），写 `<name>.provider.ts` 组装七切面。
+3. **注册**：`provider.registry.ts` 的 `providers` 记录加一行（漏了编译报错）。同步器声明 `getSessionWatchTarget()` 后，`sessions-watcher.service.ts` 自动纳管，**不需要改 watcher**。
+4. **能力**：`services/provider-capabilities.catalog.ts` 的 `PROVIDER_CATALOG` 补静态目录（权限模式、默认模型、images/files/abort/effort）；可选能力靠切面自动推导（要报账号配额就给 auth 切面加 `getQuota`，并在载荷里声明 `partitioning`）。同步更新前端镜像 `src/shared/providerCatalogFallback.ts`（parity 测试会强制）。
+5. **接线**：需要被 agent/git 等模块直接拿 runner 时，在 `server/index.ts` 用 `providerRuntimeService.getRunner(...)` 注入；需要登录流则更新 `src/modules/provider-auth/ProviderLoginModal.tsx`。
+6. **前端外观**：`src/shared/ui/LLMProviderLogo.tsx` 加 Logo、`src/shared/providerDisplay.ts` 加显示名。composer 无需改动——它按能力矩阵渲染。
+
+改完跑：`npm run typecheck && npm run lint && npm test`（provider 相关测试在 `server/modules/providers/tests/`）。
+
+## 能力矩阵：声明优于分支
+
+`provider-capabilities.catalog.ts` 放**推导不出来的静态事实**（权限模式、默认模型、附件/中止/effort）；
+`provider-capabilities.service.ts` 从**已注册切面推导**其余能力——切面在即能力在，加减切面自动翻转，不必改表。
+`supportsQuota` 就是这样推导的：`auth.getQuota` 存在即为真，而 `provider-token-usage.service.ts`
+本来就按这个方法分发配额请求；`supportsQuotaReset`（能否花掉重置卡）同理，看 `auth.consumeQuotaReset`。
+
+前端**不得**用引擎名判断某家能不能做某事，一律读矩阵。这不是洁癖：
+配额分组判定曾把 `getProviderLabel()` 的显示名（`'Codex'`）拿去和引擎 id（`'codex'`）比较，
+永远为假，于是 reserve 桶的甄别逻辑在线上从未生效，而单测因为直接传 id 一直是绿的。
+
+同理，**配额载荷自述分组形态**（`partitioning: 'model-family' | 'bucket'`），
+由各家配额适配器声明，前端不再记忆哪家是哪样。新增一家配额引擎只需给它的 auth 切面加 `getQuota`
+并声明 `partitioning`，前端一行都不用改。
+
+周窗口按模型族细分时，适配器在桶上标可选 `modelScope`（Claude 的 Opus / Sonnet / Fable），
+全模型窗口不带。前端据此显示“周配额（Fable）”；同一组里存在单模型窗口时，全模型窗口显示
+“周配额（所有模型）”，与 Claude 官方 `/usage` 的 `Current week (all models)` / `Current week (Fable)` 对齐。
+
+**配额的数据源各家不同，但都收在 auth 切面背后**：codex 起一次 `app-server` 走
+`account/rateLimits/read`，zcode 直接打 BigModel / Z.AI 的 HTTP 端点，鉴权优先取当前
+活跃 OAuth 会话的平台凭据（`zai_cn` 登录关联的 `oauth:linked_bigmodel` 令牌，或
+`oauth:bigmodel:access_token` / `oauth:zai:access_token`），无会话令牌时回退唯一一条
+编码套餐 `api-key`；凭据放入 `authorization` 头（无 Bearer 前缀），再按 `customerId`
+配对 `project-key-location` 凭据项附上可选的 `bigmodel-organization` /
+`bigmodel-project` 作用域头（带错作用域头会掏空返回，缺失就整头不发）；监控端点对鉴权失败回 HTTP 200 + body 非
+成功码，zcode 适配器先验信封再解析，任何一层拒绝一律降级为"无配额"。ZCode MCP 调用次数单独走
+zcode 网关 `zcode.z.ai/api/v1/mcp/usage`（信封 `code: 0`），鉴权是双头——`Authorization: Bearer
+<zcodejwttoken>` + `X-Bigmodel-Authorization: Bearer <编码套餐凭据>`；monitor 的 TIME_LIMIT 桶是
+工具调用次数（老套餐无周限额，不显示周行）。体验套餐余额单独成组走
+`zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=<桌面版号>`（信封 `code: 0`，
+鉴权 `Authorization: Bearer <zcodejwttoken>`，且网关**必须**带 `X-Device-Mid` 设备 UUID 头——
+来自 `onboarding-record.json`，缺了报 3001 parameter error），额度耗尽也照常成组显示。
+claude 直连 `/api/oauth/usage?cedar_ember=1`（本地 OAuth token + CLI User-Agent + 代理），
+一次取回窗口和 reset 卡；直连失败时退回 Agent SDK 的 control request，由它刷新 token
+并照常返回窗口。
+opencode 打 Go 套餐的内部端点 `/zen/go/v1/usage`（官方文档未列，随 CLI 版本可能变动），
+凭证先取 CLI 共享库 `credential` 表的 `opencode-go` API key（v1 `auth.json` 仅作回退），
+再回退 `opencode` 控制台 OAuth 行（必须有工作区 id）；key 已绑定工作区，只有 OAuth 才附带 org 头。
+令牌续期归 CLI 管，403/401/超时一律降级为"无配额"。
+各家都要拉起进程或走网络，因此统一用 `createProviderQuotaCache`（TTL 两分钟）挡在前面，
+`?refresh=true` 才穿透。claude 那条路额外有一点要守住：喂给 SDK 的输入流一条消息都不产出，
+CLI 只是挂着等输入，既不会落 transcript，也不会消耗它正在汇报的额度。
+
+**zcode 凭据解密**：`~/.zcode/v2/credentials.json` 的值有 `enc:v1`（key 可由主机环境或
+`ZCODE_CREDENTIAL_SECRET` 推导）与 `enc:v2` 两代——`enc:v2:<来源>:<sha256指纹24位>:<载荷>`，
+随机 32 字节 key 存 macOS 钥匙串（服务名 `ZCode Credential Encryption`），指纹用于验钥。
+无 GUI 的服务端读不到钥匙串，改读凭据旁的 `credential-secret` 落钥文件：在 GUI 会话跑
+`scripts/zcode-stage-credential-key.mjs` 生成，桌面端重新登录后 key 可能轮换，需重跑。
+`oauth:linked_bigmodel` 与当前 `user_info` 的用户 id 不一致时拒绝使用；回退编码套餐
+`api-key` 时，多份账号并存也不自动挑选（读错账号比没有配额更糟）。
+
+**重置卡（banked reset）随配额载荷搭车**：`ProviderQuotaData.resetCredits` 由各配额适配器
+在读取时顺带解析（`POST /providers/quota/reset` 花卡）。调用方传的只是 `resetType`，
+花卡前各家都重读一次卡列表（缓存可能是旧的），成功后作废配额缓存让下次读反映新窗口。
+codex/zcode 的挑卡规则收在共享的 `pickAvailableResetCredit`——`all` 卡覆盖一切请求，
+窄卡只精确匹配，多张可用时花最早到期的；codex 走 `account/rateLimitResetCredit/consume`
+（与 read 同一条 app-server 连接，`creditId` + `idempotencyKey`）；zcode 打 BigModel
+`/biz/customer-package-reset/list|use`（第一版只接个人号，团队号要组织/项目 ID）。
+
+claude 的窗口与 reset 列表由 `/api/oauth/usage?cedar_ember=1` 直连一次取回
+（本地 OAuth token + CLI User-Agent + `HTTPS_PROXY`），SDK `get_usage` 只在直连失败时
+兜底并刷新 token；`cedar_ember.grants` 归一化为 `resetCredits`（含 `fable` / `all` /
+`5h` / `weekly` 与 `remaining`）。花卡只在用户确认后 POST
+`/api/organizations/{org}/reset_rate_limits`，body 为
+`{ program: 'cedar_ember', grant_id, request_id }`；按 `resetType` 精确匹配最早到期的
+可用 grant（点 Fable 不会花掉完整重置），成功才作废配额缓存。读取配额本身从不花卡。
+
+**MCP 配置格式的能力同样由切面声明**：`IProviderMcp.capabilities` 给出可用 scope、transport、
+是否支持工作目录、是否支持环境变量间接（`env_vars` / `bearer_token_env_var` / `env_http_headers`，
+目前只有 codex 有；普通 `env` 与 HTTP `headers` 六家都写，不需要开关）。
+矩阵原样透出，服务器表单据此渲染。
+
+前端为首屏与请求失败保留一份镜像 `src/shared/mcpCapabilitiesFallback.ts`，
+由 `provider-catalog-parity.test.ts` 跨树钉住——这正是它此前缺的：
+旧的三张散表没有守卫，Cursor 明明会写 `cwd`，表里却写着不支持，工作目录字段因此对 Cursor 用户一直不可见。
+
+**受管 MCP（CloudCLI 自带的桥）**：`providerMcpService.addMcpServerToAllProviders` 遍历 live registry 向六家写入同一条 stdio/HTTP 条目，逐 provider 收集结果、单家失败不阻塞；`envFor(provider)` 可按引擎追加 env。两个使用者：`cloudcli-browser`（浏览器自动化，见 browser-use 模块）与 `cloudcli-scheduled-tasks`（定时任务，`envFor` 注入 `CLOUDCLI_SCHEDULED_JOBS_PROVIDER`，让桥知道自己来自哪个引擎）。两者都由 Settings 的全局开关驱动注册/注销，并在启动时 `syncAgentMcpIfNeeded()` 幂等对账，桥的 stdio 框架共用 `server/shared/mcp-stdio.ts`。
+
+## 差异吃在适配器里，不漏给前端
+
+引擎的私有包装与字段命名**必须在各自适配器里归一化掉**，共用的渲染与展示代码不得认识任何一家。
+两个已收回的例子，都曾以「前端按引擎名分支」的形式存在并腐坏：
+
+- **会话标题**：各家同步器把自己推导出的名字写进 `custom_name`，会话行一律以 `summary` 下发。
+  前端一度为 Cursor 单独读一个 `name` 字段——后端从未下发过它，于是 Cursor 会话长期显示占位名。
+- **Codex 的 `<proposed_plan>` 信封**：由 `readCodexProposedPlan` 拆成与 Claude 相同的
+  `ExitPlanMode` 计划卡。实时、会话读取、持久化三条归一化路径**都要做**；
+  此前持久化那条漏了，共用的消息渲染组件便长出一段只给 codex 用的剥标签逻辑。
+
+- **正文里的记忆标记**：引擎会给「用到了存储记忆」的回复打上机器可读标记——codex 在末尾追加
+  `<oai-mem-citation>` 块，claude 用 `<cc-memory filenames="…">` 把引用到的那句话包起来。
+  形态不同但性质一样：它们是溯源标记不是正文，留在里面就是一堆裸标签。
+  `providers/shared/memory-citations.ts` 是唯一的剥离点，`liftMemoryCitations(provider, text)`
+  归一化成 `memoryCitations`，前端统一渲染成回复下方的折叠脚注。新引擎在这个模块里加一条模式，
+  不要在自己的适配器里另写一份。注意两种形态的处理方式相反：codex 是整块切掉，claude 是脱壳保留内容。
+
+判断标准很简单：如果一段共用代码需要知道「这是哪家引擎」才能正确工作，那它就放错了地方。
+
+## 线上契约：一份定义
+
+服务端↔客户端的消息形状定义在仓库根的 **`shared/protocol/chatEvents.ts`**，两端各自 re-export，谁都不再另写一份：
+`LLMProvider`、`MessageKind`、`GatewayEventKind`、`ServerEventKind`、`NormalizedMessage`、
+`SubagentActivity`、`SubagentInfo`、`MemoryCitation`、`SessionUpserted*` / `SessionRemovedEvent`。
+
+两个 tsconfig 都已把根 `shared/` 纳入编译范围；前端另有 `@shared/*` 别名。该文件不引 `node:*` 也不引 DOM/React，
+所以两边都能编译它。
+
+**`NormalizedMessage` 没有索引签名**，`createNormalizedMessage` 的入参也没有。
+引擎适配器写入一个未在协议里声明的字段会直接编译失败——需要新字段就先在协议里声明，并说明哪个 kind 会带它。
+
+类型只管得到编译器看得见的地方，而 claude / cursor 的 runtime 是 `checkJs: false` 的 `.js`。
+因此出站还有一道**运行时闸门** `server/shared/normalized-message-contract.ts`，
+由 `ChatSessionWriter.send` 调用：
+
+- 信封坏了（不是对象、缺 `kind` 或 `provider`）→ 整条丢弃并记录原因
+- 带了协议未声明的字段 → **剥掉该字段后放行**，并在日志里点名
+
+剥离而非抛异常，是为了让违规既无法抵达前端、又不会因为一个字段杀掉用户正在跑的 run。
+闸门的字段清单由类型层的完整性断言钉住：往协议加字段却忘了登记会**编译失败并报出字段名**，
+所以它不会变成又一面陈旧的镜子。
+
+### 字段按 kind 归属
+
+哪个 kind 能带哪些字段，定义在 `shared/protocol/messageKinds.ts` 的 `MessageFieldsByKind`，
+并由 `createNormalizedMessage` 按 kind 泛型强制执行：拿 `toolName` 去构造一条 `text`、
+拿 `newSessionId` 去构造一条 `tool_use`，**构造那一行直接编译失败**。
+每个 `MessageKind` 都必须有条目，漏了同样编译失败并报出 kind 名。
+
+**读取侧仍是扁平的**——`NormalizedMessage` 有四百多处消费点，把它硬改成联合等于一次性重写全部。
+纪律装在构造处，因为漂移正是从那里产生的。消费点按需用
+`shared/protocol/messageNarrowing.ts` 的收窄谓词逐个迁移：`isToolUseMessage(m)` 之后，
+编译器知道 `toolName` 可用，也知道 `newSessionId` 不可用。
+谓词逐个 kind 写死而非泛型生成——泛型 `K` 会让 TypeScript 无法证明可赋值，
+收窄会静默退化成什么都不保证。
+
+各端在协议之上的本地扩展必须显式写出、不得混入协议本身。今天只有前端有：
+`kind` 放宽为 `TimelineMessageKind`（多一个前端自造、引擎永不产出的 `interactive_prompt`），
+外加乐观回显的簿记字段 `replacesAnchorId`。
+
+**工具卡同样要两路描述一致。** 描述一致的正解是两路读同一份记录，而不是把两份不同的记录
+对齐到同一个指纹上——codex 现在两路都读 ThreadItem，`toolId` 与入参因此天然相同
+（命令文本仍统一成 shell 包装里的那条命令，因为两种序列化一个给数组、一个给字符串）。
+
+**一条 item 在实时流里只发一次，除非它真的在推进。** 引擎宣布一条 item 的开始和完成时，只有"用户在等"的那几类（命令执行、补丁、MCP 调用、协作 spawn）值得把开始态也发出去——客户端按工具 id 合并两帧。正文和推理开始时是空的，内容靠 delta 到达；正文 delta 走 `stream_delta` 帧，推理只在完成时发一条（客户端的 thinking 合并是**追加**语义，重发累积文本会把内容叠成前缀串）。
+
+**历史只能包含转录行。** `complete`、`stream_delta`、`stream_end`、`session_created`
+描述的是"一次运行正在进行"，历史里没有运行，也就不该出现这些 kind。
+zcode 曾为每个持久化 step 产出一条 `complete`——真实会话里占全部行数的 35%，
+一行都渲染不出来，却照样计入分页、计入每一次遍历转录的扫描、计入客户端发送时记录的行数。
+`history-kind-standard.test.ts` 对四家逐一把关。
+
+**子代理的线程 id 也是适配器的责任。** Codex 用 `agent_thread_id` 指向子代理自己的同级 rollout，
+该 id 来自 `SubAgentActivity` 项；spawn 本身也只以这个项出现在 item 流里，
+所以 `Task` 行就以它的 item id 命名，`completed` / `interrupted` 再用同一个 id 收尾。
+子代理自己的 rollout 用与主线程完全相同的读法（item 流 + 同一个行渲染器）铺进折叠面板。
+
+**跨路行身份是适配器的责任，不是前端的猜测活。** 一条持久化的行存在两份——
+运行中的实时帧，和之后历史读回的那一行。前端把两份显示成一行的唯一诚实依据是**同一个 `id`**；
+对认不上时它只能退回按文本相似度和数组下标猜，重复消息就是这么来的。
+
+因此协议规定：**`kind` 属于转录行的消息（`text` / `thinking` / `tool_use` / `tool_result` /
+`task_notification`），其 `id` 必须由引擎自己的记录推导——同一条记录，无论走哪一路、读多少遍，
+id 必须字节相同。** 这条有两道闸门守着：
+
+- 编译期：`shared/protocol/messageKinds.ts` 里 `generateMessageId()` 返回带品牌的
+  `VolatileMessageId`，无法赋给转录行的 `id`（类型为 `DeterministicRowId`），写错的那一行直接编译不过。
+- 运行期：两个 `.js` 运行时和若干从 `any` 读出的历史路径编译器看不到，由
+  `enforceNormalizedMessageContract` 兜底——转录行带 `vol_` 前缀的 id 会被点名记录（消息照发，
+  丢一条真回复比重复一条更糟）。
+
+各引擎的推导依据：
+
+| 引擎 | 行身份 | 依据 |
+| --- | --- | --- |
+| claude | 落盘 `uuid` | 实时 SDK 消息与落盘行的 `uuid` 同值，两路归一化出的 id 逐行相同 |
+| codex | ThreadItem 的 `id`（`msg_…`/`rs_…`/`exec-<uuid>`/`call_…`），一项多行时后缀 `_<n>` / `_result` | 两路读的是同一个 ThreadItem：app-server 实时推 `item/started`+`item/completed`，rollout 把同一项写进 `event_msg`→`item_completed`，id 逐字相同 |
+| antigravity | `msg_<sessionId>_<toolId>`（工具行）、`msg_<sessionId>_<step_index>`（正文行） | 工具调用在两路的 step 号相差一步，由 `buildAntigravityToolId` 归一后再派生行 id；ACP 帧不带步号，正文 `providerRowKey` 取段开始时转录最新步号 +1（`assistant-step:<n>`），ACP 工具行按引擎 `toolCallId` 命名、刷新后以历史为准 |
+| zcode | `(message_id, part_id)`；推理段取开启该段事件的 `${id}_reasoning` | 引擎事件自带 id，段内后续 delta 沿用开段 id。实时流不发正文行 id（只有 delta），故 assistant 正文改由 `providerRowKey: zcode-message:<message_id>` 对账，两路同源 |
+| cursor | 未盘点 | 本 fork 不投入，只保证可编译、测试通过 |
+| opencode | 两路 id 不同源：实时行 id=引擎工具调用 id / `${消息id}_text_${序号}`、`${消息id}_reasoning_${序号}`，历史行 id=`${消息id}_${块序号}`；**assistant 正文**由 `providerRowKey: opencode-part:${消息id}_text_${序号}` 对账；工具行靠 toolId 指纹层配对 | 服务客户端化（2026-10-17，见「OpenCode 服务客户端」）后实时与历史是同一引擎记录的两个投影：`session.text.*` 事件自带 `assistantMessageID` 与**正文段序号**（按正文块计数，reasoning 另计），落盘的 `content` 数组按同一顺序排块，故两路可各自复建同一推导。序号缺失（事件无 `assistantMessageID`）时 key 不与任何持久化行相等，正文仍留在屏幕上，不会误删 |
+
+**引擎同时提供「原始记录」和「组装好的记录」时，两路都读组装的那一份。** codex 的 rollout 里
+既有 Responses API 的原始条目（`response_item`：`custom_tool_call` 及其输出、`function_call`、
+`message`），也有引擎自己组装好的 ThreadItem（`event_msg` → `item_completed`）；app-server
+实时推送的正是后者。读原始条目意味着自己重建一遍引擎已经做过的事——把 exec 脚本反解成命令、
+把补丁反解成逐文件 diff、把输出回填到调用上——而重建出来的东西带的是原始条目的 id，
+和实时那份对不上，于是每条回复渲染两遍。读组装记录则两路同源：一个词汇表
+（`codex-thread-items.ts`）、一个行渲染器、一套 id。
+
+同源不等于逐字段同形：rollout 和 app-server 会把同一个字段拼成两个名字
+（如用户消息的图片地址，rollout 写 `image_url`，app-server 写 `url`）。
+词汇表读字段时两种拼法都要认，只按一边的拼写建测试会漏掉另一边。
+
+引擎确实什么都没给时**不要伪造**：随机值会让对账从"知道自己不知道"变成"自信地答错"。
+正确做法是让推导落在引擎记录的确定性属性上（文件内序号、step 号、数据库主键都算），
+或者接受这一行无法跨路对认并在上表里写明。
+
+跨引擎一致性由 `server/modules/providers/tests/row-identity-conformance.test.ts` 守：
+同一条记录读两遍 id 必须相同，且任何转录行都不得带 `vol_` id。
+
+`providerRowKey` 只在行 id 本身无法跨路相等、但 provider 能从两路原生数据复建出同一身份时使用；
+它不承担展示 id、WebSocket `seq`、排序 `sequence` 或编辑锚点的职责。
+
+**`providerRowKey` 的边界**：前端只在 `(provider, sessionId, providerRowKey)` 唯一对应时认定两路属于同一行，再按 provider 明确给出的正文完整度选择展示来源；正文不参与身份猜测。同 key 多候选时保留双方。Antigravity 只为实时 `agent_response` 与历史纯正文 `PLANNER_RESPONSE` 设置 `assistant-step:<step_index>`，不推广到用户、工具或 `GENERIC` 行。
+
+**工具 id 同源要求**：live 与历史两路对同一工具调用必须产出**同一个 toolId**（理想：都读引擎原生 call id，如 zcode 的 `callID` 恰等于 live `toolCallId`）。做不到的引擎（antigravity 现状——锚点不同），影子卡去重只能靠前端指纹层 `src/modules/chat/utils/toolIdentity.ts` 兜底，新引擎接入时先回答这个问题。
+
+**Antigravity 转录读取**：`antigravity-transcript.provider.ts` 是 compact `transcript.jsonl` 与 `transcript_full.jsonl` 的唯一读取入口。它按原生 `step_index` 以 full 覆盖同一步、保留 compact 尚未被 full 追上的尾部，并跳过损坏 JSONL 尾行；历史正文同时带明确的完整度事实。历史专属 thinking 不进入可见时间线，因为它没有可与实时流对应的稳定身份。
+
+**会话层级要求**：会话列表只索引顶层、可由用户继续对话的 provider 会话。Antigravity 使用其摘要库的 `parent_conversation_id` 与 `nesting_depth` 识别子 agent；子 agent 不写入活动列表，已被旧版本索引的行会软归档，原始 transcript 与本地元数据保留。缺少这两个字段的旧版 Antigravity 摘要库按顶层兼容读取。
+
+### ⚠ 已知坑
+
+- **一次性 CLI 的异步任务会被静默掐死**：`agy` 的一次性 print 模式（`agy -p "<prompt>"`）在 root agent 转入 idle 后只等几秒就关停整个 CLI，日志为 `root agent idle; waiting up to 5s for N background task(s)` → `terminating N background task(s) on exit`。子代理和被放到后台执行的 `run_command` 都在这里死掉，而 CLI 仍然吐出 `status: SUCCESS`，于是前端收到 complete、任务看着「做完了」，真正的结果永远不会回来。antigravity runtime 因此把这一轮的 prompt 作为一行 NDJSON（`{"event":"user","message":{"content":"…"}}`）写进 stdin 并用 `--input-format stream-json` 启动：stdin 保持打开 → CLI 不自行关停 → 异步任务跑完，结果照常从 stream 回流；收到 `result` 事件后再关闭 stdin 让进程退出。**prompt 一旦退回 argv，这个保护就没了。**
+
+  stream-json 模式下，`agy` 自己等子代理和后台 `run_command` 全部结束才发出 `result`：后台命令的 `tool` step 一直保持 `ACTIVE` 直到命令退出，子代理回报只是一条不带正文的 `system_message` step。所以 `result` 就是整轮的终点，runtime 收到它后清空子代理卡片、关 stdin、发 `complete`。子代理卡片取自 `invoke_subagent` 的 DONE step（`step_type: "subagent"`，`subagent_info.subagents[].conversation_id`），通过 `backgroundTasks.list(sessionId)` 切面供输入框展示。进程的每种结束方式（`result`、abort、崩溃、watchdog）都先清空卡片并广播空列表，再发 `complete`。
+
+  **绝不能给 agy 传 `--print-timeout`**：它限制的是整轮时长，到点时 agy 会在子代理仍在运行时提前吐出 `status: SUCCESS` 的 `result`，runtime 一关 stdin，agy 就把子代理连同工作一起掐掉，前端还显示完成。agy 的默认值 0 表示等这一轮跑完。防卡死由服务端负责：stdin 由我们持有，`result` 一旦走不到（CLI 崩溃、stdout 被截断、result 行被 agy 穿插的纯文本搞坏导致 JSON 解析失败），进程和这次 run 会无限期挂住，所以 runtime 自带一个**以 stdout 活动续期的看门狗**（`idleTimeout` / `CLOUDCLI_ANTIGRAVITY_IDLE_TIMEOUT`，默认 30 分钟），到期 SIGTERM 并按失败收尾。主 agent 等子代理期间主流完全静默，所以一个连续 30 分钟没有任何输出的子代理也会被看门狗结束。另有一个例外：agy 的 interrupted-stream result 不是终态（它会自行注入续跑提示），在它上面关 stdin 或发 `complete` 都会让前端以为这轮结束、甚至掐死异步工作，所以只有真正的 result 才收尾。
+
+  接新的 CLI 引擎时先问两句：它的非交互模式在主循环 idle 之后如何处置未完成的后台任务；以及谁为「进程永远不退」兜底。
+
+- **会话内的权限模式归引擎所有**：app-server 形态的引擎把权限模式持久化在会话上（zcode 写 `session.permission`），而模型会在一轮里自行切进计划模式。因此设置里的权限模式是**变更时下发**，不是每轮重申：`zcode-runtime.provider.ts` 记住每个引擎会话最后下发的模式，值没变就不发 `session/setMode`。每轮重申会在两轮之间把计划模式抹掉，模型下一次调 `ExitPlanMode` 直接拿到「can only be used while plan mode is active」，审批卡片根本不会出现，而模型可以把这句报错读成「已获批准」继续动手。进程内缓存意味着服务重启后的第一条消息仍会下发一次——这是为了让重启期间改过的设置必定生效而留的取舍。
+
+- **常驻引擎的 stderr**：app-server 形态的引擎（zcode/codex）stderr 常驻嘈杂，别逐行转发日志——supervisor/客户端保留尾部环形缓冲（zcode 4000 字符），崩溃/crash-loop/session-lost 的错误全部附带尾部；engine 崩溃的真实死因只在 stderr 里。
+
+- **Codex 多代理下的事件流隔离与 mailbox 抢占**：
+  app-server 单连接在派生子代理时，子代理通知（含 `turn/completed`、`item/completed`）会混入父会话所在的同一事件流，但带自己的 `threadId`。若 `codex-runtime.provider.ts` 的 `onNotification` 未校验通知 `threadId`，子代理的 `turn/completed` 会提前触发主 turn 的 `settle()`，导致会话被误关中断。此外，子代理投递 mailbox 邮件时，引擎默认机制（`preempt_for_mailbox_mail`）会在 reasoning/commentary 边界抢占 sampling 导致中断。CloudCLI 在 `threadSettings.config` 中显式开启 `features.defer_mailbox_preemption = true` 将抢占推迟到安全边界，并在 runtime 强制丢弃非当前会话的通知，彻底实现多代理会话解耦。
+
+- **全仓散落的引擎清单**：除上述契约点外，历史上有过 6 处硬编码 6 家列表/能力表的地方（MCP scopes、公开 API 文档 `public/api-docs.html` 的 `PROVIDER_ORDER` 等）。新增引擎后 `grep -rn "antigravity" src server public --include='*.ts' --include='*.tsx' --include='*.html' -l` 扫一遍清单类常量，防止新引擎被隐藏。
+- `sessions`（运行时事件归一化/历史分页）与 `sessionSynchronizer`（落盘索引）是两个关注点，别混在一个类里。
+- 归一化消息 id 必须唯一：一个原生事件拆多个 part 时要加判别后缀；分页契约 `limit: null` = 全量、`limit: 0` = 空页。
+
+## 模型库：推理档位与"只用我的模型"
+
+`effortLevels` 是每家引擎能透传的推理档位（弱→强，空数组当且仅当 `supportsEffort` 为 false），也是自定义模型条目可声明的档位集合——`provider-capabilities.test.ts` 钉住"预定义模型声明过的档位都在集合内"。目录本身仍由各引擎提供（`codex-models.provider.ts` 读 app-server、`opencode-models.provider.ts` 发现已连接 provider 的模型、其余静态表），`provider-models.service.ts` 把用户自定义模型合并上去：同 id 只显示一项（保留自定义名称并继承引擎推理强度），删除仅存在于自定义记录里的型号才切回默认。
+
+"只用我的模型"（`setCustomModelsOnly`，存 `provider_models` 配置键）把内置型号从所有选择器里隐藏，并让第一份自定义模型成为默认值；在添加任何自定义模型之前内置型号照旧列出。`resolveResumeModel` 还会把会话行里丢过前缀的裸模型 id（`deepseek-v4.1-flash`）按目录唯一后缀还原成 `<provider>/<model>`，否则 `--model` 会被引擎当成 provider id 读而直接失败。
+
+Codex 的图片生成项不带媒体类型，`result` 是裸 base64。`compactProviderPayload` 识别实时的 `imageGeneration` 和历史的 `Extension`（`kind: image_gen.generation`），按文件头判断格式后存成图片资源，`result` 换成资源地址，因此不走大文本预览。`codex-thread-items.ts` 把两边读成同一个 `image_generation` 项：成功时是一条带 `images` 的助手行，失败时是一条错误行，没有图片字节但有 `savedPath` 时用文字说明保存位置。`ImageView` 项读成 `Read` 行，只记录路径，不复制文件。子代理时间线只显示文字和工具，不显示生成的图片。
+
+```mermaid
+flowchart LR
+  A[引擎原始结果] --> B[展示副本]
+  B --> C[媒体与大文本写入资源文件]
+  C --> D[带引用的归一化消息]
+  D --> E[实时广播与重连缓存]
+  D --> F[历史页与历史缓存]
+```
+
+各适配器在重新序列化和批量保留记录前执行压缩，`createNormalizedMessage` 与 websocket writer 再检查输出边界。资源写入失败通过 `ProviderDisplayAssetError` 上报；JSONL 的未写完尾行可以跳过，资源错误不能按坏 JSON 忽略。资源文件先写临时文件，完整写入后原子发布。写入失败清理临时文件，已有短文件重新生成。资源文件沿用 assets 模块的鉴权、文件名校验和 SVG 下载策略。
+
+OpenCode 逐条读取数据库并用有限窗口收集请求页，同时扫描计数以维持精确总数。ZCode 逐条读取联表记录；Claude、Codex、Antigravity 逐行读取文件，在分支、工具配对和顺序索引中保留压缩后的展示副本。Cursor 保留 blob 身份和引用关系，原始二进制 blob 逐条检查后释放。后几种格式仍需扫描和索引会话记录，不保证历史读取时间与页大小成正比。token 统计、Codex 标题提取，以及 Claude 的标题/最近活动时间/当前模型回读同样逐行读取，不建立整份文件字符串——会话转录可达数百 MB，而 Claude 的 watcher 每轮追加都会触发这些回读，整份读入会把 RSS 推到 PM2 内存上限。
+
+Claude、Codex 的全历史缓存按归一化结果的序列化大小、字符串与行对象开销估算容量，不用源文件大小代替。单个超预算结果只供当前请求使用，不驻留缓存。容量常量以 `session-history-cache.service.ts` 为准；计费是保守估计，不是精确堆测量。
+
+
+## 本机执行 MCP
+
+`server/modules/execution/` 提供 `/mcp/execution`，通过 Streamable HTTP 暴露异步执行工具。
+执行复用 `providerRuntimeService` 和 `chatRunRegistry`，应用会话可在聊天界面查看、处理审批。
+执行能力从 provider 注册表发现已安装且声明 `supportsTaskExecution` 的引擎及模型，不在 nexus-kit 维护第二份引擎列表。
+当前只有 ZCode 声明可靠终止契约，已完成真实派发、交付、返工续跑和取消验证。其他引擎继续使用原直连执行器。
+聊天 complete 不自动等于引擎停止：RPC 失败或超时补出的界面终态不能作为自动任务的停止凭据。
+现有 `/api/agent` 保留原协议与鉴权，与执行 MCP 共用 provider 调度层；它在起跑前把本次 `model`/`effort` 写进会话行（新会话缺省 effort 记为 `default`），续跑未显式给 `effort` 时沿用会话已记录值，避免下一轮把引擎档位重置。
+
+服务默认关闭。服务进程须显式配置：
+
+- `CLOUDCLI_EXECUTION_TOKEN`：至少 32 字符的专用令牌，由环境提供；不写入源码或任务配置。
+- `CLOUDCLI_EXECUTION_ROOTS`：允许的工作目录根路径，使用 JSON 字符串数组。路径经过真实路径校验；它限制启动目录，不构成操作系统沙箱。
+- `CLOUDCLI_EXECUTION_DIR`：可选的执行记录目录，默认 `~/.cloudcli/executions`。同一目录只由一个服务进程使用。
+
+入口校验专用 Bearer 令牌、本机连接和 Host，拒绝浏览器 Origin 与代理头。
+使用 PM2 时配置放在其 ecosystem 的进程环境中；更新后的启动或重启由用户执行。
+
+工具名与参数以 `execution.service.ts` 的工具定义为准。`execution_start` 使用 `requestId` 幂等派发；
+同标识不同内容会失败。`execution_continue` 复用应用会话，但每轮生成独立 `runId`；
+原生会话不存在时，严格续跑报错，不创建替代会话。`execution_get` 返回运行状态、最终回复和按字节游标分页的事件；
+事件保留有限预览，完整内容由引擎历史提供。`execution_cancel` 按 runId 或 requestId 取消；尚未启动的请求保存取消墓碑，阻止迟到启动。只有 `stopConfirmed: true`
+表示执行已停止。工具调用或连接结束均不等于执行结束。
+
+运行状态区分执行中、等待审批、成功、失败、取消和中断。回合 complete 后仍有后台工作时，
+执行继续等待，会话保持忙碌；最终收尾才向聊天网关发送 complete。审批由 CloudCLI 聊天界面处理，MCP 不自动批准。
+服务端保存执行身份、状态、输出和请求指纹，重启后保留已完成结果；未确认停止的运行标为中断，
+不自动重派，也不允许在该会话上继续执行。记录损坏时保留正常历史查询，阻断新派发并输出恢复错误。操作者须先核对引擎现场，当前接口不提供强行确认停止。
+
+执行使用 CloudCLI 服务端已有环境，不接收调用方的环境变量或启动命令覆盖。
+`nexus-devflow task` 的 `cloudcli` executor 只保存令牌环境变量的名称，不保存令牌；
+`executorEnvDeny` 非空时拒绝派发，因为客户端的剔除操作不能约束服务端环境。
+任务定义、工作树、自验、审计、独立验证和验收由 nexus-kit 管理，执行成功不能代替任务验收。
