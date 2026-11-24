@@ -1813,7 +1813,6 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
                   content: replayGuard.bufferText,
                   sessionId: capturedSessionId,
                   provider: PROVIDER,
-                  providerRowKey: translator.currentRowKey(),
                 }));
                 replyText += replayGuard.bufferText;
                 rememberSessionReplyPreview(sessionKey, replyText);
