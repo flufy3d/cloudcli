@@ -17,6 +17,9 @@
 
 import assert from 'node:assert/strict';
 
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { after, before, test } from 'node:test';
 
 import type { ProviderCapabilities } from '../services/provider-capabilities.service.js';
@@ -25,12 +28,26 @@ import { PROVIDER_CATALOG } from '../services/provider-capabilities.catalog.js';
 import { providerRegistry } from '../provider.registry.js';
 import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
 
+// The suite's shell may export DATABASE_PATH for the real install; keep the
+// migrations and reads on a throwaway file.
+const previousDatabasePath = process.env.DATABASE_PATH;
+let tempDirectory = '';
+
 before(async () => {
+  tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'provider-capabilities-'));
+  closeConnection();
+  process.env.DATABASE_PATH = path.join(tempDirectory, 'auth.db');
   await initializeDatabase();
 });
 
-after(() => {
+after(async () => {
   closeConnection();
+  if (previousDatabasePath === undefined) {
+    delete process.env.DATABASE_PATH;
+  } else {
+    process.env.DATABASE_PATH = previousDatabasePath;
+  }
+  await rm(tempDirectory, { recursive: true, force: true });
 });
 
 const BASELINE: Record<string, Omit<ProviderCapabilities, 'provider'>> = {
