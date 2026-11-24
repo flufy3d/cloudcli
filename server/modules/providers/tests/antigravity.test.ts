@@ -36,7 +36,7 @@ import {
 import { AntigravityMcpProvider } from '../list/antigravity/antigravity-mcp.provider.js';
 import { AntigravitySessionSynchronizer } from '../list/antigravity/antigravity-session-synchronizer.provider.js';
 import { AntigravitySkillsProvider } from '../list/antigravity/antigravity-skills.provider.js';
-import { readCanonicalAntigravityTranscript } from '../list/antigravity/antigravity-transcript.provider.js';
+import { readCanonicalAntigravityTranscript, readLatestAntigravityStepIndex } from '../list/antigravity/antigravity-transcript.provider.js';
 import { antigravityBackgroundWork } from '../list/antigravity/antigravity-subagent.js';
 import { AntigravitySessionsProvider } from '../list/antigravity/antigravity-sessions.provider.js';
 import { providerRegistry } from '../provider.registry.js';
@@ -899,6 +899,51 @@ test('canonical Antigravity transcript reader merges full rows with compact-only
       [1, '完整正文', 'complete'],
       [2, 'compact 新尾部', 'complete'],
     ]);
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('latest step probe reads the max step on disk and follows the file as it grows', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-latest-step-'));
+  const sessionId = 'latest-step-session';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  const transcriptPath = path.join(transcriptDir, 'transcript.jsonl');
+  await fs.mkdir(transcriptDir, { recursive: true });
+
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    assert.equal(readLatestAntigravityStepIndex(sessionId), undefined, 'no transcript yet');
+    // The writer can flush a tool result ahead of its call row; a torn tail is skipped.
+    await fs.writeFile(transcriptPath, [
+      JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: 'x'.repeat(70 * 1024) }),
+      JSON.stringify({ step_index: 2, type: 'GENERIC', content: 'result' }),
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', content: 'call' }),
+      '{"step_index": 9, "type": "PLANN',
+    ].join('\n'));
+    assert.equal(readLatestAntigravityStepIndex(sessionId), 2);
+    await fs.appendFile(transcriptPath, 'ER_RESPONSE"}\n');
+    assert.equal(readLatestAntigravityStepIndex(sessionId), 9);
+    assert.equal(readLatestAntigravityStepIndex('../escape'), undefined, 'unsafe ids never reach the filesystem');
+  } finally {
+    restoreDataDir();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('latest step probe widens past a row larger than its tail window', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agy-latest-step-wide-'));
+  const sessionId = 'latest-step-wide';
+  const transcriptDir = path.join(tempRoot, 'brain', sessionId, '.system_generated', 'logs');
+  await fs.mkdir(transcriptDir, { recursive: true });
+  await fs.writeFile(path.join(transcriptDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', content: 'short' }),
+    JSON.stringify({ step_index: 5, type: 'GENERIC', content: 'y'.repeat(200 * 1024) }),
+  ].join('\n'));
+  const restoreDataDir = withEnvValue('CLOUDCLI_ANTIGRAVITY_DATA_DIR', tempRoot);
+  try {
+    assert.equal(readLatestAntigravityStepIndex(sessionId), 5);
   } finally {
     restoreDataDir();
     await fs.rm(tempRoot, { recursive: true, force: true });

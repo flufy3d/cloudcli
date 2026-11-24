@@ -14,6 +14,11 @@
  *   transcript's spawn receipt, never on the frame, so the runtime binds
  *   cards, registry entries and transcript tails from that receipt (the same
  *   source history reads); the translator only reports the spawn calls.
+ * - Reply text carries the history row's `assistant-step:<n>` key. ACP
+ *   frames name no step, but agy writes a step's transcript row only when the
+ *   step finishes, so a segment's row is the step after the newest one on
+ *   disk when it starts. Without the key the client cannot retire the live
+ *   bubble once history loads and shows the reply twice until a reload.
  * - Tool rows are keyed by the engine's toolCallId. agy's stream-json rows
  *   key on transcript step indices, which ACP frames do not carry, so live
  *   and refreshed ids differ; a refresh rebuilds the timeline from history,
@@ -31,6 +36,7 @@ import {
   type AntigravityAgentSpec,
 } from './antigravity-subagent.js';
 import { ANTIGRAVITY_QUESTION_TOOL as QUESTION_TOOL_NAME, toAskUserQuestionCard } from './antigravity-question.js';
+import { buildAntigravityAssistantRowKey, readLatestAntigravityStepIndex } from './antigravity-transcript.provider.js';
 
 const PROVIDER = 'antigravity';
 
@@ -89,8 +95,13 @@ type AcpTranslation = {
   };
 };
 
+/** Reads the newest transcript step of an engine session (injectable for tests). */
+type LatestTranscriptStepReader = (engineSessionId: string) => number | undefined;
+
 /** Translates notifications for the Antigravity runtime and its session event publisher. */
 export class AntigravityAcpTranslator {
+  constructor(private readonly readLatestStep: LatestTranscriptStepReader = readLatestAntigravityStepIndex) {}
+
   /**
    * While a question card is parked, the engine echoes the question text as
    * an agent_message_chunk right beside the card (stream-only; it never
@@ -111,6 +122,8 @@ export class AntigravityAcpTranslator {
 
   /** Mirrors the print runtime's `agentResponseSegmentOpen` flag. */
   private segmentOpen = false;
+  /** The transcript step the open segment will be persisted as, when predictable. */
+  private segmentRowStep: number | undefined;
   /** Tool calls already emitted as rows, so a stray pending update can still render. */
   private readonly seenToolCalls = new Set<string>();
   private sessionId: string | null = null;
@@ -134,6 +147,7 @@ export class AntigravityAcpTranslator {
     const update = readObjectRecord(params?.update);
     if (!update) return { messages: [] };
     const kind = readOptionalString(update.sessionUpdate);
+    const engineSessionId = readOptionalString(params?.sessionId);
 
     // agy interleaves plain-text steps with tool steps without an explicit
     // end-of-text marker; the first non-text update closes the segment, the
@@ -152,7 +166,12 @@ export class AntigravityAcpTranslator {
           // The question echo beside a parked card, dropped (class comment).
           return { messages: closedByThisUpdate ? [closedByThisUpdate] : [] };
         }
-        return { messages: [...(closedByThisUpdate ? [closedByThisUpdate] : []), ...this.translateTextChunk(update)] };
+        return {
+          messages: [
+            ...(closedByThisUpdate ? [closedByThisUpdate] : []),
+            ...this.translateTextChunk(update, engineSessionId),
+          ],
+        };
       case 'agent_thought_chunk':
         // Dropped for print parity (module comment).
         return { messages: closedByThisUpdate ? [closedByThisUpdate] : [] };
@@ -187,18 +206,45 @@ export class AntigravityAcpTranslator {
     });
   }
 
-  private translateTextChunk(update: Record<string, unknown>): NormalizedMessage[] {
+  /**
+   * The open segment's row key. Consumer: the runtime's resume replay guard,
+   * which re-emits text it buffered and must keep it on the segment's key.
+   */
+  currentRowKey(): string | undefined {
+    return this.segmentOpen ? buildAntigravityAssistantRowKey(this.segmentRowStep) : undefined;
+  }
+
+  private translateTextChunk(update: Record<string, unknown>, engineSessionId: string | undefined): NormalizedMessage[] {
     const content = readObjectRecord(update.content);
     const text = content?.text;
     if (typeof text !== 'string' || text.length === 0) return [];
-    this.segmentOpen = true;
-    return [createNormalizedMessage({
+    const messages: NormalizedMessage[] = [];
+    const latestStep = engineSessionId ? this.readLatestStep(engineSessionId) : undefined;
+    // The predicted row is already on disk, so its step finished: this chunk
+    // is the next step's prose (a pushed turn can start with text while the
+    // previous turn's segment never saw a closing frame).
+    if (
+      this.segmentOpen
+      && this.segmentRowStep !== undefined
+      && latestStep !== undefined
+      && latestStep >= this.segmentRowStep
+    ) {
+      this.segmentOpen = false;
+      messages.push(this.streamEndMessage());
+    }
+    if (!this.segmentOpen) {
+      this.segmentOpen = true;
+      this.segmentRowStep = latestStep === undefined ? undefined : latestStep + 1;
+    }
+    messages.push(createNormalizedMessage({
       id: generateMessageId(PROVIDER),
       kind: 'stream_delta',
       content: text,
       sessionId: this.getSessionId(),
       provider: PROVIDER,
-    })];
+      providerRowKey: buildAntigravityAssistantRowKey(this.segmentRowStep),
+    }));
+    return messages;
   }
 
   private translateUsage(update: Record<string, unknown>): NormalizedMessage {

@@ -70,18 +70,9 @@ import {
   SPAWN_RECEIPT_PATTERN,
 } from './antigravity-subagent.js';
 import { toAskUserQuestionCard } from './antigravity-question.js';
-import { readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
+import { buildAntigravityAssistantRowKey, readCanonicalAntigravityTranscript } from './antigravity-transcript.provider.js';
 
 const PROVIDER = 'antigravity';
-
-/**
- * Builds the identity shared by Antigravity's live assistant delta and its
- * eventual PLANNER_RESPONSE transcript row. Missing native step indexes stay
- * unidentified so clients can fall back to their legacy reconciliation rules.
- */
-function buildAntigravityAssistantRowKey(stepIndex: number | undefined): string | undefined {
-  return stepIndex === undefined ? undefined : `assistant-step:${stepIndex}`;
-}
 
 /**
  * Finds the transcript.jsonl file for a session across possible brain directories.
