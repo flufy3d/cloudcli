@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import Database from 'better-sqlite3';
 
 import { sessionsDb } from '@/modules/database/index.js';
+import { readLocalModelCatalog } from '@/modules/providers/services/model-context-window.service.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
@@ -24,7 +25,6 @@ import {
 
 import {
   getOpenCodeDatabasePath,
-  readOpenCodeModelCatalogEntries,
   resolveOpenCodeSessionTableName,
 } from './opencode-data-root.js';
 import { tryResolveOpenCodeEnginePath } from './opencode-engine-path.js';
@@ -265,18 +265,24 @@ type OpenCodeCatalogModelEntry = {
   reasoning_options?: Array<{ type?: string; values?: string[] }>;
 };
 
-/** `kv` keys of the cached models.dev catalog, newest layout first (v2.2 renamed it). */
-const OPENCODE_CATALOG_KV_KEYS = ['models-dev:v2:catalog', 'models-dev:catalog'];
-
 /**
-/**
- * Narrows the shared catalog records to the fields the model picker reads.
+ * Reads the models.dev catalog OpenCode caches in its database and maps
+ * `<family>/<modelId>` to the display name and reasoning-effort values it
+ * records for each model.
  *
- * Consumer: `buildOpenCodeModelOption` only.
+ * This is where the reasoning-variant data lives in v2 — `opencode models`
+ * prints ids only, but this catalog carries the effort tiers per model and
+ * is refreshed by the CLI itself. The shared model-context-window service
+ * owns the database read (and its mtime cache); this adapter only views the
+ * entries through its own record shape.
  */
-const readOpenCodeCatalogEntries = (): Map<string, OpenCodeCatalogModelEntry> => (
-  new Map(readOpenCodeModelCatalogEntries())
-);
+const readOpenCodeCatalogEntries = (): Map<string, OpenCodeCatalogModelEntry> => {
+  const entries = new Map<string, OpenCodeCatalogModelEntry>();
+  for (const [key, record] of readLocalModelCatalog()) {
+    entries.set(key, record as OpenCodeCatalogModelEntry);
+  }
+  return entries;
+};
 
 export const DEFAULT_OPENCODE_CONTEXT_WINDOW = 200_000;
 

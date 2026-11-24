@@ -50,7 +50,6 @@ import type { ActiveBackgroundTask } from '@/shared/types';
 import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
 import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
 import ComposerOverflowMenu from '@/modules/chat/composer/ComposerOverflowMenu';
-import TokenUsageBadge from '@/modules/chat/composer/TokenUsageBadge';
 
 type MentionableFile = {
   name: string;
@@ -591,7 +590,7 @@ function ChatComposer({
         <PromptInputFooter>
           <PromptInputTools className="min-w-0">
             {/* Mobile-only ＋ panel: the low-frequency tools (usage, commands,
-                schedule, clear) collect behind it so the main row stays lean. */}
+                schedule) collect behind it so the main row stays lean. */}
             <div className="sm:hidden">
               <ComposerOverflowMenu
                 tokenBudget={tokenBudget}
@@ -599,8 +598,6 @@ function ChatComposer({
                 slashCommandsCount={slashCommandsCount}
                 onToggleCommandMenu={onToggleCommandMenu}
                 canSchedule={Boolean(input.trim())}
-                hasInput={hasInput}
-                onClearInput={onClearInput}
                 onScheduleMessage={onScheduleMessage}
                 onScheduleTask={onScheduleTask}
                 supportsNativeScheduling={supportsNativeScheduling}
@@ -620,13 +617,10 @@ function ChatComposer({
               <VoiceInputButton state={voiceState} onToggle={voiceToggle} errorMsg={voiceError} />
             )}
 
-            {/* Usage: the full chip is a desktop fixture; on phones the badge
-                only speaks up once the window closes in on full. */}
+            {/* Usage: a desktop fixture. On phones the reading lives in the
+                ＋ panel's "context usage" row, off the main row entirely. */}
             <div className="hidden sm:block">
               <TokenUsageSummary usage={tokenBudget} onClick={onShowTokenUsage} />
-            </div>
-            <div className="sm:hidden">
-              <TokenUsageBadge usage={tokenBudget} onClick={onShowTokenUsage} />
             </div>
 
             <PromptInputButton
@@ -648,7 +642,6 @@ function ChatComposer({
               <PromptInputButton
                 tooltip={{ content: t('input.clearInput', { defaultValue: 'Clear input' }) }}
                 onClick={onClearInput}
-                className="hidden sm:flex"
               >
                 <XIcon />
               </PromptInputButton>

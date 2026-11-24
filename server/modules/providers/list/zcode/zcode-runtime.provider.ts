@@ -39,6 +39,7 @@ import Database from 'better-sqlite3';
 import type { IProviderRuntime } from '@/shared/interfaces.js';
 import type { ChatAttachmentDescriptor } from '@/shared/image-attachments.js';
 import type {
+  ActiveEngineTurn,
   AnyRecord,
   SessionBackgroundWork,
   NormalizedMessage,
@@ -48,7 +49,7 @@ import type {
   ProviderTokenUsageResult,
 } from '@/shared/types.js';
 import { createCompleteMessage, createNormalizedMessage, generateMessageId, readObjectRecord, readOptionalString } from '@/shared/utils.js';
-import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
+import { notifyRunFailed, notifyRunStopped, rememberSessionReplyPreview } from '@/modules/notifications/index.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import {
   LOCAL_AGENT_TASK_TYPE,
@@ -58,6 +59,7 @@ import {
 
 import { zcodeBackgroundWork } from './zcode-background-work.js';
 import { SESSION_LOST_METHOD } from './zcode-codec.js';
+import { listZCodeEngineTurns, observeZCodeEngineTurn } from './zcode-engine-turns.js';
 import { protocolClient } from './zcode-protocol.client.js';
 import { readZCodeContextUsage } from './zcode-context-usage.js';
 import { getZCodeDatabasePath } from './zcode-data-root.js';
@@ -348,6 +350,10 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     // installation used to overwrite the singleton handler and never restore
     // the default policy.)
     protocolClient.setServerRequestHandler((request) => runLifecycle.handleServerRequest(request));
+    // Installed once per process, like the request handler above: the registry
+    // is module state, and one observer covers every session's events — not
+    // only those a run still listens to.
+    protocolClient.setSessionEventObserver((notification) => observeZCodeEngineTurn(notification));
   }
 
   /**
@@ -653,6 +659,18 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
   }
 
   /**
+   * Turns the engine is running on its own, for the running-sessions poll:
+   * the report turn a background task's notification wakes, and a turn that
+   * keeps going after its CloudCLI run ended. Nothing in the chat-run registry
+   * covers those, so without this the page shows the session idle while its
+   * transcript keeps growing. `abort` addresses a run, so these are listed as
+   * reported work with no Stop.
+   */
+  listEngineTurns(): ActiveEngineTurn[] {
+    return listZCodeEngineTurns();
+  }
+
+  /**
    * What the composer's strip shows for a session that subscribes, and
    * whether that work can still be stopped: `abort` stops the run on the
    * session, so once the turn has ended its agents keep running with nothing
@@ -853,12 +871,11 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
    *    claude-runtime pattern). `writer.setSessionId` updates the stored
    *    mapping, so the replacement is sticky across subsequent sends.
    *
-   * Both requests send only the fields the engine's strict schema declares
-   * (`session/resume` takes nothing but `sessionId`; `session/create` takes the
-   * workspace descriptor). The model is applied afterwards through
-   * `session/setModel`, which is what clears the cold-resume "model
-   * unavailable" warning (-32031) without the strict-schema -32602 rejection
-   * that an extra `runtimeModel` key produces on engine 0.16.9.
+   * ZCode 0.16.9 validates all session requests strictly. Resume sends only
+   * the session id and repairs the model afterwards through `session/setModel`
+   * (clearing the cold-resume "model unavailable" warning, -32031, without the
+   * -32602 an extra key produces); create sends the workspace descriptor plus
+   * the run's model selection (see below).
    */
   private async resolveOrCreateSession(
     appSessionId: string | null,
@@ -901,6 +918,35 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
 
     console.info(`[ZCodeRuntime] Creating new session for workspace: ${workspacePath}`);
 
+    // A fresh engine session seeds its session-level model selection from the
+    // engine default (`cloudcli-provider-config.json`'s `defaultModelSelection` —
+    // the user's legacy cli-config provider). Conversation turns carry this
+    // run's per-turn selection, but the engine's turn-0 session-title
+    // generation resolves its model from the SESSION-level selection: a stale
+    // default points the title call at a provider whose stored key no longer
+    // authenticates, so the generated title never lands and the sidebar stays
+    // on the raw first input. Hand the create the same selection the turn is
+    // about to use — best-effort, like the resume-side repair: a resolution
+    // failure must not block the create, it only lets the engine default apply.
+    let createModelSelection: ReturnType<typeof buildZCodeSendModelParams> | null = null;
+    try {
+      createModelSelection = await this.resolveSendModelParams(options, context);
+    } catch (error) {
+      console.warn(
+        '[ZCodeRuntime] Resolving the run model for the new session failed; the engine default selection applies:',
+        error,
+      );
+    }
+
+    // The create handler stringifies `model` into "providerId/modelId" and
+    // drops its `options`, so the reasoning level must also travel in the
+    // create's separate top-level `thoughtLevel` field: `setThoughtLevel`
+    // merges it into the session-level selection's options, and without it
+    // the turn-0 title call dies on "Reasoning level is required". The
+    // engine validates the value against the model's own level list and just
+    // logs `session_create.thought_level_skipped` for unsupported levels.
+    const createThoughtLevel = createModelSelection?.modelSelection?.options?.reasoningLevel;
+
     try {
       const result = await protocolClient.sendRequest<AnyRecord>(
         'session/create',
@@ -909,6 +955,10 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
             workspacePath,
             workspaceKey: workspacePath,
           },
+          ...(createModelSelection?.modelSelection
+            ? { model: createModelSelection.modelSelection }
+            : {}),
+          ...(createThoughtLevel ? { thoughtLevel: createThoughtLevel } : {}),
         }
       );
 
@@ -1339,6 +1389,18 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
     writer: ProviderRuntimeWriter,
     context: ProviderRuntimeContext,
   ): (notification: AnyRecord) => void {
+    // The terminal push carries the run's last reply text. zcode streams
+    // reply prose as stream_delta rows, which the shared writer-side capture
+    // (text rows only) never sees, so the runtime accumulates the reply and
+    // records it itself — the same arrangement the antigravity runtime uses.
+    // The late output a silenced run's background watcher forwards crosses
+    // this same closure, so the preview stays current until the real
+    // completion notification fires.
+    let runReplyText = '';
+    // The row the accumulated text belongs to. A reply arrives in several
+    // segments (one per assistant message) and the push must carry the last
+    // one, the way the text-row engines' capture does.
+    let runReplyRowKey: string | null = null;
     return (notification: AnyRecord) => {
       try {
         const method = readOptionalString(notification.method);
@@ -1412,6 +1474,35 @@ export class ZCodeRuntimeProvider implements IProviderRuntime {
               }
             });
             continue;
+          }
+          // The preview accumulation rides this run's own turn only: a turn
+          // the engine started itself (and startNow preempted) streams its
+          // winding-down prose past this listener, and letting it in would
+          // open the stop push with the cancelled turn's text. A finished
+          // segment closes the accumulator, so the registry keeps the LAST
+          // segment — what the text-row engines' capture ends up holding for
+          // the same reply shape.
+          if (turnOwner === 'own' && message.kind === 'stream_end') {
+            runReplyText = '';
+            runReplyRowKey = null;
+          }
+          if (turnOwner === 'own' && message.kind === 'stream_delta' && typeof message.content === 'string' && message.content) {
+            // The engine keeps its segment boundaries out of the protocol
+            // stream: only the deltas cross it, the `text_start`/`text_end`
+            // events are filtered away before delivery. So the boundary is
+            // the row identity — each assistant message streams under its
+            // own row key, the same change the client closes the previous
+            // bubble on. Without this the accumulator spans the whole turn
+            // and the push opens with the first segment's preamble.
+            const rowKey = message.providerRowKey ?? message.id;
+            if (runReplyRowKey !== null && rowKey !== runReplyRowKey) {
+              runReplyText = '';
+            }
+            runReplyRowKey = rowKey;
+            runReplyText += message.content;
+            if (handle.appSessionId) {
+              rememberSessionReplyPreview(handle.appSessionId, runReplyText);
+            }
           }
           this.deliverRunMessage(handle, message, sessionEvent, writer);
         }

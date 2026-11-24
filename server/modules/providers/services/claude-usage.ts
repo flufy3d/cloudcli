@@ -5,6 +5,8 @@ import {
   readUsageNumber,
   type JsonlIncrementalState,
 } from '@/shared/utils.js';
+import { resolveModelContextWindow } from '@/modules/providers/services/model-context-window.service.js';
+import { isOpenCodeGateway } from '@/modules/providers/list/claude/claude-gateway.js';
 
 /**
  * Context windows the Claude SDK reported per provider session id.
@@ -364,13 +366,24 @@ export function resolveClaudeContextWindow(
     return recorded;
   }
 
+  const taggedModel = [sources.selectedModel, model]
+    .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+
+  // The SDK states the window only for direct Anthropic runs. Behind a
+  // compatible gateway the model id is all there is, so the local catalog
+  // stands in — an explicit MODEL_CONTEXT_WINDOWS entry inside it first.
+  const inferred = resolveModelContextWindow(model ?? taggedModel ?? null, {
+    allowCatalog: isOpenCodeGateway(),
+  });
+  if (inferred) {
+    return inferred;
+  }
+
   const parsedContextWindow = Number.parseInt(sources.configured ?? '', 10);
   if (Number.isFinite(parsedContextWindow) && parsedContextWindow > 0) {
     return parsedContextWindow;
   }
 
-  const taggedModel = [sources.selectedModel, model]
-    .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
   if (taggedModel?.includes('[1m]')) {
     return 1_000_000;
   }

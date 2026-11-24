@@ -226,6 +226,17 @@ const MessageComponent = memo(({ message, prevMessage, turnAnchorMessage, isTurn
                       <PencilIcon className="h-3.5 w-3.5" />
                     </button>
                   )}
+                  {!onEditMessage && editDisabledReason && message.transcriptAnchorId && (
+                    <button
+                      type="button"
+                      disabled
+                      title={editDisabledReason}
+                      aria-label={editDisabledReason}
+                      className="cursor-not-allowed rounded p-1 opacity-40"
+                    >
+                      <PencilIcon className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   {onForkFromMessage && message.transcriptAnchorId && (
                     <button
                       type="button"

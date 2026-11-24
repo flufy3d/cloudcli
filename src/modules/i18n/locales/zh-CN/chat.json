@@ -329,6 +329,7 @@
     "nextTaskPrompt": "开始下一个任务"
   },
   "message": {
+    "editBlockedByBackgroundWork": "后台任务还在运行时不能编辑已发送的消息。请等它结束或先停掉后台任务，再重试。",
     "editAndResend": "编辑并重新发送",
     "editBlockedByBackgroundWork": "后台任务仍在运行时不能编辑已发送的消息。请等它结束，或先停止后台任务，再重试。",
     "forkFromHere": "从此处派生",

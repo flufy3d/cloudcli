@@ -101,6 +101,14 @@ export type SessionSlot = {
    */
   retiredOptimisticUserAnchors: Map<string, string>;
   /**
+   * Optimistic prompts whose pairing has been proven — the fact a live row
+   * needs before it may reconcile against that turn's persisted rows. Proof
+   * can rest on a send-time anchor or on the run having ended; the latter is
+   * cleared by the next send (`runEnded`), so it is latched here to keep the
+   * finished turn nameable however late its persisted reply indexes.
+   */
+  provenOptimisticUserAnchors: Set<string>;
+  /**
    * The placeholder row holding streamed text that no engine row has claimed
    * yet, keyed by parent scope (a subagent spawn call's id, or the empty
    * string for the session's own text). Every engine follows a streamed
@@ -162,6 +170,7 @@ function createEmptySlot(): SessionSlot {
     pendingPrompts: new Map(),
     retiredOptimisticUserAnchors: new Map(),
     streamingPlaceholderIds: new Map(),
+    provenOptimisticUserAnchors: new Set(),
     streamedSegmentCount: 0,
     runEnded: false,
     realtimeArrivalAnchors: new Map(),
@@ -334,6 +343,130 @@ type AccumulatedStream = {
 };
 
 /**
+ * The persisted rows of the turn a live row belongs to, or an empty list when
+ * that turn cannot be proven.
+ *
+ * The turn is named by the nearest user row above the live row, and the
+ * pairing computed by `reconcileOptimisticPrompts` says which persisted row
+ * that prompt became. Proof comes from that pairing or from a transcript
+ * anchor — never from what the prompt says, which is how an identical prompt
+ * from an earlier turn used to be accepted as proof.
+ */
+function resolveRealtimeTurnServerRows(
+  serverMessages: NormalizedMessage[],
+  realtimeMessages: NormalizedMessage[],
+  provenAnchors: Map<string, string>,
+  message: NormalizedMessage,
+): NormalizedMessage[] {
+  const realtimeIndex = realtimeMessages.findIndex((candidate) => candidate.id === message.id);
+  if (realtimeIndex < 0) return [];
+
+  let turnStart = -1;
+  let namedByLivePrompt = false;
+  for (let index = realtimeIndex - 1; index >= 0; index -= 1) {
+    const candidate = realtimeMessages[index];
+    if (candidate.kind !== 'text' || candidate.role !== 'user') {
+      continue;
+    }
+    namedByLivePrompt = true;
+    // Only a proven pairing may name the turn. A prompt paired on the
+    // permissive path — sent before any history was loaded — can point at
+    // an older turn that merely happens to be the newest one in the
+    // window, and fingerprinting against it would hide a real card.
+    const pairedServerId = provenAnchors.get(candidate.id)
+      ?? (candidate.id.startsWith('local_') ? null : candidate.id);
+    turnStart = pairedServerId === null
+      ? -1
+      : serverMessages.findIndex((row) => row.id === pairedServerId);
+    if (turnStart < 0 && candidate.transcriptAnchorId) {
+      turnStart = serverMessages.findIndex((row) => row.transcriptAnchorId === candidate.transcriptAnchorId);
+    }
+    break;
+  }
+
+  // A live prompt that cannot be placed leaves the turn unproven; falling
+  // back to the newest persisted turn would be a guess about which turn
+  // this row belongs to, and a wrong one hides a card the user ran.
+  if (turnStart < 0 && namedByLivePrompt) {
+    return [];
+  }
+
+  if (turnStart < 0) {
+    // No live prompt names this turn (a tab that did not send, a session
+    // resumed mid-run). A live row cannot precede a turn already on disk,
+    // so it belongs to the newest persisted one.
+    for (let index = serverMessages.length - 1; index >= 0; index -= 1) {
+      const candidate = serverMessages[index];
+      if (candidate.kind === 'text' && candidate.role === 'user') {
+        turnStart = index;
+        break;
+      }
+    }
+  }
+  if (turnStart < 0) return [];
+
+  const turnEnd = serverMessages.findIndex(
+    (candidate, index) => index > turnStart && candidate.kind === 'text' && candidate.role === 'user',
+  );
+  return serverMessages.slice(turnStart, turnEnd < 0 ? undefined : turnEnd);
+}
+
+/** What a bounded content comparison concluded about one unkeyed segment. */
+type StreamedPlaceholderReconciliation =
+  | { verdict: 'retain' }
+  | { verdict: 'retire' }
+  | { verdict: 'supersede'; serverMessageId: string };
+
+/**
+ * Reconciles a streamed segment that carries no row key against the
+ * persisted assistant rows of its own turn.
+ *
+ * The Antigravity ACP engine names a transcript step only in its persisted
+ * record, so its live deltas can carry no `providerRowKey` and the segment's
+ * placeholder has no identity to join on — the exact gap that left a reply
+ * on screen twice once history landed its keyed twin. The comparison stays
+ * inside the proven turn and concludes only on full-body shapes: an exact
+ * twin retires the live copy (history owns it), a complete persisted row
+ * that starts with the closed segment is the same reply held more fully and
+ * retires it too, and a truncated persisted row the segment extends yields
+ * to the fuller live copy until the full transcript catches up. Anything
+ * else — a different body, a partial overlap, a row of another turn —
+ * retains the placeholder, so output that exists nowhere else is never
+ * deleted on a guess.
+ */
+function reconcileStreamedPlaceholderByContent(
+  placeholder: NormalizedMessage,
+  serverTurnRows: NormalizedMessage[],
+): StreamedPlaceholderReconciliation {
+  // The persisted reader trims every body it stores, while the placeholder
+  // holds the deltas as they arrived; comparing the raw live text would fail
+  // every shape test on a segment that merely ends in whitespace, and the
+  // trimmed persisted twin could never claim it.
+  const liveContent = (placeholder.content || '').trim();
+  if (!liveContent) return { verdict: 'retain' };
+  const candidates = serverTurnRows.filter((row) =>
+    row.kind === 'text'
+    && row.role === 'assistant'
+    && row.provider === placeholder.provider
+    && Boolean(row.content),
+  );
+  // Exact twin first, so a truncated sibling can never steal a segment whose
+  // complete persisted copy is also in the turn.
+  if (candidates.some((row) => (row.content || '').trim() === liveContent)) {
+    return { verdict: 'retire' };
+  }
+  for (const row of candidates) {
+    const serverContent = (row.content || '').trim();
+    if ((row.contentCompleteness ?? 'complete') === 'complete') {
+      if (serverContent.startsWith(liveContent)) return { verdict: 'retire' };
+    } else if (liveContent.startsWith(serverContent)) {
+      return { verdict: 'supersede', serverMessageId: row.id };
+    }
+  }
+  return { verdict: 'retain' };
+}
+
+/**
  * After a server refresh, drop the realtime rows the persisted transcript
  * already owns.
  *
@@ -349,14 +482,15 @@ type AccumulatedStream = {
  * - the optimistic prompt, retired against the persisted user row that
  *   appeared after the transcript position recorded at send time;
  * - the streamed-text placeholder, retired once the engine's own row for the
- *   segment arrives or a persisted row reconciles with it by
- *   `providerRowKey`;
+ *   segment arrives, a persisted row reconciles with it by
+ *   `providerRowKey`, or — for the ACP segments whose engine names no step
+ *   on the wire — its own proven turn provably holds its full body;
  * - the synthetic settle row, which leaves with the card it settles.
  */
 function pruneRealtimeSupersededByServer(
   serverMessages: NormalizedMessage[],
   realtimeMessages: NormalizedMessage[],
-  slot: Pick<SessionSlot, 'pendingPrompts' | 'retiredOptimisticUserAnchors' | 'runEnded'>,
+  slot: Pick<SessionSlot, 'pendingPrompts' | 'retiredOptimisticUserAnchors' | 'provenOptimisticUserAnchors' | 'runEnded' | 'streamingPlaceholderIds'>,
 ): NormalizedMessage[] {
   if (realtimeMessages.length === 0) {
     return realtimeMessages;
@@ -374,74 +508,18 @@ function pruneRealtimeSupersededByServer(
     realtimeMessages,
     slot.pendingPrompts,
     slot.runEnded,
+    slot.retiredOptimisticUserAnchors,
+    slot.provenOptimisticUserAnchors,
   );
   for (const [localId, serverId] of retiredAnchors) {
     slot.retiredOptimisticUserAnchors.set(localId, serverId);
   }
+  for (const localId of provenAnchors.keys()) {
+    slot.provenOptimisticUserAnchors.add(localId);
+  }
 
-  /**
-   * The persisted rows of the turn a live row belongs to, or an empty list
-   * when that turn cannot be proven.
-   *
-   * The turn is named by the nearest user row above the live row, and the
-   * pairing computed above says which persisted row that prompt became.
-   * Proof comes from that pairing or from a transcript anchor — never from
-   * what the prompt says, which is how an identical prompt from an earlier
-   * turn used to be accepted as proof.
-   */
-  const serverTurnForRealtimeRow = (message: NormalizedMessage): NormalizedMessage[] => {
-    const realtimeIndex = realtimeMessages.findIndex((candidate) => candidate.id === message.id);
-    if (realtimeIndex < 0) return [];
-
-    let turnStart = -1;
-    let namedByLivePrompt = false;
-    for (let index = realtimeIndex - 1; index >= 0; index -= 1) {
-      const candidate = realtimeMessages[index];
-      if (candidate.kind !== 'text' || candidate.role !== 'user') {
-        continue;
-      }
-      namedByLivePrompt = true;
-      // Only a proven pairing may name the turn. A prompt paired on the
-      // permissive path — sent before any history was loaded — can point at
-      // an older turn that merely happens to be the newest one in the
-      // window, and fingerprinting against it would hide a real card.
-      const pairedServerId = provenAnchors.get(candidate.id)
-        ?? (candidate.id.startsWith('local_') ? null : candidate.id);
-      turnStart = pairedServerId === null
-        ? -1
-        : serverMessages.findIndex((row) => row.id === pairedServerId);
-      if (turnStart < 0 && candidate.transcriptAnchorId) {
-        turnStart = serverMessages.findIndex((row) => row.transcriptAnchorId === candidate.transcriptAnchorId);
-      }
-      break;
-    }
-
-    // A live prompt that cannot be placed leaves the turn unproven; falling
-    // back to the newest persisted turn would be a guess about which turn
-    // this row belongs to, and a wrong one hides a card the user ran.
-    if (turnStart < 0 && namedByLivePrompt) {
-      return [];
-    }
-
-    if (turnStart < 0) {
-      // No live prompt names this turn (a tab that did not send, a session
-      // resumed mid-run). A live row cannot precede a turn already on disk,
-      // so it belongs to the newest persisted one.
-      for (let index = serverMessages.length - 1; index >= 0; index -= 1) {
-        const candidate = serverMessages[index];
-        if (candidate.kind === 'text' && candidate.role === 'user') {
-          turnStart = index;
-          break;
-        }
-      }
-    }
-    if (turnStart < 0) return [];
-
-    const turnEnd = serverMessages.findIndex(
-      (candidate, index) => index > turnStart && candidate.kind === 'text' && candidate.role === 'user',
-    );
-    return serverMessages.slice(turnStart, turnEnd < 0 ? undefined : turnEnd);
-  };
+  const serverTurnForRealtimeRow = (message: NormalizedMessage): NormalizedMessage[] =>
+    resolveRealtimeTurnServerRows(serverMessages, realtimeMessages, provenAnchors, message);
 
   const retained = realtimeMessages.filter((message) => {
     if (serverIds.has(message.id)) {
@@ -455,15 +533,16 @@ function pruneRealtimeSupersededByServer(
     if (isStreamedTextPlaceholder(message)) {
       // Only a row that provably holds the same text may retire it: the
       // engine's own row (handled by the id test above and by
-      // `adoptStreamedSegment`), or a persisted row the provider reconciles
-      // by key and that the provider says is the more complete of the two.
+      // `adoptStreamedSegment`), a persisted row the provider reconciles
+      // by key, or — for the unkeyed ACP segments that carry no key at
+      // all — the segment's own proven turn holding its full body.
       // Retiring it on a timer or at the end of the run would delete output
       // that exists nowhere else — several engines print text they never
       // persist.
-      return !(
-        message.providerRowKey
-        && reconcileProviderRowText(message, serverMessages).winner === 'server'
-      );
+      if (!message.providerRowKey) {
+        return reconcileStreamedPlaceholderByContent(message, serverTurnForRealtimeRow(message)).verdict !== 'retire';
+      }
+      return reconcileProviderRowText(message, serverMessages).winner !== 'server';
     }
 
     if (message.kind === 'tool_use' && message.toolId) {
@@ -496,12 +575,24 @@ function pruneRealtimeSupersededByServer(
       .filter((message) => message.kind === 'tool_use' && message.toolId)
       .map((message) => message.toolId as string),
   );
-  return retained.filter((message) => {
+  const pruned = retained.filter((message) => {
     if (message.kind === 'tool_result' && message.id.startsWith('__finalized_')) {
       return message.toolId !== undefined && retainedToolUseIds.has(message.toolId);
     }
     return true;
   });
+  // A prune that retired the placeholder the adoption pointer names must
+  // clear the pointer, or the next engine row appends beside the gap instead
+  // of taking its place and its segment-start timestamp.
+  if (slot.streamingPlaceholderIds.size > 0) {
+    const prunedIds = new Set(pruned.map((row) => row.id));
+    for (const [scope, placeholderId] of slot.streamingPlaceholderIds) {
+      if (!prunedIds.has(placeholderId)) {
+        slot.streamingPlaceholderIds.delete(scope);
+      }
+    }
+  }
+  return pruned;
 }
 
 /**
@@ -607,21 +698,26 @@ function computeMerged(
   server: NormalizedMessage[],
   realtime: NormalizedMessage[],
   arrivalAnchors: Map<string, string>,
-  slot: Pick<SessionSlot, 'pendingPrompts' | 'retiredOptimisticUserAnchors' | 'runEnded'>,
+  slot: Pick<SessionSlot, 'pendingPrompts' | 'retiredOptimisticUserAnchors' | 'provenOptimisticUserAnchors' | 'runEnded'>,
 ): NormalizedMessage[] {
   if (realtime.length === 0) {
     return server;
   }
 
   const serverIds = new Set(server.map((message) => message.id));
-  const { retiredAnchors } = reconcileOptimisticPrompts(
+  const { retiredAnchors, provenAnchors } = reconcileOptimisticPrompts(
     server,
     realtime,
     slot.pendingPrompts,
     slot.runEnded,
+    slot.retiredOptimisticUserAnchors,
+    slot.provenOptimisticUserAnchors,
   );
   for (const [localId, serverId] of retiredAnchors) {
     slot.retiredOptimisticUserAnchors.set(localId, serverId);
+  }
+  for (const localId of provenAnchors.keys()) {
+    slot.provenOptimisticUserAnchors.add(localId);
   }
   // Retired prompts stay in `realtime` as turn boundaries; the merge is where
   // they stop being rendered.
@@ -643,6 +739,23 @@ function computeMerged(
   };
   const serverRowsSupersededByRealtime = new Set(
     reconciledRealtime.flatMap((message) => {
+      // An unkeyed ACP placeholder that holds the fuller body retires the
+      // truncated persisted variant (the full transcript has not caught up
+      // yet); the keyed rows below reconcile the same way through their key.
+      if (
+        message.kind === 'text'
+        && message.role === 'assistant'
+        && isStreamedTextPlaceholder(message)
+        && !message.providerRowKey
+      ) {
+        // Retired prompts stay in `realtime` as turn boundaries, so the turn
+        // lookup scans the unfiltered list, exactly like the prune pass does.
+        const match = reconcileStreamedPlaceholderByContent(
+          message,
+          resolveRealtimeTurnServerRows(server, realtime, provenAnchors, message),
+        );
+        return match.verdict === 'supersede' ? [match.serverMessageId] : [];
+      }
       if (
         !message.providerRowKey
         || !((message.kind === 'text' && message.role === 'assistant') || message.kind === 'stream_delta')
@@ -723,6 +836,7 @@ function recordRealtimeArrivalAnchors(slot: SessionSlot): void {
   if (
     anchors.size > slot.realtimeMessages.length
     || slot.retiredOptimisticUserAnchors.size > slot.realtimeMessages.length
+    || slot.provenOptimisticUserAnchors.size > slot.realtimeMessages.length
   ) {
     const liveIds = new Set(slot.realtimeMessages.map((message) => message.id));
     for (const id of anchors.keys()) {
@@ -733,6 +847,11 @@ function recordRealtimeArrivalAnchors(slot: SessionSlot): void {
     for (const id of slot.retiredOptimisticUserAnchors.keys()) {
       if (!liveIds.has(id)) {
         slot.retiredOptimisticUserAnchors.delete(id);
+      }
+    }
+    for (const id of slot.provenOptimisticUserAnchors) {
+      if (!liveIds.has(id)) {
+        slot.provenOptimisticUserAnchors.delete(id);
       }
     }
   }
@@ -1434,7 +1553,7 @@ export class SessionTimelineStore {
   appendRealtime(sessionId: string, msg: NormalizedMessage): void {
     // A frame with no id is not a renderable timeline row — gateway frames
     // such as `session_removed` carry only their own payload. Admitting one
-    // used to crash every later recompute of the merged view.
+    // made every later recompute throw in the optimistic-echo pass.
     if (typeof msg.id !== 'string' || msg.id.length === 0) {
       return;
     }
@@ -1879,6 +1998,7 @@ export class SessionTimelineStore {
     const survivingTail = slot.serverMessages[slot.serverMessages.length - 1];
     slot.pendingPrompts.clear();
     slot.retiredOptimisticUserAnchors.clear();
+    slot.provenOptimisticUserAnchors.clear();
     slot.realtimeMessages = replacements.length > 0
       ? [replacements[replacements.length - 1]]
       : [];

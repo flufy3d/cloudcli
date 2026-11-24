@@ -1,35 +1,25 @@
 /**
- * ZCode Provider Config Resolution
+ * ZCode Provider Config Location
  *
- * The ZCode desktop app points its embedded CLI engine at three provider
- * configuration files through environment variables. A bare `app-server`
- * spawn (as CloudCLI does) does not inherit them, so the engine cannot locate
- * its builtin provider catalog and `session/create` hangs until the client
- * times out — no model can be selected at all.
+ * The embedded CLI locates its built-in provider config by walking five levels
+ * up from its own entry file. That assumption holds for ZCode's source layout
+ * but not for the packaged app, where `Resources/glm/zcode.cjs` walks up to the
+ * filesystem root and the lookup dies with "无法定位 CLI ZCode Built-in Provider
+ * Config" before the app-server ever starts.
  *
- * This module reconstructs those variables from the resolved engine path and
- * the ZCode storage directory:
- * - `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`: the active builtin catalog. The
- *   engine refreshes a copy under `<storage>/v2/runtime/provider/...` and
- *   falls back to the catalog bundled with the install
- *   (`<resources>/config/provider/zcode-builtin.json`).
- * - `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE`: the install-bundled copy.
- * - `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`: the user's provider overrides
- *   (`<storage>/v2/provider_config.json`), which hold every provider and model
- *   the user added in the ZCode app.
- *
- * Every path is set only when it exists, so an older ZCode install keeps the
- * engine's own resolution behavior.
+ * The engine short-circuits that whole derivation when both
+ * `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`
+ * are set, so we resolve the packaged locations ourselves and hand them over.
  *
  * @module zcode-provider-config
  */
 
-import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
+import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
-import type { AnyRecord } from '@/shared/types.js';
 import { readObjectRecord, readOptionalString, readTrimmedStringRecord } from '@/shared/utils.js';
+import type { AnyRecord } from '@/shared/types.js';
 
 import { readZCodeIndividualPlanAuthContext, readDecryptedZCodeJwtToken } from './zcode-credentials.js';
 import { getZCodeStorageDir } from './zcode-data-root.js';
@@ -37,8 +27,8 @@ import { tryResolveEnginePath } from './zcode-engine-path.js';
 
 /**
  * Engine env override names, exported so the supervisor can strip ambient
- * values inherited from a parent ZCode App session before merging CloudCLI's
- * own resolution (see {@link resolveZCodeProviderConfigEnv}).
+ * values inherited from a parent ZCode App session before merging its own
+ * resolution (see {@link resolveZCodeProviderConfigEnv}).
  *
  * Consumers: zcode-engine-supervisor.ts and the provider-config tests.
  */
@@ -46,7 +36,27 @@ export const ZCODE_BUILTIN_PROVIDER_CONFIG_ENV = 'ZCODE_BUILTIN_PROVIDER_CONFIG_
 export const ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV = 'ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE';
 export const ZCODE_PERSONAL_PROVIDER_CONFIG_ENV = 'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE';
 
+const BUILTIN_CONFIG_ENV = ZCODE_BUILTIN_PROVIDER_CONFIG_ENV;
+const PERSONAL_CONFIG_ENV = ZCODE_PERSONAL_PROVIDER_CONFIG_ENV;
+
+const BUILTIN_CONFIG_FILE = 'zcode-builtin.json';
 const CLOUDCLI_PERSONAL_CONFIG_FILE = 'cloudcli-provider-config.json';
+
+/**
+ * Maps the provider kinds stored in `cli/config.json` onto the API protocol
+ * names accepted by ZCode 0.16.9's registry. The registry materializer and
+ * send-model builder share it so an unsupported provider cannot be registered
+ * under one protocol and executed under another.
+ */
+export function resolveZCodeProviderApiType(
+  kind: unknown,
+): 'anthropic-messages' | 'openai-chat-completions' | 'openai-responses' | null {
+  const normalized = readOptionalString(kind)?.toLowerCase();
+  if (normalized === 'anthropic' || normalized === 'anthropic-messages') return 'anthropic-messages';
+  if (normalized === 'openai-responses') return 'openai-responses';
+  if (normalized?.startsWith('openai')) return 'openai-chat-completions';
+  return null;
+}
 
 function splitModelRef(value: string): { providerId?: string; modelId: string } {
   const slashIndex = value.indexOf('/');
@@ -58,13 +68,13 @@ function splitModelRef(value: string): { providerId?: string; modelId: string } 
 }
 
 /**
- * Converts ZCode's user-facing `cli/config.json` provider definitions into the
- * strict personal-provider registry consumed by app-server 0.16.9.
+ * Converts ZCode's user-facing `cli/config.json` provider definitions into
+ * the strict personal-provider registry consumed by app-server 0.16.9.
  *
  * The generated file is CloudCLI-owned and separate from ZCode's own
  * `v2/provider_config.json`; consumers are the engine supervisor through
  * {@link resolveZCodeProviderConfigEnv}. Returns null when there is no usable
- * provider, in which case the engine keeps its own native config.
+ * legacy provider, allowing native ZCode configuration to remain authoritative.
  */
 function materializeCloudCliProviderConfig(storageDir: string): string | null {
   const sourcePath = path.join(storageDir, 'cli', 'config.json');
@@ -220,56 +230,125 @@ function materializeCloudCliProviderConfig(storageDir: string): string | null {
 }
 
 /**
- * Maps ZCode's provider `kind` onto the API shape the engine accepts.
- * Unknown kinds stay null so a provider without a supported transport is
- * skipped instead of being sent with a guessed API type.
+ * Built-in config locations relative to the engine's own directory, in the
+ * engine's own preference order: its co-located `provider/` directory first,
+ * then the packaged `Resources/config/` sibling, then the source-layout path
+ * the engine itself attempts.
  */
-export function resolveZCodeProviderApiType(
-  kind: unknown,
-): 'anthropic-messages' | 'openai-chat-completions' | 'openai-responses' | null {
-  const normalized = readOptionalString(kind)?.toLowerCase();
-  if (normalized === 'anthropic' || normalized === 'anthropic-messages') return 'anthropic-messages';
-  if (normalized === 'openai-responses') return 'openai-responses';
-  if (normalized?.startsWith('openai')) return 'openai-chat-completions';
-  return null;
-}
+const BUILTIN_RELATIVE_CANDIDATES = [
+  path.join('provider', BUILTIN_CONFIG_FILE),
+  path.join('..', 'config', 'provider', BUILTIN_CONFIG_FILE),
+  path.join('..', '..', '..', '..', '..', 'config', 'provider', BUILTIN_CONFIG_FILE),
+];
 
-/**
- * Path to a provider config file, when it exists on disk.
- */
-type ProviderConfigPaths = {
-  /** Install-bundled builtin catalog, or null when absent. */
-  bundled: string | null;
-  /** Storage-refreshed builtin catalog, or null when absent. */
-  runtime: string | null;
-  /** User provider overrides, or null when absent. */
-  personal: string | null;
-};
-
-/**
- * Finds the install-bundled builtin catalog from the engine entry path.
- *
- * The engine lives at `<app>/resources/glm/zcode.cjs` (or
- * `<app>/Contents/Resources/glm/zcode.cjs` on macOS), so the catalog sits one
- * directory up under `config/provider`. Exported for the engine-path tests.
- *
- * Consumers: `resolveZCodeProviderConfigEnv` (spawn env) and the models
- * provider (catalog fallback source).
- */
-export function findZCodeBundledProviderConfig(enginePath: string): string | null {
-  const engineDir = path.dirname(enginePath);
-  for (const relative of [
-    path.join('provider', 'zcode-builtin.json'),
-    path.join('..', 'config', 'provider', 'zcode-builtin.json'),
-  ]) {
+function findEngineBundledConfig(enginePath: string): string | null {
+  const engineDir = path.dirname(path.resolve(enginePath));
+  for (const relative of BUILTIN_RELATIVE_CANDIDATES) {
     const candidate = path.resolve(engineDir, relative);
     try {
       if (fs.statSync(candidate).isFile()) return candidate;
     } catch {
-      // Try the next supported layout.
+      // Candidate absent; try the next layout.
     }
   }
   return null;
+}
+
+/** Cached builtin file revisions keyed by path with an mtime+size identity. */
+const builtinRevisionCache = new Map<string, { key: string; revision: number | null }>();
+
+/**
+ * Numeric `revision` of a builtin config file, cached on mtime+size so the
+ * per-send resolution does not re-parse the file. Null when unreadable or
+ * non-numeric.
+ */
+function readBuiltinFileRevision(builtinPath: string): number | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(builtinPath);
+  } catch {
+    return null;
+  }
+  const key = `${stat.mtimeMs}:${stat.size}`;
+  const cached = builtinRevisionCache.get(builtinPath);
+  if (cached?.key === key) return cached.revision;
+  let revision: number | null = null;
+  try {
+    const raw = readObjectRecord(JSON.parse(fs.readFileSync(builtinPath, 'utf8')));
+    const numeric = typeof raw?.revision === 'number'
+      ? raw.revision
+      : typeof raw?.revision === 'string' ? Number(raw.revision) : Number.NaN;
+    revision = Number.isFinite(numeric) ? numeric : null;
+  } catch {
+    revision = null;
+  }
+  builtinRevisionCache.set(builtinPath, { key, revision });
+  return revision;
+}
+
+/**
+ * Newest runtime-synced builtin cache under
+ * `<storage>/v2/runtime/provider/<platform>/<version>/endpoint-<hash>/zcode-builtin.json`.
+ * The ZCode client refreshes these files from its remote catalog endpoint
+ * without an app update, so they can lead the bundled file; unreadable or
+ * revision-less entries are skipped and the highest revision wins.
+ */
+function findRuntimeBuiltinConfig(): string | null {
+  const providerRoot = path.join(getZCodeStorageDir(), 'v2', 'runtime', 'provider');
+  let platformEntries: fs.Dirent[];
+  try {
+    platformEntries = fs.readdirSync(providerRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  let best: { path: string; revision: number } | null = null;
+  for (const platform of platformEntries) {
+    if (!platform.isDirectory()) continue;
+    const platformDir = path.join(providerRoot, platform.name);
+    let versionEntries: fs.Dirent[];
+    try {
+      versionEntries = fs.readdirSync(platformDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const version of versionEntries) {
+      if (!version.isDirectory()) continue;
+      const versionDir = path.join(platformDir, version.name);
+      let endpointEntries: fs.Dirent[];
+      try {
+        endpointEntries = fs.readdirSync(versionDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const endpoint of endpointEntries) {
+        if (!endpoint.isDirectory() || !endpoint.name.startsWith('endpoint-')) continue;
+        const candidate = path.join(versionDir, endpoint.name, 'zcode-builtin.json');
+        const revision = readBuiltinFileRevision(candidate);
+        if (revision === null) continue;
+        if (!best || revision > best.revision) best = { path: candidate, revision };
+      }
+    }
+  }
+  return best?.path ?? null;
+}
+
+/**
+ * Resolves the builtin config every consumer shares: the runtime-synced cache
+ * when it carries a higher revision than the engine-bundled file (the ZCode
+ * App behaves the same way), the bundled file otherwise. Engine-spawn env,
+ * template defaults, reasoning specs, the account sync revision and the plan
+ * catalogs all read through this single resolution.
+ */
+export function findBuiltinConfig(enginePath: string): string | null {
+  const bundledPath = findEngineBundledConfig(enginePath);
+  const runtimePath = findRuntimeBuiltinConfig();
+  const bundledRevision = bundledPath ? readBuiltinFileRevision(bundledPath) : null;
+  const runtimeRevision = runtimePath ? readBuiltinFileRevision(runtimePath) : null;
+  if (runtimePath && runtimeRevision !== null
+    && (bundledRevision === null || runtimeRevision > bundledRevision)) {
+    return runtimePath;
+  }
+  return bundledPath;
 }
 
 /** Cached builtin template state keyed by builtin file identity (path+mtime+size). */
@@ -280,19 +359,28 @@ type ZCodeBuiltinTemplateState = {
    */
   templateDefaults: Map<string, Map<string, boolean>> | null;
   /**
-   * reasoningLevel option specs in file order. The engine ships its `.*`
-   * catch-all first and narrower regex rows later, and later matches
-   * supersede earlier ones, so resolution walks forward and keeps the last
-   * match. Invalid regexes never match anything.
+   * `modelRules` rows in file order. The engine ships its `.*` catch-all
+   * first and narrower regex rows later, and later matches supersede earlier
+   * ones, so resolution walks forward and keeps the last match. Regexes
+   * compile the way the engine applies them — `^(?:pattern)$` anchored,
+   * case-insensitive. Rows carry either (or both) of the reasoningLevel
+   * values and the per-model contextWindow; invalid regexes never match.
    */
-  reasoningSpecs: { regex: RegExp | null; values: string[] }[];
+  reasoningSpecs: { regex: RegExp | null; values: string[]; contextWindow: number | null }[];
+  /**
+   * Per-provider `builtinModelIds` from `providerConfigRules.providerRules` —
+   * the account plans' granted model catalogs, the same field the engine's
+   * account registry consumes. Null when the file ships no provider rules
+   * ("unknown", never "empty").
+   */
+  planModelIds: Map<string, string[]> | null;
 };
 let builtinTemplateCache: { key: string; state: ZCodeBuiltinTemplateState } | null = null;
 
 function readZCodeBuiltinTemplateState(): ZCodeBuiltinTemplateState | null {
   const enginePath = tryResolveEnginePath();
   if (!enginePath) return null;
-  const builtinPath = findActiveZCodeBuiltinConfig(enginePath);
+  const builtinPath = findBuiltinConfig(enginePath);
   if (!builtinPath) return null;
 
   let stat: fs.Stats;
@@ -305,10 +393,27 @@ function readZCodeBuiltinTemplateState(): ZCodeBuiltinTemplateState | null {
   if (builtinTemplateCache?.key === cacheKey) return builtinTemplateCache.state;
 
   try {
-    const modelConfig = readObjectRecord(
-      readObjectRecord(readObjectRecord(JSON.parse(fs.readFileSync(builtinPath, 'utf8')))?.config)?.modelConfigRules,
-    );
+    const configBody = readObjectRecord(readObjectRecord(JSON.parse(fs.readFileSync(builtinPath, 'utf8')))?.config);
+    const modelConfig = readObjectRecord(configBody?.modelConfigRules);
     if (!modelConfig) return null;
+
+    // Provider rules carry the account plans' model catalogs; absent rules
+    // mean "no knowledge" (the plan pair fallback applies downstream).
+    const providerRules = Array.isArray(readObjectRecord(configBody?.providerConfigRules)?.providerRules)
+      ? readObjectRecord(configBody?.providerConfigRules)?.providerRules as unknown[]
+      : null;
+    const planModelIds = new Map<string, string[]>();
+    for (const entry of providerRules ?? []) {
+      const record = readObjectRecord(entry);
+      const providerId = readOptionalString(record?.providerId);
+      if (!providerId) continue;
+      const modelIds = (Array.isArray(readObjectRecord(record?.config)?.builtinModelIds)
+        ? readObjectRecord(record?.config)?.builtinModelIds as unknown[]
+        : [])
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .map((value) => value.trim());
+      planModelIds.set(providerId, modelIds);
+    }
 
     // Absent rows (older engine layouts) mean "no knowledge", not "all off".
     const templateRows = Array.isArray(modelConfig.templateModelRules)
@@ -334,19 +439,27 @@ function readZCodeBuiltinTemplateState(): ZCodeBuiltinTemplateState | null {
       const values = (Array.isArray(readObjectRecord(spec)?.values) ? readObjectRecord(spec)?.values as unknown[] : [])
         .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
         .map((value) => value.trim().toLowerCase());
-      if (values.length === 0) continue;
+      const rawContextWindow = readObjectRecord(readObjectRecord(record?.config)?.properties)?.contextWindow;
+      const contextWindow = typeof rawContextWindow === 'number' && Number.isFinite(rawContextWindow) && rawContextWindow > 0
+        ? rawContextWindow
+        : null;
+      if (values.length === 0 && contextWindow === null) continue;
+      // The engine compiles these patterns as `^(?:pattern)$` with the /i
+      // flag when applying them, so uppercase ids like GLM-5.4 hit the
+      // lowercase rows and non-wrapped patterns stay anchored.
       let regex: RegExp | null = null;
       try {
-        regex = new RegExp(pattern);
+        regex = new RegExp(`^(?:${pattern})$`, 'i');
       } catch {
         // Unusable pattern: this row never matches.
       }
-      reasoningSpecs.push({ regex, values });
+      reasoningSpecs.push({ regex, values, contextWindow });
     }
 
     const state: ZCodeBuiltinTemplateState = {
       templateDefaults: templateRows ? defaults : null,
       reasoningSpecs,
+      planModelIds: providerRules ? planModelIds : null,
     };
     builtinTemplateCache = { key: cacheKey, state };
     return state;
@@ -371,13 +484,34 @@ export function readZCodeTemplateModelDefaults(): Map<string, Map<string, boolea
 }
 
 /**
+ * The individual coding plan's granted models: `builtinModelIds` of the
+ * `account:bigmodel-individual-coding-plan` rule in the resolved builtin
+ * config (runtime-synced cache first, engine-bundled file second). Null when
+ * the builtin file or its provider rules are unavailable, or the rule lists
+ * no models (more likely bad data than a plan that grants nothing) — callers
+ * fall back to the pinned plan pair rather than hiding the whole plan.
+ *
+ * Consumer: `getPersonalPlanModelIds` in zcode-models.provider.ts.
+ */
+export function readZCodeIndividualPlanModelIds(): Set<string> | null {
+  const ids = readZCodeBuiltinTemplateState()
+    ?.planModelIds
+    ?.get('account:bigmodel-individual-coding-plan');
+  if (!ids || ids.length === 0) return null;
+  const set = new Set(ids);
+  return set.size > 0 ? set : null;
+}
+
+/**
  * Effective reasoningLevel values for a model id: the values of the LAST
- * builtin `modelRules` row whose `modelMatch` regex matches it (the engine
- * ships the `.*` catch-all first). Null when nothing matches or the builtin
- * config is unavailable — callers must not invent a level then. The engine
- * rejects sends without `options.reasoningLevel` for models that ship a
- * non-empty spec ("Reasoning level is required for <provider>/<model>"), so
- * this feeds both the menu effort and the send-time default.
+ * builtin `modelRules` row whose pattern matches it (the engine ships the
+ * `.*` catch-all first, matching anchored and case-insensitively). Rows
+ * without reasoning values cannot mask an earlier row's spec. Null when
+ * nothing matches or the builtin config is unavailable — callers must not
+ * invent a level then. The engine rejects sends without
+ * `options.reasoningLevel` for models that ship a non-empty spec
+ * ("Reasoning level is required for <provider>/<model>"), so this feeds both
+ * the menu effort and the send-time default.
  *
  * Consumers: native catalog entries and native send defaults in
  * zcode-models.provider.ts.
@@ -387,117 +521,44 @@ export function readZCodeModelReasoningValues(modelId: string): string[] | null 
   if (!specs?.length) return null;
   let matched: string[] | null = null;
   for (const spec of specs) {
+    if (spec.values.length === 0) continue;
     if (spec.regex?.test(modelId)) matched = spec.values;
   }
   return matched;
 }
 
 /**
- * Finds the newest storage-refreshed builtin catalog.
+ * Context window for a model id: `properties.contextWindow` of the LAST
+ * builtin `modelRules` row whose pattern matches it — the same per-model
+ * metadata the engine applies. Null when no row carries one or the builtin
+ * config is unavailable; callers fall back to their own default window.
  *
- * The engine lays them out as
- * `<storage>/v2/runtime/provider/<platform>/<version>/endpoint-<hash>/zcode-builtin.json`;
- * the layout is globbed rather than reconstructed so platform/version naming
- * changes cannot silently break resolution. Exported for the engine-path
- * tests.
- *
- * Consumers: `resolveZCodeProviderConfigEnv` (spawn env) and the models
- * provider (primary catalog source).
+ * Consumer: `readZCodeModelContextLimit` in zcode-models.provider.ts.
  */
-export function findZCodeRuntimeProviderConfig(): string | null {
-  const runtimeRoot = path.join(getZCodeStorageDir(), 'v2', 'runtime', 'provider');
-  let platforms: fs.Dirent[];
-  try {
-    platforms = fs.readdirSync(runtimeRoot, { withFileTypes: true });
-  } catch {
-    return null;
+export function readZCodeModelContextWindow(modelId: string): number | null {
+  const specs = readZCodeBuiltinTemplateState()?.reasoningSpecs;
+  if (!specs?.length) return null;
+  let matched: number | null = null;
+  for (const spec of specs) {
+    if (spec.contextWindow === null) continue;
+    if (spec.regex?.test(modelId)) matched = spec.contextWindow;
   }
-
-  let newest: { filePath: string; mtimeMs: number } | null = null;
-
-  for (const platform of platforms) {
-    if (!platform.isDirectory()) continue;
-    const platformDir = path.join(runtimeRoot, platform.name);
-    let versions: fs.Dirent[];
-    try {
-      versions = fs.readdirSync(platformDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const version of versions) {
-      if (!version.isDirectory()) continue;
-      const versionDir = path.join(platformDir, version.name);
-      let endpoints: fs.Dirent[];
-      try {
-        endpoints = fs.readdirSync(versionDir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-
-      for (const endpoint of endpoints) {
-        if (!endpoint.isDirectory()) continue;
-        const filePath = path.join(versionDir, endpoint.name, 'zcode-builtin.json');
-        try {
-          const stat = fs.statSync(filePath);
-          if (stat.isFile() && (!newest || stat.mtimeMs > newest.mtimeMs)) {
-            newest = { filePath, mtimeMs: stat.mtimeMs };
-          }
-        } catch {
-          // Missing catalog under this endpoint; keep scanning.
-        }
-      }
-    }
-  }
-
-  return newest?.filePath ?? null;
-}
-
-/**
- * Resolves every provider-config path for one engine install.
- *
- * Consumers: `resolveZCodeProviderConfigEnv` and the models provider.
- */
-export function resolveZCodeProviderConfigPaths(enginePath: string): ProviderConfigPaths {
-  const personal = path.join(getZCodeStorageDir(), 'v2', 'provider_config.json');
-
-  return {
-    bundled: findZCodeBundledProviderConfig(enginePath),
-    runtime: findZCodeRuntimeProviderConfig(),
-    personal,
-  };
-}
-
-/** The builtin catalog the engine runs on: the refreshed runtime copy, else the bundled one. */
-function selectActiveBuiltinCatalog(paths: Pick<ProviderConfigPaths, 'bundled' | 'runtime'>): string | null {
-  return paths.runtime ?? paths.bundled;
-}
-
-/**
- * Resolves the builtin catalog path this CloudCLI-spawned engine was handed as
- * `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` (see {@link resolveZCodeProviderConfigEnv}).
- *
- * Consumer: zcode-protocol.client.ts (account-config sync), whose revision
- * tag must hash exactly the file the engine loaded.
- */
-export function findActiveZCodeBuiltinConfig(enginePath: string): string | null {
-  return selectActiveBuiltinCatalog(resolveZCodeProviderConfigPaths(enginePath));
+  return matched;
 }
 
 /**
  * Computes the exact revision string expected by ZCode app-server's
- * `provider/updateAccountConfig` RPC
- * (`zcode-builtin:${revision}:${sha256(path.resolve(configPath))}`).
+ * `provider/updateAccountConfig` RPC (`zcode-builtin:${revision}:${sha256(path.resolve(configPath))}`).
  * Returns null if the file cannot be read or is missing a valid revision.
- *
- * Consumer: {@link buildZCodeAccountSyncPayload}.
  */
 export function resolveZCodeBuiltinRevision(builtinConfigPath: string): string | null {
   try {
-    const parsed = readObjectRecord(JSON.parse(fs.readFileSync(builtinConfigPath, 'utf8')));
+    const raw = fs.readFileSync(builtinConfigPath, 'utf8');
+    const parsed = readObjectRecord(JSON.parse(raw));
     const revision = parsed?.revision;
     if (typeof revision !== 'number' && typeof revision !== 'string') return null;
-    const hash = crypto.createHash('sha256').update(path.resolve(builtinConfigPath)).digest('hex');
+    const resolvedPath = path.resolve(builtinConfigPath);
+    const hash = crypto.createHash('sha256').update(resolvedPath).digest('hex');
     return `zcode-builtin:${revision}:${hash}`;
   } catch {
     return null;
@@ -522,8 +583,6 @@ export function resolveZCodeBuiltinRevision(builtinConfigPath: string): string |
  * matches the picker, so it stays access-only.
  *
  * Returns null when neither credential is stored or the built-in config is unavailable.
- *
- * Consumer: zcode-protocol.client.ts.
  */
 export function buildZCodeAccountSyncPayload(builtinConfigPath: string): Record<string, unknown> | null {
   const jwtToken = readDecryptedZCodeJwtToken();
@@ -554,31 +613,34 @@ export function buildZCodeAccountSyncPayload(builtinConfigPath: string): Record<
 }
 
 /**
- * Builds the provider-config environment variables for an engine spawn.
+ * Resolves the provider-config environment overrides for an engine spawn.
  *
- * `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` prefers the refreshed runtime catalog
- * (what the engine would itself refresh) and falls back to the bundled copy,
- * which is what makes a bare spawn resolve providers at all.
+ * The result is authoritative for this CloudCLI-spawned engine: ambient
+ * `ZCODE_*_PROVIDER_CONFIG_FILE` values inherited from a parent ZCode App
+ * session are deliberately not honored (they point at the App's own runtime
+ * files; forwarding them leaves the engine without CloudCLI's materialized
+ * provider registry and every send fails with `provider_not_found`). The
+ * supervisor strips them from the spawn environment entirely.
  *
- * Consumers: `zcode-engine-supervisor.ts` (the default spawn wrapper).
+ * Returns an empty record only when no built-in config can be found — in that
+ * case the engine keeps its own resolution and its own error message, rather
+ * than being handed a path that does not exist.
+ *
+ * Consumer: zcode-engine-supervisor.ts (spawn env).
  */
 export function resolveZCodeProviderConfigEnv(enginePath: string): Record<string, string> {
-  const { bundled, runtime, personal } = resolveZCodeProviderConfigPaths(enginePath);
-  const env: Record<string, string> = {};
+  const builtinConfig = findBuiltinConfig(enginePath);
+  if (!builtinConfig) return {};
 
-  const activeCatalog = selectActiveBuiltinCatalog({ bundled, runtime });
-  // Without a built-in catalog the engine's own resolution is the only one
-  // that can work; injecting partial overrides would hide its own error.
-  if (!activeCatalog) return env;
-
-  env[ZCODE_BUILTIN_PROVIDER_CONFIG_ENV] = activeCatalog;
-  if (bundled) {
-    env[ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV] = bundled;
-  }
-  const personalConfig = materializeCloudCliProviderConfig(getZCodeStorageDir()) ?? personal;
-  if (personalConfig) {
-    env[ZCODE_PERSONAL_PROVIDER_CONFIG_ENV] = personalConfig;
-  }
-
-  return env;
+  const storageDir = getZCodeStorageDir();
+  // The desktop app also hands the engine its install-bundled catalog, which
+  // the engine diffs the refreshed runtime copy against.
+  const bundledConfig = findEngineBundledConfig(enginePath);
+  return {
+    [BUILTIN_CONFIG_ENV]: builtinConfig,
+    ...(bundledConfig ? { [ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV]: bundledConfig } : {}),
+    [PERSONAL_CONFIG_ENV]:
+      materializeCloudCliProviderConfig(storageDir)
+      || path.join(storageDir, 'v2', 'provider_config.json'),
+  };
 }

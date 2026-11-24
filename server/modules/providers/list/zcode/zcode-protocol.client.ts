@@ -24,13 +24,13 @@
  * @module zcode-protocol.client
  */
 
-import type { ProtocolServerRequest, SessionEventListener } from './zcode-codec.js';
+import type { ProtocolNotification, ProtocolServerRequest, SessionEventListener } from './zcode-codec.js';
 import type { ServerRequestAnswer } from './zcode-request-router.js';
 import { EngineSupervisor } from './zcode-engine-supervisor.js';
 import { RequestRouter } from './zcode-request-router.js';
 import {
   buildZCodeAccountSyncPayload,
-  findActiveZCodeBuiltinConfig,
+  findBuiltinConfig,
 } from './zcode-provider-config.js';
 
 export {
@@ -45,7 +45,7 @@ export {
 } from './zcode-codec.js';
 
 type ProtocolClientDeps = {
-  findActiveBuiltinConfig?: typeof findActiveZCodeBuiltinConfig;
+  findBuiltinConfig?: typeof findBuiltinConfig;
   buildZCodeAccountSyncPayload?: typeof buildZCodeAccountSyncPayload;
 };
 
@@ -61,7 +61,7 @@ export class ZCodeProtocolClient {
 
   private readonly supervisor: EngineSupervisor;
   private readonly router: RequestRouter;
-  private readonly findActiveBuiltinConfigFn: typeof findActiveZCodeBuiltinConfig;
+  private readonly findBuiltinConfigFn: typeof findBuiltinConfig;
   private readonly buildAccountSyncPayloadFn: typeof buildZCodeAccountSyncPayload;
 
   private syncedProcessId: number | null = null;
@@ -88,7 +88,7 @@ export class ZCodeProtocolClient {
       ensureRunning: () => this.supervisor.ensureRunning(),
       writeLine: (line: string) => this.supervisor.writeLine(line),
     });
-    this.findActiveBuiltinConfigFn = deps?.findActiveBuiltinConfig ?? findActiveZCodeBuiltinConfig;
+    this.findBuiltinConfigFn = deps?.findBuiltinConfig ?? findBuiltinConfig;
     this.buildAccountSyncPayloadFn = deps?.buildZCodeAccountSyncPayload ?? buildZCodeAccountSyncPayload;
 
     this.supervisor.onLine((line) => this.router.handleLine(line));
@@ -134,7 +134,7 @@ export class ZCodeProtocolClient {
         }
 
         const enginePath = this.supervisor.getEnginePath();
-        const builtinConfigPath = enginePath ? this.findActiveBuiltinConfigFn(enginePath) : null;
+        const builtinConfigPath = enginePath ? this.findBuiltinConfigFn(enginePath) : null;
         if (!builtinConfigPath) {
           if (pid !== null) this.syncedProcessId = pid;
           return;
@@ -199,6 +199,17 @@ export class ZCodeProtocolClient {
    */
   setServerRequestHandler(handler: (request: ProtocolServerRequest) => ServerRequestAnswer | Promise<ServerRequestAnswer>): void {
     this.router.setServerRequestHandler(handler);
+  }
+
+  /**
+   * Installs the observer that sees every session event regardless of who
+   * listens to the session.
+   *
+   * Consumer: the zcode runtime provider's engine-turn presence, which must
+   * keep following a session after its run's listener was detached.
+   */
+  setSessionEventObserver(observer: (notification: ProtocolNotification) => void): void {
+    this.router.setSessionEventObserver(observer);
   }
 
   /**

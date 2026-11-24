@@ -23,6 +23,7 @@ import type {
   ProviderRuntimeWriter,
 } from '@/shared/types.js';
 import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
+import { clearSessionReplyPreview, getSessionReplyPreview } from '@/modules/notifications/index.js';
 
 import { protocolClient } from '../list/zcode/zcode-protocol.client.js';
 import { ZCODE_CANCELLED_NOTICE, ZCODE_CANCELLED_NOTICE_KEY } from '../list/zcode/zcode-live-event-normalizer.js';
@@ -234,10 +235,16 @@ rl.on('line', (line) => {
     createdSessions.add(sessionId);
     writtenSessions.delete(sessionId);
     // ZCode 0.16.9 validates create params strictly and no longer accepts the
-    // runtimeModel catalog here. Keep this boundary aligned with the real
-    // engine so a provider upgrade cannot silently reintroduce the breakage.
+    // runtimeModel catalog here. The engine also accepts an initial model
+    // selection ({providerId, modelId, options?}) that seeds the session-level
+    // selection (0.17.1 behavior the runtime relies on for turn-0 title
+    // generation) plus a separate top-level thoughtLevel string: the create
+    // handler stringifies model and drops its options, so only thoughtLevel
+    // lands the reasoning level in the session-level selection. Keep this
+    // boundary aligned with the real engine so a provider upgrade cannot
+    // silently reintroduce the breakage.
     for (const key of Object.keys(msg.params ?? {})) {
-      if (key !== 'workspace') {
+      if (key !== 'workspace' && key !== 'model' && key !== 'thoughtLevel') {
         send({ id: msg.id, error: { code: -32602, message: 'Invalid params — (root): Unrecognized key: "' + key + '"' } });
         return;
       }
@@ -337,6 +344,36 @@ rl.on('line', (line) => {
       notify({ kind: 'result', toolCallId: 'call_live_bash', result: { success: true, content: 'a.txt' } });
       send({ method: 'session/event', params: { sessionId, type: 'model.streaming', payload: { kind: 'text_delta', delta: 'done' } } });
       send({ method: 'session/event', params: { sessionId, type: 'turn.completed', payload: {} } });
+      return;
+    }
+    if (readMode() === 'segments') {
+      // Two prose segments, the shape a reply interleaved with tool calls
+      // takes. The engine names every assistant message, so each segment
+      // streams under its own message id — and the engine's segment boundary
+      // events never cross the protocol (only the deltas do), so the row
+      // identity is the only boundary the runtime can see. The terminal push
+      // should carry the last segment, the way the text-row engines' push
+      // does.
+      const ev = (payload) => send({ method: 'session/event', params: { sessionId, type: 'model_streaming', payload } });
+      ev({ kind: 'text_delta', assistantMessageId: 'msg_seg_1', delta: '第一段开场白' });
+      // The second segment arrives in two deltas under one message id: they
+      // are one segment, not two.
+      ev({ kind: 'text_delta', assistantMessageId: 'msg_seg_2', delta: '第二段' });
+      ev({ kind: 'text_delta', assistantMessageId: 'msg_seg_2', delta: '结论' });
+      send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
+      return;
+    }
+    if (readMode() === 'segments-boundary') {
+      // The same two segments, announced by the engine's own boundary events
+      // instead of by the row identity. Both routes must land on the same
+      // preview.
+      const ev = (payload) => send({ method: 'session/event', params: { sessionId, type: 'model_streaming', payload } });
+      ev({ kind: 'text_delta', assistantMessageId: 'msg_seg_1', delta: '第一段开场白' });
+      ev({ kind: 'text_end' });
+      ev({ kind: 'text_start', assistantMessageId: 'msg_seg_2' });
+      ev({ kind: 'text_delta', assistantMessageId: 'msg_seg_2', delta: '第二段结论' });
+      ev({ kind: 'text_end' });
+      send({ method: 'session/event', params: { sessionId, type: 'turn_complete', payload: { usage: { inputTokens: 3, outputTokens: 4 } } } });
       return;
     }
     if (readMode() === 'send-fail') {
@@ -670,6 +707,66 @@ test('runtime completes a run when the engine asks for runtime preferences mid-c
   assert.equal(complete?.tokens, 7);
 });
 
+test('a completed run leaves its streamed reply in the notification preview registry', async () => {
+  fsSync.writeFileSync(modeFilePath, 'ok\n');
+  const runtime = new ZCodeRuntimeProvider();
+  const { writer } = createWriter();
+
+  // The completed push body reads this registry. zcode streams reply prose as
+  // stream_delta rows, which the shared writer-side capture (text rows only)
+  // never sees, so the runtime itself must record the accumulated reply —
+  // the stop push would otherwise fall back to the bare "ZCode: completed".
+  clearSessionReplyPreview('app-sess-preview');
+  await runtime.run('hello', { sessionId: 'app-sess-preview', cwd: stubDir }, writer, context);
+
+  assert.equal(getSessionReplyPreview('app-sess-preview'), 'hi there');
+});
+
+test('a run that preempts an engine-started turn keeps that turn out of the preview', async () => {
+  fsSync.writeFileSync(modeFilePath, 'preempt\n');
+  fsSync.writeFileSync(logFilePath, '');
+  clearSessionReplyPreview('app-sess-preempt');
+  const runtime = new ZCodeRuntimeProvider();
+  const { writer } = createWriter();
+
+  // startNow cancels the turn the engine started from a queued background
+  // notification; its winding-down prose streams past this run's listener.
+  await runtime.run('hello', { sessionId: 'app-sess-preempt', cwd: stubDir }, writer, context);
+
+  // The stop push would otherwise open with the cancelled turn's text.
+  assert.equal(getSessionReplyPreview('app-sess-preempt'), 'user reply');
+});
+
+test('a multi-segment reply leaves the last segment as the preview', async () => {
+  fsSync.writeFileSync(modeFilePath, 'segments\n');
+  fsSync.writeFileSync(logFilePath, '');
+  clearSessionReplyPreview('app-sess-segments');
+  const runtime = new ZCodeRuntimeProvider();
+  const { writer } = createWriter();
+
+  // Accumulating every stream_delta would make the push open with the first
+  // segment's preamble; the text-row engines' push carries the last segment,
+  // and this runtime's must match. The engine announces a new segment by
+  // the message id its deltas carry, so the row identity is the boundary.
+  await runtime.run('hello', { sessionId: 'app-sess-segments', cwd: stubDir }, writer, context);
+
+  assert.equal(getSessionReplyPreview('app-sess-segments'), '第二段结论');
+});
+
+test('a segment boundary announced by the engine lands on the same preview', async () => {
+  fsSync.writeFileSync(modeFilePath, 'segments-boundary\n');
+  fsSync.writeFileSync(logFilePath, '');
+  clearSessionReplyPreview('app-sess-segments-boundary');
+  const runtime = new ZCodeRuntimeProvider();
+  const { writer } = createWriter();
+
+  // The engine's own boundary events, when they do arrive, must reach the
+  // same preview the row identity gives.
+  await runtime.run('hello', { sessionId: 'app-sess-segments-boundary', cwd: stubDir }, writer, context);
+
+  assert.equal(getSessionReplyPreview('app-sess-segments-boundary'), '第二段结论');
+});
+
 test('runtime surfaces session/create failures as error messages', async () => {
   fsSync.writeFileSync(modeFilePath, 'create-fail\n');
   const runtime = new ZCodeRuntimeProvider();
@@ -724,6 +821,18 @@ test('runtime configures model and reasoning effort variant', async () => {
       workspacePath: stubDir,
       workspaceKey: stubDir,
     },
+    // The create seeds the session-level selection with the run's resolved
+    // model so the engine's turn-0 title generation (and subagent spawns)
+    // resolve a usable provider instead of the engine default. The reasoning
+    // level additionally travels as the top-level thoughtLevel field: the
+    // create handler stringifies model and drops its options, so only
+    // thoughtLevel lands the level in the session-level selection.
+    model: {
+      providerId: 'bigmodel-coding-plan',
+      modelId: 'GLM-5.3',
+      options: { reasoningLevel: 'high' },
+    },
+    thoughtLevel: 'high',
   });
 
   const sendAttempts = readStubLog().filter((entry) => entry.name === 'session_send_attempt');

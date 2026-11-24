@@ -801,7 +801,7 @@ export type BackgroundSendPrompt = {
 
 //----------------- SETTINGS CLI VERSION ------------
 
-/** One provider CLI's version state from `GET /api/providers/:provider/cli`: the installed version, the newest npm release (null when the CLI is not on npm or the registry did not answer), the command the update action runs, or why there is none ('bundled': it ships with CloudCLI; 'platform': the hosting platform manages it), whether an update run is going on, and the most recent finished run since the server started. A page that sees `updateInProgress` polls until it turns false and then shows `lastUpdate` as that run's result. Loaded by useProviderCliVersion and rendered by the settings account view. */
+/** One provider CLI's version state from `GET /api/providers/:provider/cli`: the installed version, the newest npm release (null when the CLI is not on npm or the registry did not answer), the command the update action runs, or why there is none ('bundled': it ships with CloudCLI; 'external': it is a CODEX_CLI_PATH install updated outside CloudCLI; 'platform': the hosting platform manages it), whether an update run is going on, and the most recent finished run since the server started. A page that sees `updateInProgress` polls until it turns false and then shows `lastUpdate` as that run's result. Loaded by useProviderCliVersion and rendered by the settings account view. */
 export type ProviderCliStatus = {
   provider: LLMProvider;
   installed: boolean;
@@ -809,7 +809,7 @@ export type ProviderCliStatus = {
   latestVersion: string | null;
   updateAvailable: boolean;
   updateCommand: string | null;
-  updateUnavailableReason: 'bundled' | 'platform' | null;
+  updateUnavailableReason: 'bundled' | 'external' | 'platform' | null;
   updateInProgress: boolean;
   lastUpdate: ProviderCliUpdateResult | null;
 };
@@ -1992,6 +1992,14 @@ export type TimelineSnapshot = {
   serverMessages: NormalizedMessage[];
   realtimeMessages: NormalizedMessage[];
   retiredOptimisticUserAnchors: Array<[string, string]>;
+  /**
+   * Optimistic prompts whose pairing counts as proven. A live row can only
+   * reconcile against its own turn's persisted rows through one of these, so
+   * a duplicate reply is read here first: a prompt missing from this list
+   * while `retiredOptimisticUserAnchors` holds it is a pairing that never
+   * became a fact.
+   */
+  provenOptimisticUserAnchors: string[];
   pendingPrompts: Array<[string, unknown]>;
   runEnded: boolean;
 };

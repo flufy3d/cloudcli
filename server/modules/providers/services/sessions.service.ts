@@ -7,6 +7,10 @@ import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { providerRuntimeService } from '@/modules/providers/services/provider-runtime.service.js';
 import { listBusyClaudeCliSessions } from '@/modules/providers/services/claude-cli-liveness.service.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
+import {
+  getReportedClaudeContextWindow,
+  rememberClaudeContextWindow,
+} from '@/modules/providers/services/claude-usage.js';
 import type {
   BackgroundTaskSummary,
   FetchHistoryOptions,
@@ -338,7 +342,8 @@ export const sessionsService = {
 
   /**
    * Returns app-facing ids for provider runs that are currently processing,
-   * plus every session whose background work outlived its turn.
+   * plus every session whose background work outlived its turn, plus every
+   * session whose engine is running a turn of its own.
    *
    * This is intentionally status-only: callers that only need sidebar activity
    * indicators should not attach to chat streams or request replayed messages.
@@ -392,6 +397,30 @@ export const sessionsService = {
         statusText: 'Running in the Claude CLI',
       });
       runningById.set(session.session_id, entries[entries.length - 1]);
+    }
+
+    // The engine keeps running turns of its own on a session: the report turn
+    // a background task's notification wakes after the turn that launched it
+    // ended, and a turn that keeps going after its CloudCLI run failed. Neither
+    // touches the chat-run registry, so without this the page showed the
+    // session idle while its transcript kept growing. There is no run to abort,
+    // so these are reported but not interruptible.
+    for (const provider of providerRegistry.listProviders()) {
+      for (const turn of provider.runtime.listEngineTurns?.() ?? []) {
+        const session = sessionsDb.getSessionByProviderSessionId(turn.engineSessionId);
+        if (!session || runningById.has(session.session_id)) {
+          continue;
+        }
+
+        entries.push({
+          sessionId: session.session_id,
+          provider: provider.id,
+          startedAt: turn.startedAt,
+          lastSeq: chatRunRegistry.getRun(session.session_id)?.lastSeq ?? 0,
+          canInterrupt: false,
+        });
+        runningById.set(session.session_id, entries[entries.length - 1]);
+      }
     }
 
     // The engine is the only one that knows whether it picked a queued input
@@ -604,6 +633,17 @@ export const sessionsService = {
       effort: source.effort,
       contextWindow: source.context_window,
     });
+
+    // The fork resumes the same conversation under a new provider session id,
+    // so the window the SDK reported for the source would no longer be found.
+    // Without it the page's first reading measures a 1M conversation against
+    // the 200k default until the fork's first turn reports its own.
+    if (provider === 'claude') {
+      const reportedWindow = getReportedClaudeContextWindow(source.provider_session_id);
+      if (reportedWindow) {
+        rememberClaudeContextWindow(forked.providerSessionId, reportedWindow);
+      }
+    }
 
     await broadcastSessionUpserted(forkSessionId);
 

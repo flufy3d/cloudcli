@@ -508,6 +508,320 @@ test('a keyed history prefix yields to the complete Antigravity stream', async (
   );
 });
 
+// ─── Unkeyed ACP streams: the frames name no transcript step, so the live
+// segment can carry no row key and its placeholder must reconcile by content.
+
+test('an unkeyed ACP stream retires once history lands its persisted twin', async () => {
+  const streamedContent = 'ACP frames name no transcript step, so the live segment carries no row key.';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'review the streaming path' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_8',
+    provider: 'antigravity',
+    content: streamedContent,
+    providerRowKey: 'assistant-step:3',
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: streamedContent.slice(0, 40) });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: streamedContent.slice(40) });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent).map((row) => row.id),
+    ['msg_session_8'],
+  );
+  assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 0);
+});
+
+test('an unkeyed ACP placeholder with no persisted twin survives a refresh', async () => {
+  const orphanText = 'This streamed segment exists nowhere in the persisted transcript.';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'say something' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_9',
+    provider: 'antigravity',
+    content: 'A different persisted reply.',
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: orphanText });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  // Survival, not placement: the placeholder sorts by its own arrival clock.
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content)
+      .sort(),
+    [orphanText, persistedReply.content].sort(),
+  );
+});
+
+test('an unproven turn keeps its unkeyed placeholder beside an older identical persisted reply', async () => {
+  const repeated = 'The model repeats this exact sentence in two turns of one session.';
+  const olderReply = msg(2, {
+    id: 'msg_session_10_old',
+    provider: 'antigravity',
+    content: repeated,
+  });
+  const initialUser = msg(1, { provider: 'antigravity', content: 'first question' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser, olderReply], total: 2, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser, olderReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_prompt_2',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 9000).toISOString(),
+    provider: 'antigravity',
+    kind: 'text',
+    role: 'user',
+    content: 'second question',
+  });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: repeated });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  // The live turn is not provable yet (its prompt has no persisted copy), so
+  // the older turn's identical reply must not be treated as the placeholder's
+  // twin: the placeholder stays, and the older row stays.
+  assert.equal(store.getMessages(SESSION_ID).filter((row) => row.content === repeated).length, 2);
+});
+
+test('a truncated persisted row yields to the fuller unkeyed ACP stream', async () => {
+  const completeReply = `${'A detailed implementation step with concrete safeguards. '.repeat(8)}Final verification.`;
+  const persistedPrefix = completeReply.slice(0, Math.floor(completeReply.length * 0.3));
+  const initialUser = msg(1, { provider: 'antigravity', content: 'write the complete plan' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: {
+        messages: [initialUser, msg(2, {
+          id: 'msg_session_11',
+          provider: 'antigravity',
+          content: persistedPrefix,
+          contentCompleteness: 'truncated',
+        })],
+        total: 2,
+        hasMore: false,
+      },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: completeReply });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => row.role === 'assistant')
+      .map((row) => row.content),
+    [completeReply],
+  );
+});
+
+test('a persisted twin trimmed of trailing whitespace still retires its unkeyed segment', async () => {
+  // The transcript reader trims every body it stores while the placeholder
+  // holds the deltas as they arrived, so the comparison must not hinge on
+  // edge whitespace.
+  const streamedContent = 'A segment the engine streamed with a trailing newline.\n';
+  const initialUser = msg(1, { provider: 'antigravity', content: 'review the streaming path' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_12',
+    provider: 'antigravity',
+    content: streamedContent.trim(),
+    providerRowKey: 'assistant-step:5',
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: streamedContent });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => (row.content ?? '').trim() === streamedContent.trim())
+      .map((row) => row.id),
+    ['msg_session_12'],
+  );
+  assert.equal(store.getSessionSlot(SESSION_ID)!.realtimeMessages.length, 0);
+  assert.equal(store.getSessionSlot(SESSION_ID)!.streamingPlaceholderIds.size, 0,
+    'retiring the placeholder must clear the adoption pointer');
+});
+
+test('an unkeyed ACP reply retires even when its prompt was paired before any history loaded', async () => {
+  // The production shape: a new session is sent before its (empty) first page
+  // has ever been loaded, so the optimistic prompt has no anchor. The first
+  // page then lands mid-run, which records the prompt's pairing while the
+  // turn is still streaming. That pairing is a guess then, but the run ending
+  // makes it a fact — and the reply's unkeyed placeholder can only be retired
+  // against its own turn once the turn can be named.
+  const streamedContent = 'Rune slots replace the per-room picker, and gold evolutions fire from the pair.';
+  const initialUser = msg(1, { id: 'msg_session_1', provider: 'antigravity', content: 'review the rune plan' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_11',
+    provider: 'antigravity',
+    content: streamedContent,
+    providerRowKey: 'assistant-step:11',
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_prompt_1',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME).toISOString(),
+    provider: 'antigravity',
+    kind: 'text',
+    role: 'user',
+    content: 'review the rune plan',
+  });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: streamedContent.slice(0, 20) });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: streamedContent.slice(20) });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent).map((row) => row.id),
+    ['msg_session_11'],
+  );
+});
+
+test('a proven turn stays proven after the next prompt is sent', async () => {
+  // The completion refresh can land before the transcript indexes the reply.
+  // The prompt pairing was still proven at that moment (the run had ended),
+  // and that is a fact about the transcript, not about the current run — so a
+  // later refresh, arriving after the next prompt has cleared the flag, must
+  // still retire the finished turn's placeholder.
+  const streamedContent = 'The first turn reply arrives in the transcript a moment late.';
+  const initialUser = msg(1, { id: 'msg_session_1', provider: 'antigravity', content: 'first question' });
+  const persistedReply = msg(2, {
+    id: 'msg_session_11',
+    provider: 'antigravity',
+    content: streamedContent,
+    providerRowKey: 'assistant-step:11',
+  });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    // Completion refresh: the transcript has the prompt but not yet the reply.
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser], total: 1, hasMore: false },
+    },
+    // Later refresh (the next prompt has cleared `runEnded`): the reply is in.
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [initialUser, persistedReply], total: 2, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_prompt_1',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME).toISOString(),
+    provider: 'antigravity',
+    kind: 'text',
+    role: 'user',
+    content: 'first question',
+  });
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: streamedContent });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_prompt_2',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 5000).toISOString(),
+    provider: 'antigravity',
+    kind: 'text',
+    role: 'user',
+    content: 'second question',
+  });
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.content === streamedContent).map((row) => row.id),
+    ['msg_session_11'],
+  );
+});
+
 test('a near-identical keyed Antigravity history row yields to richer markdown-formatted stream text', async () => {
   const providerRowKey = 'assistant-step:7b';
   const shared = '游戏世界与界面分工协作是现代 Web 游戏的常见架构。'.repeat(18);
@@ -1765,4 +2079,51 @@ test('gateway frames that are not about the timeline add no rows to the viewed s
   }
 
   assert.deepEqual(store.getMessages('session-1').map((message) => message.id), ['u1']);
+});
+
+// ─── Gateway frames that are not timeline rows ───────────────────────────────
+
+test('appendRealtime drops a frame whose id is missing instead of poisoning the slot', () => {
+  const store = new SessionTimelineStore();
+
+  store.appendRealtime(SESSION_ID, { ...msg(1), id: undefined as unknown as string });
+  store.appendRealtime(SESSION_ID, msg(2));
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).map((row) => row.id),
+    ['m2'],
+    'the id-less frame is ignored and the following append still works',
+  );
+});
+
+test('an id-less frame does not wedge the replay of the frames behind it', () => {
+  // The harm an id-less row does is not its own throw: the ledger buffers
+  // out-of-order frames, so a row that cannot be applied parks the
+  // contiguous cursor and every later frame of that session fails with it.
+  const store = new SessionTimelineStore();
+  store.setActiveSession(SESSION_ID);
+  store.applyServerEvent({
+    kind: 'chat_subscribed', sessionId: SESSION_ID, streamEpoch: 'gateway-a',
+    lastSeq: 3, replayFromSeq: 1, stale: false, isProcessing: true, pendingPermissions: [],
+    timestamp: '2026-10-20T00:00:00Z',
+  } as never);
+
+  const sequenced = (seq: number, extra: Record<string, unknown> = {}) => ({
+    id: `event-${seq}`, sessionId: SESSION_ID, timestamp: '2026-10-20T00:00:00Z',
+    provider: 'claude', kind: 'text', role: 'assistant', content: `row ${seq}`,
+    seq, streamEpoch: 'gateway-a', ...extra,
+  });
+
+  // The row the engine could not name: the transport identity is valid, the
+  // row identity is not.
+  store.applyServerEvent(sequenced(2, { id: undefined }) as never);
+  store.applyServerEvent(sequenced(3, { kind: 'complete', success: true }) as never);
+  store.applyServerEvent(sequenced(1) as never);
+
+  assert.equal(store.getResumeSeq(SESSION_ID), 3, 'the backlog drained past the id-less row');
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).map((row) => row.id),
+    ['event-1'],
+    'the id-less row is the only one dropped',
+  );
 });

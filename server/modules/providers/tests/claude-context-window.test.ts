@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import Database from 'better-sqlite3';
+
 import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
 import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude-models.provider.js';
+import { clearClaudeGatewayCache } from '@/modules/providers/list/claude/claude-gateway.js';
 import { queryClaudeSDK } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 import { createProviderTokenUsageService } from '@/modules/providers/services/provider-token-usage.service.js';
 import type { NormalizedMessage, ProviderRuntimeContext } from '@/shared/types.js';
@@ -259,5 +262,154 @@ test('a resumed session measures its first reading against the window it last re
     const budgets = tokenBudgets(resumed);
     // No 160000 flash before the turn ends, and nothing re-sent when the window did not change.
     assert.deepEqual(budgets.map((budget) => budget.total), [1_000_000]);
+  });
+});
+
+/** Runs one test body with MODEL_CONTEXT_WINDOWS set and restores it afterwards. */
+async function withModelContextWindows(value: string | undefined, body: () => Promise<void>): Promise<void> {
+  const previous = process.env.MODEL_CONTEXT_WINDOWS;
+  if (value === undefined) delete process.env.MODEL_CONTEXT_WINDOWS;
+  else process.env.MODEL_CONTEXT_WINDOWS = value;
+  try {
+    await body();
+  } finally {
+    if (previous === undefined) delete process.env.MODEL_CONTEXT_WINDOWS;
+    else process.env.MODEL_CONTEXT_WINDOWS = previous;
+  }
+}
+
+/**
+ * Points the process home at a throwaway directory holding an OpenCode
+ * models.dev catalog, so the local-metadata path is exercised without
+ * depending on the machine's real ~/.local/share/opencode.
+ *
+ * `baseUrl` defaults to the OpenCode gateway (the catalog is only a valid
+ * source there); pass null to simulate Claude running anywhere else.
+ */
+async function withLocalModelCatalog(
+  families: Record<string, Record<string, number>>,
+  body: () => Promise<void>,
+  options: { baseUrl?: string | null } = {},
+): Promise<void> {
+  const baseUrl = options.baseUrl === undefined
+    ? 'https://opencode.ai/inference/go/anthropic'
+    : options.baseUrl;
+  const homeDir = await mkdtemp(path.join(os.tmpdir(), 'claude-context-window-home-'));
+  const originalHomedir = os.homedir;
+  const previousBaseUrl = process.env.ANTHROPIC_BASE_URL;
+  (os as any).homedir = () => homeDir;
+  delete process.env.ANTHROPIC_BASE_URL;
+  clearClaudeGatewayCache();
+  try {
+    if (baseUrl) {
+      await mkdir(path.join(homeDir, '.claude'), { recursive: true });
+      await writeFile(
+        path.join(homeDir, '.claude', 'settings.json'),
+        JSON.stringify({ env: { ANTHROPIC_BASE_URL: baseUrl } }),
+      );
+    }
+    const dbPath = path.join(homeDir, '.local', 'share', 'opencode', 'opencode.db');
+    await mkdir(path.dirname(dbPath), { recursive: true });
+    const db = new Database(dbPath);
+    try {
+      db.exec('CREATE TABLE kv (key text PRIMARY KEY, value text NOT NULL);');
+      const catalog: Record<string, unknown> = {};
+      for (const [family, models] of Object.entries(families)) {
+        catalog[family] = {
+          models: Object.fromEntries(
+            Object.entries(models).map(([modelId, context]) => [modelId, { limit: { context } }]),
+          ),
+        };
+      }
+      db.prepare('INSERT INTO kv (key, value) VALUES (?, ?)').run(
+        'models-dev:v2:catalog',
+        JSON.stringify({ updatedAt: 1, digest: 'd', body: JSON.stringify(catalog) }),
+      );
+    } finally {
+      db.close();
+    }
+    await body();
+  } finally {
+    clearClaudeGatewayCache();
+    (os as any).homedir = originalHomedir;
+    if (previousBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = previousBaseUrl;
+    await rm(homeDir, { recursive: true, force: true });
+  }
+}
+
+const gatewayStream = (nativeId: string) => [
+  { type: 'system', subtype: 'init', session_id: nativeId },
+  assistant(nativeId, 'deepseek-v4.1-flash'),
+  // A compatible gateway reports token counts but no `contextWindow`.
+  result(nativeId, { 'deepseek-v4.1-flash': modelUsageEntry(undefined) }),
+];
+
+test('MODEL_CONTEXT_WINDOWS supplies a per-model window when the SDK reports none', async () => {
+  await withContextWindowEnv(undefined, async () => {
+    await withModelContextWindows('deepseek-v4.1-flash=777777', async () => {
+      const sent = await runScripted('app-gateway-env', gatewayStream('native-gateway-env'));
+      assert.equal(tokenBudgets(sent).at(-1)!.total, 777_777);
+    });
+  });
+});
+
+test('the cached models.dev catalog supplies the window the SDK did not report', async () => {
+  await withContextWindowEnv(undefined, async () => {
+    await withModelContextWindows(undefined, async () => {
+      await withLocalModelCatalog({ 'opencode-go': { 'deepseek-v4.1-flash': 1_000_000 } }, async () => {
+        const sent = await runScripted('app-gateway-catalog', gatewayStream('native-gateway-catalog'));
+        assert.equal(tokenBudgets(sent).at(-1)!.total, 1_000_000);
+      });
+    });
+  });
+});
+
+test('the OpenCode catalog stays out when Claude calls another endpoint', async () => {
+  await withContextWindowEnv(undefined, async () => {
+    await withModelContextWindows(undefined, async () => {
+      await withLocalModelCatalog(
+        { 'opencode-go': { 'deepseek-v4.1-flash': 1_000_000 } },
+        async () => {
+          const sent = await runScripted('app-other-gateway', gatewayStream('native-other-gateway'));
+          // Another endpoint reports no window either, and the OpenCode cache
+          // says nothing about it: the default stands instead of 1M.
+          assert.equal(tokenBudgets(sent).at(-1)!.total, 160_000);
+        },
+        { baseUrl: 'https://gateway.example.com/anthropic' },
+      );
+    });
+  });
+});
+
+test('the history-derived window falls back to the local catalog for a gateway model', async () => {
+  await withContextWindowEnv(undefined, async () => {
+    await withModelContextWindows(undefined, async () => {
+      await withLocalModelCatalog({ 'opencode-go': { 'deepseek-v4.1-flash': 1_000_000 } }, async () => {
+        const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'claude-context-window-gateway-'));
+        const transcriptPath = path.join(tempDirectory, 'native-gateway-history.jsonl');
+        try {
+          await writeFile(
+            transcriptPath,
+            `${JSON.stringify({ type: 'assistant', message: { model: 'deepseek-v4.1-flash', usage } })}\n`,
+          );
+          const service = createProviderTokenUsageService({
+            getSessionById: () => ({
+              session_id: 'app-gateway-history',
+              provider: 'claude',
+              provider_session_id: 'native-gateway-history',
+              jsonl_path: transcriptPath,
+            }) as never,
+            isProviderSessionSuperseded: () => false,
+          });
+
+          const reloaded = await service.getSessionTokenUsage('app-gateway-history');
+          assert.equal(reloaded.total, 1_000_000);
+          assert.equal(reloaded.used, 42_512);
+        } finally {
+          await rm(tempDirectory, { recursive: true, force: true });
+        }
+      });
+    });
   });
 });
