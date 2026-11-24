@@ -1,18 +1,44 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import express, { type Request, type Response } from 'express';
 
 import {
   authenticateTokenOrApiKey,
+  authenticateTokenOrApiKeyWhen,
   generateToken,
 } from '../auth.middleware.js';
 import { apiKeysDb, closeConnection, initializeDatabase, userDb } from '@/modules/database/index.js';
 
-test('authenticateTokenOrApiKey middleware supports both JWT and API Key', async () => {
+/**
+ * Points the database at a throwaway file for one test. The shell that runs the
+ * suite may export DATABASE_PATH for the real install, and these tests create
+ * users and live API keys.
+ */
+async function useIsolatedDatabase(): Promise<() => Promise<void>> {
+  const previousDatabasePath = process.env.DATABASE_PATH;
+  const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'auth-middleware-'));
+  closeConnection();
+  process.env.DATABASE_PATH = path.join(tempDirectory, 'auth.db');
   await initializeDatabase();
+  return async () => {
+    closeConnection();
+    if (previousDatabasePath === undefined) {
+      delete process.env.DATABASE_PATH;
+    } else {
+      process.env.DATABASE_PATH = previousDatabasePath;
+    }
+    await rm(tempDirectory, { recursive: true, force: true });
+  };
+}
+
+test('authenticateTokenOrApiKey middleware supports both JWT and API Key', async () => {
+  const restoreDatabase = await useIsolatedDatabase();
   try {
     const testUser = userDb.createUser('dual-auth-user', 'some-hash');
     const jwtToken = generateToken(testUser);
@@ -74,6 +100,48 @@ test('authenticateTokenOrApiKey middleware supports both JWT and API Key', async
       await once(server, 'close');
     }
   } finally {
-    closeConnection();
+    await restoreDatabase();
+  }
+});
+
+test('an API key opens only the requests the guard selects, never via the query string', async () => {
+  const restoreDatabase = await useIsolatedDatabase();
+  try {
+    const testUser = userDb.createUser('scoped-key-user', 'some-hash');
+    const jwtToken = generateToken(testUser);
+    const createdKey = apiKeysDb.createApiKey(Number(testUser.id), 'catalog-key');
+
+    const app = express();
+    const router = express.Router();
+    router.get('/:provider/models', (_req: Request, res: Response) => { res.json({ ok: true }); });
+    router.post('/:provider/models', (_req: Request, res: Response) => { res.json({ ok: true }); });
+    router.get('/mcp/servers', (_req: Request, res: Response) => { res.json({ ok: true }); });
+    app.use(
+      '/api/providers',
+      authenticateTokenOrApiKeyWhen((req) => req.method === 'GET' && /^\/[^/]+\/models\/?$/.test(req.path)),
+      router,
+    );
+
+    const server = app.listen(0);
+    await once(server, 'listening');
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/providers`;
+    const withKey = { headers: { 'X-API-Key': createdKey.apiKey } };
+
+    try {
+      assert.equal((await fetch(`${baseUrl}/claude/models`, withKey)).status, 200);
+      // The catalog write and every other route under the mount stay JWT-only.
+      assert.equal((await fetch(`${baseUrl}/claude/models`, { method: 'POST', ...withKey })).status, 401);
+      assert.equal((await fetch(`${baseUrl}/mcp/servers`, withKey)).status, 401);
+      assert.equal((await fetch(`${baseUrl}/mcp/servers`, {
+        headers: { Authorization: `Bearer ${jwtToken}` },
+      })).status, 200);
+      // A key in the query string is not a credential.
+      assert.equal((await fetch(`${baseUrl}/claude/models?apiKey=${createdKey.apiKey}`)).status, 401);
+    } finally {
+      server.close();
+      await once(server, 'close');
+    }
+  } finally {
+    await restoreDatabase();
   }
 });
