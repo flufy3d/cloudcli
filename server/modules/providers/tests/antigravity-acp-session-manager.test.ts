@@ -139,6 +139,7 @@ test('acquire opens a session and reports its facts', async () => {
     manager.release('app-1', handle);
     const again = await manager.acquire('app-1', { cwd: stubDir });
     assert.equal(again, handle);
+    assert.equal(again.continuity, 'reused', 'a resident process replays nothing');
     assert.equal(manager.size, 1);
   } finally {
     await manager.destroyAll();
@@ -156,6 +157,14 @@ test('resume rides session/load and a failure preserves the original mapping', a
     const resumed = await ok.acquire('app-resume', { cwd: stubDir, resumeProviderSessionId: 'conv-42' });
     assert.equal(resumed.sessionId, 'conv-42');
     assert.equal(resumed.continuity, 'resumed');
+
+    // Only the session/load turn replays history. The next turn on the same
+    // process must not run the replay guard: it dropped a fresh reply's first
+    // chunk ("直接") because the previous reply happened to contain it.
+    ok.release('app-resume', resumed);
+    const next = await ok.acquire('app-resume', { cwd: stubDir, resumeProviderSessionId: 'conv-42' });
+    assert.equal(next, resumed);
+    assert.equal(next.continuity, 'reused');
   } finally {
     await ok.destroyAll();
   }

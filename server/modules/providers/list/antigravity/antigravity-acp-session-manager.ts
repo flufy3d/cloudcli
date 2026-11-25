@@ -120,7 +120,14 @@ type AcpSessionHandle = {
   currentModelId: string | null;
   /** The engine's settable model ids (tier-suffixed families included). */
   availableModelIds: string[];
-  continuity: 'resumed' | 'started';
+  /**
+   * How this turn got its conversation: `started` (session/new), `resumed`
+   * (session/load, which replays the history as live frames), or `reused`
+   * (a later turn on the resident process — nothing is replayed, so the
+   * runtime's replay guard must stay off or it eats reply chunks that
+   * happen to quote the transcript tail).
+   */
+  continuity: 'resumed' | 'started' | 'reused';
 };
 
 type AcpAcquireOptions = {
@@ -183,6 +190,9 @@ export class AntigravityAcpSessionManager {
       if (matching && existing.handle) {
         existing.busy = true;
         this.clearIdleTimer(existing);
+        // Mutated in place: release() matches the handle by identity, and the
+        // turn that opened the process has already finished reading it.
+        existing.handle.continuity = 'reused';
         return existing.handle;
       }
       if (existing.backgroundCommands.size > 0) {
