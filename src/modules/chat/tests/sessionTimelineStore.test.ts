@@ -708,6 +708,112 @@ test('a persisted twin trimmed of trailing whitespace still retires its unkeyed 
     'retiring the placeholder must clear the adoption pointer');
 });
 
+/**
+ * Drives one Antigravity turn the way production does: history is loaded,
+ * the user sends a prompt, the engine streams `streamedChunks` as one segment,
+ * the turn completes, and the completion refresh lands `persistedReplies`.
+ * Returns the assistant bodies the timeline renders afterwards.
+ */
+async function renderUnkeyedTurn(streamedChunks: string[], persistedReplies: string[]): Promise<string[]> {
+  const olderUser = msg(1, { id: 'msg_old_user', provider: 'antigravity', content: 'earlier question' });
+  const olderReply = msg(2, { id: 'msg_old_reply', provider: 'antigravity', content: 'Earlier reply: we can 直接 move on.' });
+  const prompt = 'give me the prompt for the next track';
+  const persistedPrompt = msg(3, { id: 'msg_prompt', provider: 'antigravity', content: prompt });
+  const persisted = persistedReplies.map((content, index) => msg(4 + index, {
+    id: `msg_reply_${index}`,
+    provider: 'antigravity',
+    role: 'assistant',
+    content,
+    providerRowKey: `assistant-step:${4 + index}`,
+  }));
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [olderUser, olderReply], total: 2, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [olderUser, olderReply, persistedPrompt, ...persisted], total: 3 + persisted.length, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_prompt_track',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 3000).toISOString(),
+    provider: 'antigravity',
+    kind: 'text',
+    role: 'user',
+    content: prompt,
+  });
+  for (const chunk of streamedChunks) {
+    emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: chunk });
+  }
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  emitAntigravity(store, { kind: 'complete', sessionId: SESSION_ID });
+
+  await store.refreshLatestFromServer(SESSION_ID);
+  return store.getMessages(SESSION_ID)
+    .filter((row) => row.role === 'assistant' && row.id !== 'msg_old_reply')
+    .map((row) => row.content ?? '');
+}
+
+const TRACK_PROMPT_REPLY = [
+  '直接把下面这段复制到新会话里即可无缝启动 **Track 28**：',
+  '',
+  '```markdown',
+  '请在 `D:\\Projects\\rwkv-mind` 启动 **轨道 28（Track 28：0.4B 10 天平滑回放与 6/6 保持闭环，路线 B）**。',
+  '',
+  '### 当前基线（`master` @ `e286cdd`，工作树干净）',
+  '- **Track 25**：已确立 0.4B 慢路稳定配方，fp32 慢路 L14，32 桶x64。',
+  '- **文档同步**：开始和完成任务必须同步 `doc/proposals/` 与 `doc/README.md` 并干净提交 git。',
+  '```',
+].join('\n');
+
+test('an unkeyed live copy that lost its first chunk still retires against its persisted reply', async () => {
+  // The live stream dropped the leading "直接" (a server-side replay guard
+  // mistook it for history), so the live body is neither equal to nor a
+  // prefix of the persisted one. The persisted reply holds every word the
+  // live copy has, so history owns it and the reply must render once.
+  const live = TRACK_PROMPT_REPLY.slice('直接'.length);
+  const rendered = await renderUnkeyedTurn([live.slice(0, 30), live.slice(30)], [TRACK_PROMPT_REPLY]);
+  assert.deepEqual(rendered, [TRACK_PROMPT_REPLY]);
+});
+
+test('an unkeyed live copy missing a middle chunk or carrying different whitespace still retires', async () => {
+  const lines = TRACK_PROMPT_REPLY.split('\n');
+  const missingMiddle = [...lines.slice(0, 5), ...lines.slice(6)].join('\n');
+  assert.deepEqual(await renderUnkeyedTurn([missingMiddle], [TRACK_PROMPT_REPLY]), [TRACK_PROMPT_REPLY]);
+
+  const reflowed = TRACK_PROMPT_REPLY.replace(/\n/g, '\r\n  ');
+  assert.deepEqual(await renderUnkeyedTurn([reflowed], [TRACK_PROMPT_REPLY]), [TRACK_PROMPT_REPLY]);
+});
+
+test('an unkeyed live segment that spans two persisted steps retires against both', async () => {
+  const first = 'First step: inspect the transcript reader and list every place that trims bodies.';
+  const second = 'Second step: compare the live segment against the persisted rows of the same turn.';
+  assert.deepEqual(await renderUnkeyedTurn([`${first}\n\n${second}`], [first, second]), [first, second]);
+});
+
+test('an unkeyed live segment whose words are not in its turn survives the refresh', async () => {
+  // Output that exists nowhere on disk is never deleted: a short segment
+  // whose words appear elsewhere in the turn, and a long one that is mostly
+  // new text, both stay beside the persisted reply.
+  const persistedReply = 'The plan is done and documented; tests pass on both platforms.';
+  const shortOrphan = 'done';
+  assert.deepEqual(
+    (await renderUnkeyedTurn([shortOrphan], [persistedReply])).sort(),
+    [persistedReply, shortOrphan].sort(),
+  );
+  const longOrphan = 'A brand-new paragraph about the scheduler retry budget that was never written to disk at all.';
+  assert.deepEqual(
+    (await renderUnkeyedTurn([longOrphan], [persistedReply])).sort(),
+    [persistedReply, longOrphan].sort(),
+  );
+});
+
 test('an unkeyed ACP reply retires even when its prompt was paired before any history loaded', async () => {
   // The production shape: a new session is sent before its (empty) first page
   // has ever been loaded, so the optimistic prompt has no anchor. The first

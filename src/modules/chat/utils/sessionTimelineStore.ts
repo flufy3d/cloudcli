@@ -418,6 +418,79 @@ type StreamedPlaceholderReconciliation =
   | { verdict: 'supersede'; serverMessageId: string };
 
 /**
+ * Window width, in non-whitespace characters, for the coverage comparison of
+ * an unkeyed segment. Eight characters is a phrase in CJK text and most of a
+ * word pair in Latin text: long enough that an unrelated window almost never
+ * occurs verbatim in a persisted reply, short enough that one dropped or
+ * altered chunk spoils only the window or two it overlaps.
+ */
+const SEGMENT_COVERAGE_WINDOW = 8;
+
+/** Share of a segment's body that must already be on disk for history to own it. */
+const SEGMENT_COVERAGE_THRESHOLD = 0.9;
+
+/**
+ * A segment compared against its whole turn (rather than one row) must span at
+ * least this many windows, so a few common phrases never prove anything.
+ */
+const SEGMENT_SPANNING_MIN_WINDOWS = 4;
+
+/** A body with every whitespace run removed, the form the coverage test compares. */
+function stripWhitespace(text: string): string {
+  return text.replace(/\s+/g, '');
+}
+
+/**
+ * The share of `segment` (by characters) whose fixed-width windows occur
+ * verbatim in `persisted`. A live copy that differs from its persisted twin by
+ * a lost, extra or reordered chunk keeps nearly full coverage; text that is
+ * not on disk scores near zero.
+ */
+function measureSegmentCoverage(segment: string, persisted: string): number {
+  if (!segment) return 0;
+  let covered = 0;
+  for (let start = 0; start < segment.length; start += SEGMENT_COVERAGE_WINDOW) {
+    const window = segment.slice(start, start + SEGMENT_COVERAGE_WINDOW);
+    if (persisted.includes(window)) covered += window.length;
+  }
+  return covered / segment.length;
+}
+
+/**
+ * Whether the persisted rows of the turn already hold an unkeyed segment's
+ * body even though no row equals it or starts with it.
+ *
+ * The live copy and its persisted twin come from two different pipes (the ACP
+ * frames and the transcript file), and every way they have drifted apart — a
+ * chunk the runtime dropped, whitespace the reader trimmed or reflowed, a
+ * segment boundary the stream drew differently from the transcript's steps —
+ * left the reply on screen twice. Rather than chase each drift, this asks the
+ * question the exact tests stand in for: is (nearly) all of this text already
+ * on disk in this turn? Two shapes qualify:
+ *
+ * - one row covers the segment and the segment is at least half that row's
+ *   length (a short phrase that merely recurs inside a long row proves
+ *   nothing);
+ * - the turn's rows together cover a segment of several windows (a live
+ *   segment that ran across two persisted steps).
+ *
+ * Text that is mostly new stays below the threshold and keeps its placeholder.
+ */
+function isSegmentCoveredByTurn(liveContent: string, completeRowBodies: string[]): boolean {
+  const liveBody = stripWhitespace(liveContent);
+  if (!liveBody) return false;
+  const rowBodies = completeRowBodies.map(stripWhitespace).filter(Boolean);
+  const coversAlone = rowBodies.some((body) =>
+    liveBody.length * 2 >= body.length
+    && measureSegmentCoverage(liveBody, body) >= SEGMENT_COVERAGE_THRESHOLD,
+  );
+  if (coversAlone) return true;
+  if (liveBody.length < SEGMENT_COVERAGE_WINDOW * SEGMENT_SPANNING_MIN_WINDOWS) return false;
+  // The separator keeps a window from matching across two rows' seam.
+  return measureSegmentCoverage(liveBody, rowBodies.join('\u0000')) >= SEGMENT_COVERAGE_THRESHOLD;
+}
+
+/**
  * Reconciles a streamed segment that carries no row key against the
  * persisted assistant rows of its own turn.
  *
@@ -429,10 +502,11 @@ type StreamedPlaceholderReconciliation =
  * twin retires the live copy (history owns it), a complete persisted row
  * that starts with the closed segment is the same reply held more fully and
  * retires it too, and a truncated persisted row the segment extends yields
- * to the fuller live copy until the full transcript catches up. Anything
- * else — a different body, a partial overlap, a row of another turn —
- * retains the placeholder, so output that exists nowhere else is never
- * deleted on a guess.
+ * to the fuller live copy until the full transcript catches up. A body that
+ * drifted from its twin but is still (nearly) all on disk in the turn retires
+ * too (`isSegmentCoveredByTurn`). Anything else — mostly new text, a row of
+ * another turn — retains the placeholder, so output that exists nowhere else
+ * is never deleted on a guess.
  */
 function reconcileStreamedPlaceholderByContent(
   placeholder: NormalizedMessage,
@@ -462,6 +536,13 @@ function reconcileStreamedPlaceholderByContent(
     } else if (liveContent.startsWith(serverContent)) {
       return { verdict: 'supersede', serverMessageId: row.id };
     }
+  }
+  // Truncated rows are excluded: the live copy may hold text they cut off.
+  const completeRowBodies = candidates
+    .filter((row) => (row.contentCompleteness ?? 'complete') === 'complete')
+    .map((row) => row.content || '');
+  if (isSegmentCoveredByTurn(liveContent, completeRowBodies)) {
+    return { verdict: 'retire' };
   }
   return { verdict: 'retain' };
 }
