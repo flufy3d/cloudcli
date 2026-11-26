@@ -224,6 +224,9 @@ test('AntigravityProviderModels returns builtin models fallback', async () => {
     assert.ok(definition.OPTIONS.length > 0);
     assert.ok(definition.DEFAULT);
     assert.ok(definition.OPTIONS.some((m) => m.value === 'gemini-4-argon'));
+    // The picker must know this is a stand-in: without the flag it would keep
+    // showing this list until the page is reloaded, even after the CLI recovers.
+    assert.equal(definition.FALLBACK, true);
   } finally {
     restoreAgyPath();
     clearEnginePathCache();
@@ -313,6 +316,7 @@ test('AntigravityProviderModels keeps caching a healthy CLI catalog', async () =
   const second = await models.getSupportedModels();
   assert.equal(first, cliCatalog);
   assert.equal(second, cliCatalog);
+  assert.equal(first.FALLBACK, undefined, 'a live CLI catalog is not a stand-in');
   assert.equal(reads, 1);
 });
 
@@ -321,9 +325,13 @@ test('ANTIGRAVITY_BUILTIN_MODELS collapses multi-tier families and keeps fixed m
 
   const values = ANTIGRAVITY_BUILTIN_MODELS.OPTIONS.map((option) => option.value);
   for (const expected of [
+    'gemini-4-neon',
+    'gemini-4-carbon',
     'gemini-4-argon',
     'gemini-4-hydrogen',
-    'gemini-pro-orchestrator-g1-pro',
+    'gemini-pro-orchestrator-neon',
+    'gemini-pro-orchestrator',
+    'gemini-pro-orchestrator-argon',
     'gemini-3.8-flash',
     'claude-opus-5-5',
     'claude-sonnet-5-5',
@@ -331,6 +339,8 @@ test('ANTIGRAVITY_BUILTIN_MODELS collapses multi-tier families and keeps fixed m
   ]) {
     assert.ok(values.includes(expected), `${expected} must be listed`);
   }
+  // A retired CLI id must not linger in the stopgap catalog.
+  assert.ok(!values.includes('gemini-pro-orchestrator-g1-pro'));
   // Multi-tier families collapse to base ids; the single-variant gpt-oss
   // row keeps its real agy id.
   assert.equal(
@@ -351,6 +361,22 @@ test('ANTIGRAVITY_BUILTIN_MODELS collapses multi-tier families and keeps fixed m
   assert.equal(hydrogen?.effort?.encoding, 'model-suffix');
   assert.deepEqual(hydrogen?.effort?.values.map((v) => v.value), ['low', 'medium', 'high', 'xhigh']);
   assert.equal(hydrogen?.effort?.default, 'high');
+
+  const neon = ANTIGRAVITY_BUILTIN_MODELS.OPTIONS.find((o) => o.value === 'gemini-4-neon');
+  assert.equal(neon?.label, 'Gemini 4 Neon');
+  assert.equal(neon?.description, 'Google Gemini 4 Neon');
+  assert.deepEqual(neon?.effort?.values.map((v) => v.value), ['low', 'medium', 'high', 'xhigh']);
+
+  const carbon = ANTIGRAVITY_BUILTIN_MODELS.OPTIONS.find((o) => o.value === 'gemini-4-carbon');
+  assert.equal(carbon?.label, 'Gemini 4 Carbon');
+  assert.deepEqual(carbon?.effort?.values.map((v) => v.value), ['low', 'medium', 'high']);
+
+  // The three orchestrator rows are separate passthrough models, not tiers.
+  for (const value of ['gemini-pro-orchestrator-neon', 'gemini-pro-orchestrator', 'gemini-pro-orchestrator-argon']) {
+    const orchestrator = ANTIGRAVITY_BUILTIN_MODELS.OPTIONS.find((o) => o.value === value);
+    assert.ok(orchestrator, `${value} must be listed`);
+    assert.equal(orchestrator?.effort, undefined);
+  }
 
   // Claude tiers became adjustable in the current agy catalog, unlike
   // older releases where sonnet was a passthrough.

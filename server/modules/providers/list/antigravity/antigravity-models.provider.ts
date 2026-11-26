@@ -49,6 +49,13 @@ const execFileAsync = promisify(execFile);
  * family carries a description; it becomes the base model's description.
  */
 const ANTIGRAVITY_BUILTIN_RAW_MODELS: AntigravityRawModelEntry[] = [
+  { value: "gemini-4-neon-high", label: "Gemini 4 Neon (High)", description: "Google Gemini 4 Neon" },
+  { value: "gemini-4-neon-xhigh", label: "Gemini 4 Neon (XHigh)" },
+  { value: "gemini-4-neon-medium", label: "Gemini 4 Neon (Medium)" },
+  { value: "gemini-4-neon-low", label: "Gemini 4 Neon (Low)" },
+  { value: "gemini-4-carbon-medium", label: "Gemini 4 Carbon (Medium)", description: "Google Gemini 4 Carbon" },
+  { value: "gemini-4-carbon-high", label: "Gemini 4 Carbon (High)" },
+  { value: "gemini-4-carbon-low", label: "Gemini 4 Carbon (Low)" },
   { value: "gemini-4-argon-high", label: "Gemini 4 Argon (High)", description: "Google Gemini 4 Argon" },
   { value: "gemini-4-argon-medium", label: "Gemini 4 Argon (Medium)" },
   { value: "gemini-4-argon-low", label: "Gemini 4 Argon (Low)" },
@@ -56,7 +63,9 @@ const ANTIGRAVITY_BUILTIN_RAW_MODELS: AntigravityRawModelEntry[] = [
   { value: "gemini-4-hydrogen-xhigh", label: "Gemini 4 Hydrogen (XHigh)" },
   { value: "gemini-4-hydrogen-medium", label: "Gemini 4 Hydrogen (Medium)" },
   { value: "gemini-4-hydrogen-low", label: "Gemini 4 Hydrogen (Low)" },
-  { value: "gemini-pro-orchestrator-g1-pro", label: "Orchestrator (Argon)" },
+  { value: "gemini-pro-orchestrator-neon", label: "Orchestrator (Neon)" },
+  { value: "gemini-pro-orchestrator", label: "Orchestrator (Carbon)" },
+  { value: "gemini-pro-orchestrator-argon", label: "Orchestrator (Argon)" },
   { value: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)", description: "Google Gemini 3.8 Flash" },
   { value: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)" },
   { value: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)" },
@@ -74,10 +83,16 @@ const DEFAULT_BASE_MODEL = 'gemini-4-argon';
 
 /**
  * Builtin fallback model definitions when `agy models` cannot be queried.
+ *
+ * `FALLBACK: true` is the frontend's signal that this is a stand-in catalog:
+ * the picker keeps re-requesting the provider until the live `agy models`
+ * listing arrives. Without it a timed-out CLI query would pin the model menu
+ * to this (necessarily stale) list for the life of the page.
  */
 export const ANTIGRAVITY_BUILTIN_MODELS: ProviderModelsDefinition = {
   OPTIONS: dedupeAntigravityVariantModels(ANTIGRAVITY_BUILTIN_RAW_MODELS),
   DEFAULT: DEFAULT_BASE_MODEL,
+  FALLBACK: true,
 };
 
 /**
@@ -184,7 +199,7 @@ export class AntigravityProviderModels implements IProviderModels {
   constructor(fallbackTtlMs: number = 10_000, load: AntigravityCatalogLoader = fetchModelsFromCli) {
     this.catalog = createStaleWhileRefreshValue<ProviderModelsDefinition>({
       load: async () => (await load()) ?? ANTIGRAVITY_BUILTIN_MODELS,
-      ttlMs: (models) => (models === ANTIGRAVITY_BUILTIN_MODELS ? fallbackTtlMs : 5 * 60 * 1000),
+      ttlMs: (models) => (models.FALLBACK ? fallbackTtlMs : 5 * 60 * 1000),
       // The load falls back instead of rejecting; this only covers a bug in it.
       failureRetryMs: fallbackTtlMs,
       onRefreshError: (error) => console.error('[Antigravity] Model catalog refresh failed:', error),
