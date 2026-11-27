@@ -102,6 +102,7 @@ export class AntigravityAcpClient {
       // merging over process.env would quietly bring them back.
       env: options.env ?? process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     // A write racing the engine's death surfaces as an EPIPE error event on
