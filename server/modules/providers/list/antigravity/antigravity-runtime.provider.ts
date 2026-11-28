@@ -2214,6 +2214,14 @@ export class AntigravityRuntimeProvider implements IProviderRuntime {
         break;
       }
 
+      // end_turn is a text boundary: close the reply segment now, not after
+      // the drain below. A drain can hold the run open for many minutes, and
+      // an open segment stays a growing `__streaming_` row on the client that
+      // no history refresh reconciles — the transcript's copy of the same
+      // reply rendered right beside it, twice, for the whole wait.
+      const closedAtEndTurn = translator.closeOpenSegment();
+      if (closedAtEndTurn) writer.send(closedAtEndTurn);
+
       // agy's ACP prompt response does not wait for spawned subagents the
       // way print mode does: the model may yield end_turn while its reviewer
       // agents are still running, and their reports (plus the parent's own

@@ -130,6 +130,9 @@ function handle(frame) {
       // A backgrounded command is still running when the model yields
       // end_turn; the run must hold until the command completes.
       send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp-conv-1', update: { sessionUpdate: 'tool_call', toolCallId: 'call_bg', name: 'run_command', args: { CommandLine: 'sleep 2 && echo done', IsDaemon: true, toolSummary: 'Run regression suites' }, status: 'in_progress' } } });
+      // The reply prose right before end_turn: no tool frame follows it, so
+      // only end_turn itself marks where the segment ends.
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp-conv-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '已启动回归，等待完成通知。' } } } });
       send({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'end_turn', usage: { totalTokens: 3 } } });
       promptId = null;
       setTimeout(() => {
@@ -433,6 +436,12 @@ test('a backgrounded command shows on the strip and holds the run until it compl
   assert.ok(strips.length > 0, 'the strip broadcast went out');
   const running = strips[strips.length - 1].backgroundTasks as Array<{ toolName: string; description: string }>;
   assert.ok(running.some((task) => task.toolName === 'Bash' && task.description === 'Run regression suites'), 'daemon command shows as a Bash entry');
+  // The drain can last many minutes; the reply streamed before end_turn must
+  // be closed now, or the client keeps it as an open streaming row that no
+  // history refresh reconciles and the transcript's copy renders beside it.
+  const replyIndex = messages.findIndex((message) => message.kind === 'stream_delta' && String(message.content).includes('已启动回归'));
+  assert.ok(replyIndex >= 0, 'the pre-end_turn reply streamed');
+  assert.ok(messages.slice(replyIndex + 1).some((message) => message.kind === 'stream_end'), 'end_turn closed the reply segment during the drain');
 
   const result = await runPromise;
   assert.ok(Date.now() - startedAt >= 1500, 'the run drained until the command completed');

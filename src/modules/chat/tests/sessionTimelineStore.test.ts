@@ -814,6 +814,78 @@ test('an unkeyed live segment whose words are not in its turn survives the refre
   );
 });
 
+/**
+ * Drives one Antigravity turn whose reply segment stays open: the engine
+ * streamed `streamedText` and then went quiet without closing the segment
+ * (a background-work drain holds the run), and a mid-run refresh lands
+ * `persistedReplies`. Returns the reply bodies rendered after the refresh and
+ * after a late `stream_end` for the same segment.
+ */
+async function renderOpenSegmentTurn(streamedText: string, persistedReplies: string[]): Promise<{ afterRefresh: string[]; afterStreamEnd: string[] }> {
+  const olderUser = msg(1, { id: 'msg_old_user', provider: 'antigravity', content: 'mount the drive' });
+  const olderReply = msg(2, { id: 'msg_old_reply', provider: 'antigravity', content: 'The drive is mounted.' });
+  const prompt = 'start the smoke run and wait for it';
+  const persistedPrompt = msg(3, { id: 'msg_prompt', provider: 'antigravity', content: prompt });
+  const persisted = persistedReplies.map((content, index) => msg(4 + index, {
+    id: `msg_reply_${index}`,
+    provider: 'antigravity',
+    role: 'assistant',
+    content,
+    providerRowKey: `assistant-step:${4 + index}`,
+  }));
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [olderUser, olderReply], total: 2, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [olderUser, olderReply, persistedPrompt, ...persisted], total: 3 + persisted.length, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+  const replyBodies = () => store.getMessages(SESSION_ID)
+    .filter((row) => (row.role === 'assistant' || row.kind === 'stream_delta') && row.id !== 'msg_old_reply')
+    .map((row) => row.content ?? '');
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_prompt_smoke',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 3000).toISOString(),
+    provider: 'antigravity',
+    kind: 'text',
+    role: 'user',
+    content: prompt,
+  });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: streamedText });
+  await tickThrottle();
+
+  await store.refreshLatestFromServer(SESSION_ID);
+  const afterRefresh = replyBodies();
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  return { afterRefresh, afterStreamEnd: replyBodies() };
+}
+
+test('an open unkeyed segment retires when a mid-run refresh lands its persisted twin', async () => {
+  // The production shape: the reply's segment stayed open through a long
+  // drain and the transcript's copy arrived meanwhile — the same reply
+  // rendered twice until the run settled.
+  const reply = '已修复 `probe` 结尾处 `ctrl.detach()` 兼容性并重新启动全流程冒烟，Triton 核已编译缓存，等待冒烟完成通知。';
+  const { afterRefresh, afterStreamEnd } = await renderOpenSegmentTurn(reply, [reply]);
+  assert.deepEqual(afterRefresh, [reply]);
+  assert.deepEqual(afterStreamEnd, [reply], 'a late stream_end must not bring the retired row back');
+});
+
+test('an open unkeyed segment that only shares an opening with an earlier reply keeps streaming', async () => {
+  // A row that may still grow is compared strictly: matching the start of an
+  // earlier reply in the turn proves nothing about the text still to come.
+  const earlier = '已修复 `fla 0.6.0` 的 `Cache` 还原接口（改用原生 `cache.update`）并上传更新后的脚本。';
+  const growing = '已修复 `fla 0.6.0`';
+  const { afterRefresh } = await renderOpenSegmentTurn(growing, [earlier]);
+  assert.deepEqual(afterRefresh.sort(), [earlier, growing].sort());
+});
+
 test('an unkeyed ACP reply retires even when its prompt was paired before any history loaded', async () => {
   // The production shape: a new session is sent before its (empty) first page
   // has ever been loaded, so the optimistic prompt has no anchor. The first

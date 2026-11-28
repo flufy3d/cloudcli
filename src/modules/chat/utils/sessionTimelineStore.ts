@@ -490,6 +490,47 @@ function isSegmentCoveredByTurn(liveContent: string, completeRowBodies: string[]
   return measureSegmentCoverage(liveBody, rowBodies.join('\u0000')) >= SEGMENT_COVERAGE_THRESHOLD;
 }
 
+/** Whether a row is a scope's still-open `__streaming_` row. */
+function isOpenStreamingRow(message: NormalizedMessage): boolean {
+  return message.kind === 'stream_delta' && message.id.startsWith('__streaming_');
+}
+
+/**
+ * Whether an unkeyed segment that is still open already has its complete
+ * persisted twin in its own turn.
+ *
+ * An engine can leave a segment open long after its text ended — Antigravity
+ * holds the run through a background-work drain, and nothing closes the reply
+ * until the run settles — while a history refresh in between lands the
+ * transcript's copy. Without this the open row and that copy render as the
+ * same reply twice for the whole wait. The test is stricter than the closed
+ * placeholder's: a row that may still grow can share its opening with an
+ * earlier reply of the turn, so only a near-equal body counts — the same text
+ * once whitespace is ignored, or lengths within a tenth of each other with
+ * the coverage threshold met.
+ */
+function isOpenSegmentPersisted(openRow: NormalizedMessage, serverTurnRows: NormalizedMessage[]): boolean {
+  const liveBody = stripWhitespace(openRow.content || '');
+  if (!liveBody) return false;
+  return serverTurnRows.some((row) => {
+    if (
+      row.kind !== 'text'
+      || row.role !== 'assistant'
+      || row.provider !== openRow.provider
+      || (row.contentCompleteness ?? 'complete') !== 'complete'
+    ) {
+      return false;
+    }
+    const body = stripWhitespace(row.content || '');
+    if (!body) return false;
+    if (body === liveBody) return true;
+    const shorter = Math.min(body.length, liveBody.length);
+    const longer = Math.max(body.length, liveBody.length);
+    return shorter * 10 >= longer * 9
+      && measureSegmentCoverage(liveBody, body) >= SEGMENT_COVERAGE_THRESHOLD;
+  });
+}
+
 /**
  * Reconciles a streamed segment that carries no row key against the
  * persisted assistant rows of its own turn.
@@ -624,6 +665,14 @@ function pruneRealtimeSupersededByServer(
         return reconcileStreamedPlaceholderByContent(message, serverTurnForRealtimeRow(message)).verdict !== 'retire';
       }
       return reconcileProviderRowText(message, serverMessages).winner !== 'server';
+    }
+
+    if (isOpenStreamingRow(message) && !message.providerRowKey) {
+      // An unkeyed segment the engine never closed (a drain holds the run
+      // open) whose transcript copy has already landed. Dropping the row also
+      // drops its buffer (`discardStreamBufferIfPruned`), so a late flush
+      // cannot bring it back.
+      return !isOpenSegmentPersisted(message, serverTurnForRealtimeRow(message));
     }
 
     if (message.kind === 'tool_use' && message.toolId) {
