@@ -886,6 +886,93 @@ test('an open unkeyed segment that only shares an opening with an earlier reply 
   assert.deepEqual(afterRefresh.sort(), [earlier, growing].sort());
 });
 
+test('a persisted twin that lands before the throttle flushes the live text still renders once', async () => {
+  // The refresh can beat the client's own 100ms stream throttle: the twin is
+  // merged while the reply is still a buffer, the row appears afterwards, and
+  // a quiet run (a background command) brings no further refresh to retire
+  // it. The merged view must hide the live copy whichever side lands last.
+  const reply = '全链路冒烟测试已全部跑通，已正式启动全量 S1，结果实时同步至 Google Drive `track32/full/s1`。';
+  const olderUser = msg(1, { id: 'msg_old_user', provider: 'antigravity', content: 'earlier question' });
+  const olderReply = msg(2, { id: 'msg_old_reply', provider: 'antigravity', content: 'Earlier reply.' });
+  const prompt = '开工';
+  const persistedPrompt = msg(3, { id: 'msg_prompt', provider: 'antigravity', content: prompt });
+  const persistedReply = msg(4, { id: 'msg_reply', provider: 'antigravity', content: reply, providerRowKey: 'assistant-step:4' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [olderUser, olderReply], total: 2, hasMore: false },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [olderUser, olderReply, persistedPrompt, persistedReply], total: 4, hasMore: false },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  store.appendRealtime(SESSION_ID, {
+    id: 'local_prompt_kaigong',
+    sessionId: SESSION_ID,
+    timestamp: new Date(BASE_TIME + 3000).toISOString(),
+    provider: 'antigravity',
+    kind: 'text',
+    role: 'user',
+    content: prompt,
+  });
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: reply });
+  // The refresh lands while the delta is still buffered…
+  await store.refreshLatestFromServer(SESSION_ID);
+  // …and only then does the throttle push the live row.
+  await tickThrottle();
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID)
+      .filter((row) => (row.role === 'assistant' || row.kind === 'stream_delta') && row.id !== 'msg_old_reply')
+      .map((row) => row.content),
+    [reply],
+  );
+});
+
+test('a reload into a turn longer than the page still retires the replayed reply', async () => {
+  // A turn longer than one history page: after a reload the window holds no
+  // user row at all, only this turn's own rows. Every row in such a window is
+  // part of the newest turn, so the replayed live reply can be matched there.
+  const reply = 'S1 冒烟已成功通过（`bit_equal=True`，`cov=6/6`），继续推进 S2 平滑衰减睡眠。';
+  const toolRows = Array.from({ length: 6 }, (_, index) => msg(10 + index, {
+    id: `msg_tool_${index}`,
+    provider: 'antigravity',
+    kind: 'tool_use',
+    role: undefined,
+    content: undefined,
+    toolName: 'run_command',
+    toolId: `call_${index}`,
+    toolInput: { CommandLine: `step ${index}` },
+  }));
+  const persistedReply = msg(16, { id: 'msg_reply_long', provider: 'antigravity', role: 'assistant', content: reply, providerRowKey: 'assistant-step:16' });
+  const fetchPage = scriptedFetcher([
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [...toolRows, persistedReply], total: 300, hasMore: true },
+    },
+    {
+      params: { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 },
+      page: { messages: [...toolRows, persistedReply], total: 300, hasMore: true },
+    },
+  ]);
+  const store = new SessionTimelineStore({ fetchPage });
+
+  await store.fetchFromServer(SESSION_ID, { limit: SESSION_MESSAGES_PAGE_SIZE, offset: 0 });
+  // The run's frames replay into the reloaded tab: no local prompt exists.
+  emitAntigravity(store, { kind: 'stream_delta', sessionId: SESSION_ID, content: reply });
+  emitAntigravity(store, { kind: 'stream_end', sessionId: SESSION_ID });
+  await store.refreshLatestFromServer(SESSION_ID);
+
+  assert.deepEqual(
+    store.getMessages(SESSION_ID).filter((row) => row.role === 'assistant').map((row) => row.content),
+    [reply],
+  );
+});
+
 test('an unkeyed ACP reply retires even when its prompt was paired before any history loaded', async () => {
   // The production shape: a new session is sent before its (empty) first page
   // has ever been loaded, so the optimistic prompt has no anchor. The first

@@ -357,6 +357,7 @@ function resolveRealtimeTurnServerRows(
   realtimeMessages: NormalizedMessage[],
   provenAnchors: Map<string, string>,
   message: NormalizedMessage,
+  options: { wholeWindowWithoutUserRow?: boolean } = {},
 ): NormalizedMessage[] {
   const realtimeIndex = realtimeMessages.findIndex((candidate) => candidate.id === message.id);
   if (realtimeIndex < 0) return [];
@@ -402,6 +403,13 @@ function resolveRealtimeTurnServerRows(
         break;
       }
     }
+    // No user row in the loaded window at all: a turn longer than one history
+    // page, seen from a tab that loaded it mid-run. A turn boundary would be a
+    // user row, so every row in this window belongs to the newest turn — the
+    // one the live row belongs to. Opt-in: unkeyed text compares whole bodies
+    // and may use it, while tool fingerprints (identical commands are real
+    // repeats) keep requiring a turn they can name.
+    if (turnStart < 0 && options.wholeWindowWithoutUserRow) return serverMessages;
   }
   if (turnStart < 0) return [];
 
@@ -642,6 +650,8 @@ function pruneRealtimeSupersededByServer(
 
   const serverTurnForRealtimeRow = (message: NormalizedMessage): NormalizedMessage[] =>
     resolveRealtimeTurnServerRows(serverMessages, realtimeMessages, provenAnchors, message);
+  const serverTurnForRealtimeText = (message: NormalizedMessage): NormalizedMessage[] =>
+    resolveRealtimeTurnServerRows(serverMessages, realtimeMessages, provenAnchors, message, { wholeWindowWithoutUserRow: true });
 
   const retained = realtimeMessages.filter((message) => {
     if (serverIds.has(message.id)) {
@@ -662,7 +672,7 @@ function pruneRealtimeSupersededByServer(
       // that exists nowhere else — several engines print text they never
       // persist.
       if (!message.providerRowKey) {
-        return reconcileStreamedPlaceholderByContent(message, serverTurnForRealtimeRow(message)).verdict !== 'retire';
+        return reconcileStreamedPlaceholderByContent(message, serverTurnForRealtimeText(message)).verdict !== 'retire';
       }
       return reconcileProviderRowText(message, serverMessages).winner !== 'server';
     }
@@ -672,7 +682,7 @@ function pruneRealtimeSupersededByServer(
       // open) whose transcript copy has already landed. Dropping the row also
       // drops its buffer (`discardStreamBufferIfPruned`), so a late flush
       // cannot bring it back.
-      return !isOpenSegmentPersisted(message, serverTurnForRealtimeRow(message));
+      return !isOpenSegmentPersisted(message, serverTurnForRealtimeText(message));
     }
 
     if (message.kind === 'tool_use' && message.toolId) {
@@ -882,7 +892,7 @@ function computeMerged(
         // lookup scans the unfiltered list, exactly like the prune pass does.
         const match = reconcileStreamedPlaceholderByContent(
           message,
-          resolveRealtimeTurnServerRows(server, realtime, provenAnchors, message),
+          resolveRealtimeTurnServerRows(server, realtime, provenAnchors, message, { wholeWindowWithoutUserRow: true }),
         );
         return match.verdict === 'supersede' ? [match.serverMessageId] : [];
       }
@@ -907,6 +917,25 @@ function computeMerged(
     }
     if (message.kind === 'thinking' && isThinkingRowEchoOnServer(message, server)) {
       return false;
+    }
+    // The refresh prune retires unkeyed live text only for rows that exist
+    // when history lands. A twin that lands first — the refresh beating the
+    // stream throttle, or the segment closing after it — would leave the live
+    // copy beside it until some later refresh, and a quiet run may bring
+    // none. The merge reruns on every change, so hiding the copy here makes
+    // the outcome independent of which side arrived last; the next prune then
+    // drops the row itself.
+    if (
+      !message.providerRowKey
+      && (isStreamedTextPlaceholder(message) || isOpenStreamingRow(message))
+    ) {
+      const turnRows = resolveRealtimeTurnServerRows(server, realtime, provenAnchors, message, { wholeWindowWithoutUserRow: true });
+      const persisted = isOpenStreamingRow(message)
+        ? isOpenSegmentPersisted(message, turnRows)
+        : reconcileStreamedPlaceholderByContent(message, turnRows).verdict === 'retire';
+      if (persisted) {
+        return false;
+      }
     }
     if (
       (message.kind === 'text' && message.role === 'assistant')
